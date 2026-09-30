@@ -143,6 +143,10 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
   const feedbackActivities = activities.filter(isFeedbackActivity);
   const failureDetail = failed ? latestFailureDetail(activities) : null;
   const approvalRate = task.generatedCount > 0 ? Math.round((task.savedCount / task.generatedCount) * 100) : null;
+  // A task's ticket lives in jiraIssueKeys OR linearIssueKeys depending on its source — reading only
+  // the Jira list left every Linear task showing a bare "—" placeholder beside its status. Same
+  // combined list the full task page uses; a task with no ticket gets no key slot at all.
+  const ticketKey = [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? [])][0];
   const draftsTsv = toTsv(
     ["Title", "Priority", "Severity", "Component", "Preconditions", "Steps", "Expected Result", "Tags"],
     task.drafts.map((draft) => [
@@ -184,7 +188,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
         {/* Header — kept slim and always visible so the close control never scrolls out of reach */}
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-3">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="font-mono text-xs text-[var(--muted-soft)]">{task.jiraIssueKeys[0] || "—"}</span>
+            {ticketKey && <span className="font-mono text-xs text-[var(--muted-soft)]">{ticketKey}</span>}
             <StatusChip tone={taskStatusTone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip>
           </div>
           <button

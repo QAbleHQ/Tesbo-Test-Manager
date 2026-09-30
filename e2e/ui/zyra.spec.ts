@@ -199,6 +199,9 @@ test.describe("zyra / agents (UI)", () => {
     projectId?: string;
     context?: string;
     sources?: Array<{ type: string; title: string; detail: string }>;
+    /** The ticket a Jira- or Linear-linked task carries — both default to none, as before. */
+    jiraIssueKeys?: string[];
+    linearIssueKeys?: string[];
   }
 
   /** Writes a completed Zyra task straight into the table, drafts and all. Returns its id. */
@@ -225,13 +228,15 @@ test.describe("zyra / agents (UI)", () => {
         (project_id, requested_by, provider, model, user_story, requested_count,
          include_happy_flow, include_negative_flow, include_multi_tab, include_cross_browser, include_boundary,
          generated_count, generated_payload, saved_count, save_events, agent_name, task_status,
-         feedback, context, jira_issue_keys, token_input, token_output, token_total, source_summary, activity_log)
+         feedback, context, jira_issue_keys, linear_issue_keys, token_input, token_output, token_total, source_summary, activity_log)
        VALUES (${literal(projectId)}, ${literal(t.owner.userId)}, 'openai', 'gpt-4o-mini',
          ${literal(userStory)}, ${drafts.length},
          true, true, false, false, false,
          ${drafts.length}, ${literal(JSON.stringify(drafts))}::jsonb, 0, '[]'::jsonb,
          ${literal(ZYRA_AGENT_NAME)}, ${literal(options.status ?? "in_review")},
-         '', ${literal(options.context ?? "")}, '[]'::jsonb, 10, 20, 30, ${literal(sources)}::jsonb, ${literal(activity)}::jsonb);`,
+         '', ${literal(options.context ?? "")},
+         ${literal(JSON.stringify(options.jiraIssueKeys ?? []))}::jsonb, ${literal(JSON.stringify(options.linearIssueKeys ?? []))}::jsonb,
+         10, 20, 30, ${literal(sources)}::jsonb, ${literal(activity)}::jsonb);`,
     );
     return scalar(
       `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(projectId)} AND user_story = ${literal(userStory)};`,
@@ -1249,6 +1254,61 @@ test.describe("zyra / agents (UI)", () => {
     await expect(kanbanColumn(page, "Failed").getByText(userStory)).toBeVisible();
     // Before the fix a failed task normalized to 'todo' and landed here instead.
     await expect(kanbanColumn(page, "Pending").getByText(userStory)).toHaveCount(0);
+  });
+
+  // ─── The full task page's description (fix for "[Task] Jira/Linear – Task Description Missing in
+  // Full Task Details") ──────────────────────────────────────────────────────
+  //
+  // A Jira/Linear task's ticket description is captured into task.context when the task is created
+  // from Requirements. The quick-view popup rendered it; "View full task" ([taskId]/page.tsx) never
+  // did, so the full page showed no description at all — only a 320-character excerpt under Sources.
+
+  for (const provider of ["Jira", "Linear"] as const) {
+    const keys = (key: string) => (provider === "Jira" ? { jiraIssueKeys: [key] } : { linearIssueKeys: [key] });
+
+    test(`ZYU-122 the full task page renders a ${provider} ticket's description as formatted Markdown`, async ({ browser }) => {
+      const key = provider === "Jira" ? "ZYD-1" : "LIN-D1";
+      const taskId = seedTask({ userStory: stamp(`${provider} description story`), context: TICKET_MARKDOWN, ...keys(key) });
+      const page = await open(browser, `/agents/tasks/${taskId}`);
+
+      const description = page.getByTestId("task-description");
+      await expect(description).toBeVisible();
+      await expect(description.locator("h3")).toHaveText("LIN-05: Submit an Expense Claim");
+      await expect(description.locator("strong")).toHaveText(["Module:", "Priority:", "User Story:"]);
+      await expect(description.locator("li")).toHaveText(["Receipt is mandatory", "Amount must be positive"]);
+      const link = description.getByRole("link", { name: "the claim policy" });
+      await expect(link).toHaveAttribute("href", "https://example.com/claims");
+      await expect(link).toHaveAttribute("rel", /noopener/);
+      const text = (await description.innerText()).replace(/\s+/g, " ");
+      expect(text, "no Markdown syntax is left visible on the full page").not.toMatch(MARKDOWN_SYNTAX);
+      expect(text).toContain("As an employee, I want to submit an expense claim");
+      // The ticket key the task is linked to still shows alongside it.
+      await expect(page.getByText(key, { exact: true })).toBeVisible();
+    });
+
+    test(`ZYU-123 a ${provider} task with no description says so on the full task page`, async ({ browser }) => {
+      const taskId = seedTask({ userStory: stamp(`${provider} empty description story`), context: "", ...keys(provider === "Jira" ? "ZYD-2" : "LIN-D2") });
+      const page = await open(browser, `/agents/tasks/${taskId}`);
+
+      await expect(page.getByTestId("task-description")).toContainText("No description available");
+      // The rest of the page is unaffected by the empty state.
+      await expect(page.getByRole("button", { name: "Generated Testcases (2)" })).toBeVisible();
+    });
+  }
+
+  test("ZYU-124 raw HTML in a task description is shown as text on the full task page, never rendered", async ({ browser }) => {
+    const context = [
+      `<img src=x onerror="window.__zyraTaskXss=1"> <b>not bold</b>`,
+      `[click me](javascript:window.__zyraTaskXss=1)`,
+    ].join("\n");
+    const taskId = seedTask({ userStory: stamp("XSS description story"), context, linearIssueKeys: ["LIN-D3"] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    const description = page.getByTestId("task-description");
+    await expect(description).toContainText("<b>not bold</b>");
+    await expect(description.locator("img, b")).toHaveCount(0);
+    await expect(description.locator('a[href^="javascript"], [onerror]')).toHaveCount(0);
+    expect(await page.evaluate(() => (window as unknown as { __zyraTaskXss?: number }).__zyraTaskXss)).toBeUndefined();
   });
 
   // ─── The review table, which is where the writes happen ────────────────────

@@ -6514,6 +6514,79 @@ export class LegacyService implements OnModuleInit {
     return this.getBug(bugId);
   }
 
+  // Flat discussion on a bug (V129) — the KB comment shape minus threading, anchors and resolution.
+  // Routed under /api/projects/:projectId so ProjectWriteLockGuard covers the write, which is why
+  // the bug is resolved against the URL's project rather than through requireBugAccess alone.
+
+  private bugCommentView(row: Body): Body {
+    return {
+      id: String(row.id),
+      bugId: String(row.bug_id),
+      authorId: row.author_id ? String(row.author_id) : null,
+      authorName: row.author_name ? String(row.author_name) : "Unknown",
+      body: String(row.body || ""),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString()
+    };
+  }
+
+  /** The bug, if it is live and belongs to this project; otherwise the same 404 as a missing bug. */
+  private async bugInProject(projectId: string, bugId: string): Promise<{ id: string; title: string }> {
+    if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
+    const res = await this.db.query<{ id: string; title: string }>(
+      "SELECT id, title FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+      [bugId, projectId]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+    return res.rows[0];
+  }
+
+  async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    await this.bugInProject(projectId, bugId);
+    const res = await this.db.query(
+      `SELECT c.id, c.bug_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM bug_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       WHERE c.bug_id = $1 AND c.is_deleted = false
+       ORDER BY c.created_at ASC, c.id ASC`,
+      [bugId]
+    );
+    const list = res.rows.map((row) => this.bugCommentView(row));
+    return { list, total: list.length };
+  }
+
+  async createBugComment(projectId: string, userId: string | null | undefined, bugId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+
+    // String() would store an object as "[object Object]" and a number as its digits — refuse
+    // anything that is not text instead.
+    const raw = body?.body;
+    if (raw !== undefined && raw !== null && typeof raw !== "string") {
+      throw new BadRequestException({ error: "Comment must be text." });
+    }
+    const text = (raw ?? "").trim();
+    if (!text) throw new BadRequestException({ error: "Comment cannot be empty." });
+    if (text.length > 10000) throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+
+    const res = await this.db.query(
+      `WITH inserted AS (
+         INSERT INTO bug_comments (project_id, bug_id, author_id, body)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, bug_id, author_id, body, created_at, updated_at
+       )
+       SELECT i.*, COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM inserted i
+       LEFT JOIN users a ON a.id = i.author_id`,
+      [projectId, bugId, uid, text]
+    );
+    await this.logProjectActivity(projectId, uid, "commented", "bug", bugId, bug.title, { commentId: res.rows[0].id });
+    return this.bugCommentView(res.rows[0]);
+  }
+
   /**
    * One bug by id, without a caller check.
    *
@@ -10473,6 +10546,30 @@ export class LegacyService implements OnModuleInit {
       values
     );
     return { list: res.rows.map(toCamel), total: count.rows[0]?.count ?? 0 };
+  }
+
+  // One synced ticket by its exact key — what a Zyra "jira_ticket" citation opens. Deliberately NOT
+  // scoped to the currently enabled mapping the way jiraTickets (the Requirements list) is: Zyra
+  // reads jira_tickets by project_id alone (relevantJiraSnapshot/jiraSnapshot), and a disconnect or
+  // re-map keeps the old mapping's rows, so a ticket Zyra read and cited can belong to a mapping that
+  // has since been switched off. Resolving the citation through the list endpoint therefore reported
+  // a ticket Zyra had just read as "could not be found". Same scope as the reader, so anything Zyra
+  // could cite, this can open. Two rows can share a key only across two Jira connections in one
+  // project; the currently mapped one wins, then the most recently synced.
+  async jiraTicketByKey(projectId: string, userId: string | null | undefined, issueKey: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const key = String(issueKey || "").trim();
+    if (!key) throw new BadRequestException({ error: "Jira issue key is required." });
+    const res = await this.db.query(
+      `SELECT * FROM jira_tickets
+       WHERE project_id = $1 AND jira_issue_key = $2
+       ORDER BY CASE WHEN mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1) THEN 0 ELSE 1 END,
+                synced_at DESC NULLS LAST
+       LIMIT 1`,
+      [projectId, key]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Jira ticket not found" });
+    return toCamel(res.rows[0]);
   }
 
   async jiraComment(projectId: string, userId: string | null | undefined, body: Body) {

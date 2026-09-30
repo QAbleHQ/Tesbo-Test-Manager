@@ -1,8 +1,9 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button, Field, FieldLabel, Input } from "@/components/ui";
 import type { BugAttachment } from "@/lib/api";
+import { isImageAttachment } from "@/components/bugs/BugAttachments";
 import {
   EVIDENCE_ACCEPT_ATTRIBUTE,
   EVIDENCE_ALLOWED_EXTENSIONS,
@@ -17,6 +18,31 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const THUMB_CLASS = "h-9 w-9 shrink-0 rounded-[4px] border border-[var(--border-subtle)] object-cover";
+
+/*
+ * A picked-but-not-yet-uploaded image, previewed from the local file. Read as a data URL rather
+ * than an object URL: nothing to revoke, so StrictMode's double-run effects cannot revoke a URL the
+ * <img> is still showing, and a removed row leaves no blob behind.
+ */
+function StagedThumbnail({ file }: { file: File }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (!cancelled && typeof reader.result === "string") setSrc(reader.result);
+    };
+    reader.readAsDataURL(file);
+    return () => {
+      cancelled = true;
+      reader.abort();
+    };
+  }, [file]);
+  // eslint-disable-next-line @next/next/no-img-element
+  return src ? <img src={src} alt={file.name} data-testid="evidence-thumbnail" className={THUMB_CLASS} /> : <span className={THUMB_CLASS} />;
 }
 
 interface Props {
@@ -95,13 +121,20 @@ export default function BugEvidenceField({
                   key={att.id}
                   className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]"
                 >
-                  {downloadUrl ? (
-                    <a href={downloadUrl(att.id)} target="_blank" rel="noreferrer" className="text-[var(--accent-light)] hover:underline truncate">
-                      {att.fileName}
-                    </a>
-                  ) : (
-                    <span className="truncate">{att.fileName}</span>
-                  )}
+                  <span className="flex min-w-0 items-center gap-2.5">
+                    {/* Same thumbnail rule as Bug Details (BugAttachments): images only. */}
+                    {downloadUrl && isImageAttachment(att) && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={downloadUrl(att.id)} alt={att.fileName} loading="lazy" data-testid="evidence-thumbnail" className={THUMB_CLASS} />
+                    )}
+                    {downloadUrl ? (
+                      <a href={downloadUrl(att.id)} target="_blank" rel="noreferrer" className="text-[var(--accent-light)] hover:underline truncate">
+                        {att.fileName}
+                      </a>
+                    ) : (
+                      <span className="truncate">{att.fileName}</span>
+                    )}
+                  </span>
                   <span className="flex items-center gap-2 shrink-0">
                     <span className="text-[var(--muted)]">{formatFileSize(att.fileSize)}</span>
                     {onRemoveExisting && (
@@ -121,7 +154,10 @@ export default function BugEvidenceField({
                   key={`${file.name}-${index}`}
                   className="flex items-center justify-between rounded-[var(--radius-control)] border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-1.5 text-[13px]"
                 >
-                  <span className="truncate">{file.name}</span>
+                  <span className="flex min-w-0 items-center gap-2.5">
+                    {isImageAttachment({ fileName: file.name, contentType: file.type }) && <StagedThumbnail file={file} />}
+                    <span className="truncate">{file.name}</span>
+                  </span>
                   <span className="flex items-center gap-2 shrink-0">
                     <span className="text-[var(--muted)]">{formatFileSize(file.size)}</span>
                     <button type="button" onClick={() => removeStagedFile(index)} className="text-[var(--muted)] hover:text-[var(--error-foreground)]">

@@ -872,6 +872,23 @@ export class LegacyController {
     return this.legacy.removeBugLink(req.userId, bugId, linkId);
   }
 
+  // Project-scoped (unlike the /api/bugs/:bugId routes above) so ProjectWriteLockGuard refuses a
+  // new comment on a read-only locked project while still letting it be read.
+  @Get("/api/projects/:projectId/bugs/:bugId/comments")
+  listBugComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("bugId") bugId: string) {
+    return this.legacy.listBugComments(projectId, req.userId, bugId);
+  }
+
+  @Post("/api/projects/:projectId/bugs/:bugId/comments")
+  createBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.createBugComment(projectId, req.userId, bugId, body);
+  }
+
   @Post("/api/projects/:projectId/bugs/:bugId/attachments")
   @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
   uploadBugAttachments(
@@ -1859,6 +1876,11 @@ export class LegacyController {
   @Get("/api/projects/:projectId/jira/tickets")
   jiraTickets(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
     return this.legacy.jiraTickets(projectId, req.userId, query);
+  }
+
+  @Get("/api/projects/:projectId/jira/tickets/:issueKey")
+  jiraTicketByKey(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("issueKey") issueKey: string) {
+    return this.legacy.jiraTicketByKey(projectId, req.userId, issueKey);
   }
 
   @Post("/api/projects/:projectId/jira/comment")
