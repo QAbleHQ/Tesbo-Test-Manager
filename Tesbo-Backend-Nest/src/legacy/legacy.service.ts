@@ -6514,6 +6514,79 @@ export class LegacyService implements OnModuleInit {
     return this.getBug(bugId);
   }
 
+  // Flat discussion on a bug (V129) — the KB comment shape minus threading, anchors and resolution.
+  // Routed under /api/projects/:projectId so ProjectWriteLockGuard covers the write, which is why
+  // the bug is resolved against the URL's project rather than through requireBugAccess alone.
+
+  private bugCommentView(row: Body): Body {
+    return {
+      id: String(row.id),
+      bugId: String(row.bug_id),
+      authorId: row.author_id ? String(row.author_id) : null,
+      authorName: row.author_name ? String(row.author_name) : "Unknown",
+      body: String(row.body || ""),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString()
+    };
+  }
+
+  /** The bug, if it is live and belongs to this project; otherwise the same 404 as a missing bug. */
+  private async bugInProject(projectId: string, bugId: string): Promise<{ id: string; title: string }> {
+    if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
+    const res = await this.db.query<{ id: string; title: string }>(
+      "SELECT id, title FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+      [bugId, projectId]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+    return res.rows[0];
+  }
+
+  async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    await this.bugInProject(projectId, bugId);
+    const res = await this.db.query(
+      `SELECT c.id, c.bug_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM bug_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       WHERE c.bug_id = $1 AND c.is_deleted = false
+       ORDER BY c.created_at ASC, c.id ASC`,
+      [bugId]
+    );
+    const list = res.rows.map((row) => this.bugCommentView(row));
+    return { list, total: list.length };
+  }
+
+  async createBugComment(projectId: string, userId: string | null | undefined, bugId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+
+    // String() would store an object as "[object Object]" and a number as its digits — refuse
+    // anything that is not text instead.
+    const raw = body?.body;
+    if (raw !== undefined && raw !== null && typeof raw !== "string") {
+      throw new BadRequestException({ error: "Comment must be text." });
+    }
+    const text = (raw ?? "").trim();
+    if (!text) throw new BadRequestException({ error: "Comment cannot be empty." });
+    if (text.length > 10000) throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+
+    const res = await this.db.query(
+      `WITH inserted AS (
+         INSERT INTO bug_comments (project_id, bug_id, author_id, body)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, bug_id, author_id, body, created_at, updated_at
+       )
+       SELECT i.*, COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM inserted i
+       LEFT JOIN users a ON a.id = i.author_id`,
+      [projectId, bugId, uid, text]
+    );
+    await this.logProjectActivity(projectId, uid, "commented", "bug", bugId, bug.title, { commentId: res.rows[0].id });
+    return this.bugCommentView(res.rows[0]);
+  }
+
   /**
    * One bug by id, without a caller check.
    *

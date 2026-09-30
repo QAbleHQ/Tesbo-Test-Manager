@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import {
   deleteBug,
@@ -16,6 +16,7 @@ import { Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { BugStatusBadge } from "@/components/bugs/BugBadges";
+import BugComments from "@/components/bugs/BugComments";
 import BugDetailsBody from "@/components/bugs/BugDetailsBody";
 import EditBugModal from "@/components/bugs/EditBugModal";
 
@@ -28,6 +29,7 @@ import EditBugModal from "@/components/bugs/EditBugModal";
 export default function BugDetailPage() {
   const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const projectId = params.id as string;
   const bugId = params.bugId as string;
   const { currentUser } = useAppData();
@@ -36,7 +38,8 @@ export default function BugDetailPage() {
 
   const [bug, setBug] = useState<BugItem | null>(null);
   const [notFound, setNotFound] = useState(false);
-  const [editing, setEditing] = useState(false);
+  // ?edit=1 is how the Bug Details panel's Edit opens this page straight into the edit form.
+  const [editing, setEditing] = useState(searchParams.get("edit") === "1");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -156,7 +159,11 @@ export default function BugDetailPage() {
             jiraConnected={jiraConnected}
             linearConnected={linearConnected}
             hasTestRuns={hasTestRuns}
-            onClose={() => setEditing(false)}
+            onClose={() => {
+              setEditing(false);
+              // Drop ?edit=1 so a refresh shows the bug rather than reopening the form.
+              if (searchParams.get("edit")) router.replace(`/projects/${projectId}/bugs/${bugId}`, { scroll: false });
+            }}
             onChanged={load}
           />
         ) : (
@@ -165,6 +172,7 @@ export default function BugDetailPage() {
             className="space-y-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
           >
             <BugDetailsBody bug={bug} projectId={projectId} />
+            <BugComments key={bug.id} projectId={projectId} bugId={bug.id} />
           </section>
         )}
       </main>

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, test, type APIRequestContext } from "@playwright/test";
+import { expect, request as playwrightRequest, test, type APIRequestContext } from "@playwright/test";
+import { env } from "../utils/env";
 import {
   loginAs,
   provisionRbacTenant,
@@ -1190,5 +1191,195 @@ test.describe("bug_links soft-delete (hard-delete remediation Phase 7)", () => {
       await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
       await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
     }
+  });
+});
+
+/*
+ * Comments on a bug (V129) — GET/POST /api/projects/:projectId/bugs/:bugId/comments. Flat and
+ * chronological: no replies, edit, delete or resolve. The read-only plan lock on the POST is covered
+ * in billing-lifecycle.spec.ts (BUGC-A-10), which owns the tenant that can be locked.
+ */
+test.describe("bug comments", () => {
+  let asB: APIRequestContext;
+  let anon: APIRequestContext;
+
+  test.beforeAll(async () => {
+    asB = await playwrightRequest.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: path.join(__dirname, "../.auth/state-b.json"),
+    });
+    // The request fixture inherits account A's storageState; clear it for a truly anonymous caller.
+    anon = await playwrightRequest.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+  });
+
+  test.afterAll(async () => {
+    await asB?.dispose();
+    await anon?.dispose();
+  });
+
+  function commentsUrl(bugId: string, projectId: string = ctx.projectId) {
+    return `/api/projects/${projectId}/bugs/${bugId}/comments`;
+  }
+
+  async function newBug(request: APIRequestContext, label: string): Promise<{ id: string; title: string }> {
+    const res = await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+      data: { title: `E2E Bug Comments ${label} ${Date.now()}` },
+    });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  test("BUGC-A-01 a bug with no comments lists an empty set", async ({ request }) => {
+    const bug = await newBug(request, "Empty");
+    try {
+      const res = await request.get(commentsUrl(bug.id));
+      expect(res.status()).toBe(200);
+      expect(await res.json()).toEqual({ list: [], total: 0 });
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-02 adding a comment returns it with its author and timestamp, trimmed, and it is listed", async ({ request }) => {
+    const bug = await newBug(request, "Add");
+    const me = await (await request.get("/api/auth/me")).json();
+    try {
+      const startedAt = Date.now();
+      const res = await request.post(commentsUrl(bug.id), { data: { body: "  Reproduced on staging too.  " } });
+      expect(res.status(), await res.text()).toBe(201);
+      const created = await res.json();
+      expect(created).toMatchObject({ bugId: bug.id, authorId: me.userId, body: "Reproduced on staging too." });
+      expect(typeof created.id).toBe("string");
+      expect(created.authorName).toBeTruthy();
+      expect(created.authorName).not.toBe("Unknown");
+      expect(Date.parse(created.createdAt)).toBeGreaterThanOrEqual(startedAt - 60_000);
+
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.total).toBe(1);
+      expect(listed.list).toEqual([created]);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-03 comments list oldest first, and an identical body posted twice is kept twice", async ({ request }) => {
+    const bug = await newBug(request, "Order");
+    try {
+      for (const body of ["first", "second", "second"]) {
+        expect((await request.post(commentsUrl(bug.id), { data: { body } })).ok()).toBeTruthy();
+      }
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.total).toBe(3);
+      expect(listed.list.map((c: { body: string }) => c.body)).toEqual(["first", "second", "second"]);
+      expect(new Set(listed.list.map((c: { id: string }) => c.id)).size).toBe(3);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-04 an empty, whitespace-only, missing or non-text body is refused and nothing is stored", async ({ request }) => {
+    const bug = await newBug(request, "Invalid");
+    try {
+      for (const data of [{ body: "" }, { body: "   \n\t " }, {}, { body: null }]) {
+        const res = await request.post(commentsUrl(bug.id), { data, failOnStatusCode: false });
+        expect(res.status(), JSON.stringify(data)).toBe(400);
+        expect((await res.json()).error).toBe("Comment cannot be empty.");
+      }
+      for (const data of [{ body: 42 }, { body: { text: "hi" } }, { body: ["hi"] }]) {
+        const res = await request.post(commentsUrl(bug.id), { data, failOnStatusCode: false });
+        expect(res.status(), JSON.stringify(data)).toBe(400);
+        expect((await res.json()).error).toBe("Comment must be text.");
+      }
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(0);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-05 10,000 characters is accepted and 10,001 is refused", async ({ request }) => {
+    const bug = await newBug(request, "Length");
+    try {
+      const atLimit = await request.post(commentsUrl(bug.id), { data: { body: "x".repeat(10_000) } });
+      expect(atLimit.status()).toBe(201);
+      expect((await atLimit.json()).body).toHaveLength(10_000);
+
+      const over = await request.post(commentsUrl(bug.id), { data: { body: "x".repeat(10_001) }, failOnStatusCode: false });
+      expect(over.status()).toBe(400);
+      expect((await over.json()).error).toContain("10,000");
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(1);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-06 an unknown, malformed, deleted or other-project bug is a 404 for both list and add", async ({ request }) => {
+    const deleted = await newBug(request, "Deleted");
+    await request.delete(`/api/bugs/${deleted.id}`);
+    const live = await newBug(request, "Mismatch");
+    const other = await (
+      await request.post("/api/projects", {
+        data: { name: `E2E Bug Comments Other ${Date.now()}`, projectKey: `BC${Date.now().toString(36).toUpperCase()}`, projectType: "tesbox" },
+      })
+    ).json();
+    try {
+      const cases: Array<[string, string]> = [
+        ["unknown", commentsUrl("00000000-0000-0000-0000-000000000000")],
+        ["malformed", commentsUrl("not-a-uuid")],
+        ["deleted", commentsUrl(deleted.id)],
+        // A real, reachable bug addressed through a different project the caller also belongs to.
+        ["other project", commentsUrl(live.id, other.id)],
+      ];
+      for (const [label, url] of cases) {
+        const list = await request.get(url, { failOnStatusCode: false });
+        expect(list.status(), `list: ${label}`).toBe(404);
+        const add = await request.post(url, { data: { body: "hello" }, failOnStatusCode: false });
+        expect(add.status(), `add: ${label}`).toBe(404);
+      }
+      expect((await (await request.get(commentsUrl(live.id))).json()).total).toBe(0);
+    } finally {
+      await request.delete(`/api/bugs/${live.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${other.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-07 another workspace and an anonymous caller can neither read nor add comments", async ({ request }) => {
+    const bug = await newBug(request, "Authz");
+    try {
+      await request.post(commentsUrl(bug.id), { data: { body: "Account A only" } });
+      for (const [label, caller] of [["account B", asB], ["anonymous", anon]] as const) {
+        const list = await caller.get(commentsUrl(bug.id), { failOnStatusCode: false });
+        expect([401, 403, 404], `${label} list`).toContain(list.status());
+        const add = await caller.post(commentsUrl(bug.id), { data: { body: `From ${label}` }, failOnStatusCode: false });
+        expect([401, 403, 404], `${label} add`).toContain(add.status());
+      }
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.list.map((c: { body: string }) => c.body)).toEqual(["Account A only"]);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-08 adding a comment is recorded in the project's activity feed", async ({ request }) => {
+    const bug = await newBug(request, "Activity");
+    try {
+      await request.post(commentsUrl(bug.id), { data: { body: "Logged" } });
+      const feed = await (await request.get(`/api/projects/${ctx.projectId}/activity`, { params: { limit: "100" } })).json();
+      const entry = feed.list.find(
+        (i: { action?: string; entityType?: string; entityId?: string }) =>
+          i.action === "commented" && i.entityType === "bug" && i.entityId === bug.id,
+      );
+      expect(entry, "no 'commented' entry for the bug in the activity feed").toBeTruthy();
+      expect(entry.entityName).toBe(bug.title);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-09 comments are not returned for a bug once it is deleted", async ({ request }) => {
+    const bug = await newBug(request, "Cascade");
+    await request.post(commentsUrl(bug.id), { data: { body: "Before delete" } });
+    await request.delete(`/api/bugs/${bug.id}`);
+    const res = await request.get(commentsUrl(bug.id), { failOnStatusCode: false });
+    expect(res.status()).toBe(404);
   });
 });

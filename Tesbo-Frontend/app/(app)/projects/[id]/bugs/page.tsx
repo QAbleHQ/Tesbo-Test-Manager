@@ -47,6 +47,7 @@ import {
   BugStatusBadge,
   MemberAvatar,
 } from "@/components/bugs/BugBadges";
+import BugComments from "@/components/bugs/BugComments";
 import BugDetailsBody from "@/components/bugs/BugDetailsBody";
 import EditBugModal from "@/components/bugs/EditBugModal";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
@@ -1018,18 +1019,18 @@ export default function BugsPage() {
           <section aria-label="Bug details" className="flex h-full flex-col">
             <div className="flex-1 space-y-5 overflow-y-auto p-5">
               <BugDetailsBody bug={viewBug} projectId={projectId} />
+              <BugComments key={viewBug.id} projectId={projectId} bugId={viewBug.id} />
             </div>
 
             {/* Footer actions — primary on the left, destructive on the right, as in the Test Case
                 detail panel. */}
             <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--border)] p-4">
               <div className="flex items-center gap-2">
+                {/* Opens the full bug page straight into its in-place edit form, rather than the
+                    Edit Bug dialog the list row and board card still use. */}
                 <Button
                   variant="primary"
-                  onClick={() => {
-                    openEdit(viewBug);
-                    setViewBug(null);
-                  }}
+                  onClick={() => router.push(`/projects/${projectId}/bugs/${viewBug.id}?edit=1`)}
                 >
                   <svg
                     className="w-4 h-4"

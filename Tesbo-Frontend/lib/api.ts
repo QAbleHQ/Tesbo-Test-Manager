@@ -2747,6 +2747,26 @@ export async function getBug(bugId: string): Promise<BugItem> {
   return api(`/api/bugs/${bugId}`);
 }
 
+/** One comment on a bug. Flat and chronological — no replies or resolution (see V129). */
+export interface BugComment {
+  id: string;
+  bugId: string;
+  authorId: string | null;
+  /** Name, else email; "Unknown" once the author's account is gone. */
+  authorName: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listBugComments(projectId: string, bugId: string): Promise<{ list: BugComment[]; total: number }> {
+  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`);
+}
+
+export async function createBugComment(projectId: string, bugId: string, body: string): Promise<BugComment> {
+  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`, { method: "POST", body: { body } });
+}
+
 export async function createBug(projectId: string, data: {
   title: string;
   description?: string;

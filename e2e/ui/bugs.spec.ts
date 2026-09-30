@@ -1756,15 +1756,64 @@ test.describe("bug details panel", () => {
     }
   });
 
-  test("BUG-U-51 Edit hands off to the Edit Bug modal for the same bug and closes the panel", async ({ page }) => {
+  /** The full page's in-place Edit Bug card. */
+  function fullPageEditForm(page: Page): Locator {
+    return page.getByRole("region", { name: "Edit bug" });
+  }
+
+  /** FieldLabel has no htmlFor, so the title is reached as the first input after its label. */
+  function fullPageTitleInput(page: Page): Locator {
+    return fullPageEditForm(page).locator("xpath=.//label[contains(., 'Bug Title')]/following::input[1]");
+  }
+
+  test("BUG-U-51 Edit opens the full bug page straight into its edit form, and Cancel leaves it on the bug", async ({ page }) => {
+    // Was: Edit opened the Edit Bug dialog over the list. Changed on request — the panel's Edit now
+    // goes to the full-page form (the list row / board card pencil still use the dialog, BUG-U-13).
     const bug = await createBug(api, projectId, { title: `E2E Panel Edit ${uniqueSuffix()}` });
     try {
       await openFromList(page, bug.title);
       await panelBody(page).getByRole("button", { name: "Edit", exact: true }).click();
-      await expect(panelBody(page)).toBeHidden();
-      await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
-      const values = await page.locator("input").evaluateAll((els) => els.map((el) => (el as HTMLInputElement).value));
-      expect(values).toContain(bug.title);
+
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}\\?edit=1$`));
+      await expect(panelBody(page)).toHaveCount(0);
+      await expect(fullPageEditForm(page)).toBeVisible();
+      await expect(fullPageTitleInput(page)).toHaveValue(bug.title);
+      // In place, not the dialog: the form spans the page's main column.
+      const formBox = (await fullPageEditForm(page).boundingBox())!;
+      const mainBox = (await fullPageEditForm(page).locator("xpath=ancestor::main[1]").boundingBox())!;
+      expect(formBox.width).toBeGreaterThan(mainBox.width - 60);
+
+      await fullPageEditForm(page).getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(fullPageEditForm(page)).toHaveCount(0);
+      await expect(page.getByRole("region", { name: "Bug details" })).toBeVisible();
+      // The flag is dropped, so a refresh shows the bug rather than reopening the form.
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}$`));
+      await page.reload();
+      await expect(page.getByRole("region", { name: "Bug details" })).toBeVisible();
+      await expect(fullPageEditForm(page)).toHaveCount(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-70 saving the full-page form opened from the panel's Edit persists and shows the bug", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Edit Save ${uniqueSuffix()}` });
+    const renamed = `${bug.title} saved`;
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Edit", exact: true }).click();
+      await fullPageTitleInput(page).fill(renamed);
+      await fullPageEditForm(page).getByLabel("Severity").selectOption("Critical");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+
+      await expect(fullPageEditForm(page)).toHaveCount(0);
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}$`));
+      await expect(page.getByRole("heading", { level: 1, name: renamed })).toBeVisible();
+      await expect(page.getByRole("region", { name: "Bug details" }).getByText("Critical", { exact: true })).toBeVisible();
+
+      const persisted = await (await api.get(`/api/bugs/${bug.id}`)).json();
+      expect(persisted.title).toBe(renamed);
+      expect(persisted.severity).toBe("Critical");
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
@@ -2040,6 +2089,262 @@ test.describe("bug full page", () => {
       await expect(anon.getByText(bug.title)).toHaveCount(0);
     } finally {
       await ctx.close();
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * The Comments section at the bottom of Bug Details (components/bugs/BugComments.tsx) — in the side
+ * panel and on the full page. The API contract (validation, ordering, access) is in
+ * api/bugs.spec.ts "bug comments"; this is what the person reading the bug sees and does.
+ */
+test.describe("bug comments", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  type SeededComment = { id: string; authorName: string; body: string; createdAt: string };
+
+  function commentsUrl(bugId: string) {
+    return `/api/projects/${projectId}/bugs/${bugId}/comments`;
+  }
+
+  /** Every request the page makes for this bug's comments, for route interception. */
+  function commentsRoute(bugId: string) {
+    return `**/api/projects/${projectId}/bugs/${bugId}/comments`;
+  }
+
+  async function seedComment(bugId: string, body: string): Promise<SeededComment> {
+    const res = await api.post(commentsUrl(bugId), { data: { body } });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  /** The panel body; Drawer has no role="dialog", so the page labels its own section. */
+  function panelBody(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  function comments(scope: Locator): Locator {
+    return scope.getByRole("region", { name: "Comments" });
+  }
+
+  async function openPanel(page: Page, title: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(panelBody(page)).toBeVisible();
+  }
+
+  test("BUG-U-63 the panel lists existing comments oldest first, each with its author and timestamp, below the details", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments List ${uniqueSuffix()}` });
+    try {
+      const first = await seedComment(bug.id, "First look: reproduces on Chrome.");
+      const second = await seedComment(bug.id, "Second look:\nalso on Firefox.");
+      await openPanel(page, bug.title);
+
+      const section = comments(panelBody(page));
+      await expect(section.getByText("Comments (2)")).toBeVisible();
+      const items = section.getByTestId("bug-comment");
+      await expect(items).toHaveCount(2);
+      for (const [i, c] of [first, second].entries()) {
+        await expect(items.nth(i).getByText(c.authorName, { exact: true })).toBeVisible();
+        await expect(items.nth(i).locator("time")).toHaveAttribute("datetime", c.createdAt);
+      }
+      await expect(items.nth(0)).toContainText("First look: reproduces on Chrome.");
+      // Line breaks in a comment survive (whitespace-pre-wrap), rather than collapsing into one line.
+      await expect(items.nth(1).getByText(/Second look:\s+also on Firefox\./)).toBeVisible();
+
+      // Placement: after the last details field, inside the scrolling body, above the footer.
+      const reportedOn = (await panelBody(page).getByText("Reported On", { exact: true }).boundingBox())!;
+      const sectionBox = (await section.boundingBox())!;
+      expect(sectionBox.y).toBeGreaterThan(reportedOn.y);
+      const footerEdit = panelBody(page).getByRole("button", { name: "Edit", exact: true });
+      await section.scrollIntoViewIfNeeded();
+      expect((await section.boundingBox())!.y).toBeLessThan((await footerEdit.boundingBox())!.y);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-64 a bug with no comments says so, and Add Comment stays disabled until there is text", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Empty ${uniqueSuffix()}` });
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+      const add = section.getByRole("button", { name: "Add Comment" });
+      await expect(add).toBeDisabled();
+      await section.getByLabel("Add a comment").fill("   \n  ");
+      await expect(add, "whitespace alone is not a comment").toBeDisabled();
+      await section.getByLabel("Add a comment").fill("Now there is text");
+      await expect(add).toBeEnabled();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-65 adding a comment shows it straight away, clears the box, and it is saved", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Add ${uniqueSuffix()}` });
+    const body = `Added from the panel ${uniqueSuffix()}`;
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+
+      // Count list fetches: the new comment must come from the POST response, not a refetch.
+      let listFetches = 0;
+      await page.route(commentsRoute(bug.id), (route) => {
+        if (route.request().method() === "GET") listFetches += 1;
+        return route.continue();
+      });
+
+      await section.getByLabel("Add a comment").fill(`  ${body}  `);
+      await section.getByRole("button", { name: "Add Comment" }).click();
+
+      const items = section.getByTestId("bug-comment");
+      await expect(items).toHaveCount(1);
+      await expect(items.first()).toContainText(body);
+      await expect(section.getByText("No comments yet.")).toHaveCount(0);
+      await expect(section.getByText("Comments (1)")).toBeVisible();
+      await expect(section.getByLabel("Add a comment")).toHaveValue("");
+      expect(listFetches).toBe(0);
+
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list.map((c: { body: string }) => c.body)).toEqual([body]);
+      await expect(items.first().getByText(persisted.list[0].authorName, { exact: true })).toBeVisible();
+
+      // And it is still there when the bug is opened again.
+      await page.unroute(commentsRoute(bug.id));
+      await openPanel(page, bug.title);
+      await expect(comments(panelBody(page)).getByTestId("bug-comment")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-66 a failed post shows the server's reason, keeps the draft, and a retry succeeds", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Post Error ${uniqueSuffix()}` });
+    const body = `Retry me ${uniqueSuffix()}`;
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+
+      await page.route(commentsRoute(bug.id), (route) =>
+        route.request().method() === "POST"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Comment service unavailable." }) })
+          : route.continue(),
+      );
+      await section.getByLabel("Add a comment").fill(body);
+      await section.getByRole("button", { name: "Add Comment" }).click();
+
+      await expect(section.getByTestId("bug-comment-error")).toContainText("Comment service unavailable.");
+      await expect(section.getByLabel("Add a comment")).toHaveValue(body);
+      await expect(section.getByTestId("bug-comment")).toHaveCount(0);
+      await expect(section.getByRole("button", { name: "Add Comment" })).toBeEnabled();
+
+      await page.unroute(commentsRoute(bug.id));
+      await section.getByRole("button", { name: "Add Comment" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(section.getByTestId("bug-comment-error")).toHaveCount(0);
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.total, "the failed attempt must not have stored anything").toBe(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-67 comments show a loading state, and a failed load offers Retry", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Load Error ${uniqueSuffix()}` });
+    try {
+      await seedComment(bug.id, "Visible after retry");
+      let release: () => void = () => {};
+      const held = new Promise<void>((resolve) => (release = resolve));
+      let failNext = true;
+      await page.route(commentsRoute(bug.id), async (route) => {
+        if (route.request().method() !== "GET") return route.continue();
+        if (failNext) {
+          failNext = false;
+          // Hold the first load open long enough to see the loading state, then fail it.
+          await held;
+          return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Upstream timeout" }) });
+        }
+        return route.continue();
+      });
+
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("Loading comments…")).toBeVisible();
+      release();
+
+      await expect(section.getByRole("alert")).toContainText("Couldn't load comments: Upstream timeout");
+      await expect(section.getByText("No comments yet."), "a failed load is not an empty list").toHaveCount(0);
+      await section.getByRole("button", { name: "Retry" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(section.getByText("Visible after retry")).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-68 switching to another bug shows that bug's comments, not the previous one's", async ({ page }) => {
+    const a = await createBug(api, projectId, { title: `E2E Comments Switch A ${uniqueSuffix()}` });
+    const b = await createBug(api, projectId, { title: `E2E Comments Switch B ${uniqueSuffix()}` });
+    try {
+      await seedComment(a.id, "Only on bug A");
+      await openPanel(page, a.title);
+      await expect(comments(panelBody(page)).getByText("Only on bug A")).toBeVisible();
+      await comments(panelBody(page)).getByLabel("Add a comment").fill("Unsent draft for A");
+
+      await panelBody(page).getByRole("button", { name: "Close", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: b.title }).click();
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+      await expect(section.getByText("Only on bug A")).toHaveCount(0);
+      await expect(section.getByLabel("Add a comment")).toHaveValue("");
+    } finally {
+      await api.delete(`/api/bugs/${a.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/bugs/${b.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-69 the full bug page shows the same comments and can add one", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Full Page ${uniqueSuffix()}` });
+    const body = `Added from the full page ${uniqueSuffix()}`;
+    try {
+      const seeded = await seedComment(bug.id, "Seeded before opening");
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const section = comments(page.getByRole("region", { name: "Bug details" }));
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(section.getByText(seeded.authorName, { exact: true })).toBeVisible();
+
+      await section.getByLabel("Add a comment").fill(body);
+      await section.getByRole("button", { name: "Add Comment" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(2);
+      await expect(section.getByTestId("bug-comment").nth(1)).toContainText(body);
+
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list.map((c: { body: string }) => c.body)).toEqual(["Seeded before opening", body]);
+    } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });
