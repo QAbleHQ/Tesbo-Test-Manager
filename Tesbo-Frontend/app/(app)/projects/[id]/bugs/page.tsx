@@ -1192,22 +1192,15 @@ export default function BugsPage() {
       >
         {viewBug && (
           <div className="space-y-5">
-            {/* Bug Key + Title + Status */}
+            {/* Bug Key + Title — severity/priority/status are labelled fields in the grid below */}
             <div>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  {/* Falls back to the bug's own per-project id when it has no external tracker
-                      ticket — same "Bug Key" fallback the Test Run and Test Case Detail screens use. */}
-                  <p className="font-mono text-xs text-[var(--muted-soft)] mb-0.5">{viewBug.integrationIssueKey || viewBug.externalId}</p>
-                  <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
-                    {viewBug.title}
-                  </h3>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <BugSeverityBadge severity={viewBug.severity} />
-                  <BugPriorityBadge priority={viewBug.priority} />
-                  <BugStatusBadge status={viewBug.status} />
-                </div>
+              <div className="min-w-0">
+                {/* Falls back to the bug's own per-project id when it has no external tracker
+                    ticket — same "Bug Key" fallback the Test Run and Test Case Detail screens use. */}
+                <p className="font-mono text-xs text-[var(--muted-soft)] mb-0.5">{viewBug.integrationIssueKey || viewBug.externalId}</p>
+                <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
+                  {viewBug.title}
+                </h3>
               </div>
             </div>
 
@@ -1287,6 +1280,34 @@ export default function BugsPage() {
                 </ul>
               </div>
             ) : null}
+
+            {/* Severity / Priority / Status — read-only here; Edit Bug is where they change. These
+                used to sit unlabelled beside the title, where an untriaged bug's priority rendered as
+                a bare "—" that read as a separator rather than a value. */}
+            <div className="grid grid-cols-3 gap-4">
+              <div>
+                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+                  Severity
+                </p>
+                <BugSeverityBadge severity={viewBug.severity} />
+              </div>
+              <div>
+                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+                  Priority
+                </p>
+                {viewBug.priority ? (
+                  <BugPriorityBadge priority={viewBug.priority} />
+                ) : (
+                  <span className="text-sm text-[var(--muted-soft)]">Not set</span>
+                )}
+              </div>
+              <div>
+                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+                  Status
+                </p>
+                <BugStatusBadge status={viewBug.status} />
+              </div>
+            </div>
 
             {/* Metadata grid */}
             <div className="grid grid-cols-2 gap-4">
