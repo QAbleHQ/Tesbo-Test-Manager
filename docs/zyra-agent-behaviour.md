@@ -99,7 +99,7 @@ those are true until the user separately reviews and saves the batch.
 ## 5. Batching for volume
 
 Large asks are planned then executed in batches (`ZYRA_PLAN_BATCH_SIZE = 5`,
-`ZYRA_PLAN_MAX_SCENARIOS = 40`) rather than one oversized call that truncates past the provider's
+`ZYRA_PLAN_MAX_SCENARIOS = 100`, the "all" tier only) rather than one oversized call that truncates past the provider's
 output ceiling and returns invalid JSON.
 
 - Scenarios are planned first, then each batch is generated, saved, and posted as its own message.

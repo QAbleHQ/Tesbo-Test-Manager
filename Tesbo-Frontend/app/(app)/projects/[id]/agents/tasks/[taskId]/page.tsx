@@ -8,14 +8,17 @@ import {
   createSuite,
   deleteZyraTaskDraft,
   getJiraStatus,
+  getLinearStatus,
   getZyraTask,
   listJiraTickets,
+  listLinearTickets,
   listSuites,
   listZyraTaskTicketComments,
   retryZyraTicketComment,
   saveZyraTask,
   sendZyraFeedback,
   type JiraTicket,
+  type LinearTicket,
   type SuiteNode,
   type ZyraTask,
   type ZyraTicketComment,
@@ -131,12 +134,14 @@ export default function ZyraTaskDetailPage() {
   const [task, setTask] = useState<ZyraTask | null>(null);
   const [suites, setSuites] = useState<SuiteNode[]>([]);
   const [jiraTickets, setJiraTickets] = useState<JiraTicket[]>([]);
+  const [linearTickets, setLinearTickets] = useState<LinearTicket[]>([]);
   const [ticketComments, setTicketComments] = useState<ZyraTicketComment[]>([]);
   const [retryingCommentId, setRetryingCommentId] = useState<string | null>(null);
   const [selectedDrafts, setSelectedDrafts] = useState<number[]>([]);
   const [feedback, setFeedback] = useState("");
   const [referenceNote, setReferenceNote] = useState("");
   const [selectedJiraKeys, setSelectedJiraKeys] = useState<string[]>([]);
+  const [selectedLinearKeys, setSelectedLinearKeys] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<DetailTab>("testcases");
   const [savingOpen, setSavingOpen] = useState(false);
   const [saveMode, setSaveMode] = useState<SaveMode>("existing");
@@ -147,14 +152,18 @@ export default function ZyraTaskDetailPage() {
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A save failure renders inside the Save modal: the page-level `error` banner sits under the
+  // modal's backdrop, so a failed save looked like the button had done nothing.
+  const [saveError, setSaveError] = useState<string | null>(null);
   const pollInFlightRef = useRef(false);
 
   const loadData = useCallback(async () => {
     try {
-      const [taskData, suiteList, jiraStatus, comments] = await Promise.all([
+      const [taskData, suiteList, jiraStatus, linearStatus, comments] = await Promise.all([
         getZyraTask(projectId, taskId),
         listSuites(projectId).catch(() => []),
         getJiraStatus(projectId).catch(() => ({ connected: false })),
+        getLinearStatus(projectId).catch(() => ({ connected: false })),
         listZyraTaskTicketComments(projectId, taskId).catch(() => [] as ZyraTicketComment[]),
       ]);
       setTask(taskData);
@@ -166,6 +175,12 @@ export default function ZyraTaskDetailPage() {
         setJiraTickets(tickets.list || []);
       } else {
         setJiraTickets([]);
+      }
+      if (linearStatus.connected) {
+        const tickets = await listLinearTickets(projectId, { limit: 50 }).catch(() => ({ list: [], total: 0 }));
+        setLinearTickets(tickets.list || []);
+      } else {
+        setLinearTickets([]);
       }
       setError(null);
     } catch (err) {
@@ -255,7 +270,15 @@ export default function ZyraTaskDetailPage() {
 
   function openSaveModal(indexes?: number[]) {
     setSavingDraftIndexes(indexes || selectedDrafts);
+    setSaveError(null);
     setSavingOpen(true);
+  }
+
+  function closeSaveModal() {
+    // Held open while a save is in flight, as Cancel already is, so its outcome can't land unseen.
+    if (working) return;
+    setSavingOpen(false);
+    setSaveError(null);
   }
 
   async function handleFeedback() {
@@ -268,11 +291,13 @@ export default function ZyraTaskDetailPage() {
         feedback: feedback.trim(),
         referenceNote: referenceNote.trim() || undefined,
         jiraIssueKeys: selectedJiraKeys,
+        linearIssueKeys: selectedLinearKeys,
       });
       setTask(result.task);
       setFeedback("");
       setReferenceNote("");
       setSelectedJiraKeys([]);
+      setSelectedLinearKeys([]);
       setMessage("Feedback sent. Zyra moved the task to Todo and is regenerating the testcase drafts now — this can take a minute.");
       await loadData();
     } catch (err) {
@@ -326,6 +351,7 @@ export default function ZyraTaskDetailPage() {
     setWorking(true);
     setMessage(null);
     setError(null);
+    setSaveError(null);
     try {
       let suiteId = saveMode === "existing" ? targetSuiteId : "";
       if (saveMode === "new" && newSuiteName.trim()) {
@@ -341,7 +367,7 @@ export default function ZyraTaskDetailPage() {
       setSavingDraftIndexes(null);
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save testcases.");
+      setSaveError(err instanceof Error ? err.message : "Failed to save testcases.");
     } finally {
       setWorking(false);
     }
@@ -443,9 +469,9 @@ export default function ZyraTaskDetailPage() {
             <p className="mt-2 text-sm text-[var(--muted)]">
               {task.generatedCount} testcase{task.generatedCount === 1 ? "" : "s"} generated, {task.savedCount} saved, {task.tokenUsage.total} tokens, updated {new Date(task.updatedAt).toLocaleString()}
             </p>
-            {task.jiraIssueKeys.length > 0 && (
+            {(task.jiraIssueKeys.length > 0 || (task.linearIssueKeys ?? []).length > 0) && (
               <div className="mt-3 flex flex-wrap gap-2">
-                {task.jiraIssueKeys.map((key) => (
+                {[...task.jiraIssueKeys, ...(task.linearIssueKeys ?? [])].map((key) => (
                   <span key={key} className="rounded-full bg-[var(--brand-soft)] px-2.5 py-1 text-xs font-medium text-[var(--accent-light)]">
                     {key}
                   </span>
@@ -647,7 +673,7 @@ export default function ZyraTaskDetailPage() {
             </Field>
             <Field>
               <FieldLabel>Docs or ticket references for knowledge base</FieldLabel>
-              <Textarea value={referenceNote} onChange={(event) => setReferenceNote(event.target.value)} rows={3} placeholder="Mention docs, Jira tickets, release notes, or policy links Zyra should consider." />
+              <Textarea value={referenceNote} onChange={(event) => setReferenceNote(event.target.value)} rows={3} placeholder="Mention docs, Jira or Linear tickets, release notes, or policy links Zyra should consider." />
             </Field>
             {jiraTickets.length > 0 && (
               <Field>
@@ -671,6 +697,37 @@ export default function ZyraTaskDetailPage() {
                         type="button"
                         key={key}
                         onClick={() => setSelectedJiraKeys((prev) => prev.filter((item) => item !== key))}
+                        className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]"
+                      >
+                        {key} x
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </Field>
+            )}
+            {linearTickets.length > 0 && (
+              <Field>
+                <FieldLabel>Attach Linear tickets</FieldLabel>
+                <Select
+                  value=""
+                  onChange={(event) => {
+                    const key = event.target.value;
+                    if (key && !selectedLinearKeys.includes(key)) setSelectedLinearKeys((prev) => [...prev, key]);
+                  }}
+                >
+                  <option value="">Select ticket...</option>
+                  {linearTickets.map((ticket) => (
+                    <option key={ticket.id} value={ticket.linearIssueKey}>{ticket.linearIssueKey} - {ticket.summary}</option>
+                  ))}
+                </Select>
+                {selectedLinearKeys.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {selectedLinearKeys.map((key) => (
+                      <button
+                        type="button"
+                        key={key}
+                        onClick={() => setSelectedLinearKeys((prev) => prev.filter((item) => item !== key))}
                         className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]"
                       >
                         {key} x
@@ -731,9 +788,10 @@ export default function ZyraTaskDetailPage() {
         </Card>
       )}
 
-      <Modal open={savingOpen} onClose={() => setSavingOpen(false)} title="Save generated testcases">
+      <Modal open={savingOpen} onClose={closeSaveModal} title="Save generated testcases">
         <div className="space-y-4">
           <p className="text-sm text-[var(--muted)]">Save {(savingDraftIndexes || selectedDrafts).length} selected testcase draft(s) into a suite.</p>
+          {saveError && <p role="alert" className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">{saveError}</p>}
           <Field>
             <FieldLabel>Suite target</FieldLabel>
             <Select value={saveMode} onChange={(event) => setSaveMode(event.target.value as SaveMode)}>
@@ -756,7 +814,7 @@ export default function ZyraTaskDetailPage() {
             </Field>
           )}
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => setSavingOpen(false)} disabled={working}>Cancel</Button>
+            <Button variant="secondary" onClick={closeSaveModal} disabled={working}>Cancel</Button>
             <Button onClick={handleSave} disabled={working || (savingDraftIndexes || selectedDrafts).length === 0 || (saveMode === "new" && !newSuiteName.trim())}>{working ? "Saving..." : "Save"}</Button>
           </div>
         </div>

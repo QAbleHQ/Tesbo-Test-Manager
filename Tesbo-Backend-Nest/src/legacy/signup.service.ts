@@ -10,6 +10,7 @@ import { AuthenticatedRequest } from "../common/request.types";
 import { validatePersonName } from "../common/person-name.util";
 import { validateMobileNumber } from "../common/mobile-number.util";
 import { DatabaseService } from "../database/database.service";
+import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
 import { InvitationRow, LegacyService } from "./legacy.service";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -35,7 +36,8 @@ export class SignupService {
     private readonly password: PasswordService,
     private readonly auth: AuthService,
     private readonly audit: AuditService,
-    private readonly legacy: LegacyService
+    private readonly legacy: LegacyService,
+    private readonly welcomeEmail: WelcomeEmailService
   ) {}
 
   async startSelfServeSignup(
@@ -76,6 +78,7 @@ export class SignupService {
     if (!pending) throw new BadRequestException({ error: "No pending signup found for this email. Please start again." });
 
     const userId = await this.createUserFromPending(pending);
+    await this.welcomeEmail.schedule(userId);
     await this.auth.signInUser(userId, email, req, res);
     await this.audit.log(userId, "signup_completed", "auth", email, "{}", ip, ua);
     return { ok: true, userId };
@@ -141,6 +144,7 @@ export class SignupService {
     if (!pending) throw new BadRequestException({ error: "No pending registration found for this invite. Please start again." });
 
     const userId = await this.completeInviteRegistration(inv, pending);
+    await this.welcomeEmail.schedule(userId);
     await this.auth.signInUser(userId, inv.email, req, res);
     await this.audit.log(userId, "invite_registration_completed", "organization", inv.organization_id, "{}", ip, ua);
     return { ok: true, userId, organizationId: inv.organization_id };

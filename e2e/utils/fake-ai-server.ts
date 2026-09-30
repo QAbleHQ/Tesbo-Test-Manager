@@ -27,11 +27,26 @@ export interface FakeAiRequest {
   messages: Array<{ role: string; content: string }>;
 }
 
+export interface FakeAiEmbeddingRequest {
+  model: string;
+  /** The texts the backend asked to embed, normalized to an array. */
+  input: string[];
+}
+
 export interface FakeAiServer {
   /** Pass as `baseUrl` when creating a workspace AI key (provider "openai" or a custom gateway). */
   baseUrl: string;
-  /** Every request this server received, in arrival order — for asserting on what the backend sent. */
+  /** Every chat-completion request this server received, in arrival order — for asserting on what the backend sent. */
   requests: FakeAiRequest[];
+  /**
+   * Every POST .../embeddings this server received — kept apart from `requests` and the reply queue.
+   * With an embeddings-capable provider ("openai"), the backend embeds the user's message for
+   * knowledge-base search and embeds newly written KB documents in the background; before this
+   * split those calls were served from the same FIFO queue and could consume a reply scripted for
+   * the router. Always answered 503, so retrieval degrades to keyword search (it never throws) and
+   * a test can assert whether a KB search was attempted at all by looking here.
+   */
+  embeddingRequests: FakeAiEmbeddingRequest[];
   /**
    * Queue one scripted chat-completion reply, consumed FIFO. `content` becomes
    * `choices[0].message.content` verbatim — pass the JSON envelope buildZyraChatDecision (or
@@ -67,6 +82,7 @@ export interface FakeAiServer {
 export async function startFakeAiServer(): Promise<FakeAiServer> {
   const queue: string[] = [];
   const requests: FakeAiRequest[] = [];
+  const embeddingRequests: FakeAiEmbeddingRequest[] = [];
   let failStatus: number | null = null;
   let failMessage = "stubbed provider failure";
   let delayMs: number | null = null;
@@ -79,6 +95,20 @@ export async function startFakeAiServer(): Promise<FakeAiServer> {
     let raw = "";
     req.on("data", (chunk) => (raw += chunk));
     req.on("end", () => {
+      if ((req.url || "").split("?")[0].endsWith("/embeddings")) {
+        // Never consumes the chat reply queue, a pending failNextWith, or a pending delay.
+        let parsed: { model?: unknown; input?: unknown } = {};
+        try {
+          parsed = JSON.parse(raw || "{}");
+        } catch {
+          // Logged with no input — still counts as "an embeddings call was attempted".
+        }
+        const input = Array.isArray(parsed.input) ? parsed.input.map(String) : parsed.input === undefined ? [] : [String(parsed.input)];
+        embeddingRequests.push({ model: String(parsed.model || ""), input });
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "fake-ai-server does not serve embeddings" } }));
+        return;
+      }
       const thisDelay = delayMs;
       delayMs = null;
       let body: FakeAiRequest;
@@ -130,6 +160,7 @@ export async function startFakeAiServer(): Promise<FakeAiServer> {
   return {
     baseUrl: `http://host.docker.internal:${port}/v1`,
     requests,
+    embeddingRequests,
     queueReply(content) {
       queue.push(typeof content === "string" ? content : JSON.stringify(content));
     },
@@ -143,6 +174,7 @@ export async function startFakeAiServer(): Promise<FakeAiServer> {
     reset() {
       queue.length = 0;
       requests.length = 0;
+      embeddingRequests.length = 0;
       failStatus = null;
       failMessage = "stubbed provider failure";
       delayMs = null;

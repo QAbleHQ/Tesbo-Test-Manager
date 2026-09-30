@@ -7,6 +7,7 @@ import {
   writeStorageState,
   type RbacTenant,
 } from "../utils/rbac-tenant";
+import { startFakeAiServer, type FakeAiServer } from "../utils/fake-ai-server";
 
 /*
  * The Agents screens: the agent picker, Zyra's chat, Zyra's settings, the task board, and the task
@@ -100,9 +101,17 @@ test.describe("zyra / agents (UI)", () => {
     exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${projects});`);
     exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(t.organizationId)};`);
     exec(`DELETE FROM jira_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM jira_project_mappings WHERE project_id IN (${projects});`);
+    // The task-detail Feedback pickers (ZYU-113..116) seed a Linear connection, mapping and tickets too.
+    exec(`DELETE FROM linear_tickets WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM linear_project_mappings WHERE project_id IN (${projects});`);
     exec(
-      `DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider = 'jira';`,
+      `DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)} AND provider IN ('jira', 'linear');`,
     );
+  }
+
+  function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   function stamp(label: string): string {
@@ -1018,10 +1027,167 @@ test.describe("zyra / agents (UI)", () => {
     await page.getByRole("tab", { name: "Kanban board" }).click();
     await page.locator("button", { has: page.getByText(userStory) }).click();
 
+    // The description is rendered as Markdown now (ZYU-107), so blank-line-separated sections come
+    // out as separate paragraphs rather than one pre-wrap <p> holding the raw string — the
+    // behaviour this test protects (sections are not run together) is unchanged.
     const panel = page.locator(".slide-in-right");
-    const contextParagraph = panel.locator("div.no-scrollbar p").last();
-    await expect(contextParagraph).toHaveCSS("white-space", "pre-wrap");
-    expect(await contextParagraph.textContent()).toBe(context);
+    const paragraphs = panel.locator("div.no-scrollbar .zyra-prose p");
+    await expect(paragraphs).toHaveText(["Section one detail.", "Section two detail.", "Section three detail."]);
+  });
+
+  // ─── Markdown in the description (fix for "Zyra task displays Markdown formatting in ticket
+  // descriptions") ────────────────────────────────────────────────────────────
+  //
+  // Jira/Linear tickets arrive through the Knowledge Base as flattened Markdown (see
+  // IntegrationSyncDocumentBuilder), and that text becomes task.context. Before the fix all three
+  // surfaces printed it verbatim, so "### LIN-05 …" and "**Module:** Claim" showed their syntax.
+  // The quick-view panel now renders it with lib/markdown.ts; the list row and Kanban card, being
+  // two-line clamped previews where headings and lists cannot lay out, show it as plain text.
+
+  /** The shape of the Linear ticket in the bug report's screenshot. */
+  const TICKET_MARKDOWN = [
+    "### LIN-05: Submit an Expense Claim",
+    "",
+    "**Module:** Claim",
+    "**Priority:** Medium",
+    "",
+    "**User Story:**",
+    "As an employee, I want to submit an expense claim with supporting documents so that I can request reimbursement.",
+    "",
+    "- Receipt is mandatory",
+    "- Amount must be _positive_",
+    "",
+    "See [the claim policy](https://example.com/claims) for limits.",
+  ].join("\n");
+
+  /** Markdown syntax that must never survive into a rendered or preview surface. */
+  const MARKDOWN_SYNTAX = /###|\*\*|\]\(|(^|\s)- /;
+
+  test("ZYU-107 the quick-view panel renders a ticket's Markdown description instead of showing its syntax", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Markdown panel story");
+    seedTask({ userStory, context: TICKET_MARKDOWN });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    const description = panel.locator("div.no-scrollbar .zyra-prose");
+    await expect(description.locator("h3")).toHaveText("LIN-05: Submit an Expense Claim");
+    await expect(description.locator("strong")).toHaveText(["Module:", "Priority:", "User Story:"]);
+    await expect(description.locator("li")).toHaveText(["Receipt is mandatory", "Amount must be positive"]);
+    await expect(description.locator("em")).toHaveText("positive");
+    const link = description.getByRole("link", { name: "the claim policy" });
+    await expect(link).toHaveAttribute("href", "https://example.com/claims");
+    // Opens outside the app, and without handing the target a window.opener back into it.
+    await expect(link).toHaveAttribute("target", "_blank");
+    await expect(link).toHaveAttribute("rel", /noopener/);
+
+    const text = (await description.innerText()) ?? "";
+    expect(text, "no Markdown syntax is left visible in the rendered description").not.toMatch(MARKDOWN_SYNTAX);
+    expect(text).toContain("As an employee, I want to submit an expense claim");
+  });
+
+  test("ZYU-108 the task window row previews a Markdown description as plain text", async ({ browser }) => {
+    const userStory = stamp("Markdown row story");
+    seedTask({ userStory, context: TICKET_MARKDOWN });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    // Wait for the row itself first: the list can still be on its loading skeleton when the page
+    // opens, and a count of the row's <p> would otherwise spend its whole timeout on that skeleton.
+    await expect(row).toBeVisible();
+    const preview = row.locator("p");
+    await expect(preview).toHaveCount(1);
+    const text = (await preview.textContent()) ?? "";
+    expect(text, "the row preview carries no Markdown syntax").not.toMatch(MARKDOWN_SYNTAX);
+    expect(text).toContain("LIN-05: Submit an Expense Claim Module: Claim Priority: Medium");
+    // A link keeps its visible text and drops the URL syntax.
+    expect(text).toContain("See the claim policy for limits.");
+    expect(text).not.toContain("https://example.com/claims");
+  });
+
+  test("ZYU-109 the kanban card previews a Markdown description as plain text", async ({ browser }) => {
+    const userStory = stamp("Markdown card story");
+    seedTask({ userStory, context: TICKET_MARKDOWN });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    const card = page.locator("button", { has: page.getByText(userStory) });
+    // The card's second <p> is its "N testcases generated" summary line; the description is first.
+    await expect(card.locator("p")).toHaveCount(2);
+    const text = (await card.locator("p").first().textContent()) ?? "";
+    expect(text, "the card preview carries no Markdown syntax").not.toMatch(MARKDOWN_SYNTAX);
+    expect(text).toContain("LIN-05: Submit an Expense Claim Module: Claim");
+  });
+
+  test("ZYU-110 raw HTML in a description is shown as text, never rendered as markup", async ({ browser }) => {
+    const userStory = stamp("HTML in context story");
+    // Ticket bodies are third-party content. The quote-breaking link is the payload lib/markdown.ts's
+    // own comment calls out; the javascript: link must stay inert text since only http(s) is linked.
+    const context = [
+      `<img src=x onerror="window.__zyraMdXss=1"> <b>not bold</b>`,
+      `[x](https://a" onmouseover="window.__zyraMdXss=2" x=")`,
+      `[click](javascript:window.__zyraMdXss=3)`,
+    ].join("\n");
+    seedTask({ userStory, context });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    await expect(row.locator("img, b")).toHaveCount(0);
+    await row.click();
+
+    const description = page.locator(".slide-in-right div.no-scrollbar .zyra-prose");
+    await expect(description).toContainText("<b>not bold</b>");
+    await expect(description.locator("img, b")).toHaveCount(0);
+    await expect(description.locator('a[href^="javascript"], [onmouseover], [onerror]')).toHaveCount(0);
+    await description.hover();
+    expect(await page.evaluate(() => (window as unknown as { __zyraMdXss?: number }).__zyraMdXss)).toBeUndefined();
+  });
+
+  test("ZYU-111 a plain description with snake_case identifiers and no Markdown is shown unchanged", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Plain context story");
+    // Intraword underscores are not emphasis (CommonMark agrees) — without that rule, turning on
+    // Markdown rendering would mangle every plain description that names a field.
+    const context = "Validate user_id and order_id before saving the claim_total.";
+    seedTask({ userStory, context });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    // See ZYU-108: wait out the list's loading skeleton before asserting on the row's contents.
+    await expect(row).toBeVisible();
+    await expect(row.locator("p")).toHaveText(context);
+    await row.click();
+
+    const description = page.locator(".slide-in-right div.no-scrollbar .zyra-prose");
+    await expect(description).toHaveText(context);
+    await expect(description.locator("em, strong")).toHaveCount(0);
+  });
+
+  test("ZYU-112 a whitespace-only description renders no description line on the row, card or panel", async ({
+    browser,
+  }) => {
+    const userStory = stamp("Whitespace context story");
+    seedTask({ userStory, context: "   \n\n   " });
+
+    const page = await open(browser, "/agents/tasks");
+    const row = page.getByRole("button", { name: new RegExp(escapeRegExp(userStory)) });
+    await expect(row).toBeVisible();
+    await expect(row.locator("p")).toHaveCount(0);
+
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    const card = page.locator("button", { has: page.getByText(userStory) });
+    // Only the card's own summary line, as in ZYU-25 — no blank description paragraph.
+    await expect(card.locator("p")).toHaveCount(1);
+
+    await card.click();
+    const panel = page.locator(".slide-in-right");
+    await expect(panel.getByText(userStory)).toBeVisible();
+    await expect(panel.locator("div.no-scrollbar .zyra-prose")).toHaveCount(0);
+    await expect(panel.locator("h2 + p")).toHaveCount(0);
   });
 
   test("ZYU-63 a failed task with a long failure detail still keeps 'Close task' reachable in the footer", async ({
@@ -1309,6 +1475,66 @@ test.describe("zyra / agents (UI)", () => {
       )
       .toBe("High");
     expect(scalar(`SELECT component FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Sign in with a valid password';`)).toBe("Auth");
+  });
+
+  /*
+   * "[Zyra] Save Test Cases error message is hidden behind the modal" — a failed save used to write
+   * to the page-level error banner, which sits under the modal's portaled backdrop. The text was in
+   * the DOM, so a page-wide toBeVisible() would have passed; the assertion is therefore scoped to
+   * the dialog, and a trial click proves nothing is layered over it.
+   */
+  test("ZYU-117 a failed save shows its error inside the open Save modal, and a retry still saves", async ({ browser }) => {
+    const title = stamp("Save failure draft");
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const failure = "Suite is locked for this plan — upgrade to save more testcases.";
+
+    // First attempt is held until released, then refused; later attempts reach the real API.
+    // Pathname predicate rather than a glob: the API is on a different origin from the page.
+    let attempts = 0;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    await page.route(
+      (url) => url.pathname === `/api/projects/${tenant!.mainProjectId}/agents/zyra/tasks/${taskId}/save`,
+      async (route) => {
+        if (route.request().method() !== "POST") return route.continue();
+        attempts++;
+        if (attempts > 1) return route.continue();
+        await held;
+        await route.fulfill({ status: 422, contentType: "application/json", body: JSON.stringify({ error: failure }) });
+      },
+    );
+
+    await page.getByRole("row", { name: new RegExp(title) }).getByRole("button", { name: "Save" }).click();
+    const dialog = modal(page, "Save generated testcases");
+    await dialog.getByRole("button", { name: "Save" }).click();
+
+    // In flight: the button reports it, and Escape can't dismiss the modal out from under the result.
+    await expect(dialog.getByRole("button", { name: "Saving..." })).toBeDisabled();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeVisible();
+    release();
+
+    const alert = dialog.getByRole("alert");
+    await expect(alert).toHaveText(failure);
+    // Actionability includes "receives pointer events" — this fails if the backdrop covers the text.
+    await alert.click({ trial: true });
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeEnabled();
+
+    // Closing and reopening starts clean rather than replaying the stale failure.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    await page.getByRole("row", { name: new RegExp(title) }).getByRole("button", { name: "Save" }).click();
+    await expect(dialog.getByRole("alert")).toHaveCount(0);
+
+    // Retry goes through the unchanged success path: modal closes, page confirms, the row exists.
+    await dialog.getByRole("button", { name: "Save" }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText("1 testcase saved.")).toBeVisible();
+    await expect
+      .poll(() => Number(scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`)))
+      .toBe(1);
+    expect(attempts).toBe(2);
   });
 
   test("ZYU-15 deleting a draft removes it from the task and leaves the rest", { tag: '@tesbo.testId("TES-TC-1100")' }, async ({ browser }) => {
@@ -1660,6 +1886,246 @@ test.describe("zyra / agents (UI)", () => {
     await donePage.getByRole("button", { name: "Feedback (0)" }).click();
     await expect(donePage.getByText("Feedback isn't available once a task is closed.")).toBeVisible();
     await expect(donePage.getByRole("button", { name: "Send feedback" })).toBeDisabled();
+  });
+
+  // ─── Feedback tab: attaching Jira and Linear tickets (fix for "Feedback form does not show a
+  // Linear ticket dropdown") ──────────────────────────────────────────────────────────────────
+
+  /*
+   * The form used to load and offer Jira tickets only; Linear tickets could not be attached at all,
+   * though POST .../feedback has always accepted linearIssueKeys (api/zyra.spec.ts ZYR-A-93).
+   *
+   * Both ticket lists are scoped to the project's currently ENABLED mapping (mapped_remote_id —
+   * see api/integrations.spec.ts currentOrAutoLinearMapping), so a ticket row alone never reaches
+   * the picker: each seed below writes connection + enabled mapping + tickets carrying its id.
+   */
+  function seedFeedbackTickets(provider: "jira" | "linear", tickets: Array<{ key: string; summary: string }>): void {
+    const t = tenant!;
+    const org = literal(t.organizationId);
+    const project = literal(t.mainProjectId);
+    exec(
+      `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) ` +
+        `VALUES (${org}, ${literal(provider)}, 'e2e-zyra-ui-feedback', 'https://e2e-zyra-ui-feedback.invalid', 'e2e', '', now() + interval '365 days') ` +
+        `ON CONFLICT (organization_id, provider) DO NOTHING;`,
+    );
+    const connectionId = literal(
+      scalar(`SELECT id FROM integration_connections WHERE organization_id = ${org} AND provider = ${literal(provider)};`),
+    );
+    const remoteId = literal(`${provider}-feedback-${t.mainProjectId}`);
+    if (provider === "jira") {
+      exec(
+        "INSERT INTO jira_project_mappings (project_id, jira_connection_id, jira_project_id, jira_project_key, jira_project_name, enabled) " +
+          `VALUES (${project}, ${connectionId}, ${remoteId}, 'ZFB', 'E2E feedback mapping', true) ON CONFLICT DO NOTHING;`,
+      );
+    } else {
+      exec(
+        "INSERT INTO linear_project_mappings (project_id, integration_connection_id, linear_team_id, linear_team_key, linear_team_name, entity_type, enabled) " +
+          `VALUES (${project}, ${connectionId}, ${remoteId}, 'ZFB', 'E2E feedback mapping', 'team', true) ON CONFLICT DO NOTHING;`,
+      );
+    }
+    for (const ticket of tickets) {
+      exec(
+        provider === "jira"
+          ? "INSERT INTO jira_tickets (project_id, jira_connection_id, jira_issue_id, jira_issue_key, summary, issue_type, status, mapped_remote_id) " +
+              `VALUES (${project}, ${connectionId}, ${literal(ticket.key)}, ${literal(ticket.key)}, ${literal(ticket.summary)}, 'Story', 'Open', ${remoteId});`
+          : "INSERT INTO linear_tickets (project_id, integration_connection_id, linear_issue_id, linear_issue_key, summary, issue_type, status, mapped_remote_id) " +
+              `VALUES (${project}, ${connectionId}, ${literal(ticket.key)}, ${literal(ticket.key)}, ${literal(ticket.summary)}, 'Story', 'Todo', ${remoteId});`,
+      );
+    }
+  }
+
+  /** The picker's native <select>. FieldLabel has no htmlFor, so it is reached through its Field
+   *  (div.space-y-2); `.last()` is the innermost such div, as outer containers also match. */
+  function ticketPicker(page: Page, label: "Attach Jira tickets" | "Attach Linear tickets"): Locator {
+    return page
+      .locator("div.space-y-2")
+      .filter({ has: page.locator("label", { hasText: new RegExp(`^${label}$`) }) })
+      .last()
+      .locator("select");
+  }
+
+  async function openFeedbackTab(browser: Browser, taskId: string): Promise<Page> {
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: /^Feedback \(/ }).click();
+    await expect(page.getByRole("heading", { name: "Send feedback" })).toBeVisible();
+    return page;
+  }
+
+  /** A fake-provider key (utils/fake-ai-server.ts), so the regeneration Send feedback kicks off
+   *  completes for real. A custom gateway provider name keeps embeddings off (see api/zyra.spec.ts
+   *  ZYR-A-91's allocateFakeAiKey comment). */
+  async function allocateFakeProviderKey(ai: FakeAiServer): Promise<void> {
+    const keyRes = await api.post("/api/workspace/ai-keys", {
+      data: { name: `E2E ui feedback fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "e2e-fake-gateway", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await api.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function waitForTaskSettled(taskId: string): Promise<string> {
+    for (let i = 0; i < 80; i++) {
+      const status = scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+      if (status !== "todo" && status !== "in_progress") return status;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`);
+  }
+
+  function isFeedbackRequest(url: string, method: string): boolean {
+    return method === "POST" && /\/agents\/zyra\/tasks\/[^/]+\/feedback$/.test(new URL(url).pathname);
+  }
+
+  test("ZYU-113 with Linear connected, the Feedback tab offers a Linear ticket picker, and the picked ticket reaches Zyra and the task", async ({
+    browser,
+  }) => {
+    // The regression test for the report: before the fix there is no "Attach Linear tickets" field
+    // at all, so this fails at the first picker assertion.
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const linearKey = `ZLN-${suffix}`;
+    const linearSummary = `Linear refund window rule ${suffix}`;
+    seedFeedbackTickets("linear", [{ key: linearKey, summary: linearSummary }, { key: `ZLN-${suffix}-B`, summary: "Another Linear ticket" }]);
+    const ai = await startFakeAiServer();
+    try {
+      await allocateFakeProviderKey(ai);
+      const taskId = seedTask();
+      const page = await openFeedbackTab(browser, taskId);
+
+      const picker = ticketPicker(page, "Attach Linear tickets");
+      await expect(picker).toBeVisible();
+      await expect(picker.locator("option", { hasText: `${linearKey} - ${linearSummary}` })).toHaveCount(1);
+      // Linear is the only provider connected — no empty Jira field alongside it.
+      await expect(page.getByText("Attach Jira tickets", { exact: true })).toHaveCount(0);
+
+      await picker.selectOption(linearKey);
+      const chip = page.getByRole("button", { name: `${linearKey} x` });
+      await expect(chip).toBeVisible();
+      // The select resets to its placeholder after each pick; picking the same key again must not add a second chip.
+      await expect(picker).toHaveValue("");
+      await picker.selectOption(linearKey);
+      await expect(chip).toHaveCount(1);
+
+      ai.queueReply({
+        drafts: [{
+          title: "Refund refused after the refund window",
+          preconditions: "",
+          stepsJson: JSON.stringify([{ stepNumber: 1, action: "Request a late refund", expectedResult: "It is refused" }]),
+          testData: "",
+          expectedSummary: "It is refused.",
+          priority: "P1",
+          tags: ["zyra"],
+          sourceRefs: [],
+        }],
+      });
+      await page.getByPlaceholder("Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule.").fill("Cover the Linear refund rule");
+      const sent = page.waitForRequest((req) => isFeedbackRequest(req.url(), req.method()));
+      await page.getByRole("button", { name: "Send feedback" }).click();
+      expect((await sent).postDataJSON()).toMatchObject({ linearIssueKeys: [linearKey], jiraIssueKeys: [] });
+      await expect(page.getByText(/Feedback sent\./)).toBeVisible();
+      // Sending clears the selection.
+      await expect(page.getByRole("button", { name: `${linearKey} x` })).toHaveCount(0);
+
+      expect(await waitForTaskSettled(taskId), "regeneration must complete, not fail").toBe("in_review");
+      expect(JSON.parse(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))).toEqual([linearKey]);
+      expect(JSON.stringify(ai.requests[0]?.messages ?? []), "the Linear ticket's summary must reach the model").toContain(linearSummary);
+
+      // The task header now shows the attached Linear key, as it always did for Jira keys.
+      await page.reload();
+      await expect(page.getByRole("heading", { name: "Zyra task", level: 1 })).toBeVisible();
+      await expect(page.locator("span", { hasText: new RegExp(`^${linearKey}$`) })).toBeVisible();
+    } finally {
+      await ai.close();
+    }
+  });
+
+  test("ZYU-114 with Jira and Linear both connected, each picker lists only its own tickets and sends them in its own list", async ({ browser }) => {
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const jiraKey = `ZJI-${suffix}`;
+    const linearKey = `ZLN-${suffix}`;
+    const linearKey2 = `ZLN-${suffix}-B`;
+    seedFeedbackTickets("jira", [{ key: jiraKey, summary: "Seeded Jira feedback ticket" }]);
+    seedFeedbackTickets("linear", [{ key: linearKey, summary: "Seeded Linear feedback ticket" }, { key: linearKey2, summary: "Second Linear ticket" }]);
+    const ai = await startFakeAiServer();
+    try {
+      await allocateFakeProviderKey(ai);
+      const taskId = seedTask();
+      const page = await openFeedbackTab(browser, taskId);
+
+      const jiraPicker = ticketPicker(page, "Attach Jira tickets");
+      const linearPicker = ticketPicker(page, "Attach Linear tickets");
+      await expect(jiraPicker).toBeVisible();
+      await expect(linearPicker).toBeVisible();
+      await expect(jiraPicker.locator("option", { hasText: linearKey })).toHaveCount(0);
+      await expect(linearPicker.locator("option", { hasText: jiraKey })).toHaveCount(0);
+
+      await jiraPicker.selectOption(jiraKey);
+      await linearPicker.selectOption(linearKey);
+      await linearPicker.selectOption(linearKey2);
+      // Clicking a chip removes just that key.
+      await page.getByRole("button", { name: `${linearKey2} x` }).click();
+      await expect(page.getByRole("button", { name: `${linearKey2} x` })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: `${linearKey} x` })).toBeVisible();
+      await expect(page.getByRole("button", { name: `${jiraKey} x` })).toBeVisible();
+
+      await page.getByPlaceholder("Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule.").fill("Use both tickets");
+      const sent = page.waitForRequest((req) => isFeedbackRequest(req.url(), req.method()));
+      await page.getByRole("button", { name: "Send feedback" }).click();
+      expect((await sent).postDataJSON()).toMatchObject({ jiraIssueKeys: [jiraKey], linearIssueKeys: [linearKey] });
+      await expect(page.getByText(/Feedback sent\./)).toBeVisible();
+
+      expect(await waitForTaskSettled(taskId)).toBe("in_review");
+      expect(JSON.parse(scalar(`SELECT jira_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))).toEqual([jiraKey]);
+      expect(JSON.parse(scalar(`SELECT linear_issue_keys::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))).toEqual([linearKey]);
+    } finally {
+      await ai.close();
+    }
+  });
+
+  test("ZYU-115 no ticket picker is shown for a provider that is not connected or has no tickets in the mapped scope", async ({ browser }) => {
+    const taskId = seedTask();
+
+    // Nothing connected: neither picker, and the rest of the form still works.
+    let page = await openFeedbackTab(browser, taskId);
+    await expect(page.getByRole("button", { name: "Send feedback" })).toBeVisible();
+    await expect(page.getByText("Attach Jira tickets", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+
+    // Linear connected and mapped, but with no tickets synced: still no empty picker.
+    seedFeedbackTickets("linear", []);
+    page = await openFeedbackTab(browser, taskId);
+    await expect(page.getByRole("button", { name: "Send feedback" })).toBeVisible();
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+
+    // Jira only: the Jira picker is unaffected by the Linear addition.
+    seedFeedbackTickets("jira", [{ key: `ZJI-${Date.now()}`, summary: "Jira only" }]);
+    page = await openFeedbackTab(browser, taskId);
+    await expect(ticketPicker(page, "Attach Jira tickets")).toBeVisible();
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+  });
+
+  test("ZYU-116 a failing Linear status call hides only the Linear picker; the task and the Jira picker still load", async ({ browser }) => {
+    const suffix = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const jiraKey = `ZJI-${suffix}`;
+    seedFeedbackTickets("jira", [{ key: jiraKey, summary: "Jira survives" }]);
+    seedFeedbackTickets("linear", [{ key: `ZLN-${suffix}`, summary: "Hidden by the failure" }]);
+    const taskId = seedTask();
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    // The API is cross-origin from the page, so match on path rather than a full URL.
+    await page.route(/\/linear\/status(\?|$)/, (route) => route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' }));
+    await page.goto(`/projects/${tenant!.mainProjectId}/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: /^Feedback \(/ }).click();
+
+    await expect(page.getByRole("heading", { name: "Send feedback" })).toBeVisible();
+    await expect(ticketPicker(page, "Attach Jira tickets").locator("option", { hasText: jiraKey })).toHaveCount(1);
+    await expect(page.getByText("Attach Linear tickets", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Failed to load task.")).toHaveCount(0);
   });
 
   // ─── Sources tab: label and formatting ─────────────────────────────────────
@@ -2632,5 +3098,446 @@ test.describe("zyra / agents (UI)", () => {
     expect(attrs.href).toContain('example.com"onmouseover=alert(1');
     // Exactly the three attributes renderMarkdown's own link markup sets: href, target, rel.
     expect(attrs.attributeCount).toBe(3);
+  });
+
+  // ─── Settings → AI Providers: the "Add workspace AI key" form ──────────────
+  //
+  // "Workspace AI key provider resets to default after deployment": nothing server-side rewrites a
+  // stored provider, but the add form opened pre-set to OpenAI / gpt-4o on every page load. After a
+  // deploy reloads the page, that read as the saved provider having reset — and since the form has
+  // no edit mode, a remove-and-re-add that missed the field really did save openai. These pin that
+  // the form starts unselected and that the saved provider survives a reload untouched.
+
+  async function openAiProviders(browser: Browser): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    // The model list is fetched from the provider itself once a key is typed. Answer it locally so
+    // these tests never send a (fake) key to a real provider.
+    await page.route("**/api/workspace/ai-keys/models", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ models: [{ id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6" }], source: "fallback", reason: "" }),
+      }),
+    );
+    await page.goto("/settings?tab=ai");
+    await expect(page.getByRole("heading", { name: "Workspace AI keys" })).toBeVisible();
+    return page;
+  }
+
+  /** The add form. FieldLabel has no htmlFor, so its selects are told apart by an option they own. */
+  function addKeyForm(page: Page) {
+    const form = page.locator("form").filter({ has: page.getByRole("button", { name: /Add workspace AI key|Adding key/ }) });
+    return {
+      form,
+      name: form.getByPlaceholder("Primary OpenAI key"),
+      provider: form.locator("select").filter({ has: page.locator("option", { hasText: "Select a provider" }) }),
+      apiKey: form.locator('input[type="password"]'),
+      model: form.locator("select").filter({ has: page.locator("option", { hasText: "Enter a model name manually..." }) }),
+      submit: form.getByRole("button", { name: /Add workspace AI key|Adding key/ }),
+    };
+  }
+
+  /**
+   * The saved-keys table row for `name`. Matched on an exact Name cell, not row text: the project
+   * allocation table below lists every key as a "<name> (<provider>)" option, so a text filter hits
+   * those rows too.
+   */
+  function keyRow(page: Page, name: string): Locator {
+    return page.getByRole("row").filter({ has: page.getByRole("cell", { name, exact: true }) });
+  }
+
+  function storedProvider(name: string): string {
+    return scalar(
+      `SELECT provider FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)} AND name = ${literal(name)};`,
+    );
+  }
+
+  test("ZYU-104 with an Anthropic key saved, the add form opens unselected — not on OpenAI — and cannot submit a default", async ({ browser }) => {
+    const name = stamp("anthropic key");
+    const created = await api.post("/api/workspace/ai-keys", {
+      data: { name, provider: "anthropic", apiKey: "sk-ant-e2e-not-a-real-key", defaultModel: "claude-sonnet-4-6" },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `creating the key — ${await created.text()}`).toBe(201);
+
+    const page = await openAiProviders(browser);
+    const f = addKeyForm(page);
+
+    // The saved key is shown as saved…
+    await expect(keyRow(page, name)).toContainText("ANTHROPIC");
+    // …and the add form does not claim a provider of its own.
+    await expect(f.provider).toHaveValue("");
+    await expect(f.provider.locator("option:checked")).toHaveText("Select a provider");
+
+    // Name and key filled but no provider picked: there is no default left to fall back on.
+    await f.name.fill(stamp("no provider"));
+    await f.apiKey.fill("sk-e2e-not-a-real-key");
+    await expect(f.submit).toBeDisabled();
+
+    expect(storedProvider(name), "opening the page must not change the stored provider").toBe("anthropic");
+  });
+
+  test("ZYU-105 a key added as Anthropic through the form is stored as Anthropic and still shows so after a reload", async ({ browser }) => {
+    const page = await openAiProviders(browser);
+    const f = addKeyForm(page);
+    const name = stamp("form key");
+
+    await f.name.fill(name);
+    await f.provider.selectOption("anthropic");
+    await f.apiKey.fill("sk-ant-e2e-not-a-real-key");
+    await f.model.selectOption("claude-sonnet-4-6");
+    await f.submit.click();
+    await expect(page.getByText("Workspace AI key added.")).toBeVisible();
+
+    // Persisted state, via the API the screen itself reads.
+    const list = await api.get("/api/workspace/ai-keys", { failOnStatusCode: false });
+    expect(list.status()).toBe(200);
+    const saved = ((await list.json()).keys as Array<{ name: string; provider: string; defaultModel: string | null }>).find((k) => k.name === name);
+    expect(saved, "the key the form added").toBeTruthy();
+    expect(saved!.provider).toBe("anthropic");
+    expect(saved!.defaultModel).toBe("claude-sonnet-4-6");
+
+    // A reload (what a deploy does to an open tab) shows the saved provider and an unselected form.
+    await page.reload();
+    await expect(keyRow(page, name)).toContainText("ANTHROPIC");
+    await expect(addKeyForm(page).provider).toHaveValue("");
+    expect(storedProvider(name)).toBe("anthropic");
+  });
+
+  test("ZYU-106 re-adding a saved key's name through the form is refused and leaves its provider as saved", async ({ browser }) => {
+    const name = stamp("dup key");
+    const created = await api.post("/api/workspace/ai-keys", {
+      data: { name, provider: "anthropic", apiKey: "sk-ant-e2e-original-key", defaultModel: "claude-sonnet-4-6" },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `creating the key — ${await created.text()}`).toBe(201);
+
+    const page = await openAiProviders(browser);
+    const f = addKeyForm(page);
+    await f.name.fill(name);
+    await f.provider.selectOption("openai");
+    await f.apiKey.fill("sk-e2e-should-not-apply");
+    await f.submit.click();
+
+    await expect(page.getByText(/already exists/)).toBeVisible();
+    await expect(keyRow(page, name)).toContainText("ANTHROPIC");
+    expect(storedProvider(name), "the refused re-add must not overwrite the saved provider").toBe("anthropic");
+  });
+});
+
+/*
+ * Sending a real chat message through the page, against the fake provider (utils/fake-ai-server.ts).
+ *
+ * Regression coverage for "Failed to fetch (api-app-stage.tesbo.io)" with Knowledge Base access OFF.
+ * The page used to hold one POST open for the whole turn; a generation turn runs for minutes, and
+ * Cloudflare drops an origin request at 100 s with a CORS-less 524, so the browser reported a
+ * network failure while the backend went on to save the reply. The page now starts the turn with
+ * `background: true` (the POST returns as soon as the message is recorded) and polls the session
+ * until its user message leaves `processing`. A 100-second cutoff is not reproducible here, so these
+ * tests pin the property that removes it: the POST returns while the model is still answering.
+ */
+test.describe("zyra / chat send (UI, fake provider)", () => {
+  let tenant: RbacTenant | null = null;
+  let api: APIRequestContext;
+  let ai: FakeAiServer;
+  let ownerState = "";
+  const contexts: BrowserContext[] = [];
+  const composer = (page: Page) => page.getByPlaceholder("Ask Zyra to generate, update, or review test cases...");
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-ui-chat");
+    if (!tenant) return;
+    api = await loginAs(tenant.owner);
+    ownerState = await writeStorageState(tenant.owner, "zyra-ui-chat-owner");
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    if (tenant) purge();
+    await Promise.all(contexts.map((ctx) => ctx.close()));
+    await api?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+    ai?.reset();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)};`);
+    exec(`UPDATE projects SET settings = COALESCE(settings, '{}'::jsonb) - 'zyraAgent' WHERE id = ${project};`);
+  }
+
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await api.post("/api/workspace/ai-keys", {
+      data: { name: `E2E ui chat fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "openai", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const allocRes = await api.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: (await keyRes.json()).id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function setKnowledgeBaseAccess(enabled: boolean): Promise<void> {
+    const res = await api.patch(`/api/projects/${tenant!.mainProjectId}/agents/zyra/settings`, {
+      data: { capabilities: { knowledgeBase: enabled } },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `saving the KB capability — ${await res.text()}`).toBeLessThan(300);
+  }
+
+  async function seedKbDoc(marker: string): Promise<void> {
+    let folderId = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    if (!folderId) {
+      exec(
+        "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, is_root) " +
+          `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, NULL, 'Knowledge base', true);`,
+      );
+      folderId = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = true;`);
+    }
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { folderId, documentType: "general", title: `${marker} seat policy`, contentText: `${marker}: a booking allows at most 10 seats.` },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `seeding the KB doc — ${await res.text()}`).toBe(201);
+  }
+
+  async function openChat(browser: Browser): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: ownerState });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/agents/zyra`);
+    await expect(composer(page)).toBeEnabled();
+    return page;
+  }
+
+  function isSendRequest(url: string, method: string): boolean {
+    return method === "POST" && /\/agents\/zyra\/chat\/sessions\/[^/]+\/messages$/.test(new URL(url).pathname);
+  }
+
+  function queueAnswer(reply: string): void {
+    ai.queueReply({ reply, reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+  }
+
+  test("ZYU-100 with Knowledge Base access off, a message gets its reply — the send returns while Zyra is still answering", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const marker = `Zorblax${Date.now() % 100000}`;
+    await seedKbDoc(marker);
+    await setKnowledgeBaseAccess(false);
+    const page = await openChat(browser);
+    const reply = `No knowledge-base access here, so I cannot confirm the ${marker} seat limit.`;
+    // The model answers only after 6 s; the send must not wait for it.
+    ai.delayNextReplyMs(6_000);
+    queueAnswer(reply);
+
+    const sendResponse = page.waitForResponse((res) => isSendRequest(res.url(), res.request().method()));
+    await composer(page).fill(`How many seats can a ${marker} booking hold?`);
+    await composer(page).press("Enter");
+    const response = await sendResponse;
+    expect(response.status()).toBe(201);
+    expect(response.request().postDataJSON()).toMatchObject({ background: true });
+    // The POST came back while the model was still holding its answer — the reply can't be here yet.
+    expect(ai.requests.length, "the router call should still be in flight").toBeLessThanOrEqual(1);
+    await expect(page.getByText(reply)).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Thinking..." })).toBeVisible();
+
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole("button", { name: "Thinking..." })).toHaveCount(0);
+    await expect(page.getByText(/Failed to fetch|could not reach the API|couldn't finish answering/)).toHaveCount(0);
+    expect(JSON.stringify(ai.requests[0].messages), "the KB document reached the model with access off").not.toContain(`${marker}: a booking allows`);
+
+    // Persisted, not just rendered: the turn is in the session with its user message settled.
+    const sessionId = scalar(`SELECT session_id FROM zyra_chat_messages WHERE project_id = ${literal(tenant!.mainProjectId)} AND role = 'user' LIMIT 1;`);
+    const session = await (await api.get(`/api/projects/${tenant!.mainProjectId}/agents/zyra/chat/sessions/${sessionId}`)).json();
+    expect(session.messages.map((m: { role: string; status: string }) => [m.role, m.status])).toEqual([["user", "sent"], ["assistant", "completed"]]);
+  });
+
+  test("ZYU-101 with Knowledge Base access on, the reply still arrives and the model is shown the knowledge base", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const marker = `Zorblax${Date.now() % 100000}`;
+    await seedKbDoc(marker);
+    const page = await openChat(browser);
+    queueAnswer("A booking allows at most 10 seats.");
+
+    await composer(page).fill(`How many seats can a ${marker} booking hold?`);
+    await page.getByRole("button", { name: "Send" }).click();
+
+    await expect(page.getByText("A booking allows at most 10 seats.")).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByText(/Failed to fetch|could not reach the API/)).toHaveCount(0);
+    expect(JSON.stringify(ai.requests[0].messages)).toContain(`${marker}: a booking allows at most 10 seats.`);
+  });
+
+  test("ZYU-102 reloading mid-turn keeps waiting for the same turn and shows its reply, without sending it twice", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser);
+    ai.delayNextReplyMs(6_000);
+    queueAnswer("Answer that outlived a reload.");
+
+    const sendResponse = page.waitForResponse((res) => isSendRequest(res.url(), res.request().method()));
+    await composer(page).fill("How many test cases exist?");
+    await composer(page).press("Enter");
+    await sendResponse;
+    await page.reload();
+
+    // After the reload nothing local knows about the turn — only the server's `processing` status.
+    // The message text also names the session (sidebar entry + chat header), so target the bubble.
+    await expect(page.locator("div.whitespace-pre-wrap", { hasText: "How many test cases exist?" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Thinking..." })).toBeVisible();
+    await expect(page.getByText("Answer that outlived a reload.")).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeEnabled();
+    expect(
+      Number(scalar(`SELECT COUNT(*) FROM zyra_chat_messages WHERE project_id = ${literal(tenant!.mainProjectId)} AND role = 'user';`)),
+      "the message was sent again after the reload",
+    ).toBe(1);
+  });
+
+  test("ZYU-103 a send the server refuses shows the server's reason and drops the unsent message", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser);
+    // A 409 is what the server answers while another turn in the session is still running.
+    await page.route(
+      (url) => /\/agents\/zyra\/chat\/sessions\/[^/]+\/messages$/.test(url.pathname),
+      async (route) => {
+        if (route.request().method() !== "POST") return route.continue();
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "Zyra is still working on your previous message in this session — wait for it to finish before sending another." }),
+        });
+      },
+    );
+
+    await composer(page).fill("A message that will be refused");
+    await composer(page).press("Enter");
+
+    await expect(page.getByText(/Zyra is still working on your previous message/)).toBeVisible();
+    await expect(page.getByText("A message that will be refused")).toHaveCount(0);
+    await expect(composer(page)).toBeEnabled();
+    expect(ai.requests.length, "a refused send must never reach the model").toBe(0);
+  });
+
+  // ─── Request trace ────────────────────────────────────────────────────────
+  // The trace is persisted on the request's own message (see zyra-turn-trace.ts), so the states a
+  // live send can't reach on demand — a failed request, one whose process died, one running in
+  // another tab — are arranged by writing that trace directly, in the exact shape the backend writes.
+
+  function traceJson(outcome: string, steps: Array<{ stage: string; status: string; meta?: Record<string, unknown> }>): string {
+    const at = new Date(Date.now() - 30_000).toISOString();
+    return JSON.stringify({
+      version: 1,
+      outcome,
+      startedAt: at,
+      endedAt: outcome === "running" ? null : new Date().toISOString(),
+      steps: steps.map((s) => ({ ...s, attempt: 1, startedAt: at, endedAt: s.status === "active" ? null : new Date().toISOString() })),
+    });
+  }
+
+  function seedRequest(status: string, trace: string, opts: { claimed?: boolean } = {}): string {
+    const t = tenant!;
+    exec(`INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES (${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E trace session');`);
+    const sessionId = scalar(`SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`);
+    exec(
+      "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, trace) VALUES " +
+        `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'user', 'Seeded question', ${literal(status)}, ${literal(trace)}::jsonb);`,
+    );
+    if (opts.claimed) exec(`UPDATE zyra_chat_sessions SET processing_since = now() WHERE id = ${literal(sessionId)};`);
+    return sessionId;
+  }
+
+  async function gotoChat(browser: Browser): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: ownerState });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/agents/zyra`);
+    return page;
+  }
+
+  test("ZYU-118 a send shows its live trace while it runs, then the finished trace under the reply — still there after a reload", async ({ browser }) => {
+    await allocateFakeAiKey();
+    // Held long enough to observe the decision step while it is running.
+    ai.delayNextReplyMs(4_000);
+    queueAnswer("There are no test cases yet.");
+    const page = await openChat(browser);
+    await composer(page).fill("How many test cases exist?");
+    await composer(page).press("Enter");
+
+    const running = page.locator('[data-zyra-trace="running"]');
+    await expect(running.locator('[data-zyra-step="routing"][data-zyra-step-status="active"]')).toBeVisible({ timeout: 20_000 });
+    await expect(running.getByText(/zyra · step \d+ · /)).toBeVisible();
+    // No invented total: the old header claimed "turn 7/8" before knowing what the turn would need.
+    await expect(running.getByText(/turn \d+\/\d+/)).toHaveCount(0);
+
+    await expect(page.getByText("There are no test cases yet.")).toBeVisible({ timeout: 30_000 });
+    const finished = page.locator('[data-zyra-trace="completed"]');
+    await expect(finished).toBeVisible();
+    await expect(finished.locator("summary")).toContainText("[DONE]");
+    await finished.locator("summary").click();
+    await expect(finished.locator('[data-zyra-step="context:knowledge"]')).toBeVisible();
+    await expect(finished.locator('[data-zyra-step="routing"]')).toContainText("answer");
+    // An answer never generates, so the trace must not claim it did.
+    await expect(finished.locator('[data-zyra-step="generating"]')).toHaveCount(0);
+
+    await page.reload();
+    await expect(page.locator('[data-zyra-trace="completed"]')).toBeVisible();
+  });
+
+  test("ZYU-119 a request that failed before any reply shows its trace under the request, with the step that failed", async ({ browser }) => {
+    seedRequest("failed", traceJson("failed", [
+      { stage: "received", status: "ok" },
+      { stage: "routing", status: "failed", meta: { status: "failed", reason: "This turn did not complete." } },
+    ]));
+    const page = await gotoChat(browser);
+    const failed = page.locator('[data-zyra-trace="failed"]');
+    await expect(failed.locator("summary")).toContainText("[FAILED]");
+    await failed.locator("summary").click();
+    const routing = failed.locator('[data-zyra-step="routing"]');
+    await expect(routing).toContainText("[FAIL]");
+    await expect(routing).toContainText("This turn did not complete.");
+    await expect(composer(page)).toBeEnabled();
+  });
+
+  test("ZYU-120 a request left processing by a turn that died reads as interrupted, and the conversation is not locked", async ({ browser }) => {
+    seedRequest("processing", traceJson("running", [
+      { stage: "received", status: "ok" },
+      { stage: "routing", status: "active", meta: { totalContextItems: 2 } },
+    ]));
+    const page = await gotoChat(browser);
+    // Before the fix this row kept the composer disabled and the page polling, forever.
+    await expect(composer(page)).toBeEnabled();
+    const failed = page.locator('[data-zyra-trace="failed"]');
+    await failed.locator("summary").click();
+    await expect(failed.locator('[data-zyra-step="routing"]')).toContainText("interrupted");
+  });
+
+  test("ZYU-121 a request still running elsewhere (another tab, or before a reload) shows its steps so far from the persisted trace", async ({ browser }) => {
+    seedRequest("processing", traceJson("running", [
+      { stage: "received", status: "ok" },
+      { stage: "context:jira", status: "empty", meta: { items: [], count: 0 } },
+      { stage: "routing", status: "active", meta: { totalContextItems: 0 } },
+    ]), { claimed: true });
+    const page = await gotoChat(browser);
+    const running = page.locator('[data-zyra-trace="running"]');
+    await expect(running.getByText(/zyra · step 3 · /)).toBeVisible();
+    await expect(running.locator('[data-zyra-step="routing"]')).toContainText("[RUN]");
+    await expect(running.locator('[data-zyra-step="context:jira"]')).toContainText("none found");
+    await expect(composer(page)).toBeDisabled();
   });
 });

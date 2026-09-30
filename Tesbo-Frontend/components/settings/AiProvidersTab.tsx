@@ -29,10 +29,13 @@ export default function AiProvidersTab() {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
-  const [newProvider, setNewProvider] = useState("openai");
+  // Starts unselected, never on a concrete provider: this form only ever adds a key, but a
+  // pre-filled "OpenAI" read as the workspace's saved provider having reset (e.g. after a deploy
+  // reloads the page), and a remove-and-re-add that missed the field silently saved openai.
+  const [newProvider, setNewProvider] = useState("");
   const [newCustomProvider, setNewCustomProvider] = useState("");
   const [newApiKey, setNewApiKey] = useState("");
-  const [newDefaultModel, setNewDefaultModel] = useState("gpt-4o");
+  const [newDefaultModel, setNewDefaultModel] = useState("");
   const [newBaseUrl, setNewBaseUrl] = useState("");
   const [newAuthHeaderName, setNewAuthHeaderName] = useState("Authorization");
   const [newAuthScheme, setNewAuthScheme] = useState("Bearer");
@@ -269,8 +272,9 @@ export default function AiProvidersTab() {
                 }}
                 disabled={saving}
               >
+                <option value="" disabled>Select a provider</option>
                 {/* Keeps the current selection visible while the catalog is in flight. */}
-                {providerCatalog.length === 0 && <option value={newProvider}>{newProvider}</option>}
+                {providerCatalog.length === 0 && newProvider && newProvider !== "custom" && <option value={newProvider}>{newProvider}</option>}
                 {providerCatalog.map((provider) => (
                   <option key={provider.id} value={provider.id}>{provider.label}</option>
                 ))}

@@ -2,13 +2,18 @@ import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { tracedEmbeddingCall } from "../observability/embedding-trace";
 import { EmbeddingKeyAllocation, embedTexts, resolveEmbeddingAllocation } from "./rag-ai-allocation";
+import { RagChunkingService } from "./rag-chunking.service";
 import {
   RAG_ANN_CANDIDATES,
   RAG_CONFIDENT_SIMILARITY,
   RAG_CONTEXT_CHAR_BUDGET,
   RAG_FTS_CANDIDATES,
+  RAG_FTS_MAX_REQUIRED_TERMS,
+  RAG_FTS_MIN_TERM_COVERAGE,
   RAG_MAX_SOURCES,
   RAG_MIN_SIMILARITY,
+  RAG_PASSAGE_CHARS,
+  RAG_QUERY_BOILERPLATE,
   RAG_RRF_K,
   TESTCASE_SIMILARITY_THRESHOLD
 } from "./rag.constants";
@@ -43,6 +48,16 @@ interface FusedSource {
   title: string;
   score: number;
   chunks: Array<{ content: string; headingPath: string | null }>;
+  // Set only for a source that reached fusion through keyword search alone (no ANN chunk): the
+  // whole document text, narrowed to its relevant passages by focusSources before budgeting.
+  fullText?: string;
+}
+
+// The request's content terms, as Postgres 'english' lexemes, and the OR query built from them.
+interface KeywordQuery {
+  terms: string[];
+  tsquery: string;
+  minMatchedTerms: number;
 }
 
 // Optional Langfuse trace anchor for the query-embedding call this retrieval makes. Both fields
@@ -69,6 +84,9 @@ type RetrievalOpts = { maxSources?: number; charBudget?: number } & RetrievalTra
 @Injectable()
 export class RagRetrievalService {
   private readonly logger = new Logger(RagRetrievalService.name);
+  // Pure text -> chunks, no dependencies — instantiated directly rather than injected so this
+  // service's constructor (and every `new RagRetrievalService(db)` in its specs) stays unchanged.
+  private readonly chunker = new RagChunkingService();
 
   constructor(private readonly db: DatabaseService) {}
 
@@ -95,19 +113,25 @@ export class RagRetrievalService {
       const text = String(query || "").trim();
       if (!text) return { items: [], semanticSearchRan: false, reason: "Empty query.", topScore: null, confidence: "none" };
 
-      const resolved = await resolveEmbeddingAllocation(this.db, projectId);
+      const [resolved, keyword] = await Promise.all([resolveEmbeddingAllocation(this.db, projectId), this.keywordQuery(text)]);
       reason = resolved.reason;
       const allocation = resolved.allocation;
 
       const [annRowsRaw, ftsDocRows, ftsFileRows] = await Promise.all([
         allocation ? this.annSearch(projectId, allocation, text, { traceId: opts.traceId, traceSeed: opts.traceSeed }) : Promise.resolve([] as AnnRow[]),
-        this.ftsSearch(projectId, "knowledge_documents", "content_text", text),
-        this.ftsSearch(projectId, "knowledge_files", "extracted_text", text)
+        keyword ? this.ftsSearch(projectId, "knowledge_documents", "content_text", keyword) : Promise.resolve([] as FtsRow[]),
+        keyword ? this.ftsSearch(projectId, "knowledge_files", "extracted_text", keyword) : Promise.resolve([] as FtsRow[])
       ]);
       // Reported honestly even when every candidate gets filtered below — "we searched and the best
       // match scored 0.31" is a real, useful signal, distinct from "no candidates existed at all".
       const topScore = annRowsRaw.length ? Math.max(...annRowsRaw.map((row) => row.cosine_similarity)) : null;
-      const confidence = this.confidenceFor(topScore);
+      // A keyword match now has to hit a real share of the request's content terms (see ftsSearch),
+      // so it is at least a loose match — never "none", which the drafting prompt reads as "nothing
+      // was found, write from general practice". That reading is what turned a document that
+      // literally stated the requirement into a generic test case: with no embeddings key in any
+      // workspace, keyword search is the only retrieval that runs, and it was always graded "none".
+      const semanticConfidence = this.confidenceFor(topScore);
+      const confidence: RagRetrievalConfidence = semanticConfidence === "none" && (ftsDocRows.length || ftsFileRows.length) ? "weak" : semanticConfidence;
       // The relevance floor: RRF's own score is a rank position, not a magnitude (see
       // RAG_MIN_SIMILARITY's own comment), so a weak candidate pool must be excluded here, before
       // fusion, or it fills the context budget indistinguishably from a strong one.
@@ -116,9 +140,11 @@ export class RagRetrievalService {
         return { items: [], semanticSearchRan: Boolean(allocation), reason, topScore, confidence };
       }
 
-      const fused = this.fuse(annRows, [...ftsDocRows, ...ftsFileRows]);
+      const maxSources = opts.maxSources ?? RAG_MAX_SOURCES;
+      const fused = this.fuse(annRows, [...ftsDocRows, ...ftsFileRows]).slice(0, maxSources);
+      await this.focusSources(fused, keyword);
       return {
-        items: this.budgetToItems(fused, opts.maxSources ?? RAG_MAX_SOURCES, opts.charBudget ?? RAG_CONTEXT_CHAR_BUDGET),
+        items: this.budgetToItems(fused, maxSources, opts.charBudget ?? RAG_CONTEXT_CHAR_BUDGET),
         semanticSearchRan: Boolean(allocation),
         reason,
         topScore,
@@ -256,21 +282,146 @@ export class RagRetrievalService {
     return res.rows;
   }
 
-  private async ftsSearch(projectId: string, table: "knowledge_documents" | "knowledge_files", contentColumn: string, query: string): Promise<FtsRow[]> {
+  /**
+   * The request's content terms, stemmed by Postgres itself so they line up exactly with each
+   * document's search_vector, minus the words that describe the request rather than the product
+   * (RAG_QUERY_BOILERPLATE). Null when nothing is left to search on ("generate test cases").
+   *
+   * This replaced plainto_tsquery, which ANDs every word of the message: "Generate test cases for
+   * session timeout" required a document to contain "generate", "test", "case" AND "timeout", so a
+   * doc stating "sessions expire after 20 minutes" was never found and retrieval fell back to the
+   * 12 most recently edited documents. Never throws — a failure here just skips keyword search.
+   */
+  private async keywordQuery(text: string): Promise<KeywordQuery | null> {
+    const res = await this.db
+      .query<{ terms: string[] | null; boilerplate: string[] | null }>(
+        "SELECT tsvector_to_array(to_tsvector('english', $1)) AS terms, tsvector_to_array(to_tsvector('english', $2)) AS boilerplate",
+        [text, RAG_QUERY_BOILERPLATE.join(" ")]
+      )
+      .catch(() => ({ rows: [] as Array<{ terms: string[] | null; boilerplate: string[] | null }> }));
+    const boilerplate = new Set(res.rows[0]?.boilerplate ?? []);
+    const terms = (res.rows[0]?.terms ?? []).filter((term) => term && !boilerplate.has(term));
+    if (!terms.length) return null;
+    return {
+      terms,
+      tsquery: terms.map(RagRetrievalService.quoteLexeme).join(" | "),
+      minMatchedTerms: Math.min(RAG_FTS_MAX_REQUIRED_TERMS, Math.max(1, Math.ceil(terms.length * RAG_FTS_MIN_TERM_COVERAGE)))
+    };
+  }
+
+  // A lexeme as a quoted tsquery operand. Cast with ::tsquery (not to_tsquery) so an already-stemmed
+  // lexeme is not stemmed a second time; quotes and backslashes are the only characters that need
+  // escaping inside the quotes.
+  private static quoteLexeme(term: string): string {
+    return `'${term.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
+  }
+
+  private async ftsSearch(projectId: string, table: "knowledge_documents" | "knowledge_files", contentColumn: string, keyword: KeywordQuery): Promise<FtsRow[]> {
     const titleColumn = table === "knowledge_documents" ? "title" : "original_file_name";
     const approvalFilter = table === "knowledge_documents" ? "AND (document_type != 'ai_memory' OR status = 'approved')" : "";
     const sourceType: RagSourceType = table === "knowledge_documents" ? "document" : "file";
+    // Any-term match (served by the GIN index), then a coverage floor so one shared common word
+    // isn't enough, then ranked — ts_rank on an OR query rewards documents matching more terms.
     const res = await this.db
       .query<{ id: string; title: string; content: string; rank: number }>(
-        `SELECT id, ${titleColumn} AS title, ${contentColumn} AS content, ts_rank(search_vector, plainto_tsquery('english', $2)) AS rank
+        `SELECT id, ${titleColumn} AS title, ${contentColumn} AS content, ts_rank(search_vector, $2::tsquery) AS rank
          FROM ${table}
          WHERE project_id = $1 AND is_deleted = false ${approvalFilter}
-           AND search_vector @@ plainto_tsquery('english', $2)
+           AND search_vector @@ $2::tsquery
+           AND (SELECT count(*) FROM unnest($3::text[]) AS t(term) WHERE search_vector @@ t.term::tsquery) >= $4
          ORDER BY rank DESC LIMIT ${RAG_FTS_CANDIDATES}`,
-        [projectId, query]
+        [projectId, keyword.tsquery, keyword.terms.map(RagRetrievalService.quoteLexeme), keyword.minMatchedTerms]
       )
       .catch(() => ({ rows: [] as Array<{ id: string; title: string; content: string; rank: number }> }));
     return res.rows.map((row) => ({ source_type: sourceType, source_id: row.id, title: row.title, content: row.content, rank: row.rank }));
+  }
+
+  /**
+   * Narrows each keyword-only source to the passages that match the request, in place. A source
+   * found by ANN already carries its matching chunks and is left alone.
+   */
+  private async focusSources(sources: FusedSource[], keyword: KeywordQuery | null): Promise<void> {
+    const pending = sources.filter((source) => source.fullText !== undefined);
+    if (!pending.length) return;
+    const passages = await this.selectPassages(pending.map((source) => source.fullText as string), keyword);
+    pending.forEach((source, i) => {
+      source.chunks = passages[i];
+    });
+  }
+
+  /**
+   * For callers holding whole documents they did not find through search — an explicit picker
+   * selection, a folder named in the message: each document narrowed to the passages most
+   * relevant to `query`, within RAG_PASSAGE_CHARS. Replaces a flat `content.slice(0, 1500)`, which
+   * dropped every requirement stated after a document's opening. Never throws.
+   */
+  async focusOnQuery(contents: string[], query: string): Promise<string[]> {
+    const keyword = String(query || "").trim() ? await this.keywordQuery(String(query).trim()) : null;
+    const passages = await this.selectPassages(contents, keyword);
+    return passages.map((chosen) => chosen.map((passage) => passage.content).join("\n...\n"));
+  }
+
+  /**
+   * Splits each text with the same chunker the embedding pipeline uses, scores every chunk against
+   * the request in Postgres (same 'english' stemming as the search itself), and keeps the
+   * best-scoring chunks up to RAG_PASSAGE_CHARS, back in document order. A text already within
+   * that size is passed whole. With no query terms, or no chunk matching any, or a failed scoring
+   * query, this degrades to the text's opening — exactly the previous behaviour.
+   */
+  private async selectPassages(texts: string[], keyword: KeywordQuery | null): Promise<Array<Array<{ content: string; headingPath: string | null }>>> {
+    // The chunker strips heading lines into headingPath; they go back in front of the passage because
+    // a heading is often what gives a bare value its meaning ("Password rules" over "8 to 64 characters").
+    const chunked = texts.map((text) => {
+      const value = String(text || "");
+      if (value.length <= RAG_PASSAGE_CHARS) return null;
+      const chunks = this.chunker.chunk(value).map((chunk) => ({
+        headingPath: chunk.headingPath,
+        body: chunk.headingPath ? `${chunk.headingPath}\n${chunk.content}` : chunk.content
+      }));
+      return chunks.length ? chunks : null;
+    });
+    const opening = (text: string) => [{ content: String(text || "").slice(0, RAG_PASSAGE_CHARS), headingPath: null }];
+
+    const ranks = new Map<string, number>();
+    if (keyword && chunked.some(Boolean)) {
+      const sourceIdx: number[] = [];
+      const chunkIdx: number[] = [];
+      const bodies: string[] = [];
+      chunked.forEach((chunks, s) => chunks?.forEach((chunk, c) => {
+        sourceIdx.push(s);
+        chunkIdx.push(c);
+        bodies.push(chunk.body);
+      }));
+      const res = await this.db
+        .query<{ s: number; c: number; rank: number }>(
+          `SELECT x.s, x.c, ts_rank(to_tsvector('english', x.body), $4::tsquery) AS rank
+           FROM unnest($1::int[], $2::int[], $3::text[]) AS x(s, c, body)`,
+          [sourceIdx, chunkIdx, bodies, keyword.tsquery]
+        )
+        .catch((err) => {
+          this.logger.warn(`Passage ranking failed, falling back to each document's opening: ${err instanceof Error ? err.message : err}`);
+          return { rows: [] as Array<{ s: number; c: number; rank: number }> };
+        });
+      for (const row of res.rows) ranks.set(`${row.s}:${row.c}`, Number(row.rank));
+    }
+
+    return texts.map((text, s) => {
+      const chunks = chunked[s];
+      if (!chunks) return String(text || "").length <= RAG_PASSAGE_CHARS ? [{ content: String(text || ""), headingPath: null }] : opening(text);
+      const scored = chunks.map((chunk, c) => ({ chunk, c, rank: ranks.get(`${s}:${c}`) ?? 0 })).filter((entry) => entry.rank > 0);
+      if (!scored.length) return opening(text);
+      scored.sort((a, b) => b.rank - a.rank || a.c - b.c);
+      const chosen: typeof scored = [];
+      let used = 0;
+      for (const entry of scored) {
+        if (chosen.length && used + entry.chunk.body.length > RAG_PASSAGE_CHARS) continue;
+        chosen.push(entry);
+        used += entry.chunk.body.length;
+      }
+      return chosen
+        .sort((a, b) => a.c - b.c)
+        .map((entry) => ({ content: entry.chunk.body.slice(0, RAG_PASSAGE_CHARS), headingPath: entry.chunk.headingPath }));
+    });
   }
 
   // Reciprocal rank fusion in application code (not SQL — ANN rows are chunk-level, FTS rows
@@ -291,7 +442,9 @@ export class RagRetrievalService {
       const key = `${row.source_type}:${row.source_id}`;
       const existing = bySource.get(key) || { key, sourceType: row.source_type, sourceId: row.source_id, title: row.title, score: 0, chunks: [] };
       existing.score += 1 / (RAG_RRF_K + rank + 1);
-      if (!existing.chunks.length) existing.chunks.push({ content: row.content.slice(0, 1500), headingPath: null });
+      // Whole text kept for focusSources to narrow to the matching passages — not the first 1500
+      // characters, which is where a requirement stated later in the document used to get dropped.
+      if (!existing.chunks.length) existing.fullText = String(row.content || "");
       bySource.set(key, existing);
     });
 

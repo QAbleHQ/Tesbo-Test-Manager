@@ -2444,7 +2444,7 @@ reviewScript() {
 
 *Exhaustive / "all possible cases" batched generation (the plan/task lifecycle for chat)*
 - Detected via message phrasing ("all possible", "as many as possible", "exhaustive", "every scenario", "full coverage", "all types") or by the project's configured testcase range being `all`.
-- Zyra first calls a cheap planning pass (`planZyraChatScenarios`) to produce a todo-list of up to 40 distinct scenario labels (never < 2, else falls back to one bounded normal-sized batch to avoid truncation).
+- Zyra first calls a cheap planning pass (`planZyraChatScenarios`) to produce a todo-list of up to 100 distinct scenario labels (the "all" tier only — every other range, and any count the user names, is capped at 50) (never < 2, else falls back to one bounded normal-sized batch to avoid truncation).
 - Generates the first batch (5 scenarios) inline and replies immediately ("I identified N distinct scenarios... here are the first 5...").
 - Remaining scenarios are handed to a **fire-and-forget background loop** (`continueZyraChatPlan`) that generates and posts each subsequent 5-scenario batch as its own new assistant chat message, polled by the frontend every 3 seconds while `activePlan.status === "running"`.
 - **Stop** (`POST .../stop-plan`): pauses the plan (status → `paused`), preserving `remainingScenarios`/`doneCount`/`totalCount` — an in-flight batch already running server-side is *not* aborted mid-request, it finishes and posts its own message, but the loop checks the plan id before starting the *next* batch and stops if the plan was cleared/paused.

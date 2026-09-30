@@ -7,6 +7,7 @@ import { OtpService } from "../auth/otp.service";
 import { PasswordService } from "../auth/password.service";
 import { AuthService } from "../auth/auth.service";
 import { AuditService } from "../audit/audit.service";
+import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
 
 /**
  * Covers the registration-via-invite path: a brand-new user who has never had
@@ -72,8 +73,10 @@ function makeService(opts: {
     logProjectActivity: jest.fn().mockResolvedValue(undefined)
   } as unknown as LegacyService;
 
-  const svc = new SignupService(db, config, otp, password, auth, audit, legacy);
-  return { svc, query, txQuery, otp, password, auth, audit, legacy };
+  const welcomeEmail = { schedule: jest.fn().mockResolvedValue(undefined) } as unknown as WelcomeEmailService;
+
+  const svc = new SignupService(db, config, otp, password, auth, audit, legacy, welcomeEmail);
+  return { svc, query, txQuery, otp, password, auth, audit, legacy, welcomeEmail };
 }
 
 const req = {} as any;
@@ -170,7 +173,7 @@ describe("SignupService — invite-based registration", () => {
     };
 
     it("creates the user, assigns the invited role in the org and its projects, and marks the invite accepted", async () => {
-      const { svc, txQuery, query, auth, audit, legacy } = makeService({ invitation: INVITE, dbOpts: { pendingSignup: PENDING } });
+      const { svc, txQuery, query, auth, audit, legacy, welcomeEmail } = makeService({ invitation: INVITE, dbOpts: { pendingSignup: PENDING } });
 
       const result = await svc.verifyInviteRegistration("raw-token", "123456", "1.2.3.4", "ua", req, res);
       expect(result).toEqual({ ok: true, userId: "new-user-1", organizationId: "org-1" });
@@ -199,15 +202,19 @@ describe("SignupService — invite-based registration", () => {
       expect(legacy.logProjectActivity).toHaveBeenCalledWith(
         "proj-1", "new-user-1", "project_member_added", "project_member", "new-user-1", "bob@example.com", { role: "qa_engineer", via: "invitation_registered" }
       );
+      // The welcome email is scheduled for the committed user, exactly once.
+      expect(welcomeEmail.schedule).toHaveBeenCalledTimes(1);
+      expect(welcomeEmail.schedule).toHaveBeenCalledWith("new-user-1");
       // Sanity: query() (non-transactional) is untouched by the transaction's own inserts.
       expect(query.mock.calls.some((c) => String(c[0]).includes("INSERT INTO users"))).toBe(false);
     });
 
     it("rejects an invalid or expired OTP code", async () => {
-      const { svc } = makeService({ invitation: INVITE, dbOpts: { pendingSignup: PENDING }, otpVerifyResult: false });
+      const { svc, welcomeEmail } = makeService({ invitation: INVITE, dbOpts: { pendingSignup: PENDING }, otpVerifyResult: false });
       await expect(svc.verifyInviteRegistration("raw-token", "000000", "1.2.3.4", "ua", req, res)).rejects.toMatchObject({
         response: { error: "invalid_or_expired_otp" }
       });
+      expect(welcomeEmail.schedule).not.toHaveBeenCalled();
     });
 
     it("rejects when no pending registration exists for this invite (e.g. never started, or expired)", async () => {
@@ -231,5 +238,37 @@ describe("SignupService — invite-based registration", () => {
         ConflictException
       );
     });
+  });
+});
+
+describe("SignupService — self-serve signup schedules the welcome email", () => {
+  const PENDING = {
+    id: "pending-2",
+    email: "ada@example.com",
+    name: "Ada Lovelace",
+    first_name: "Ada",
+    last_name: "Lovelace",
+    mobile_number: null,
+    password_hash: "hashed:pw",
+    invitation_id: null
+  };
+
+  it("schedules it once for the new user after the account is created", async () => {
+    const { svc, welcomeEmail, auth } = makeService({ dbOpts: { pendingSignup: PENDING } });
+    const result = await svc.verifySelfServeSignup("ada@example.com", "123456", "1.2.3.4", "ua", req, res);
+    expect(result).toEqual({ ok: true, userId: "new-user-1" });
+    expect(welcomeEmail.schedule).toHaveBeenCalledTimes(1);
+    expect(welcomeEmail.schedule).toHaveBeenCalledWith("new-user-1");
+    expect(auth.signInUser).toHaveBeenCalled();
+  });
+
+  it("schedules nothing when the code is wrong or there is no pending signup", async () => {
+    const wrong = makeService({ dbOpts: { pendingSignup: PENDING }, otpVerifyResult: false });
+    await expect(wrong.svc.verifySelfServeSignup("ada@example.com", "000000", "ip", "ua", req, res)).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(wrong.welcomeEmail.schedule).not.toHaveBeenCalled();
+
+    const none = makeService({ dbOpts: { pendingSignup: null } });
+    await expect(none.svc.verifySelfServeSignup("ada@example.com", "123456", "ip", "ua", req, res)).rejects.toBeInstanceOf(BadRequestException);
+    expect(none.welcomeEmail.schedule).not.toHaveBeenCalled();
   });
 });

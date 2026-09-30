@@ -44,7 +44,9 @@ function formatApiError(status: number, body: ApiErrorBody): string {
 function isNetworkFetchError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : "Network request failed";
   return (
-    msg === "Failed to fetch" ||
+    // Recent Chrome appends the host — "Failed to fetch (api-app-stage.tesbo.io)" — so an exact
+    // match silently stopped recognising network errors and surfaced the raw TypeError text.
+    msg.startsWith("Failed to fetch") ||
     msg === "Load failed" ||
     msg.includes("NetworkError") ||
     msg.includes("network")
@@ -1096,6 +1098,32 @@ export interface ZyraChatMessage {
   reviewRequestId?: string | null;
   /** How many consecutive resume attempts this message's chain has already burned through. */
   resumeAttempt: number;
+  /**
+   * What Zyra actually did for this request — see zyra-turn-trace.ts on the backend. On a user
+   * message it is that request's trace (written step by step while it runs); on an assistant
+   * message only when the reply answers no user message of its own (a plan batch, a resumed turn).
+   */
+  trace?: ZyraTurnTrace | null;
+}
+
+export type ZyraTraceStepStatus = "active" | "ok" | "empty" | "skipped" | "blocked" | "failed" | "timed_out";
+export type ZyraTraceOutcome = "running" | "completed" | "completed_with_errors" | "timed_out" | "failed";
+
+export interface ZyraTraceStep {
+  stage: string;
+  attempt: number;
+  status: ZyraTraceStepStatus;
+  meta?: Record<string, unknown>;
+  startedAt: string;
+  endedAt: string | null;
+}
+
+export interface ZyraTurnTrace {
+  version: 1;
+  outcome: ZyraTraceOutcome;
+  startedAt: string;
+  endedAt: string | null;
+  steps: ZyraTraceStep[];
 }
 
 export interface ZyraChatActivePlan {
@@ -1182,6 +1210,30 @@ export async function sendZyraChatMessage(
   });
 }
 
+/** User-message status while its background turn (startZyraChatMessage) is still running. */
+export const ZYRA_MESSAGE_PROCESSING = "processing";
+/** User-message status when its background turn failed before posting a reply. */
+export const ZYRA_MESSAGE_FAILED = "failed";
+
+/**
+ * Background form of sendZyraChatMessage — what the chat page uses. Resolves as soon as the server
+ * has recorded the message; the turn itself keeps running server-side. A turn can take minutes, and
+ * a request held open that long is cut off by Cloudflare at 100 s ("Failed to fetch") even though the
+ * backend goes on to save the reply. Watch completion by polling getZyraChatSession until the user
+ * message `userMessageId` leaves ZYRA_MESSAGE_PROCESSING (`opts.turnId`'s SSE stream is a bonus).
+ */
+export async function startZyraChatMessage(
+  projectId: string,
+  sessionId: string,
+  message: string,
+  opts: { turnId?: string } = {}
+): Promise<{ accepted: true; userMessageId: string; session: ZyraChatSession }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: { message, turnId: opts.turnId, background: true },
+  });
+}
+
 /**
  * Resumes a turn whose provider call timed out (message.status === ZYRA_MESSAGE_TIMED_OUT) — picks
  * the SAME turn back up server-side (skipping the routing call if it had already resolved a
@@ -1213,6 +1265,8 @@ export async function continueZyraChatMessage(
 
 export type ZyraTurnProgressEvent =
   | { kind: "stage"; stage: string; meta?: Record<string, unknown> }
+  /** Merges `meta` into the latest step named `stage` ("*" = the open one). */
+  | { kind: "update"; stage: string; meta?: Record<string, unknown> }
   | { kind: "complete"; payload: unknown }
   | { kind: "error"; message: string }
   | { kind: "unknown" };
@@ -3156,7 +3210,7 @@ export interface SyncRun {
   status: SyncRunStatus;
   stage: SyncRunStage;
   remoteProjectKey: string | null;
-  /** Linear only — the mapped Team/Project name. Null for Jira and for runs recorded before it existed. */
+  /** The mapped Jira project / Linear Team or Project name. Null for runs recorded before it was stored. */
   remoteProjectName: string | null;
   totalTickets: number;
   processedTickets: number;
