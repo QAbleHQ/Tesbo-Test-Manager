@@ -418,6 +418,7 @@ export class PlanLimitsService {
    * a provider for a workspace rather than fail a request.
    */
   async isIntegrationAllowed(organizationId: string, provider: string): Promise<boolean> {
+    if (!this.config.isStripeBillingEnabled) return true;
     const { effectivePlan } = await this.getEntitlement(organizationId);
     return effectivePlan === "pro" || LAUNCH_ALLOWED_INTEGRATIONS.has(provider);
   }
