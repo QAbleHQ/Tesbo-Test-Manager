@@ -4,6 +4,7 @@ import { env } from "../utils/env";
 import { clearOtpIpRateLimit, disposableEmail, seedOtpCode } from "../utils/otp";
 import { hashPasswordForSeed } from "../utils/password";
 import { dbControlAvailable, exec, execAllowingAuditImmutability, literal, scalar } from "../utils/psql";
+import { expectWelcomeJobScheduled, readWelcomeJob, removeWelcomeJob } from "../utils/welcome-email-queue";
 
 async function anonContext(playwright: import("@playwright/test").PlaywrightWorkerArgs["playwright"]) {
   // Playwright Test's request.newContext() otherwise inherits the project's default
@@ -249,6 +250,34 @@ test.describe("otp", () => {
     expect(me.email).toBe(email);
 
     await anon.dispose();
+  });
+
+  // The Create account → "Email code" tab (and Sign in → "Email code" for an unknown address) creates
+  // the account inside /otp/verify, so that is a registration and has to schedule the welcome email.
+  // A later code sign-in of the same, now existing, account is not one and must not re-schedule it.
+  test("an email-code signup schedules one welcome email; a later code sign-in does not add another", async ({ playwright }) => {
+    test.skip(!env.targetIsLocal, "welcome-email job lives in the local stack's Redis");
+    const anon = await anonContext(playwright);
+    const email = disposableEmail("api-otp-welcome");
+    let userId: string | undefined;
+    try {
+      seedOtpCode(email, "357913");
+      const first = await anon.post("/api/auth/otp/verify", { data: { email, code: "357913" } });
+      expect(first.ok(), `first verify failed: ${await first.text()}`).toBeTruthy();
+      userId = (await first.json()).userId;
+      expect(userId, "/otp/verify returned no userId").toBeTruthy();
+      const job = expectWelcomeJobScheduled(userId!);
+
+      // Same address again: an existing user signing in, not a registration.
+      seedOtpCode(email, "468024");
+      const again = await anon.post("/api/auth/otp/verify", { data: { email, code: "468024" } });
+      expect(again.ok(), `second verify failed: ${await again.text()}`).toBeTruthy();
+      const after = readWelcomeJob(userId!);
+      expect(after?.timestamp, "a sign-in of an existing account re-scheduled the welcome email").toBe(job.timestamp);
+    } finally {
+      removeWelcomeJob(userId);
+      await anon.dispose();
+    }
   });
 
   test("rate-limits repeated OTP requests", { tag: '@tesbo.testId("TES-TC-30")' }, async ({ playwright }) => {
