@@ -380,6 +380,35 @@ test.describe("self-serve signup", () => {
     expect(userCount(email)).toBe(1);
     expect(scalar(`SELECT mobile_number IS NULL FROM users WHERE email = ${literal(email.toLowerCase())};`)).toBe("t");
   });
+
+  test("SGN-A-19 a resend after the first code and pending signup expired still completes the signup", async () => {
+    // The /signup code step's "Resend code" re-calls signup/start rather than /otp/request, because
+    // the pending signup expires on the same timer as the code: a fresh code alone would pass the OTP
+    // check and then fail on "No pending signup found". This pins the backend half of that choice.
+    // Spends two signup/start attempts; see BUDGET at the top of the file.
+    const email = signupEmail("resend-expired");
+    const normalized = email.toLowerCase();
+    const details = { firstName: "EndToEnd", lastName: "Resent", email, password: "E2eSignPass9f3!" };
+    expect((await start(details)).status()).toBe(204);
+
+    execMany([
+      `UPDATE pending_signups SET expires_at = now() - interval '1 minute' WHERE email = ${literal(normalized)}`,
+      `UPDATE otp_codes SET expires_at = now() - interval '1 minute' WHERE email = ${literal(normalized)}`,
+    ]);
+    expect(usablePendingCount(email)).toBe(0);
+
+    const resent = await start(details);
+    expect(resent.status(), `the resend's signup/start answered ${resent.status()}: ${await resent.text()}`).toBe(204);
+    expect(usablePendingCount(email), "the resend did not write a fresh pending signup").toBe(1);
+
+    seedOtpCode(email, "777777");
+    const verified = await verify({ email, code: "777777" });
+    expect(verified.status(), `verify after a resend — ${await verified.text()}`).toBe(201);
+    welcomed.push((await verified.json()).userId);
+    expect(userCount(email)).toBe(1);
+    expect(scalar(`SELECT last_name FROM users WHERE email = ${literal(normalized)};`)).toBe("Resent");
+    expect(usablePendingCount(email), "the resent pending signup was not consumed").toBe(0);
+  });
   // ─── Field rules (BetterBugs 6a7c621b) ─────────────────────────────────────
   //
   // "Validation and maximum character limits are missing for Sign Up fields" — first name, last name
