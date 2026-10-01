@@ -7,7 +7,7 @@ import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
 import { closeZyraTask, type ZyraTask } from "@/lib/api";
 import { Button, CopyButton, StatusChip, PriorityBadge, SeverityBadge, type Priority, type Severity } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
-import { renderMarkdown } from "@/lib/markdown";
+import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
 import { ACTION_LABEL, TechniqueBadges } from "./ZyraChatReviewPanel";
 
 export const JIRA_BADGE_CLASS =
@@ -340,7 +340,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 <div key={`${task.id}-source-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
                   <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                   <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{source.title}</h3>
-                  {source.type === "knowledge_base" ? (
+                  {isMarkdownSource(source.type) ? (
                     <div
                       className="zyra-prose zyra-prose-compact break-words mt-1 text-[12px] text-[var(--muted)]"
                       dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}

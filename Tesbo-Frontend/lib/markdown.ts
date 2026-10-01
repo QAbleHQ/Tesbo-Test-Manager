@@ -51,6 +51,16 @@ export function markdownToPlainText(text: string): string {
     .join(" ");
 }
 
+// Zyra task source types whose `detail` is captured document/ticket text, which Jira and Linear
+// descriptions carry as Markdown. Shared by the task detail page and the quick-view panel so the
+// two can't disagree. `story` is left out: it is the user's own one-line story, shown plain
+// everywhere else (the task heading, Kanban cards).
+const MARKDOWN_SOURCE_TYPES = new Set(["knowledge_base", "context", "jira", "linear"]);
+
+export function isMarkdownSource(type: string): boolean {
+  return MARKDOWN_SOURCE_TYPES.has(type);
+}
+
 export function renderMarkdown(text: string): string {
   // Quotes matter here, not just `<`/`>`: the link replacement above interpolates its captured URL
   // straight into a double-quoted href attribute, so an unescaped `"` in the source text (e.g.

@@ -2190,7 +2190,7 @@ test.describe("zyra / agents (UI)", () => {
 
   // ─── Sources tab: label and formatting ─────────────────────────────────────
 
-  test("ZYU-30 the quick-view panel's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+  test("ZYU-30 the quick-view panel's Sources tab labels context 'User Story Context' and keeps each line on its own row", async ({
     browser,
   }) => {
     /*
@@ -2200,6 +2200,9 @@ test.describe("zyra / agents (UI)", () => {
      * flattened paragraph. The real generation flow that builds this source can't be driven end to
      * end here (see the file header — no AI provider is configured for this suite), so the source is
      * seeded the way aiGenerate leaves it and this asserts the panel renders it correctly.
+     *
+     * Context now goes through renderMarkdown (see ZYU-125), which turns each non-blank line into
+     * its own paragraph — so "line breaks kept" is asserted as three rows, not as pre-wrap text.
      */
     const userStory = stamp("Context story");
     const context = "Line one of the story\nLine two of the story\nLine three";
@@ -2217,12 +2220,13 @@ test.describe("zyra / agents (UI)", () => {
     await expect(panel.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
 
     const sourceCard = panel.locator("div.rounded-lg", { has: title });
-    const detail = sourceCard.locator("p");
-    await expect(detail, "the detail paragraph must preserve line breaks visually, not collapse them").toHaveCSS("white-space", "pre-wrap");
-    expect(await detail.textContent()).toBe(context);
+    await expect(
+      sourceCard.locator(".zyra-prose p"),
+      "each line of the context must stay on its own row, not collapse into one paragraph",
+    ).toHaveText(["Line one of the story", "Line two of the story", "Line three"]);
   });
 
-  test("ZYU-31 the task detail page's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+  test("ZYU-31 the task detail page's Sources tab labels context 'User Story Context' and keeps each line on its own row", async ({
     browser,
   }) => {
     const context = "Line one of the story\nLine two of the story\nLine three";
@@ -2236,14 +2240,12 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
 
     const sourceCard = page.locator("div.rounded-lg", { has: title });
-    const detail = sourceCard.locator("p");
-    await expect(detail).toHaveCSS("white-space", "pre-wrap");
-    expect(await detail.textContent()).toBe(context);
+    await expect(sourceCard.locator(".zyra-prose p")).toHaveText(["Line one of the story", "Line two of the story", "Line three"]);
   });
 
   test("ZYU-32 a source with no line breaks in its detail still renders correctly", async ({ browser }) => {
-    // Guard against a regression the other way: whitespace-pre-wrap must not visually alter
-    // single-line detail text (extra wrapping, stray whitespace) — only multi-line text is affected.
+    // Guard against a regression the other way: rendering context as Markdown must not alter
+    // single-line plain text (extra wrapping, stray whitespace) — it stays one paragraph, verbatim.
     const single = "A single line of context with no breaks at all";
     const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: single }] });
 
@@ -2259,10 +2261,10 @@ test.describe("zyra / agents (UI)", () => {
 
   // ─── Sources tab: Knowledge Base Markdown rendering (KAN-6 report) ─────────
   //
-  // legacy.service.ts labels the source object `{ type: "knowledge_base", ... }` — only that type
-  // goes through renderMarkdown (lib/markdown.ts, shared with the Zyra chat page); every other
-  // source type keeps rendering as literal whitespace-pre-wrap text, which is what ZYU-30/31/32
-  // above depend on. Real generation can't be driven end to end in this suite (see file header —
+  // legacy.service.ts labels the source object `{ type: "knowledge_base", ... }`. It goes through
+  // renderMarkdown (lib/markdown.ts, shared with the Zyra chat page), as do `context`, `jira` and
+  // `linear` since ZYU-125 — the gate is isMarkdownSource(). `story` keeps rendering as literal
+  // whitespace-pre-wrap text (ZYU-39). Real generation can't be driven end to end in this suite (see file header —
   // no AI provider is configured), so these seed a `knowledge_base` source directly, the same way
   // the context/story sources above are seeded, and assert on what the panel/page render from it.
 
@@ -2381,23 +2383,109 @@ test.describe("zyra / agents (UI)", () => {
     await expect(panel.getByText("<img", { exact: false })).toBeVisible();
   });
 
-  test("ZYU-39 a non-Knowledge-Base source's Markdown-looking text is not parsed as Markdown", async ({ browser }) => {
-    // Locks the type gate in TaskQuickViewPanel/the task detail page: only `knowledge_base`
-    // sources go through renderMarkdown. Every other type (context, story, jira, linear,
-    // existing_testcase) must keep rendering as literal pre-wrap text — ZYU-30/31/32 depend on
-    // that for `context`, and this pins it against the Markdown-looking text a real Jira
-    // description or user story can plausibly contain (e.g. a literal "- " bullet in prose).
+  test("ZYU-39 a story source's Markdown-looking text is not parsed as Markdown", async ({ browser }) => {
+    // Locks the other side of isMarkdownSource(): `story` is the user's own one-line story, shown
+    // plain in the task heading and on Kanban cards, so the Sources tab must not reinterpret a
+    // literal "# " or "**" in it either. (This test used to pin the same for `context`; ZYU-125
+    // deliberately reversed that, because a Jira/Linear description arrives as Markdown.)
     const raw = "# Not a heading\n**not bold** and a - bullet look-alike";
-    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: raw }] });
+    const taskId = seedTask({ sources: [{ type: "story", title: "User story", detail: raw }] });
 
     const page = await open(browser, `/agents/tasks/${taskId}`);
     await page.getByRole("button", { name: "Sources (1)" }).click();
 
     await expect(page.getByRole("heading", { name: "Not a heading" })).toHaveCount(0);
-    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    const title = page.getByRole("heading", { name: "User story", level: 3 });
     const sourceCard = page.locator("div.rounded-lg", { has: title });
     const detail = sourceCard.locator("p");
     expect(await detail.textContent()).toBe(raw);
+  });
+
+  // ─── Sources tab: Linear/Jira ticket Markdown in context (reported screenshot) ─
+  //
+  // A task created from a Linear ticket stores the ticket's Markdown description as `context`, and
+  // aiGenerate copies its first 320 characters into a "User Story Context" source. Only
+  // `knowledge_base` sources were rendered, so the card showed "- **Status:** Backlog" verbatim.
+  // The fixture is the reported ticket's context, cut at 320 the way legacy.service.ts cuts it.
+  const LINEAR_CONTEXT = [
+    "QAB-241: LIN-01: Create a System User",
+    "# QAB-241: LIN-01: Create a System User",
+    "",
+    "- **Status:** Backlog",
+    "- **Type:** Issue",
+    "- **Priority:** No priority",
+    "- **Assignee:** Namrata Gosai",
+    "- **Reporter:** Namrata Gosai",
+    "- **Created:** 2026-09-22",
+    "- **Updated:** 2026-09-24",
+    "- **Link:** https://linear.app/qable/issue/QAB-241/lin-01-create-a-system-user",
+  ]
+    .join("\n")
+    .slice(0, 320);
+
+  async function expectLinearContextRendered(scope: Page | Locator) {
+    const title = scope.getByRole("heading", { name: "User Story Context", level: 3 });
+    const sourceCard = scope.locator("div.rounded-lg", { has: title });
+    await expect(sourceCard.getByRole("heading", { name: "QAB-241: LIN-01: Create a System User", level: 1 })).toBeVisible();
+    await expect(sourceCard.locator("li")).toHaveCount(8);
+    await expect(sourceCard.locator("li").first()).toHaveText("Status: Backlog");
+    await expect(sourceCard.locator("li strong", { hasText: "Assignee:" })).toBeVisible();
+    await expect(sourceCard.getByText("**", { exact: false }), "no raw bold markers may be shown").toHaveCount(0);
+    await expect(sourceCard.getByText("# QAB-241", { exact: false }), "no raw heading marker may be shown").toHaveCount(0);
+  }
+
+  test("ZYU-125 the task detail page renders a Linear ticket's context source as formatted Markdown", async ({ browser }) => {
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: LINEAR_CONTEXT }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+    await expectLinearContextRendered(page);
+  });
+
+  test("ZYU-126 the quick-view panel renders a Linear ticket's context source as formatted Markdown", async ({ browser }) => {
+    const userStory = stamp("Linear context story");
+    seedTask({ userStory, sources: [{ type: "context", title: "User Story Context", detail: LINEAR_CONTEXT }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expectLinearContextRendered(panel);
+  });
+
+  test("ZYU-127 jira and linear sources render Markdown too, a link cut mid-syntax stays plain text, and HTML stays escaped", async ({
+    browser,
+  }) => {
+    const marker = `xss-marker-${Date.now()}`;
+    const taskId = seedTask({
+      sources: [
+        { type: "jira", title: "KAN-9", detail: "Checkout **must** retry\n- once\n- twice" },
+        // The 320-character slice can end inside a link; the unclosed syntax must render as plain
+        // text rather than swallow or break the card.
+        { type: "linear", title: "QAB-9", detail: "- **Status:** Backlog\n- **Link:** [ticket](https://linear.app/qab" },
+        { type: "context", title: "User Story Context", detail: `<img src=x onerror="window.__zyraXss='${marker}'">` },
+      ],
+    });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (3)" }).click();
+
+    const card = (name: string) => page.locator("div.rounded-lg", { has: page.getByRole("heading", { name, level: 3 }) });
+    await expect(card("KAN-9").locator("strong", { hasText: "must" })).toBeVisible();
+    await expect(card("KAN-9").locator("li")).toHaveText(["once", "twice"]);
+
+    await expect(card("QAB-9").locator("li")).toHaveCount(2);
+    await expect(card("QAB-9").locator("li").first()).toHaveText("Status: Backlog");
+    await expect(card("QAB-9").locator("a"), "a cut-off link must not become an anchor").toHaveCount(0);
+    await expect(card("QAB-9").locator("li").nth(1)).toContainText("[ticket](https://linear.app/qab");
+
+    const contextCard = card("User Story Context");
+    await expect(contextCard.locator("img")).toHaveCount(0);
+    await expect(contextCard.getByText("<img", { exact: false })).toBeVisible();
+    const injected = await page.evaluate(() => (window as unknown as Record<string, unknown>).__zyraXss);
+    expect(injected, "context now goes through renderMarkdown, which escapes HTML first").toBeUndefined();
   });
 
   // ─── Transient network failures (fix for "Failed to fetch" on Zyra staging) ─

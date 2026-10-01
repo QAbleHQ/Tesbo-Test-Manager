@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { env } from "../utils/env";
 import { clearOtpIpRateLimit, clearOtpRateLimit, disposableEmail, seedOtpCode } from "../utils/otp";
+import { exec, literal, scalar } from "../utils/psql";
 
 test.describe("login", () => {
   // Start these tests logged out even though the project default carries an
@@ -160,6 +161,48 @@ test.describe("otp login", () => {
 
     await page.getByRole("link", { name: "Use a different email" }).click();
     await expect(page).toHaveURL(/\/login/);
+  });
+
+  test("resend code is locked for 30 seconds after a successful resend", async ({ page }) => {
+    // Regression: the button was disabled only while the request was in flight, so "Code sent" was
+    // itself clickable and every click mailed another code. Each send also counts toward the 5-attempt
+    // login lockout (AuthService.requestOtp), so a few impatient clicks locked the email for a day.
+    // /verify-otp is shared by login and signup's "Email code" mode, so this covers both entry points.
+    const email = disposableEmail("otp-resend-cooldown");
+    const normalized = email.toLowerCase();
+    const sentCodes = () => Number(scalar(`SELECT COUNT(*) FROM otp_codes WHERE email = ${literal(normalized)};`));
+    try {
+      // Fake clock (still running in real time) so the cooldown can be skipped rather than waited out.
+      await page.clock.install();
+      await requestOtpCode(page, email);
+      expect(sentCodes()).toBe(1);
+
+      await page.getByRole("button", { name: "Resend code" }).click();
+      const sent = page.getByRole("button", { name: "Code sent" });
+      await expect(sent).toBeDisabled();
+      expect(sentCodes()).toBe(2);
+
+      // A forced click (a double-click, or clicking the success label) must not send a third code.
+      await sent.click({ force: true });
+      expect(sentCodes()).toBe(2);
+
+      // Past the 4s "Code sent" label, the countdown takes over and the button stays locked.
+      await page.clock.fastForward(5_000);
+      const cooling = page.getByRole("button", { name: /Resend in \d+s/ });
+      await expect(cooling).toBeDisabled();
+      await cooling.click({ force: true });
+      expect(sentCodes()).toBe(2);
+
+      await page.clock.fastForward(26_000);
+      await expect(page.getByRole("button", { name: "Resend code" })).toBeEnabled();
+    } finally {
+      // The two sends above landed on the login lockout counter, keyed `login:<email>`
+      // (LoginLockoutService.key) — not one of the shapes clearOtpRateLimit() clears.
+      exec(
+        `DELETE FROM otp_rate_limit WHERE email = ${literal(`login:${normalized}`)}; ` +
+          `DELETE FROM otp_codes WHERE email = ${literal(normalized)};`,
+      );
+    }
   });
 
   test("inviting a teammate from onboarding creates a real invitation, not a silent membership grant", { tag: '@tesbo.testId("TES-TC-3010")' }, async ({ page }) => {

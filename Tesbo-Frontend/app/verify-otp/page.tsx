@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
@@ -10,6 +10,8 @@ import { AuthSplitShell } from "@/components/auth/AuthSplitShell";
 import { OtpBoxInput } from "@/components/auth/OtpBoxInput";
 import { AuthLoadingScreen } from "@/components/auth/AuthLoadingScreen";
 import { Button, FieldError } from "@/components/ui";
+
+const RESEND_COOLDOWN_MS = 30_000;
 
 function VerifyOtpForm() {
   const router = useRouter();
@@ -23,6 +25,23 @@ function VerifyOtpForm() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [resendState, setResendState] = useState<"idle" | "sending" | "sent">("idle");
+  const [cooldownEndsAt, setCooldownEndsAt] = useState<number | null>(null);
+  const [now, setNow] = useState(0);
+
+  // Every send counts toward the 5-attempt login lockout (AuthService.requestOtp), so the button
+  // stays locked for the whole cooldown, not just the "Code sent" label. Remaining time is derived
+  // from the end timestamp so a throttled background tab can't stretch it.
+  useEffect(() => {
+    if (cooldownEndsAt === null) return;
+    const id = setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (t >= cooldownEndsAt) setCooldownEndsAt(null);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [cooldownEndsAt]);
+
+  const cooldownSeconds = cooldownEndsAt === null ? 0 : Math.max(0, Math.ceil((cooldownEndsAt - now) / 1000));
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -52,12 +71,15 @@ function VerifyOtpForm() {
   }
 
   async function handleResend() {
-    if (!email || resendState === "sending") return;
+    if (!email || resendState === "sending" || cooldownSeconds > 0) return;
     setResendState("sending");
     setError("");
     try {
       await requestOtp(email);
       setCode("");
+      const t = Date.now();
+      setNow(t);
+      setCooldownEndsAt(t + RESEND_COOLDOWN_MS);
       setResendState("sent");
       setTimeout(() => setResendState("idle"), 4000);
     } catch (err) {
@@ -97,10 +119,16 @@ function VerifyOtpForm() {
           <button
             type="button"
             onClick={handleResend}
-            disabled={resendState === "sending"}
+            disabled={resendState === "sending" || cooldownSeconds > 0}
             className="font-medium text-[var(--accent-light)] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {resendState === "sent" ? "Code sent" : resendState === "sending" ? "Sending..." : "Resend code"}
+            {resendState === "sent"
+              ? "Code sent"
+              : resendState === "sending"
+                ? "Sending..."
+                : cooldownSeconds > 0
+                  ? `Resend in ${cooldownSeconds}s`
+                  : "Resend code"}
           </button>
         </p>
 
