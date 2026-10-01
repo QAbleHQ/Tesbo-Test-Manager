@@ -27,7 +27,7 @@ import { IconSparkles, IconUser } from "@tabler/icons-react";
 import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, SeverityBadge, type Severity } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
-import { renderMarkdown } from "@/lib/markdown";
+import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
 import { ACTION_LABEL, TechniqueBadges } from "@/components/agents/ZyraChatReviewPanel";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -790,7 +790,7 @@ export default function ZyraTaskDetailPage() {
               <div key={`${source.type}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
                 <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                 <h3 className="mt-1 text-sm font-semibold text-[var(--foreground)]">{source.title}</h3>
-                {source.type === "knowledge_base" ? (
+                {isMarkdownSource(source.type) ? (
                   <div
                     className="zyra-prose zyra-prose-compact break-words mt-1 text-sm text-[var(--muted)]"
                     dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}
