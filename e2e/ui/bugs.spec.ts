@@ -1,5 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+import { filesForm, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 import {
   createBug,
   createProject,
@@ -1600,5 +1601,1179 @@ test.describe("bug — field order matches between Report a Bug and Edit Bug", (
     expect(statusIdx, "Status must be present in Edit Bug").toBeGreaterThan(-1);
     expect(statusIdx).toBeGreaterThan(descIdx);
     expect(statusIdx).toBeLessThan(severityIdx);
+  });
+});
+
+/*
+ * Bug Details as a right-side detail panel. It used to be a small centred modal; it now uses the
+ * shared Drawer the Test Run detail panel uses (components/ui/Drawer.tsx), with the same content
+ * and the same Edit / Delete / Close actions. These pin the placement, that nothing was dropped in
+ * the move, and that every action and dismissal still does what it did in the modal.
+ */
+test.describe("bug details panel", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** The panel body. Drawer renders without role="dialog", so the page labels its own section. */
+  function panelBody(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  /**
+   * The whole drawer surface (header + body). The section sits in Drawer's scroll wrapper, whose
+   * parent is the panel itself, two levels up. Drawer is shared and its close button has no
+   * aria-label, so this is also how that header control is reached: it is the panel's first button.
+   */
+  function panel(page: Page): Locator {
+    return panelBody(page).locator("xpath=../..");
+  }
+
+  async function openFromList(page: Page, title: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(panelBody(page)).toBeVisible();
+  }
+
+  test("BUG-U-48 opening a bug shows a full-height panel docked to the right, with every detail and action", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const cycle = await (await api.post(`/api/projects/${projectId}/cycles`, { data: { name: `E2E Panel Run ${suffix}` } })).json();
+    const testcase = await (
+      await api.post(`/api/projects/${projectId}/testcases`, { data: { title: `E2E Panel Case ${suffix}` } })
+    ).json();
+    await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+    const me = await (await api.get("/api/auth/me")).json();
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: {
+          title: `E2E Panel Bug ${suffix}`,
+          description: `Panel description ${suffix}`,
+          severity: "High",
+          priority: "P1",
+          assigneeId: me.userId,
+          links: [{ testcaseId: testcase.id, cycleId: cycle.id }],
+        },
+      })
+    ).json();
+    try {
+      await openFromList(page, bug.title);
+
+      // Placement: right edge of the viewport, full height, the Drawer's 480px width.
+      const viewport = page.viewportSize()!;
+      const box = (await panel(page).boundingBox())!;
+      expect(box.x + box.width).toBeGreaterThanOrEqual(viewport.width - 1);
+      expect(box.y).toBeLessThanOrEqual(1);
+      expect(box.height).toBeGreaterThanOrEqual(viewport.height - 1);
+      expect(box.width).toBeLessThanOrEqual(481);
+      expect(box.x, "a centred modal would leave room on the right").toBeGreaterThan(viewport.width / 2);
+
+      // Header: eyebrow, key and title.
+      const surface = panel(page);
+      await expect(surface.getByText("Bug Details", { exact: true })).toBeVisible();
+      await expect(surface.getByText(bug.externalId, { exact: true })).toBeVisible();
+      await expect(surface.getByRole("heading", { name: bug.title })).toBeVisible();
+
+      // Body: every field the modal had.
+      const body = panelBody(page);
+      for (const label of ["Description", "Severity", "Priority", "Status", "Linked Test Cases & Runs", "Reported By", "Assigned To", "Reported On"]) {
+        await expect(body.getByText(label, { exact: true }), label).toBeVisible();
+      }
+      await expect(body.getByText(`Panel description ${suffix}`)).toBeVisible();
+      await expect(body.getByText("High", { exact: true })).toBeVisible();
+      await expect(body.getByText("P1", { exact: true })).toBeVisible();
+      await expect(body.getByText("Open", { exact: true })).toBeVisible();
+      await expect(body.getByText(testcase.title)).toBeVisible();
+      await expect(body.getByText(`— ${cycle.name}`)).toBeVisible();
+
+      // Footer actions.
+      for (const name of ["Edit", "Close", "Delete Bug"]) {
+        await expect(body.getByRole("button", { name, exact: true })).toBeVisible();
+      }
+      await expect(body.getByRole("link", { name: "Open full page" })).toHaveAttribute(
+        "href",
+        `/projects/${projectId}/bugs/${bug.id}`,
+      );
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/testcases/${testcase.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-49 a board card opens the same panel", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Board ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "Board", exact: true }).click();
+      await page.locator('[role="button"]').filter({ hasText: bug.title }).first().click();
+      await expect(panelBody(page)).toBeVisible();
+      await expect(panel(page).getByRole("heading", { name: bug.title })).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-50 Close, the header close button, Escape and a backdrop click each dismiss the panel", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Dismiss ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Close", exact: true }).click();
+      await expect(panelBody(page)).toBeHidden();
+
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await panel(page).locator("button").first().click();
+      await expect(panelBody(page)).toBeHidden();
+
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await expect(panelBody(page)).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(panelBody(page)).toBeHidden();
+
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await expect(panelBody(page)).toBeVisible();
+      // The backdrop fills the viewport behind the right-docked panel; its far left is backdrop.
+      await page.mouse.click(10, page.viewportSize()!.height / 2);
+      await expect(panelBody(page)).toBeHidden();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  /** The full page's in-place Edit Bug card. */
+  function fullPageEditForm(page: Page): Locator {
+    return page.getByRole("region", { name: "Edit bug" });
+  }
+
+  /** FieldLabel has no htmlFor, so the title is reached as the first input after its label. */
+  function fullPageTitleInput(page: Page): Locator {
+    return fullPageEditForm(page).locator("xpath=.//label[contains(., 'Bug Title')]/following::input[1]");
+  }
+
+  test("BUG-U-51 Edit opens the full bug page straight into its edit form, and Cancel leaves it on the bug", async ({ page }) => {
+    // Was: Edit opened the Edit Bug dialog over the list. Changed on request — the panel's Edit now
+    // goes to the full-page form (the list row / board card pencil still use the dialog, BUG-U-13).
+    const bug = await createBug(api, projectId, { title: `E2E Panel Edit ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Edit", exact: true }).click();
+
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}\\?edit=1$`));
+      await expect(panelBody(page)).toHaveCount(0);
+      await expect(fullPageEditForm(page)).toBeVisible();
+      await expect(fullPageTitleInput(page)).toHaveValue(bug.title);
+      // In place, not the dialog: the form spans the page's main column.
+      const formBox = (await fullPageEditForm(page).boundingBox())!;
+      const mainBox = (await fullPageEditForm(page).locator("xpath=ancestor::main[1]").boundingBox())!;
+      expect(formBox.width).toBeGreaterThan(mainBox.width - 60);
+
+      await fullPageEditForm(page).getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(fullPageEditForm(page)).toHaveCount(0);
+      await expect(page.getByRole("region", { name: "Bug details" })).toBeVisible();
+      // The flag is dropped, so a refresh shows the bug rather than reopening the form.
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}$`));
+      await page.reload();
+      await expect(page.getByRole("region", { name: "Bug details" })).toBeVisible();
+      await expect(fullPageEditForm(page)).toHaveCount(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-70 saving the full-page form opened from the panel's Edit persists and shows the bug", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Edit Save ${uniqueSuffix()}` });
+    const renamed = `${bug.title} saved`;
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Edit", exact: true }).click();
+      await fullPageTitleInput(page).fill(renamed);
+      await fullPageEditForm(page).getByLabel("Severity").selectOption("Critical");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+
+      await expect(fullPageEditForm(page)).toHaveCount(0);
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}$`));
+      await expect(page.getByRole("heading", { level: 1, name: renamed })).toBeVisible();
+      await expect(page.getByRole("region", { name: "Bug details" }).getByText("Critical", { exact: true })).toBeVisible();
+
+      const persisted = await (await api.get(`/api/bugs/${bug.id}`)).json();
+      expect(persisted.title).toBe(renamed);
+      expect(persisted.severity).toBe("Critical");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-52 Delete Bug asks for confirmation, and confirming removes the bug", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Delete ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "Delete Bug", exact: true }).click();
+      await expect(panelBody(page)).toBeHidden();
+      // The confirm modal's title is the only "Delete Bug" text left once the panel is gone.
+      await expect(page.getByText("Delete Bug", { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+
+      await expect(page.locator("tbody tr").filter({ hasText: bug.title })).toHaveCount(0);
+      expect((await api.get(`/api/bugs/${bug.id}`, { failOnStatusCode: false })).status()).toBe(404);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-53 an untriaged, unassigned, unlinked bug shows its empty states, and no Last updated", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Empty ${uniqueSuffix()}` });
+    try {
+      await openFromList(page, bug.title);
+      const body = panelBody(page);
+      await expect(body.getByText("Not set", { exact: true })).toBeVisible();
+      await expect(body.getByText("Unassigned", { exact: true })).toBeVisible();
+      await expect(body.getByText("Not linked", { exact: true })).toBeVisible();
+      // No description was given, so the section is omitted rather than rendered empty.
+      await expect(body.getByText("Description", { exact: true })).toHaveCount(0);
+      await expect(body.getByText(/^Last updated:/)).toHaveCount(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-54 Last updated appears once the bug has been edited", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Panel Updated ${uniqueSuffix()}` });
+    try {
+      await api.patch(`/api/bugs/${bug.id}`, { data: { status: "In Progress" } });
+      await openFromList(page, bug.title);
+      await expect(panelBody(page).getByText(/^Last updated:/)).toBeVisible();
+      await expect(panelBody(page).getByText("In Progress", { exact: true })).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-55 a long description scrolls inside the panel while the footer actions stay on screen", async ({ page }) => {
+    const description = Array.from({ length: 150 }, (_, i) => `Line ${i + 1} of a long reproduction`).join("\n");
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Panel Long ${uniqueSuffix()}`, description } })
+    ).json();
+    try {
+      await openFromList(page, bug.title);
+      const body = panelBody(page);
+      const viewportHeight = page.viewportSize()!.height;
+
+      // The footer is pinned: fully inside the viewport without any scrolling.
+      const edit = body.getByRole("button", { name: "Edit", exact: true });
+      await expect(edit).toBeInViewport({ ratio: 1 });
+      const editBox = (await edit.boundingBox())!;
+      expect(editBox.y + editBox.height).toBeLessThanOrEqual(viewportHeight);
+
+      // The body is what scrolls, and scrolling it reaches the last line.
+      const scroller = body.locator(":scope > div").first();
+      const overflows = await scroller.evaluate((el) => el.scrollHeight > el.clientHeight);
+      expect(overflows, "a 150-line description must overflow the panel body").toBe(true);
+      await body.getByText("Line 150 of a long reproduction").scrollIntoViewIfNeeded();
+      await expect(body.getByText("Line 150 of a long reproduction")).toBeInViewport();
+      await expect(edit).toBeInViewport({ ratio: 1 });
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * The full-page bug view at /projects/:id/bugs/:bugId — the panel's "Open full page" target, the
+ * way the execute page is for the Test Run panel. It renders the same BugDetailsBody as the panel
+ * and the same EditBugModal as the list, so these cover the route, the navigation in and out of
+ * it, and its own Edit / Delete wiring; the modal's form behaviour is covered by the Edit Bug
+ * specs above.
+ */
+test.describe("bug full page", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** The page's details card. Labelled by the page itself; nothing here has role="dialog". */
+  function details(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  test("BUG-U-56 Open full page goes from the panel to the bug's own page, with every detail and a way back", async ({ page }) => {
+    const suffix = uniqueSuffix();
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: { title: `E2E Full Page ${suffix}`, description: `Full page description ${suffix}`, severity: "Critical", priority: "P0" },
+      })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await page.getByRole("link", { name: "Open full page" }).click();
+
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.id}$`));
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+      await expect(page.getByText(bug.externalId, { exact: true }).first()).toBeVisible();
+      // The side panel is not what is showing: the list page and its drawer are gone.
+      await expect(page.locator("tbody tr")).toHaveCount(0);
+
+      const card = details(page);
+      for (const label of ["Description", "Severity", "Priority", "Status", "Linked Test Cases & Runs", "Reported By", "Assigned To", "Reported On"]) {
+        await expect(card.getByText(label, { exact: true }), label).toBeVisible();
+      }
+      await expect(card.getByText(`Full page description ${suffix}`)).toBeVisible();
+      await expect(card.getByText("Critical", { exact: true })).toBeVisible();
+      await expect(card.getByText("P0", { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Delete Bug", exact: true })).toBeVisible();
+
+      // Breadcrumb back to the list. Scoped to the page header: the app sidebar has its own
+      // "Bugs" link.
+      await page.locator("header").getByRole("link", { name: "Bugs", exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  /** The in-page Edit Bug card (the list uses a dialog; this page edits in place). */
+  function editForm(page: Page): Locator {
+    return page.getByRole("region", { name: "Edit bug" });
+  }
+
+  /** FieldLabel is not tied to its input (no htmlFor), so getByLabel cannot reach the title; it
+   *  is the first input after the "Bug Title" label. */
+  function titleInput(page: Page): Locator {
+    return editForm(page).locator("xpath=.//label[contains(., 'Bug Title')]/following::input[1]");
+  }
+
+  test("BUG-U-57 Edit on the full page edits in place, saves, and the page shows the new values", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Edit ${uniqueSuffix()}` });
+    const renamed = `${bug.title} renamed`;
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+
+      // In place, like the Test Run execute page: the form card replaces the details card, the
+      // header's Edit/Delete give way to the form's own actions, and no dialog opens over it.
+      await expect(editForm(page)).toBeVisible();
+      await expect(details(page)).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Edit", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Delete Bug", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("heading", { level: 2, name: "Edit Bug" })).toBeVisible();
+      const formBox = (await editForm(page).boundingBox())!;
+      const mainBox = (await editForm(page).locator("xpath=ancestor::main[1]").boundingBox())!;
+      expect(formBox.width, "the form spans the page, it is not a centred dialog").toBeGreaterThan(mainBox.width - 60);
+
+      await expect(titleInput(page)).toHaveValue(bug.title);
+      await titleInput(page).fill(renamed);
+      await editForm(page).getByLabel("Bug priority").selectOption("P2");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+
+      await expect(editForm(page)).toHaveCount(0);
+      await expect(page.getByRole("heading", { level: 1, name: renamed })).toBeVisible();
+      await expect(details(page).getByText("P2", { exact: true })).toBeVisible();
+
+      const persisted = await (await api.get(`/api/bugs/${bug.id}`)).json();
+      expect(persisted.title).toBe(renamed);
+      expect(persisted.priority).toBe("P2");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-61 Cancel on the in-place edit discards the change and restores the details", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Cancel ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await titleInput(page).fill(`${bug.title} discarded`);
+      await editForm(page).getByRole("button", { name: "Cancel", exact: true }).click();
+
+      await expect(editForm(page)).toHaveCount(0);
+      await expect(details(page)).toBeVisible();
+      await expect(page.getByRole("heading", { level: 1, name: bug.title, exact: true })).toBeVisible();
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).title).toBe(bug.title);
+
+      // Reopening starts from the stored bug, not the discarded draft.
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await expect(titleInput(page)).toHaveValue(bug.title);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-62 the full page uses the page width, with no extra side gutters around the details", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Width ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const card = (await details(page).boundingBox())!;
+      const main = (await details(page).locator("xpath=ancestor::main[1]").boundingBox())!;
+      // Only main's own px-6 (24px a side) separates the card from the page edges — the same
+      // gutter the execute page has, not a centred max-width column.
+      expect(card.x - main.x).toBeLessThanOrEqual(25);
+      expect(main.x + main.width - (card.x + card.width)).toBeLessThanOrEqual(25);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-58 Delete on the full page can be cancelled, and confirming it deletes and returns to the list", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Delete ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+
+      await page.getByRole("button", { name: "Delete Bug", exact: true }).click();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+      expect((await api.get(`/api/bugs/${bug.id}`, { failOnStatusCode: false })).status()).toBe(200);
+
+      await page.getByRole("button", { name: "Delete Bug", exact: true }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
+      expect((await api.get(`/api/bugs/${bug.id}`, { failOnStatusCode: false })).status()).toBe(404);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-59 an unknown or deleted bug id says so and links back to the list", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Gone ${uniqueSuffix()}` });
+    await api.delete(`/api/bugs/${bug.id}`);
+
+    for (const id of [bug.id, "00000000-0000-0000-0000-000000000000"]) {
+      await page.goto(`/projects/${projectId}/bugs/${id}`);
+      await expect(page.getByText("This bug could not be found. It may have been deleted.")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Delete Bug", exact: true })).toHaveCount(0);
+    }
+    await page.getByRole("link", { name: "Back to Bugs" }).click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
+  });
+
+  test("BUG-U-60 a signed-out visitor is sent to log in and never sees the bug", async ({ browser }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Anon ${uniqueSuffix()}` });
+    const ctx = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+    try {
+      const anon = await ctx.newPage();
+      await anon.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      await expect(anon).toHaveURL(/\/login/);
+      await expect(anon.getByText(bug.title)).toHaveCount(0);
+    } finally {
+      await ctx.close();
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * The Comments section at the bottom of Bug Details (components/bugs/BugComments.tsx) — in the side
+ * panel and on the full page. The API contract (validation, ordering, access) is in
+ * api/bugs.spec.ts "bug comments"; this is what the person reading the bug sees and does.
+ */
+test.describe("bug comments", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  type SeededComment = { id: string; authorName: string; body: string; createdAt: string };
+
+  function commentsUrl(bugId: string) {
+    return `/api/projects/${projectId}/bugs/${bugId}/comments`;
+  }
+
+  /** Every request the page makes for this bug's comments, for route interception. */
+  function commentsRoute(bugId: string) {
+    return `**/api/projects/${projectId}/bugs/${bugId}/comments`;
+  }
+
+  async function seedComment(bugId: string, body: string): Promise<SeededComment> {
+    const res = await api.post(commentsUrl(bugId), { data: { body } });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  /** The panel body; Drawer has no role="dialog", so the page labels its own section. */
+  function panelBody(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  function comments(scope: Locator): Locator {
+    return scope.getByRole("region", { name: "Comments" });
+  }
+
+  async function openPanel(page: Page, title: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(panelBody(page)).toBeVisible();
+  }
+
+  test("BUG-U-63 the panel lists existing comments oldest first, each with its author and timestamp, below the details", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments List ${uniqueSuffix()}` });
+    try {
+      const first = await seedComment(bug.id, "First look: reproduces on Chrome.");
+      const second = await seedComment(bug.id, "Second look:\nalso on Firefox.");
+      await openPanel(page, bug.title);
+
+      const section = comments(panelBody(page));
+      await expect(section.getByText("Comments (2)")).toBeVisible();
+      const items = section.getByTestId("bug-comment");
+      await expect(items).toHaveCount(2);
+      for (const [i, c] of [first, second].entries()) {
+        await expect(items.nth(i).getByText(c.authorName, { exact: true })).toBeVisible();
+        await expect(items.nth(i).locator("time")).toHaveAttribute("datetime", c.createdAt);
+      }
+      await expect(items.nth(0)).toContainText("First look: reproduces on Chrome.");
+      // Line breaks in a comment survive (whitespace-pre-wrap), rather than collapsing into one line.
+      await expect(items.nth(1).getByText(/Second look:\s+also on Firefox\./)).toBeVisible();
+
+      // Placement: after the last details field, inside the scrolling body, above the footer.
+      const reportedOn = (await panelBody(page).getByText("Reported On", { exact: true }).boundingBox())!;
+      const sectionBox = (await section.boundingBox())!;
+      expect(sectionBox.y).toBeGreaterThan(reportedOn.y);
+      const footerEdit = panelBody(page).getByRole("button", { name: "Edit", exact: true });
+      await section.scrollIntoViewIfNeeded();
+      expect((await section.boundingBox())!.y).toBeLessThan((await footerEdit.boundingBox())!.y);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-64 a bug with no comments says so, and Add Comment stays disabled until there is text", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Empty ${uniqueSuffix()}` });
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+      const add = section.getByRole("button", { name: "Add Comment" });
+      await expect(add).toBeDisabled();
+      await section.getByLabel("Add a comment").fill("   \n  ");
+      await expect(add, "whitespace alone is not a comment").toBeDisabled();
+      await section.getByLabel("Add a comment").fill("Now there is text");
+      await expect(add).toBeEnabled();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-65 adding a comment shows it straight away, clears the box, and it is saved", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Add ${uniqueSuffix()}` });
+    const body = `Added from the panel ${uniqueSuffix()}`;
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+
+      // Count list fetches: the new comment must come from the POST response, not a refetch.
+      let listFetches = 0;
+      await page.route(commentsRoute(bug.id), (route) => {
+        if (route.request().method() === "GET") listFetches += 1;
+        return route.continue();
+      });
+
+      await section.getByLabel("Add a comment").fill(`  ${body}  `);
+      await section.getByRole("button", { name: "Add Comment" }).click();
+
+      const items = section.getByTestId("bug-comment");
+      await expect(items).toHaveCount(1);
+      await expect(items.first()).toContainText(body);
+      await expect(section.getByText("No comments yet.")).toHaveCount(0);
+      await expect(section.getByText("Comments (1)")).toBeVisible();
+      await expect(section.getByLabel("Add a comment")).toHaveValue("");
+      expect(listFetches).toBe(0);
+
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list.map((c: { body: string }) => c.body)).toEqual([body]);
+      await expect(items.first().getByText(persisted.list[0].authorName, { exact: true })).toBeVisible();
+
+      // And it is still there when the bug is opened again.
+      await page.unroute(commentsRoute(bug.id));
+      await openPanel(page, bug.title);
+      await expect(comments(panelBody(page)).getByTestId("bug-comment")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-66 a failed post shows the server's reason, keeps the draft, and a retry succeeds", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Post Error ${uniqueSuffix()}` });
+    const body = `Retry me ${uniqueSuffix()}`;
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+
+      await page.route(commentsRoute(bug.id), (route) =>
+        route.request().method() === "POST"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Comment service unavailable." }) })
+          : route.continue(),
+      );
+      await section.getByLabel("Add a comment").fill(body);
+      await section.getByRole("button", { name: "Add Comment" }).click();
+
+      await expect(section.getByTestId("bug-comment-error")).toContainText("Comment service unavailable.");
+      await expect(section.getByLabel("Add a comment")).toHaveValue(body);
+      await expect(section.getByTestId("bug-comment")).toHaveCount(0);
+      await expect(section.getByRole("button", { name: "Add Comment" })).toBeEnabled();
+
+      await page.unroute(commentsRoute(bug.id));
+      await section.getByRole("button", { name: "Add Comment" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(section.getByTestId("bug-comment-error")).toHaveCount(0);
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.total, "the failed attempt must not have stored anything").toBe(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-67 comments show a loading state, and a failed load offers Retry", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Load Error ${uniqueSuffix()}` });
+    try {
+      await seedComment(bug.id, "Visible after retry");
+      let release: () => void = () => {};
+      const held = new Promise<void>((resolve) => (release = resolve));
+      let failNext = true;
+      await page.route(commentsRoute(bug.id), async (route) => {
+        if (route.request().method() !== "GET") return route.continue();
+        if (failNext) {
+          failNext = false;
+          // Hold the first load open long enough to see the loading state, then fail it.
+          await held;
+          return route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Upstream timeout" }) });
+        }
+        return route.continue();
+      });
+
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      await expect(section.getByText("Loading comments…")).toBeVisible();
+      release();
+
+      await expect(section.getByRole("alert")).toContainText("Couldn't load comments: Upstream timeout");
+      await expect(section.getByText("No comments yet."), "a failed load is not an empty list").toHaveCount(0);
+      await section.getByRole("button", { name: "Retry" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(section.getByText("Visible after retry")).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-68 switching to another bug shows that bug's comments, not the previous one's", async ({ page }) => {
+    const a = await createBug(api, projectId, { title: `E2E Comments Switch A ${uniqueSuffix()}` });
+    const b = await createBug(api, projectId, { title: `E2E Comments Switch B ${uniqueSuffix()}` });
+    try {
+      await seedComment(a.id, "Only on bug A");
+      await openPanel(page, a.title);
+      await expect(comments(panelBody(page)).getByText("Only on bug A")).toBeVisible();
+      await comments(panelBody(page)).getByLabel("Add a comment").fill("Unsent draft for A");
+
+      await panelBody(page).getByRole("button", { name: "Close", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: b.title }).click();
+      const section = comments(panelBody(page));
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+      await expect(section.getByText("Only on bug A")).toHaveCount(0);
+      await expect(section.getByLabel("Add a comment")).toHaveValue("");
+    } finally {
+      await api.delete(`/api/bugs/${a.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/bugs/${b.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-69 the full bug page shows the same comments and can add one", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Full Page ${uniqueSuffix()}` });
+    const body = `Added from the full page ${uniqueSuffix()}`;
+    try {
+      const seeded = await seedComment(bug.id, "Seeded before opening");
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const section = comments(page.getByRole("region", { name: "Bug details" }));
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(section.getByText(seeded.authorName, { exact: true })).toBeVisible();
+
+      await section.getByLabel("Add a comment").fill(body);
+      await section.getByRole("button", { name: "Add Comment" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(2);
+      await expect(section.getByTestId("bug-comment").nth(1)).toContainText(body);
+
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list.map((c: { body: string }) => c.body)).toEqual(["Seeded before opening", body]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * The Attachments section of Bug Details (components/bugs/BugAttachments.tsx): image thumbnails
+ * with an in-app preview, filename links for everything else, and Open/View + Delete on every file.
+ * Upload, storage and the delete endpoint itself are covered in api/attachments.spec.ts.
+ */
+test.describe("bug attachments in Bug Details", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  type Attachment = { id: string; fileName: string };
+
+  /** A bug with these files attached, through the same upload route the Report Bug form uses. */
+  async function bugWith(label: string, files: UploadFile[]): Promise<{ id: string; title: string; attachments: Attachment[] }> {
+    const bug = await createBug(api, projectId, { title: `E2E Attachments ${label} ${uniqueSuffix()}` });
+    // The route takes at most 10 files per request (FilesInterceptor's cap), as the UI batches too.
+    for (let i = 0; i < files.length; i += 10) {
+      const res = await api.post(`/api/projects/${projectId}/bugs/${bug.id}/attachments`, {
+        multipart: filesForm(files.slice(i, i + 10)),
+      });
+      expect(res.ok(), await res.text()).toBeTruthy();
+    }
+    const full = await (await api.get(`/api/bugs/${bug.id}`)).json();
+    return { ...bug, attachments: full.attachments };
+  }
+
+  function downloadUrl(attachmentId: string) {
+    return `/api/projects/${projectId}/bugs/attachments/${attachmentId}/download`;
+  }
+
+  function panelBody(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  async function openPanel(page: Page, title: string): Promise<void> {
+    await page.goto(`/projects/${projectId}/bugs`);
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    await page.locator("tbody tr").filter({ hasText: title }).click();
+    await expect(panelBody(page)).toBeVisible();
+  }
+
+  /** True once the browser actually decoded the image — a broken or unauthorised src stays 0×0. */
+  async function expectDecoded(img: Locator): Promise<void> {
+    await expect
+      .poll(() => img.evaluate((el) => (el as HTMLImageElement).complete && (el as HTMLImageElement).naturalWidth > 0))
+      .toBe(true);
+  }
+
+  test("BUG-U-71 images show as thumbnails and other files as filename links, each with Open/View and Delete", async ({ page }) => {
+    const bug = await bugWith("Mixed", [
+      pngFile("shot-one.png"),
+      pngFile("shot-two.png"),
+      sizedFile("report.pdf", 2048, "application/pdf"),
+      textFile("console.txt"),
+    ]);
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+      await expect(body.getByText("Attachments (4)")).toBeVisible();
+
+      const thumbs = body.getByTestId("bug-attachment-image");
+      await expect(thumbs).toHaveCount(2);
+      for (const name of ["shot-one.png", "shot-two.png"]) {
+        const thumb = thumbs.filter({ hasText: name });
+        await expectDecoded(thumb.getByRole("img", { name }));
+        await expect(thumb.getByRole("button", { name: `View ${name}` }).first()).toBeVisible();
+        await expect(thumb.getByRole("button", { name: `Delete ${name}` })).toBeVisible();
+      }
+
+      const rows = body.getByTestId("bug-attachment-file");
+      await expect(rows).toHaveCount(2);
+      for (const name of ["report.pdf", "console.txt"]) {
+        const att = bug.attachments.find((a) => a.fileName === name)!;
+        const row = rows.filter({ hasText: name });
+        await expect(row.getByRole("img")).toHaveCount(0);
+        // Open keeps the existing behaviour for non-images: the file's download route, in a new tab.
+        const open = row.getByRole("link", { name: `Open ${name}` });
+        await expect(open).toHaveAttribute("href", new RegExp(`${downloadUrl(att.id)}$`));
+        await expect(open).toHaveAttribute("target", "_blank");
+        await expect(row.getByRole("link", { name, exact: true })).toHaveAttribute("href", new RegExp(`${downloadUrl(att.id)}$`));
+        await expect(row.getByRole("button", { name: `Delete ${name}` })).toBeVisible();
+      }
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-72 View opens the full image in a preview, and closing it keeps Bug Details open", async ({ page }) => {
+    const bug = await bugWith("Preview", [pngFile("preview-me.png")]);
+    try {
+      await openPanel(page, bug.title);
+      await panelBody(page).getByRole("button", { name: "View preview-me.png" }).first().click();
+
+      const preview = page.getByRole("region", { name: "Attachment preview" });
+      await expect(preview).toBeVisible();
+      await expect(preview.getByRole("heading", { name: "preview-me.png" })).toBeVisible();
+      await expectDecoded(preview.getByRole("img", { name: "preview-me.png" }));
+      await expect(preview.getByRole("link", { name: "Download" })).toHaveAttribute(
+        "href",
+        new RegExp(`${downloadUrl(bug.attachments[0].id)}$`),
+      );
+
+      await preview.getByRole("button", { name: "Close preview" }).click();
+      await expect(preview).toHaveCount(0);
+      await expect(panelBody(page)).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-73 deleting an image asks first; Cancel keeps it, confirming removes it from the panel and the server", async ({ page }) => {
+    const bug = await bugWith("Delete Image", [pngFile("keep.png"), pngFile("remove.png")]);
+    const removed = bug.attachments.find((a) => a.fileName === "remove.png")!;
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+
+      await body.getByRole("button", { name: "Delete remove.png" }).click();
+      await expect(page.getByText("Delete attachment", { exact: true })).toBeVisible();
+      await expect(page.getByText(`Delete "remove.png" from this bug?`, { exact: false })).toBeVisible();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(2);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toHaveLength(2);
+
+      await body.getByRole("button", { name: "Delete remove.png" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(1);
+      await expect(body.getByTestId("bug-attachment-image").filter({ hasText: "keep.png" })).toBeVisible();
+      await expect(body.getByText("Attachments (1)")).toBeVisible();
+      // The panel is still the same bug — deleting a file is not deleting the bug.
+      await expect(body).toBeVisible();
+
+      const after = await (await api.get(`/api/bugs/${bug.id}`)).json();
+      expect(after.attachments.map((a: Attachment) => a.fileName)).toEqual(["keep.png"]);
+      expect((await api.get(downloadUrl(removed.id), { failOnStatusCode: false })).ok()).toBe(false);
+
+      // And the list was refreshed: reopening shows one file, not a stale two.
+      await page.reload();
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await expect(panelBody(page).getByTestId("bug-attachment-image")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-74 a non-image file can be deleted from the full bug page, and the last one removes the section", async ({ page }) => {
+    const bug = await bugWith("Delete File", [sizedFile("spec.pdf", 1024, "application/pdf")]);
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const card = page.getByRole("region", { name: "Bug details" });
+      await expect(card.getByTestId("bug-attachment-file")).toHaveCount(1);
+      await card.getByRole("button", { name: "Delete spec.pdf" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+
+      await expect(card.getByTestId("bug-attachment-file")).toHaveCount(0);
+      await expect(card.getByText(/^Attachments/)).toHaveCount(0);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toEqual([]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-75 a failed delete says so and leaves the attachment in place", async ({ page }) => {
+    const bug = await bugWith("Delete Error", [pngFile("stuck.png")]);
+    try {
+      await openPanel(page, bug.title);
+      await page.route("**/api/bugs/attachments/*", (route) =>
+        route.request().method() === "DELETE"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Storage is unavailable." }) })
+          : route.continue(),
+      );
+      await panelBody(page).getByRole("button", { name: "Delete stuck.png" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+
+      await expect(panelBody(page).getByTestId("bug-attachment-error")).toContainText("Storage is unavailable.");
+      await expect(panelBody(page).getByTestId("bug-attachment-image")).toHaveCount(1);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toHaveLength(1);
+    } finally {
+      await page.unroute("**/api/bugs/attachments/*");
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-77 the Edit Bug form shows thumbnails for existing image attachments, and none for other files", async ({ page }) => {
+    const bug = await bugWith("Edit Thumbs", [pngFile("edit-shot.png"), sizedFile("edit-notes.pdf", 1024, "application/pdf")]);
+    try {
+      // Both ways into Edit Bug render the same field: the full-page form and the list's dialog.
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      await expect(form.getByTestId("evidence-thumbnail")).toHaveCount(1);
+      await expectDecoded(form.getByRole("img", { name: "edit-shot.png" }));
+      await expect(form.getByRole("img", { name: "edit-notes.pdf" })).toHaveCount(0);
+      await expect(form.getByRole("link", { name: "edit-notes.pdf" })).toBeVisible();
+
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).getByRole("button", { name: "Edit bug" }).click();
+      await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+      await expectDecoded(page.getByRole("img", { name: "edit-shot.png" }));
+      await expect(page.getByTestId("evidence-thumbnail")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-78 a newly picked image is previewed before saving, and removing it removes the preview", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Attachments Staged ${uniqueSuffix()}` });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      const png = pngFile("picked.png");
+      const txt = textFile("picked.txt");
+      await form.locator('input[type="file"]').setInputFiles([
+        { name: png.name, mimeType: png.mimeType, buffer: png.body },
+        { name: txt.name, mimeType: txt.mimeType, buffer: txt.body },
+      ]);
+
+      await expect(form.getByText("picked.txt")).toBeVisible();
+      await expect(form.getByTestId("evidence-thumbnail")).toHaveCount(1);
+      await expectDecoded(form.getByRole("img", { name: "picked.png" }));
+      // Nothing is uploaded until Save.
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toEqual([]);
+
+      await form.locator("li", { hasText: "picked.png" }).getByRole("button").click();
+      await expect(form.getByTestId("evidence-thumbnail")).toHaveCount(0);
+      await expect(form.getByText("picked.txt")).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-76 many attachments wrap inside the panel without widening it", async ({ page }) => {
+    const files = [
+      ...Array.from({ length: 10 }, (_, i) => pngFile(`Screenshot 2026-09-11 1${String(i).padStart(5, "0")} with a long name.png`)),
+      sizedFile("Tesbo_RAG_Testing_Report_with_a_very_long_file_name_indeed.docx", 1024, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ];
+    const bug = await bugWith("Many", files);
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(10);
+      await expect(body.getByTestId("bug-attachment-file")).toHaveCount(1);
+
+      // No horizontal overflow: the scroll area is no wider than the panel it sits in.
+      const scroller = body.locator(":scope > div").first();
+      const overflow = await scroller.evaluate((el) => el.scrollWidth - el.clientWidth);
+      expect(overflow).toBeLessThanOrEqual(1);
+      const panelBox = (await body.boundingBox())!;
+      for (const box of await body.getByTestId("bug-attachment-image").evaluateAll((els) =>
+        els.map((el) => el.getBoundingClientRect().right),
+      )) {
+        expect(box).toBeLessThanOrEqual(panelBox.x + panelBox.width + 1);
+      }
+      // The footer actions are still where they were.
+      await expect(body.getByRole("button", { name: "Delete Bug", exact: true })).toBeInViewport({ ratio: 1 });
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * Bug Details' Activity section: the bug's own history (from the project activity feed, filtered
+ * to this bug) beside Comments on the full page, stacked under it in the narrow side panel. The
+ * logging itself — which actions, which actor — is specified in api/bugs.spec.ts "bug activity";
+ * these tests are about what the screen shows.
+ */
+test.describe("bug activity", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  let actorName: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  /** A fresh bug, plus the name the feed attributes its creation to (the screens user). */
+  async function seedBug(label: string) {
+    const bug = await createBug(api, projectId, { title: `E2E Activity ${label} ${uniqueSuffix()}` });
+    const feed = await (
+      await api.get(`/api/projects/${projectId}/activity`, { params: { entityType: "bug", entityId: bug.id } })
+    ).json();
+    actorName = feed.list.find((i: { action: string }) => i.action === "bug_created")?.actorName;
+    expect(actorName, "the bug_created row names who filed the bug").toBeTruthy();
+    return bug;
+  }
+
+  function detailsRegion(page: Page): Locator {
+    return page.getByRole("region", { name: "Bug details" });
+  }
+
+  test("BUG-U-79 the full page shows Activity beside Comments, oldest first, naming the actor of each entry", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const bug = await seedBug("Page");
+    try {
+      await api.patch(`/api/bugs/${bug.id}`, { data: { status: "In Progress", priority: "P1" } });
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      const entries = activity.getByTestId("bug-activity");
+      await expect(entries).toHaveCount(3);
+      await expect(entries.nth(0)).toContainText(`${actorName} created the bug`);
+      await expect(entries.nth(1)).toContainText(`${actorName} changed status from Open to In Progress`);
+      await expect(entries.nth(2)).toContainText(`${actorName} changed priority from None to P1`);
+      await expect(entries.nth(0).locator("time")).toHaveAttribute("datetime", /\d{4}-\d{2}-\d{2}T/);
+
+      // Side by side: same row, Activity to the right of Comments.
+      const c = (await comments.boundingBox())!;
+      const a = (await activity.boundingBox())!;
+      expect(Math.abs(a.y - c.y)).toBeLessThan(4);
+      expect(a.x).toBeGreaterThan(c.x + c.width - 4);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-80 posting a comment adds its entry to Activity without a reload, and Comments still works as before", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const bug = await seedBug("Comment");
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
+
+      await comments.getByLabel("Add a comment").fill("Seen again on build 12");
+      await comments.getByRole("button", { name: "Add Comment" }).click();
+      await expect(comments.getByTestId("bug-comment")).toHaveCount(1);
+      await expect(activity.getByTestId("bug-activity").last()).toContainText(`${actorName} added a comment`);
+
+      const persisted = await (await api.get(`/api/projects/${projectId}/bugs/${bug.id}/comments`)).json();
+      expect(persisted.list.map((x: { body: string }) => x.body)).toEqual(["Seen again on build 12"]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-81 on a narrow screen Activity stacks below Comments", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    const bug = await seedBug("Narrow");
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
+      const c = (await comments.boundingBox())!;
+      const a = (await activity.boundingBox())!;
+      expect(a.y).toBeGreaterThanOrEqual(c.y + c.height - 1);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), "no horizontal scroll").toBe(true);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-82 the side panel shows the bug's Activity under its Comments", async ({ page }) => {
+    const bug = await seedBug("Panel");
+    try {
+      await api.patch(`/api/bugs/${bug.id}`, { data: { status: "Closed" } });
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(2);
+      await expect(activity.getByTestId("bug-activity").last()).toContainText(`${actorName} closed the bug (was Open)`);
+      const c = (await detailsRegion(page).getByRole("region", { name: "Comments" }).boundingBox())!;
+      expect((await activity.boundingBox())!.y).toBeGreaterThan(c.y);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-83 when the activity request fails the section says so and offers Retry, and Comments is unaffected", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const bug = await seedBug("Failure");
+    try {
+      let fail = true;
+      await page.route(`**/api/projects/${projectId}/activity?**`, (route) =>
+        fail ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Boom" }) }) : route.continue(),
+      );
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      await expect(activity.getByRole("alert")).toContainText("Couldn't load activity");
+      await expect(detailsRegion(page).getByRole("region", { name: "Comments" }).getByText("No comments yet.")).toBeVisible();
+
+      fail = false;
+      await activity.getByRole("button", { name: "Retry" }).click();
+      await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
   });
 });

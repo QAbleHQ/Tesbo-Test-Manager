@@ -6510,12 +6510,164 @@ export class LegacyService implements OnModuleInit {
     // After the commit, not inside it: the bug is the record that must exist, and a failure while
     // flipping an execution should not roll back the bug report someone just wrote.
     await this.failLinkedExecutions(projectId, userId, links);
-    return this.getBug(bugId as string);
+    const created: Body = await this.getBug(bugId as string);
+    await this.logProjectActivity(projectId, uid, "bug_created", "bug", String(created.id), String(created.title ?? ""), {
+      status: created.status ?? null,
+      severity: created.severity ?? null,
+      priority: created.priority ?? null,
+      assigneeId: created.assigneeId ?? null,
+      assigneeName: created.assigneeName ?? null
+    });
+    return created;
+  }
+
+  /**
+   * Bug Details' Activity section reads these rows back through the project activity feed
+   * (filtered by entityId), so each meaningful change to a bug is one audit row with the caller as
+   * actor: one per status / severity / priority / assignee change, plus a single `bug_updated`
+   * naming whichever other fields were edited. Compared against the row as it was before the
+   * PATCH, so re-saving an unchanged form logs nothing.
+   */
+  private async logBugChanges(projectId: string, actorId: string, before: Body, after: Body) {
+    const log = (action: string, diff: Body) =>
+      this.logProjectActivity(projectId, actorId, action, "bug", String(after.id), String(after.title ?? ""), diff);
+    const same = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
+    if (!same(before.status, after.status)) await log("bug_status_changed", { from: before.status ?? null, to: after.status ?? null });
+    if (!same(before.severity, after.severity)) await log("bug_severity_changed", { from: before.severity ?? null, to: after.severity ?? null });
+    if (!same(before.priority, after.priority)) await log("bug_priority_changed", { from: before.priority ?? null, to: after.priority ?? null });
+    if (!same(before.assigneeId, after.assigneeId)) {
+      await log("bug_assignee_changed", {
+        fromId: before.assigneeId ?? null,
+        fromName: before.assigneeName ?? null,
+        toId: after.assigneeId ?? null,
+        toName: after.assigneeName ?? null
+      });
+    }
+    const linkKey = (bug: Body) =>
+      normalizeJsonArray(bug.links)
+        .map((l: Body) => `${l.testcaseId ?? ""}|${l.cycleId ?? ""}|${l.executionId ?? ""}`)
+        .sort()
+        .join(",");
+    const fields = ["title", "description", "externalUrl", "integrationProvider", "integrationIssueKey", "betterbugsUrl"].filter(
+      (field) => !same(before[field], after[field])
+    );
+    if (linkKey(before) !== linkKey(after)) fields.push("links");
+    if (fields.length) await log("bug_updated", { fields });
+  }
+
+  /**
+   * Project members named in a comment as `@Display Name` or `@email`. There is no mention picker —
+   * the comment box is plain text — so this matches against the project's own members, longest
+   * name first so `@Ann Lee` is not also read as `@Ann`. The `@` must start a word, so the middle
+   * of an email address typed as prose never counts as a mention.
+   */
+  private async bugCommentMentions(projectId: string, text: string): Promise<Array<{ id: string; name: string }>> {
+    if (!text.includes("@")) return [];
+    const members = await this.db.query<{ id: string; name: string | null; email: string }>(
+      `SELECT u.id, NULLIF(TRIM(u.name), '') AS name, u.email
+       FROM project_members pm JOIN users u ON u.id = pm.user_id
+       WHERE pm.project_id = $1`,
+      [projectId]
+    );
+    const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const candidates = members.rows
+      .flatMap((m) => [m.name, m.email].filter((label): label is string => !!label).map((label) => ({ m, label })))
+      .sort((a, b) => b.label.length - a.label.length);
+    let remaining = text;
+    const found = new Map<string, { id: string; name: string }>();
+    for (const { m, label } of candidates) {
+      const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_.@])@${escape(label)}(?![\\p{L}\\p{N}_])`, "giu");
+      if (!pattern.test(remaining)) continue;
+      // Blank the matched text out so a shorter member name inside it is not matched again.
+      remaining = remaining.replace(pattern, (_match, lead: string) => `${lead} `);
+      if (!found.has(String(m.id))) found.set(String(m.id), { id: String(m.id), name: m.name || m.email });
+    }
+    return Array.from(found.values());
   }
 
   async getBugForUser(userId: string | null | undefined, bugId: string) {
     await this.requireBugAccess(userId, bugId);
     return this.getBug(bugId);
+  }
+
+  // Flat discussion on a bug (V129) — the KB comment shape minus threading, anchors and resolution.
+  // Routed under /api/projects/:projectId so ProjectWriteLockGuard covers the write, which is why
+  // the bug is resolved against the URL's project rather than through requireBugAccess alone.
+
+  private bugCommentView(row: Body): Body {
+    return {
+      id: String(row.id),
+      bugId: String(row.bug_id),
+      authorId: row.author_id ? String(row.author_id) : null,
+      authorName: row.author_name ? String(row.author_name) : "Unknown",
+      body: String(row.body || ""),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString()
+    };
+  }
+
+  /** The bug, if it is live and belongs to this project; otherwise the same 404 as a missing bug. */
+  private async bugInProject(projectId: string, bugId: string): Promise<{ id: string; title: string }> {
+    if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
+    const res = await this.db.query<{ id: string; title: string }>(
+      "SELECT id, title FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+      [bugId, projectId]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+    return res.rows[0];
+  }
+
+  async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    await this.bugInProject(projectId, bugId);
+    const res = await this.db.query(
+      `SELECT c.id, c.bug_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM bug_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       WHERE c.bug_id = $1 AND c.is_deleted = false
+       ORDER BY c.created_at ASC, c.id ASC`,
+      [bugId]
+    );
+    const list = res.rows.map((row) => this.bugCommentView(row));
+    return { list, total: list.length };
+  }
+
+  async createBugComment(projectId: string, userId: string | null | undefined, bugId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+
+    // String() would store an object as "[object Object]" and a number as its digits — refuse
+    // anything that is not text instead.
+    const raw = body?.body;
+    if (raw !== undefined && raw !== null && typeof raw !== "string") {
+      throw new BadRequestException({ error: "Comment must be text." });
+    }
+    const text = (raw ?? "").trim();
+    if (!text) throw new BadRequestException({ error: "Comment cannot be empty." });
+    if (text.length > 10000) throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+
+    const res = await this.db.query(
+      `WITH inserted AS (
+         INSERT INTO bug_comments (project_id, bug_id, author_id, body)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, bug_id, author_id, body, created_at, updated_at
+       )
+       SELECT i.*, COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM inserted i
+       LEFT JOIN users a ON a.id = i.author_id`,
+      [projectId, bugId, uid, text]
+    );
+    await this.logProjectActivity(projectId, uid, "commented", "bug", bugId, bug.title, { commentId: res.rows[0].id });
+    for (const mentioned of await this.bugCommentMentions(projectId, text)) {
+      await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
+        commentId: res.rows[0].id,
+        mentionedUserId: mentioned.id,
+        mentionedName: mentioned.name
+      });
+    }
+    return this.bugCommentView(res.rows[0]);
   }
 
   /**
@@ -6552,6 +6704,7 @@ export class LegacyService implements OnModuleInit {
     // hidden from the picker.
     const clearsAssignee = body.assigneeId === null || body.assigneeId === "";
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
+    const before = await this.getBug(bugId);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
        status=COALESCE($5,status), severity=COALESCE($6,severity), priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
@@ -6580,7 +6733,9 @@ export class LegacyService implements OnModuleInit {
       const sanitized = await this.sanitizeBugLinks(String(owner.rows[0]?.project_id ?? ""), normalizeJsonArray(body.links));
       await this.db.transaction((client) => this.replaceBugLinks(client, bugId, uid, sanitized));
     }
-    return this.getBug(bugId);
+    const after = await this.getBug(bugId);
+    await this.logBugChanges(projectId, uid, before, after);
+    return after;
   }
 
   async addBugLink(userId: string | null | undefined, bugId: string, body: Body) {
@@ -6629,8 +6784,12 @@ export class LegacyService implements OnModuleInit {
 
   async deleteBug(userId: string | null | undefined, bugId: string) {
     const uid = this.requireUser(userId);
-    await this.requireBugAccess(userId, bugId);
-    await this.db.query("UPDATE bugs SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL", [bugId, uid]);
+    const projectId = await this.requireBugAccess(userId, bugId);
+    const res = await this.db.query<{ title: string }>(
+      "UPDATE bugs SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING title",
+      [bugId, uid]
+    );
+    if (res.rows[0]) await this.logProjectActivity(projectId, uid, "bug_deleted", "bug", bugId, res.rows[0].title, {});
   }
 
   // The client controls the uploaded filename completely, and it is only ever a display label —
@@ -6730,7 +6889,7 @@ export class LegacyService implements OnModuleInit {
     const project = await this.requireProjectAccess(uid, projectId);
     if (!files || files.length === 0) throw new BadRequestException({ error: "No files were uploaded" });
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
-    const bug = await this.db.query("SELECT b.id FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
+    const bug = await this.db.query("SELECT b.id, b.title FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
     if (!bug.rows[0]) throw new NotFoundException({ error: "Bug not found" });
     LegacyService.assertValidEvidenceFiles(files);
     await this.planLimits.assertStorageAvailable(
@@ -6749,6 +6908,10 @@ export class LegacyService implements OnModuleInit {
         [projectId, bugId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
       );
       created.push(toCamel(res.rows[0]));
+      await this.logProjectActivity(projectId, uid, "bug_attachment_added", "bug", bugId, String(bug.rows[0].title ?? ""), {
+        attachmentId: String(res.rows[0].id),
+        fileName: String(res.rows[0].file_name)
+      });
     }
     return { list: created, total: created.length };
   }
@@ -6790,7 +6953,17 @@ export class LegacyService implements OnModuleInit {
     const file = await this.bugAttachment(attachmentId);
     await this.requireProjectAccess(uid, String(file.project_id));
     await this.storage.delete(file.storage_path);
-    await this.db.query("UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [attachmentId, uid]);
+    const deleted = await this.db.query(
+      "UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+      [attachmentId, uid]
+    );
+    if (deleted.rows[0]) {
+      const owner = await this.db.query<{ title: string }>("SELECT title FROM bugs WHERE id = $1", [file.entity_id]);
+      await this.logProjectActivity(String(file.project_id), uid, "bug_attachment_deleted", "bug", String(file.entity_id), owner.rows[0]?.title ?? null, {
+        attachmentId,
+        fileName: String(file.file_name)
+      });
+    }
     return { ok: true };
   }
 
@@ -7691,7 +7864,15 @@ export class LegacyService implements OnModuleInit {
     const projectId = String(query.projectId || "").trim();
     const search = String(query.search || "").trim();
     const since = String(query.since || "").trim();
+    const entityId = String(query.entityId || "").trim();
 
+    if (entityId) {
+      // One entity's own history — Bug Details' Activity section. entity_id is free text shared by
+      // every entity type (ids, not always uuids), so it is bounded rather than uuid-checked.
+      if (entityId.length > 255) throw new BadRequestException({ error: "entityId is too long" });
+      values.push(entityId);
+      filters.push(`ae.entity_id = $${values.length}`);
+    }
     if (entityType) {
       values.push(entityType.split(",").map((t) => t.trim()).filter(Boolean));
       filters.push(`ae.entity_type = ANY($${values.length}::text[])`);
@@ -7773,6 +7954,13 @@ export class LegacyService implements OnModuleInit {
         WHERE a.project_id IS NULL AND ${orgOnlySql}
       `
       : "";
+    // Bugs filed since bug mutations started writing audit rows (bug_created onwards) have a real,
+    // actor-attributed history in audit_logs, so the synthetic created/updated rows below — which
+    // credit every edit to the reporter — are only kept for older bugs that have nothing else.
+    const bugHasNoAuditTrail = `NOT EXISTS (
+          SELECT 1 FROM audit_logs bx
+          WHERE bx.entity_type = 'bug' AND bx.entity_id = b.id::text AND bx.action = 'bug_created'
+        )`;
     return `
       WITH activity_events AS (
         SELECT
@@ -7857,7 +8045,7 @@ export class LegacyService implements OnModuleInit {
           NULL::text, b.created_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
-        WHERE ${projectScopeSql}
+        WHERE ${projectScopeSql} AND ${bugHasNoAuditTrail}
 
         UNION ALL
         SELECT
@@ -7868,7 +8056,7 @@ export class LegacyService implements OnModuleInit {
           NULL::text, b.updated_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
-        WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second'
+        WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second' AND ${bugHasNoAuditTrail}
 
         UNION ALL
         SELECT

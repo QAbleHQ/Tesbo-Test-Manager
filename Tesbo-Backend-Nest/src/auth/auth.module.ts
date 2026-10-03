@@ -9,9 +9,10 @@ import { OtpService } from "./otp.service";
 import { PasswordResetService } from "./password-reset.service";
 import { PasswordService } from "./password.service";
 import { AdminModule } from "../admin/admin.module";
+import { WelcomeEmailModule } from "../welcome-email/welcome-email.module";
 
 @Module({
-  imports: [AdminModule],
+  imports: [AdminModule, WelcomeEmailModule],
   controllers: [AuthController],
   providers: [
     AuthService,

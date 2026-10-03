@@ -2749,6 +2749,26 @@ export async function getBug(bugId: string): Promise<BugItem> {
   return api(`/api/bugs/${bugId}`);
 }
 
+/** One comment on a bug. Flat and chronological — no replies or resolution (see V129). */
+export interface BugComment {
+  id: string;
+  bugId: string;
+  authorId: string | null;
+  /** Name, else email; "Unknown" once the author's account is gone. */
+  authorName: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listBugComments(projectId: string, bugId: string): Promise<{ list: BugComment[]; total: number }> {
+  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`);
+}
+
+export async function createBugComment(projectId: string, bugId: string, body: string): Promise<BugComment> {
+  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`, { method: "POST", body: { body } });
+}
+
 export async function createBug(projectId: string, data: {
   title: string;
   description?: string;
@@ -3904,12 +3924,13 @@ export interface ActivityLogItem {
 
 export async function listActivity(
   projectId: string,
-  params?: { limit?: number; offset?: number; entityType?: string; actorId?: string; search?: string; since?: string }
+  params?: { limit?: number; offset?: number; entityType?: string; entityId?: string; actorId?: string; search?: string; since?: string }
 ): Promise<{ list: ActivityLogItem[]; total: number }> {
   const sp = new URLSearchParams();
   if (params?.limit != null) sp.set("limit", String(params.limit));
   if (params?.offset != null) sp.set("offset", String(params.offset));
   if (params?.entityType) sp.set("entityType", params.entityType);
+  if (params?.entityId) sp.set("entityId", params.entityId);
   if (params?.actorId) sp.set("actorId", params.actorId);
   if (params?.search) sp.set("search", params.search);
   if (params?.since) sp.set("since", params.since);

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
@@ -25,6 +25,9 @@ import {
 
 type Step = "form" | "code";
 
+const RESEND_COOLDOWN_MS = 30_000;
+const INVALID_CODE_MESSAGE = "That code is invalid or has expired. Request a new one.";
+
 export default function SignupPage() {
   const router = useRouter();
   const [mode, setMode] = useState<AuthMode>("password");
@@ -43,6 +46,24 @@ export default function SignupPage() {
   const [emailError, setEmailError] = useState("");
   const [passwordError, setPasswordError] = useState("");
   const [formError, setFormError] = useState("");
+  const [resending, setResending] = useState(false);
+  const [resendNotice, setResendNotice] = useState("");
+  const [cooldownEndsAt, setCooldownEndsAt] = useState<number | null>(null);
+  const [now, setNow] = useState(0);
+
+  // Ticks once a second only while a cooldown is running. Remaining time is derived from the end
+  // timestamp rather than decremented, so a throttled background tab can't stretch the cooldown.
+  useEffect(() => {
+    if (cooldownEndsAt === null) return;
+    const id = setInterval(() => {
+      const t = Date.now();
+      setNow(t);
+      if (t >= cooldownEndsAt) setCooldownEndsAt(null);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [cooldownEndsAt]);
+
+  const cooldownSeconds = cooldownEndsAt === null ? 0 : Math.max(0, Math.ceil((cooldownEndsAt - now) / 1000));
 
   function clearFormErrors() {
     setFirstNameError("");
@@ -58,6 +79,40 @@ export default function SignupPage() {
     setStep("form");
     setError("");
     clearFormErrors();
+  }
+
+  function signupPayload() {
+    return {
+      firstName: firstName.trim(),
+      lastName: lastName.trim(),
+      mobileNumber: mobileNumber.trim() ? normalizeMobileNumber(mobileNumber.trim()) : undefined,
+      email: email.trim().toLowerCase(),
+      password,
+    };
+  }
+
+  /*
+   * Re-runs signup/start rather than requesting a bare OTP: the pending signup expires on the same
+   * timer as the code, so a fresh code on its own would pass the OTP check and then fail with "No
+   * pending signup found". Starting again writes a new pending signup and a new code together.
+   */
+  async function handleResendCode() {
+    if (resending || cooldownSeconds > 0) return;
+    setResending(true);
+    setError("");
+    setResendNotice("");
+    try {
+      await startSignup(signupPayload());
+      setCode("");
+      setResendNotice(`We sent a new code to ${email}.`);
+      const t = Date.now();
+      setNow(t);
+      setCooldownEndsAt(t + RESEND_COOLDOWN_MS);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to resend code");
+    } finally {
+      setResending(false);
+    }
   }
 
   async function handlePasswordFormSubmit(e: FormEvent) {
@@ -85,16 +140,9 @@ export default function SignupPage() {
       return;
     }
 
-    const normalizedMobile = mobileNumber.trim() ? normalizeMobileNumber(mobileNumber.trim()) : undefined;
     setSubmitting(true);
     try {
-      await startSignup({
-        firstName: firstName.trim(),
-        lastName: lastName.trim(),
-        mobileNumber: normalizedMobile,
-        email: email.trim().toLowerCase(),
-        password,
-      });
+      await startSignup(signupPayload());
       setStep("code");
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "Failed to start signup");
@@ -106,6 +154,7 @@ export default function SignupPage() {
   async function handlePasswordCodeSubmit(e: FormEvent) {
     e.preventDefault();
     setError("");
+    setResendNotice("");
     if (code.trim().length < 6) {
       setError("Enter the 6-digit code");
       return;
@@ -116,7 +165,8 @@ export default function SignupPage() {
       router.push("/onboarding");
       router.refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Invalid or expired code");
+      const message = err instanceof Error ? err.message : "";
+      setError(!message || message === "invalid_or_expired_otp" ? INVALID_CODE_MESSAGE : message);
     } finally {
       setSubmitting(false);
     }
@@ -155,6 +205,7 @@ export default function SignupPage() {
             onClick={() => {
               setStep("form");
               setError("");
+              setResendNotice("");
             }}
             className="mb-6 flex items-center gap-1.5 text-xs text-[var(--muted)] hover:text-[var(--foreground)]"
           >
@@ -291,6 +342,22 @@ export default function SignupPage() {
             <Button type="submit" disabled={submitting} fullWidth style={gradientCta}>
               {submitting ? "Verifying..." : "Verify and create account"}
             </Button>
+            {resendNotice && (
+              <p role="status" className="text-center text-[13px] text-[var(--muted)]">
+                {resendNotice}
+              </p>
+            )}
+            <p className="text-center text-[13px] text-[var(--muted)]">
+              Didn&apos;t get it?{" "}
+              <button
+                type="button"
+                onClick={handleResendCode}
+                disabled={submitting || resending || cooldownSeconds > 0}
+                className="font-medium text-[var(--accent-light)] hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {resending ? "Sending..." : cooldownSeconds > 0 ? `Resend in ${cooldownSeconds}s` : "Resend code"}
+              </button>
+            </p>
           </form>
         )}
 

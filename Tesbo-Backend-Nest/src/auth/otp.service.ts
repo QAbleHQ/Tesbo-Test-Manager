@@ -4,6 +4,7 @@ import { DatabaseService } from "../database/database.service";
 import { AppConfigService } from "../config/app-config.service";
 import { EmailService } from "./email.service";
 import { SessionCacheService } from "../cache/session-cache.service";
+import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
 
 @Injectable()
 export class OtpService {
@@ -11,7 +12,8 @@ export class OtpService {
     private readonly db: DatabaseService,
     private readonly config: AppConfigService,
     private readonly email: EmailService,
-    private readonly sessionCache: SessionCacheService
+    private readonly sessionCache: SessionCacheService,
+    private readonly welcomeEmail: WelcomeEmailService
   ) {}
 
   async requestOtp(rawEmail: string, _ipAddress?: string | null, _userAgent?: string | null): Promise<boolean> {
@@ -34,9 +36,12 @@ export class OtpService {
   async verifyOtp(rawEmail: string, code: string, ipAddress?: string | null, userAgent?: string | null): Promise<string | null> {
     const email = rawEmail.trim().toLowerCase();
     if (!(await this.verifyOtpCode(email, code))) return null;
-    const userId = await this.findOrCreateUser(email);
-    if (!userId) return null;
-    return this.createSession(userId, ipAddress, userAgent);
+    const user = await this.findOrCreateUser(email);
+    if (!user) return null;
+    // Passwordless sign-in doubles as signup: only a call that actually created the account welcomes
+    // it — an existing user signing in with a code is not a registration.
+    if (user.created) await this.welcomeEmail.schedule(user.id);
+    return this.createSession(user.id, ipAddress, userAgent);
   }
 
   async verifyOtpCode(rawEmail: string, code: string): Promise<boolean> {
@@ -104,14 +109,17 @@ export class OtpService {
     await this.db.query("UPDATE otp_codes SET used_at = now() WHERE id = $1", [otpId]);
   }
 
-  private async findOrCreateUser(email: string): Promise<string | null> {
+  private async findOrCreateUser(email: string): Promise<{ id: string; created: boolean } | null> {
     const existing = await this.db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [email]);
-    if (existing.rows[0]) return existing.rows[0].id;
+    if (existing.rows[0]) return { id: existing.rows[0].id, created: false };
     const inserted = await this.db.query<{ id: string }>(
       "INSERT INTO users (email, name) VALUES ($1, $2) ON CONFLICT (email) DO NOTHING RETURNING id",
       [email, email.split("@")[0]]
     );
-    return inserted.rows[0]?.id ?? (await this.findOrCreateUser(email));
+    // No row back means a concurrent verify won the insert — that call is the one that created (and
+    // welcomes) the account, so this one re-reads it as existing.
+    if (inserted.rows[0]) return { id: inserted.rows[0].id, created: true };
+    return this.findOrCreateUser(email);
   }
 
   private generateOtp(): string {

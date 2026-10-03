@@ -680,6 +680,38 @@ test.describe("payment lifecycle", () => {
       expect(nested.status()).toBe(403);
     });
 
+    test("BUGC-A-10 a locked project's bug comments stay readable, but a new comment is refused", async () => {
+      // Bug comments are routed under /api/projects/:projectId precisely so ProjectWriteLockGuard
+      // covers them (the older /api/bugs/:bugId routes sit outside it). Seed while the grace window
+      // is still open, then close it.
+      setGraceWindow(orgId, 1);
+      const locked = activeProjectIdsOldestFirst(orgId)[2];
+      const bug = await (
+        await asBilling.post(`/api/projects/${locked}/bugs`, { data: { title: `E2E Locked Comment Bug ${Date.now()}` } })
+      ).json();
+      try {
+        const before = await asBilling.post(`/api/projects/${locked}/bugs/${bug.id}/comments`, {
+          data: { body: "Written before the lock" },
+        });
+        expect(before.ok()).toBeTruthy();
+
+        setGraceWindow(orgId, -1);
+        const refused = await asBilling.post(`/api/projects/${locked}/bugs/${bug.id}/comments`, {
+          data: { body: "Written after the lock" },
+          failOnStatusCode: false,
+        });
+        expect(refused.status()).toBe(403);
+        expect((await refused.json()).error).toContain("read-only");
+
+        const read = await asBilling.get(`/api/projects/${locked}/bugs/${bug.id}/comments`);
+        expect(read.ok()).toBeTruthy();
+        expect((await read.json()).list.map((c: { body: string }) => c.body)).toEqual(["Written before the lock"]);
+      } finally {
+        // DELETE /api/bugs/:bugId is outside the project-path guard, so this works while locked.
+        await asBilling.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      }
+    });
+
     test("archiving a locked project is still allowed — otherwise the lock is inescapable", { tag: '@tesbo.testId("TES-TC-71")' }, async () => {
       setGraceWindow(orgId, -1);
       const oldest = activeProjectIdsOldestFirst(orgId);

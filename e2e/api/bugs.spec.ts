@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, test, type APIRequestContext } from "@playwright/test";
+import { expect, request as playwrightRequest, test, type APIRequestContext } from "@playwright/test";
+import { env } from "../utils/env";
 import {
   loginAs,
   provisionRbacTenant,
@@ -1189,6 +1190,458 @@ test.describe("bug_links soft-delete (hard-delete remediation Phase 7)", () => {
     } finally {
       await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseA.id}`, { failOnStatusCode: false });
       await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseB.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * Comments on a bug (V129) — GET/POST /api/projects/:projectId/bugs/:bugId/comments. Flat and
+ * chronological: no replies, edit, delete or resolve. The read-only plan lock on the POST is covered
+ * in billing-lifecycle.spec.ts (BUGC-A-10), which owns the tenant that can be locked.
+ */
+test.describe("bug comments", () => {
+  let asB: APIRequestContext;
+  let anon: APIRequestContext;
+
+  test.beforeAll(async () => {
+    asB = await playwrightRequest.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: path.join(__dirname, "../.auth/state-b.json"),
+    });
+    // The request fixture inherits account A's storageState; clear it for a truly anonymous caller.
+    anon = await playwrightRequest.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+  });
+
+  test.afterAll(async () => {
+    await asB?.dispose();
+    await anon?.dispose();
+  });
+
+  function commentsUrl(bugId: string, projectId: string = ctx.projectId) {
+    return `/api/projects/${projectId}/bugs/${bugId}/comments`;
+  }
+
+  async function newBug(request: APIRequestContext, label: string): Promise<{ id: string; title: string }> {
+    const res = await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+      data: { title: `E2E Bug Comments ${label} ${Date.now()}` },
+    });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  test("BUGC-A-01 a bug with no comments lists an empty set", async ({ request }) => {
+    const bug = await newBug(request, "Empty");
+    try {
+      const res = await request.get(commentsUrl(bug.id));
+      expect(res.status()).toBe(200);
+      expect(await res.json()).toEqual({ list: [], total: 0 });
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-02 adding a comment returns it with its author and timestamp, trimmed, and it is listed", async ({ request }) => {
+    const bug = await newBug(request, "Add");
+    const me = await (await request.get("/api/auth/me")).json();
+    try {
+      const startedAt = Date.now();
+      const res = await request.post(commentsUrl(bug.id), { data: { body: "  Reproduced on staging too.  " } });
+      expect(res.status(), await res.text()).toBe(201);
+      const created = await res.json();
+      expect(created).toMatchObject({ bugId: bug.id, authorId: me.userId, body: "Reproduced on staging too." });
+      expect(typeof created.id).toBe("string");
+      expect(created.authorName).toBeTruthy();
+      expect(created.authorName).not.toBe("Unknown");
+      expect(Date.parse(created.createdAt)).toBeGreaterThanOrEqual(startedAt - 60_000);
+
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.total).toBe(1);
+      expect(listed.list).toEqual([created]);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-03 comments list oldest first, and an identical body posted twice is kept twice", async ({ request }) => {
+    const bug = await newBug(request, "Order");
+    try {
+      for (const body of ["first", "second", "second"]) {
+        expect((await request.post(commentsUrl(bug.id), { data: { body } })).ok()).toBeTruthy();
+      }
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.total).toBe(3);
+      expect(listed.list.map((c: { body: string }) => c.body)).toEqual(["first", "second", "second"]);
+      expect(new Set(listed.list.map((c: { id: string }) => c.id)).size).toBe(3);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-04 an empty, whitespace-only, missing or non-text body is refused and nothing is stored", async ({ request }) => {
+    const bug = await newBug(request, "Invalid");
+    try {
+      for (const data of [{ body: "" }, { body: "   \n\t " }, {}, { body: null }]) {
+        const res = await request.post(commentsUrl(bug.id), { data, failOnStatusCode: false });
+        expect(res.status(), JSON.stringify(data)).toBe(400);
+        expect((await res.json()).error).toBe("Comment cannot be empty.");
+      }
+      for (const data of [{ body: 42 }, { body: { text: "hi" } }, { body: ["hi"] }]) {
+        const res = await request.post(commentsUrl(bug.id), { data, failOnStatusCode: false });
+        expect(res.status(), JSON.stringify(data)).toBe(400);
+        expect((await res.json()).error).toBe("Comment must be text.");
+      }
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(0);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-05 10,000 characters is accepted and 10,001 is refused", async ({ request }) => {
+    const bug = await newBug(request, "Length");
+    try {
+      const atLimit = await request.post(commentsUrl(bug.id), { data: { body: "x".repeat(10_000) } });
+      expect(atLimit.status()).toBe(201);
+      expect((await atLimit.json()).body).toHaveLength(10_000);
+
+      const over = await request.post(commentsUrl(bug.id), { data: { body: "x".repeat(10_001) }, failOnStatusCode: false });
+      expect(over.status()).toBe(400);
+      expect((await over.json()).error).toContain("10,000");
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(1);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-06 an unknown, malformed, deleted or other-project bug is a 404 for both list and add", async ({ request }) => {
+    const deleted = await newBug(request, "Deleted");
+    await request.delete(`/api/bugs/${deleted.id}`);
+    const live = await newBug(request, "Mismatch");
+    const other = await (
+      await request.post("/api/projects", {
+        data: { name: `E2E Bug Comments Other ${Date.now()}`, projectKey: `BC${Date.now().toString(36).toUpperCase()}`, projectType: "tesbox" },
+      })
+    ).json();
+    try {
+      const cases: Array<[string, string]> = [
+        ["unknown", commentsUrl("00000000-0000-0000-0000-000000000000")],
+        ["malformed", commentsUrl("not-a-uuid")],
+        ["deleted", commentsUrl(deleted.id)],
+        // A real, reachable bug addressed through a different project the caller also belongs to.
+        ["other project", commentsUrl(live.id, other.id)],
+      ];
+      for (const [label, url] of cases) {
+        const list = await request.get(url, { failOnStatusCode: false });
+        expect(list.status(), `list: ${label}`).toBe(404);
+        const add = await request.post(url, { data: { body: "hello" }, failOnStatusCode: false });
+        expect(add.status(), `add: ${label}`).toBe(404);
+      }
+      expect((await (await request.get(commentsUrl(live.id))).json()).total).toBe(0);
+    } finally {
+      await request.delete(`/api/bugs/${live.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${other.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-07 another workspace and an anonymous caller can neither read nor add comments", async ({ request }) => {
+    const bug = await newBug(request, "Authz");
+    try {
+      await request.post(commentsUrl(bug.id), { data: { body: "Account A only" } });
+      for (const [label, caller] of [["account B", asB], ["anonymous", anon]] as const) {
+        const list = await caller.get(commentsUrl(bug.id), { failOnStatusCode: false });
+        expect([401, 403, 404], `${label} list`).toContain(list.status());
+        const add = await caller.post(commentsUrl(bug.id), { data: { body: `From ${label}` }, failOnStatusCode: false });
+        expect([401, 403, 404], `${label} add`).toContain(add.status());
+      }
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.list.map((c: { body: string }) => c.body)).toEqual(["Account A only"]);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-08 adding a comment is recorded in the project's activity feed", async ({ request }) => {
+    const bug = await newBug(request, "Activity");
+    try {
+      await request.post(commentsUrl(bug.id), { data: { body: "Logged" } });
+      const feed = await (await request.get(`/api/projects/${ctx.projectId}/activity`, { params: { limit: "100" } })).json();
+      const entry = feed.list.find(
+        (i: { action?: string; entityType?: string; entityId?: string }) =>
+          i.action === "commented" && i.entityType === "bug" && i.entityId === bug.id,
+      );
+      expect(entry, "no 'commented' entry for the bug in the activity feed").toBeTruthy();
+      expect(entry.entityName).toBe(bug.title);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-09 comments are not returned for a bug once it is deleted", async ({ request }) => {
+    const bug = await newBug(request, "Cascade");
+    await request.post(commentsUrl(bug.id), { data: { body: "Before delete" } });
+    await request.delete(`/api/bugs/${bug.id}`);
+    const res = await request.get(commentsUrl(bug.id), { failOnStatusCode: false });
+    expect(res.status()).toBe(404);
+  });
+});
+
+/*
+ * Bug Details' Activity section. Every meaningful bug change writes one audit_logs row with the
+ * caller as actor, read back through the project activity feed filtered by entityId. The tenant is
+ * the "bugs-assignee" one because attribution needs a second project member: the owner files each
+ * bug and the QA member changes it, so a row credited to the reporter (what the old synthetic
+ * "bug updated" row did) fails these tests rather than passing by coincidence.
+ */
+test.describe("bug activity", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let asQa: APIRequestContext;
+  let asGuest: APIRequestContext;
+
+  type Activity = {
+    id: string;
+    action: string;
+    actorId: string | null;
+    actorName: string | null;
+    entityType: string;
+    entityId: string;
+    entityName: string | null;
+    diff: string | null;
+    createdAt: string;
+  };
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("bugs-assignee");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    asQa = await loginAs(tenant.qa);
+    asGuest = await loginAs(tenant.guest);
+  });
+
+  test.afterAll(async () => {
+    if (tenant) resetRbacMembership(tenant);
+    await asOwner?.dispose();
+    await asQa?.dispose();
+    await asGuest?.dispose();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  async function newBug(label: string, data: Record<string, unknown> = {}): Promise<{ id: string; title: string }> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: `E2E Bug Activity ${label} ${Date.now()}`, ...data },
+    });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  /** This bug's activity, oldest first — the order Bug Details shows it in. */
+  async function activityOf(bugId: string, as: APIRequestContext = asOwner): Promise<Activity[]> {
+    const res = await as.get(`/api/projects/${tenant!.mainProjectId}/activity`, {
+      params: { entityType: "bug", entityId: bugId, limit: "100" },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    const body = await res.json();
+    return (body.list as Activity[]).slice().reverse();
+  }
+
+  const diffOf = (row: Activity) => JSON.parse(row.diff || "{}");
+  const actions = (rows: Activity[]) => rows.map((r) => r.action);
+
+  test("BUGA-A-01 filing a bug logs one bug_created row for the reporter, scoped to that bug only", async () => {
+    const other = await newBug("Other");
+    const bug = await newBug("Create", { severity: "High", priority: "P1", assigneeId: tenant!.qa.userId });
+    try {
+      const rows = await activityOf(bug.id);
+      expect(actions(rows)).toEqual(["bug_created"]);
+      expect(rows.every((r) => r.entityId === bug.id), "entityId must scope the feed to this bug alone").toBe(true);
+      expect(rows[0].actorId).toBe(tenant!.owner.userId);
+      expect(rows[0].actorName).toBe("E2E bugs-assignee Owner");
+      expect(rows[0].entityName).toBe(bug.title);
+      expect(diffOf(rows[0])).toMatchObject({ status: "Open", severity: "High", priority: "P1", assigneeId: tenant!.qa.userId });
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      await asOwner.delete(`/api/bugs/${other.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGA-A-02 a status change is credited to whoever changed it, not the reporter, and Closed is logged", async () => {
+    const bug = await newBug("Status");
+    try {
+      expect((await asQa.patch(`/api/bugs/${bug.id}`, { data: { status: "In Progress" } })).ok()).toBeTruthy();
+      expect((await asQa.patch(`/api/bugs/${bug.id}`, { data: { status: "Closed" } })).ok()).toBeTruthy();
+
+      const rows = (await activityOf(bug.id)).filter((r) => r.action === "bug_status_changed");
+      expect(rows.map(diffOf)).toEqual([
+        { from: "Open", to: "In Progress" },
+        { from: "In Progress", to: "Closed" },
+      ]);
+      for (const row of rows) {
+        expect(row.actorId, "the QA member made this change").toBe(tenant!.qa.userId);
+        expect(row.actorName).toBe("E2E bugs-assignee QA");
+      }
+      // The synthetic reporter-attributed "updated" row must not appear alongside the real history.
+      expect(actions(await activityOf(bug.id))).not.toContain("updated");
+      expect(actions(await activityOf(bug.id))).not.toContain("created");
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGA-A-03 severity and priority changes are logged with from/to, and an unchanged re-save logs nothing", async () => {
+    const bug = await newBug("Severity", { severity: "Low" });
+    try {
+      await asQa.patch(`/api/bugs/${bug.id}`, { data: { severity: "Critical", priority: "P0" } });
+      const afterChange = await activityOf(bug.id);
+      expect(diffOf(afterChange.find((r) => r.action === "bug_severity_changed")!)).toEqual({ from: "Low", to: "Critical" });
+      expect(diffOf(afterChange.find((r) => r.action === "bug_priority_changed")!)).toEqual({ from: null, to: "P0" });
+
+      // The edit form re-sends every field; only a real difference is history.
+      const current = await (await asOwner.get(`/api/bugs/${bug.id}`)).json();
+      await asQa.patch(`/api/bugs/${bug.id}`, {
+        data: { title: current.title, description: current.description, status: current.status, severity: current.severity, priority: current.priority },
+      });
+      expect((await activityOf(bug.id)).length).toBe(afterChange.length);
+
+      await asQa.patch(`/api/bugs/${bug.id}`, { data: { priority: null } });
+      const cleared = (await activityOf(bug.id)).filter((r) => r.action === "bug_priority_changed");
+      expect(diffOf(cleared[cleared.length - 1])).toEqual({ from: "P0", to: null });
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGA-A-04 assigning and unassigning name both the actor and the assignee", async () => {
+    const bug = await newBug("Assign");
+    try {
+      await asOwner.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: tenant!.qa.userId } });
+      await asQa.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: tenant!.manager.userId } });
+      await asQa.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: null } });
+
+      const rows = (await activityOf(bug.id)).filter((r) => r.action === "bug_assignee_changed");
+      expect(rows.map((r) => r.actorId)).toEqual([tenant!.owner.userId, tenant!.qa.userId, tenant!.qa.userId]);
+      expect(rows.map(diffOf)).toEqual([
+        { fromId: null, fromName: null, toId: tenant!.qa.userId, toName: "E2E bugs-assignee QA" },
+        { fromId: tenant!.qa.userId, fromName: "E2E bugs-assignee QA", toId: tenant!.manager.userId, toName: "E2E bugs-assignee Manager" },
+        { fromId: tenant!.manager.userId, fromName: "E2E bugs-assignee Manager", toId: null, toName: null },
+      ]);
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGA-A-05 editing other fields logs one bug_updated naming exactly the fields that changed", async () => {
+    const bug = await newBug("Edit", { description: "before" });
+    try {
+      const renamed = `${bug.title} renamed`;
+      await asQa.patch(`/api/bugs/${bug.id}`, { data: { title: renamed, description: "after", status: "Open" } });
+      const rows = await activityOf(bug.id);
+      const edits = rows.filter((r) => r.action === "bug_updated");
+      expect(edits).toHaveLength(1);
+      expect(diffOf(edits[0])).toEqual({ fields: ["title", "description"] });
+      expect(edits[0].actorId).toBe(tenant!.qa.userId);
+      expect(edits[0].entityName, "entity name is the title after the edit").toBe(renamed);
+      expect(actions(rows), "status was re-sent unchanged, so no status row").not.toContain("bug_status_changed");
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGA-A-06 adding and deleting an attachment are both logged with the file name and actor", async () => {
+    const bug = await newBug("Attachment");
+    try {
+      const upload = await asQa.post(`/api/projects/${tenant!.mainProjectId}/bugs/${bug.id}/attachments`, {
+        multipart: { files: { name: "repro-steps.txt", mimeType: "text/plain", buffer: Buffer.from("steps") } },
+      });
+      expect(upload.ok(), await upload.text()).toBeTruthy();
+      const attachmentId = (await upload.json()).list[0].id;
+      expect((await asOwner.delete(`/api/bugs/attachments/${attachmentId}`)).ok()).toBeTruthy();
+
+      const rows = await activityOf(bug.id);
+      const added = rows.find((r) => r.action === "bug_attachment_added")!;
+      const deleted = rows.find((r) => r.action === "bug_attachment_deleted")!;
+      expect(added.actorId).toBe(tenant!.qa.userId);
+      expect(diffOf(added)).toEqual({ attachmentId, fileName: "repro-steps.txt" });
+      expect(deleted.actorId).toBe(tenant!.owner.userId);
+      expect(diffOf(deleted)).toEqual({ attachmentId, fileName: "repro-steps.txt" });
+
+      // Deleting it again is a 404, and must not log a second deletion.
+      await asOwner.delete(`/api/bugs/attachments/${attachmentId}`, { failOnStatusCode: false });
+      expect((await activityOf(bug.id)).filter((r) => r.action === "bug_attachment_deleted")).toHaveLength(1);
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGA-A-07 a comment logs 'commented', and each project member it @mentions once", async () => {
+    const bug = await newBug("Mention");
+    try {
+      const body = [
+        "@E2E bugs-assignee QA can you retry this? @E2E bugs-assignee QA ping.",
+        `cc @${tenant!.manager.email}.`,
+        `Not a mention: mail ${tenant!.owner.email} or ask @E2E bugs-assignee Guest (not in the project).`,
+      ].join("\n");
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs/${bug.id}/comments`, { data: { body } });
+      expect(res.status(), await res.text()).toBe(201);
+      const comment = await res.json();
+      expect(comment.body, "the comment itself is stored unchanged").toBe(body);
+
+      const rows = await activityOf(bug.id);
+      const commented = rows.filter((r) => r.action === "commented");
+      expect(commented).toHaveLength(1);
+      expect(commented[0].actorId).toBe(tenant!.owner.userId);
+
+      const mentions = rows.filter((r) => r.action === "bug_mentioned");
+      expect(mentions.every((r) => r.actorId === tenant!.owner.userId)).toBe(true);
+      expect(mentions.map(diffOf).sort((a, b) => a.mentionedName.localeCompare(b.mentionedName))).toEqual([
+        { commentId: comment.id, mentionedUserId: tenant!.manager.userId, mentionedName: "E2E bugs-assignee Manager" },
+        { commentId: comment.id, mentionedUserId: tenant!.qa.userId, mentionedName: "E2E bugs-assignee QA" },
+      ]);
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGA-A-08 deleting a bug logs bug_deleted, and the whole life reads in order", async () => {
+    const bug = await newBug("Lifecycle");
+    await asQa.patch(`/api/bugs/${bug.id}`, { data: { status: "In Progress", assigneeId: tenant!.qa.userId } });
+    await asQa.post(`/api/projects/${tenant!.mainProjectId}/bugs/${bug.id}/comments`, { data: { body: "Fixed in build 42" } });
+    await asQa.patch(`/api/bugs/${bug.id}`, { data: { status: "Closed" } });
+    expect((await asOwner.delete(`/api/bugs/${bug.id}`)).ok()).toBeTruthy();
+
+    // The bug is gone, but its history is still readable from the project feed.
+    const rows = await activityOf(bug.id);
+    expect(actions(rows)).toEqual([
+      "bug_created",
+      "bug_status_changed",
+      "bug_assignee_changed",
+      "commented",
+      "bug_status_changed",
+      "bug_deleted",
+    ]);
+    expect(rows[rows.length - 1].actorId).toBe(tenant!.owner.userId);
+  });
+
+  test("BUGA-A-09 a bug's activity is not readable outside its project, and a bad entityId is a 400", async () => {
+    const bug = await newBug("Access");
+    const anon = await playwrightRequest.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    try {
+      const url = `/api/projects/${tenant!.mainProjectId}/activity`;
+      const params = { entityType: "bug", entityId: bug.id };
+      const guest = await asGuest.get(url, { params, failOnStatusCode: false });
+      expect([403, 404], `a non-member read the bug's activity: ${guest.status()}`).toContain(guest.status());
+      const unauthenticated = await anon.get(url, { params, failOnStatusCode: false });
+      expect([401, 403], `an anonymous caller read the bug's activity: ${unauthenticated.status()}`).toContain(unauthenticated.status());
+
+      const tooLong = await asOwner.get(url, { params: { entityId: "x".repeat(256) }, failOnStatusCode: false });
+      expect(tooLong.status()).toBe(400);
+      const unknown = await (await asOwner.get(url, { params: { entityId: "no-such-entity" } })).json();
+      expect(unknown).toEqual({ list: [], total: 0 });
+    } finally {
+      await anon.dispose();
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });
 });
