@@ -1549,6 +1549,167 @@ test.describe("zyra / agents (UI)", () => {
   });
 
   /*
+   * "Save Test Cases popup — suite target" — the modal used to open on "Existing suite" with that
+   * dropdown's empty value labelled "No suite", so an untouched modal was already submittable and
+   * silently saved unassigned test cases. "No suite" was an option of the wrong dropdown, and Save
+   * had no rule for the existing-suite path at all. The target is now an explicit choice (No suite /
+   * Existing suite / Create new suite) behind a "Select suite" placeholder, and Save is enabled only
+   * when the chosen path is complete. ZYU-128..132 pin each path plus the payload it sends.
+   */
+  const SUITE_TARGET_OPTIONS = ["Select suite", "No suite", "Existing suite", "Create new suite"];
+
+  function isSaveRequest(taskId: string) {
+    // Pathname predicate rather than a glob: the API is on a different origin from the page.
+    return (req: { url(): string; method(): string }) =>
+      req.method() === "POST" && new URL(req.url()).pathname === `/api/projects/${tenant!.mainProjectId}/agents/zyra/tasks/${taskId}/save`;
+  }
+
+  async function seedSuite(name: string): Promise<string> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, { data: { name } });
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    return String((await res.json()).id);
+  }
+
+  async function openSaveFor(page: Page, title: string | RegExp): Promise<Locator> {
+    await page.getByRole("row", { name: title }).getByRole("button", { name: "Save" }).click();
+    return modal(page, "Save generated testcases");
+  }
+
+  test("ZYU-128 the Save modal opens on 'Select suite' with Save disabled and no suite fields", async ({ browser }) => {
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, /Sign in with a valid password/);
+
+    const target = dialog.getByRole("combobox");
+    // Exactly one select: the target. The existing-suite picker and name field are not rendered yet.
+    await expect(target).toHaveCount(1);
+    await expect(target).toHaveValue("");
+    await expect(target.locator("option:checked")).toHaveText("Select suite");
+    expect((await target.locator("option").allTextContents()).map((s) => s.trim())).toEqual(SUITE_TARGET_OPTIONS);
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
+  test("ZYU-129 'No suite' hides every suite field and saves the draft unassigned", async ({ browser }) => {
+    const title = stamp("No suite draft");
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+
+    await dialog.getByRole("combobox").selectOption("none");
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    const save = dialog.getByRole("button", { name: "Save" });
+    await expect(save).toBeEnabled();
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await save.click();
+    expect((await request).postDataJSON().suiteId).toBeUndefined();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText("1 testcase saved.")).toBeVisible();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(suite_id::text, 'NULL') FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe("NULL");
+  });
+
+  test("ZYU-130 'Existing suite' blocks Save until a suite is picked, then saves into that suite", async ({ browser }) => {
+    const title = stamp("Existing suite draft");
+    const suiteName = stamp("Target suite");
+    const suiteId = await seedSuite(suiteName);
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    const save = dialog.getByRole("button", { name: "Save" });
+
+    await dialog.getByRole("combobox").first().selectOption("existing");
+    const picker = dialog.getByRole("combobox").nth(1);
+    await expect(picker).toBeVisible();
+    await expect(picker).toHaveValue("");
+    // "No suite" is a target of its own now, not a value hiding inside this list.
+    const pickerOptions = (await picker.locator("option").allTextContents()).map((s) => s.trim());
+    expect(pickerOptions).not.toContain("No suite");
+    expect(pickerOptions).toContain(suiteName);
+    await expect(save).toBeDisabled();
+
+    await picker.selectOption({ label: suiteName });
+    await expect(save).toBeEnabled();
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await save.click();
+    expect((await request).postDataJSON().suiteId).toBe(suiteId);
+    await expect
+      .poll(() => scalar(`SELECT suite_id::text FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe(suiteId);
+  });
+
+  test("ZYU-131 'Create new suite' keeps Save disabled for a blank name and caps the name at 255", async ({ browser }) => {
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, /Sign in with a valid password/);
+    const save = dialog.getByRole("button", { name: "Save" });
+
+    await dialog.getByRole("combobox").selectOption("new");
+    const name = dialog.getByRole("textbox");
+    await expect(name).toBeVisible();
+    await expect(save).toBeDisabled();
+
+    await name.fill("   ");
+    await expect(save).toBeDisabled();
+    await expect(dialog.getByText("Suite name is required")).toBeVisible();
+
+    // suites.name is VARCHAR(255); the field stops there instead of letting the API reject it.
+    await name.fill("x".repeat(300));
+    await expect(name).toHaveValue("x".repeat(255));
+    await expect(save).toBeEnabled();
+
+    await name.fill(stamp("Suite"));
+    await expect(dialog.getByText("Suite name is required")).toHaveCount(0);
+    await expect(save).toBeEnabled();
+    // No click: ZYU-14 already proves the create-and-save path end to end.
+  });
+
+  test("ZYU-132 switching target drops the stale suite, and reopening the modal starts clean", async ({ browser }) => {
+    const title = stamp("Switch target draft");
+    const suiteName = stamp("Stale suite");
+    await seedSuite(suiteName);
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    let dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    const target = dialog.getByRole("combobox").first();
+
+    await target.selectOption("existing");
+    await dialog.getByRole("combobox").nth(1).selectOption({ label: suiteName });
+    await target.selectOption("new");
+    await dialog.getByRole("textbox").fill(stamp("Abandoned"));
+
+    // Cancel and reopen: nothing from the abandoned attempt survives.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+    await expect(dialog.getByRole("combobox")).toHaveValue("");
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    await dialog.getByRole("combobox").selectOption("existing");
+    await expect(dialog.getByRole("combobox").nth(1)).toHaveValue("");
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    // Pick a suite, then change your mind: the suite must not ride along with a "No suite" save.
+    await dialog.getByRole("combobox").nth(1).selectOption({ label: suiteName });
+    await dialog.getByRole("combobox").first().selectOption("none");
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await dialog.getByRole("button", { name: "Save" }).click();
+    expect((await request).postDataJSON().suiteId).toBeUndefined();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(suite_id::text, 'NULL') FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe("NULL");
+    // And no suite was created by the abandoned "Create new suite" attempt.
+    expect(Number(scalar(`SELECT COUNT(*) FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name LIKE 'E2E Abandoned %';`))).toBe(0);
+  });
+
+  /*
    * "[Zyra] Save Test Cases error message is hidden behind the modal" — a failed save used to write
    * to the page-level error banner, which sits under the modal's portaled backdrop. The text was in
    * the DOM, so a page-wide toBeVisible() would have passed; the assertion is therefore scoped to
@@ -1578,6 +1739,8 @@ test.describe("zyra / agents (UI)", () => {
 
     await page.getByRole("row", { name: new RegExp(title) }).getByRole("button", { name: "Save" }).click();
     const dialog = modal(page, "Save generated testcases");
+    // The modal opens on "Select suite" and can't submit until a target is chosen (ZYU-128).
+    await dialog.getByRole("combobox").selectOption("none");
     await dialog.getByRole("button", { name: "Save" }).click();
 
     // In flight: the button reports it, and Escape can't dismiss the modal out from under the result.
@@ -1599,6 +1762,8 @@ test.describe("zyra / agents (UI)", () => {
     await expect(dialog.getByRole("alert")).toHaveCount(0);
 
     // Retry goes through the unchanged success path: modal closes, page confirms, the row exists.
+    // Reopening resets the target too (ZYU-132), so it's chosen again.
+    await dialog.getByRole("combobox").selectOption("none");
     await dialog.getByRole("button", { name: "Save" }).click();
     await expect(dialog).toHaveCount(0);
     await expect(page.getByText("1 testcase saved.")).toBeVisible();
