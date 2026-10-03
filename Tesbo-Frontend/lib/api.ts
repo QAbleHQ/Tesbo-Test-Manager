@@ -1133,6 +1133,8 @@ export interface ZyraChatActivePlan {
   batchSize: number;
   doneCount: number;
   totalCount: number;
+  /** Scenarios that have a test case — what progress shows. doneCount is the batch cursor, which grows with retries. Absent on plans started before it existed. */
+  coveredCount?: number;
 }
 
 export interface ZyraChatSession {

@@ -260,18 +260,28 @@ test.describe("zyra / agents (UI)", () => {
    * would once applyZyraChatOperations stages it. Seeded directly for the same reason seedTask()
    * is: reaching this state through the live chat route needs a model this suite never calls.
    */
-  function seedChatReviewBatch(options: { status?: string; entries?: ChatEntry[] } = {}): {
+  //
+  // `sessionId` appends another batch to an existing session (an exhaustive plan posts one message
+  // per batch into the same conversation). `linkMessage: false` writes the message without
+  // review_request_id — the shape every background plan batch was stored in before
+  // postZyraPlanMessage persisted it, while each row still carried its own reviewRequestId.
+  function seedChatReviewBatch(
+    options: { status?: string; entries?: ChatEntry[]; sessionId?: string; linkMessage?: boolean; content?: string } = {},
+  ): {
     taskId: string;
     sessionId: string;
   } {
     const t = tenant!;
-    exec(
-      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
-        `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
-    );
-    const sessionId = scalar(
-      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
-    );
+    let sessionId = options.sessionId;
+    if (!sessionId) {
+      exec(
+        "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+          `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
+      );
+      sessionId = scalar(
+        `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+      );
+    }
     const entries: ChatEntry[] = options.entries ?? [
       {
         opType: "create",
@@ -318,7 +328,8 @@ test.describe("zyra / agents (UI)", () => {
     exec(
       "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
         `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
-        `'I have drafted these test cases for your review.', 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ${literal(taskId)});`,
+        `${literal(options.content ?? "I have drafted these test cases for your review.")}, 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ` +
+        `${options.linkMessage === false ? "NULL" : literal(taskId)});`,
     );
     exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
     return { taskId, sessionId };
@@ -2708,6 +2719,101 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByText(/This batch was already saved or closed/)).toBeVisible();
     await expect(page.getByRole("checkbox", { name: /Select proposed test case/ })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /Save \d+ to repository/ })).toHaveCount(0);
+  });
+
+  /*
+   * "All – Exhaustive" plans post one assistant message per batch into the same conversation. Every
+   * batch after the first was stored without review_request_id (postZyraPlanMessage never wrote it),
+   * and the panel only rendered off that column — so the header said "5 test cases drafted for
+   * review" with nothing under it. The rows themselves still carried their batch's reviewRequestId;
+   * these pin that every batch renders, earlier ones survive later ones, and each panel acts on its
+   * own batch. api/zyra-chat-consistency.spec.ts ZCC-B-17 pins the stored link for new batches.
+   */
+  function planBatch(label: string, count: number): ChatEntry[] {
+    return Array.from({ length: count }, (_, i) => ({
+      opType: "create" as const,
+      draft: { suiteId: null, title: `${label} case ${i + 1}`, description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+    }));
+  }
+
+  test("ZYU-125 every batch of an exhaustive plan renders its drafts, including batches stored without the message-level review link", async ({ browser }) => {
+    const b1 = stamp("Plan batch one");
+    const b2 = stamp("Plan batch two");
+    const b3 = stamp("Plan batch three");
+    const first = seedChatReviewBatch({ entries: planBatch(b1, 2), content: "I identified 6 distinct scenarios to cover. Here are the first 2." });
+    const second = seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b2, 2), linkMessage: false, content: "Here are 2 more test case(s) — 4/6 scenarios covered so far." });
+    const third = seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b3, 2), linkMessage: false, content: "Here are the final 2 test case(s) — all 6 scenarios are now covered." });
+    const page = await open(browser, "/agents/zyra");
+
+    for (const label of [b1, b2, b3]) {
+      await expect(page.getByText(`${label} case 1`), `${label} must be reviewable in the chat`).toBeVisible();
+      await expect(page.getByText(`${label} case 2`)).toBeVisible();
+    }
+    await expect(page.getByText(/2 of 2 selected — pending review/), "one review panel per batch").toHaveCount(3);
+
+    // The fallback panel must address ITS batch, not the first one: a discard in batch three
+    // changes batch three's stored drafts and leaves the other two untouched.
+    await page.getByRole("listitem").filter({ hasText: `${b3} case 1` }).getByRole("button", { name: "Discard" }).click();
+    await expect(page.getByText(`${b3} case 1`)).toHaveCount(0);
+    await expect.poll(() => draftTitles(third.taskId)).toEqual([`${b3} case 2`]);
+    expect(draftTitles(second.taskId)).toEqual([`${b2} case 1`, `${b2} case 2`]);
+    expect(draftTitles(first.taskId)).toEqual([`${b1} case 1`, `${b1} case 2`]);
+  });
+
+  test("ZYU-126 a batch landing while the plan runs is appended below the earlier one, which keeps its review state", async ({ browser }) => {
+    const b1 = stamp("Running plan batch one");
+    const b2 = stamp("Running plan batch two");
+    const first = seedChatReviewBatch({ entries: planBatch(b1, 2), content: "I identified 4 distinct scenarios to cover. Here are the first 2." });
+    // A plan row the page polls on — nothing executes it (the batch loop is only ever launched by a
+    // send, a resume, or a backend restart), so this test controls exactly when the next batch lands.
+    const plan = { planId: `e2e-plan-${Date.now()}`, status: "running", remainingScenarios: ["S3", "S4"], batchSize: 2, doneCount: 2, totalCount: 4, originalMessage: "Generate all possible cases" };
+    exec(`UPDATE zyra_chat_sessions SET active_plan = ${literal(JSON.stringify(plan))}::jsonb WHERE id = ${literal(first.sessionId)};`);
+    try {
+      const page = await open(browser, "/agents/zyra");
+      await expect(page.getByText(/Generating remaining scenarios — 2\/4 covered \(50%\)/)).toBeVisible();
+      await expect(page.getByText(`${b1} case 1`)).toBeVisible();
+      // In-progress review work on the earlier batch, which the next poll must not reset.
+      await page.getByRole("checkbox", { name: "Select proposed test case 1" }).first().uncheck();
+      await expect(page.getByText(/1 of 2 selected — pending review/)).toBeVisible();
+
+      // The background loop's next batch, stored the way postZyraPlanMessage now stores it.
+      seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b2, 2), content: "Here are the final 2 test case(s) — all 4 scenarios are now covered." });
+      exec(`UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = ${literal(first.sessionId)};`);
+
+      await expect(page.getByText(`${b2} case 1`), "the new batch must appear without a reload").toBeVisible({ timeout: 15_000 });
+      await expect(page.getByText(`${b2} case 2`)).toBeVisible();
+      await expect(page.getByText(`${b1} case 1`), "the earlier batch must not be replaced").toBeVisible();
+      await expect(page.getByText(/1 of 2 selected — pending review/), "the earlier batch's selection survives the refresh").toBeVisible();
+      await expect(page.getByText(/2 of 2 selected — pending review/)).toHaveCount(1);
+      await expect(page.getByText(/Generating remaining scenarios/)).toHaveCount(0);
+      // Each title rendered once — a refresh replaces the transcript, it never duplicates a batch.
+      await expect(page.getByText(`${b1} case 1`)).toHaveCount(1);
+      await expect(page.getByText(`${b2} case 1`)).toHaveCount(1);
+    } finally {
+      exec(`UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = ${literal(first.sessionId)};`);
+    }
+  });
+
+  test("ZYU-127 an unlinked message whose rows name two different batches gets no guessed review panel", async ({ browser }) => {
+    const label = stamp("Ambiguous batch");
+    const { sessionId, taskId } = seedChatReviewBatch({ entries: planBatch(label, 2) });
+    const otherTask = seedChatReviewBatch({ sessionId, entries: planBatch(stamp("Other batch"), 1) }).taskId;
+    // Rewrite the first message as unlinked, with its second row pointing at the other batch.
+    const rows = JSON.parse(
+      scalar(`SELECT testcases::text FROM zyra_chat_messages WHERE review_request_id = ${literal(taskId)};`) || "[]",
+    ) as Array<Record<string, unknown>>;
+    rows[1].reviewRequestId = otherTask;
+    exec(
+      `UPDATE zyra_chat_messages SET review_request_id = NULL, testcases = ${literal(JSON.stringify(rows))}::jsonb ` +
+        `WHERE review_request_id = ${literal(taskId)};`,
+    );
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(/Other batch case 1/)).toBeVisible();
+    await expect(page.getByText(/1 of 1 selected — pending review/)).toBeVisible();
+    // Only the other, properly linked batch gets a panel — no actions are offered against a guess.
+    await expect(page.getByText(/of 2 selected — pending review/)).toHaveCount(0);
+    await expect(page.getByText(`${label} case 1`)).toHaveCount(0);
   });
 
   test("ZYU-69 saving only part of a batch leaves the rest visible and actionable, not resolved", async ({ browser }) => {
