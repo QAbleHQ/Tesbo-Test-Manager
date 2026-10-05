@@ -32,12 +32,15 @@ import { filesForm, pngFile, sizedFile, textFile, type UploadFile } from "../uti
 const LAUNCH_LIMIT_BYTES = 500 * 1024 * 1024;
 
 /*
- * LegacyService.EVIDENCE_MAX_FILE_SIZE — the per-file ceiling for bug and execution evidence,
- * separate from (and well under) the 100MB MAX_UPLOAD_SIZE the knowledge base uses. Hardcoded here
- * the way LAUNCH_LIMIT_BYTES is: if MAX_EVIDENCE_FILE_SIZE is ever set to something else in the
- * environment under test, these two boundary cases are the ones that should fail and say so.
+ * LegacyService.EVIDENCE_MAX_FILE_SIZE — the per-file ceiling for execution (test-run) evidence,
+ * separate from (and well under) the 100MB MAX_UPLOAD_SIZE the knowledge base uses — and
+ * LegacyService.BUG_FILE_MAX_SIZE, the lower ceiling for a bug's own files and its comments' files.
+ * Hardcoded here the way LAUNCH_LIMIT_BYTES is: if MAX_EVIDENCE_FILE_SIZE or MAX_BUG_FILE_SIZE is
+ * ever set to something else in the environment under test, the boundary cases are the ones that
+ * should fail and say so.
  */
 const EVIDENCE_MAX_BYTES = 25 * 1024 * 1024;
+const BUG_FILE_MAX_BYTES = 20 * 1024 * 1024;
 
 test.describe("attachments", () => {
   let tenant: RbacTenant | null = null;
@@ -262,18 +265,18 @@ test.describe("attachments", () => {
   });
 
   /*
-   * The client (BugEvidenceField / lib/api.ts's uploadBugAttachments) splits anything over the
-   * ten-file cap into sequential requests against the same bug rather than sending one request the
-   * cap above would refuse outright. This is the backend half of that fix: appending attachments
-   * across several requests must behave exactly like one request would — every file lands on the
-   * one bug, and issuing more than one attachment request must never touch the bugs table itself.
+   * The client (BugEvidenceField / lib/api.ts's uploadBugAttachments) may send a bug's files in
+   * several requests. Appending across requests must behave exactly like one request would — every
+   * file lands on the one bug, and more than one attachment request must never touch the bugs table
+   * itself. A bug holds at most ten files in all, counted across requests, so the eleventh is refused
+   * however it arrives.
    * (The frontend half — a failed batch must not cause a second bug to be created on retry — is a
    * client state-machine concern with nothing to assert here; it's covered in
    * e2e/ui/bugs.spec.ts's BUG-U-36/BUG-U-37.)
    */
-  test("attachments split across multiple requests all land on the same bug, not a duplicate", async () => {
+  test("attachments split across multiple requests all land on the same bug, up to ten in all", async () => {
     const suffix = Date.now();
-    const firstBatch = Array.from({ length: 10 }, (_, i) => textFile(`split-a-${suffix}-${i}.txt`));
+    const firstBatch = Array.from({ length: 7 }, (_, i) => textFile(`split-a-${suffix}-${i}.txt`));
     const secondBatch = Array.from({ length: 3 }, (_, i) => textFile(`split-b-${suffix}-${i}.txt`));
 
     const first = await upload(asQa, bugUploadUrl(), firstBatch);
@@ -281,8 +284,13 @@ test.describe("attachments", () => {
     const second = await upload(asQa, bugUploadUrl(), secondBatch);
     expect(second.ok(), `second batch failed: ${second.status()} ${await second.text()}`).toBeTruthy();
 
+    // The eleventh is refused on its own request too, and changes nothing.
+    const eleventh = await upload(asQa, bugUploadUrl(), [textFile(`split-c-${suffix}.txt`)]);
+    expect(eleventh.status()).toBe(400);
+    expect((await eleventh.json()).error).toBe("A bug can have at most 10 attachments.");
+
     const bug = await (await asOwner.get(`/api/bugs/${bugId}`)).json();
-    expect(bug.attachments).toHaveLength(13);
+    expect(bug.attachments).toHaveLength(10);
     expect(bug.attachments.map((a: any) => a.fileName).sort()).toEqual(
       [...firstBatch, ...secondBatch].map((f) => f.name).sort(),
     );
@@ -478,27 +486,27 @@ test.describe("attachments", () => {
     expect(attachmentRows(tenant!)).toHaveLength(4);
   });
 
-  test("a file over the evidence limit is refused, with the limit in the message", { tag: '@tesbo.testId("TES-TC-1114")' }, async () => {
+  test("a bug file over the 20MB limit is refused, with the limit in the message", { tag: '@tesbo.testId("TES-TC-1114")' }, async () => {
     const name = `huge-${Date.now()}.png`;
-    const res = await upload(asQa, bugUploadUrl(), [sizedFile(name, EVIDENCE_MAX_BYTES + 1024, "image/png")]);
+    const res = await upload(asQa, bugUploadUrl(), [sizedFile(name, BUG_FILE_MAX_BYTES + 1024, "image/png")]);
 
     expect(res.status()).toBe(400);
     const { error } = await res.json();
     expect(error).toContain(name);
-    expect(error).toMatch(/25\.0MB/);
+    expect(error).toMatch(/20\.0MB/);
     expect(attachmentRows(tenant!)).toHaveLength(0);
   });
 
-  test("a file exactly at the evidence limit is accepted", { tag: '@tesbo.testId("TES-TC-1115")' }, async () => {
+  test("a bug file exactly at the 20MB limit is accepted", { tag: '@tesbo.testId("TES-TC-1115")' }, async () => {
     // The boundary in the allowed direction: a cap that also rejects the value it names is a
-    // different cap. The 25MB body is the reason this is one test and not a loop.
-    const file = sizedFile(`at-limit-${Date.now()}.png`, EVIDENCE_MAX_BYTES, "image/png");
+    // different cap. The 20MB body is the reason this is one test and not a loop.
+    const file = sizedFile(`at-limit-${Date.now()}.png`, BUG_FILE_MAX_BYTES, "image/png");
     const res = await upload(asQa, bugUploadUrl(), [file]);
 
     expect(res.ok(), `upload failed: ${res.status()} ${await res.text()}`).toBeTruthy();
     const rows = attachmentRows(tenant!);
     expect(rows).toHaveLength(1);
-    expect(rows[0].fileSize).toBe(EVIDENCE_MAX_BYTES);
+    expect(rows[0].fileSize).toBe(BUG_FILE_MAX_BYTES);
   });
 
   test("one bad file in a batch refuses the whole batch, storing none of it", { tag: '@tesbo.testId("TES-TC-1116")' }, async () => {
@@ -515,7 +523,7 @@ test.describe("attachments", () => {
     expect(attachmentRows(tenant!), "a rejected batch must not leave partial evidence behind").toHaveLength(0);
   });
 
-  test("execution evidence is held to the same rules as bug evidence", { tag: '@tesbo.testId("TES-TC-1117")' }, async () => {
+  test("execution evidence is held to the same type rules as bug evidence, but keeps its own 25MB limit", { tag: '@tesbo.testId("TES-TC-1117")' }, async () => {
     const suffix = Date.now();
     const unsupported = await upload(asQa, executionUploadUrl(), [
       { name: `run-log-${suffix}.exe`, mimeType: "application/octet-stream", body: Buffer.from("MZ") },
@@ -527,6 +535,12 @@ test.describe("attachments", () => {
     ]);
     expect(oversize.status()).toBe(400);
     expect(attachmentRows(tenant!)).toHaveLength(0);
+
+    // Between the two limits: too big for a bug, fine for a test run.
+    const between = sizedFile(`run-recording-${suffix}.mp4`, BUG_FILE_MAX_BYTES + 1024, "video/mp4");
+    expect((await upload(asQa, bugUploadUrl(), [between])).status(), "over a bug's 20MB").toBe(400);
+    const onRun = await upload(asQa, executionUploadUrl(), [between]);
+    expect(onRun.ok(), `under a test run's 25MB: ${onRun.status()} ${await onRun.text()}`).toBeTruthy();
 
     const accepted = await upload(asQa, executionUploadUrl(), [pngFile(`run-shot-ok-${suffix}.png`)]);
     expect(accepted.ok(), `upload failed: ${accepted.status()} ${await accepted.text()}`).toBeTruthy();

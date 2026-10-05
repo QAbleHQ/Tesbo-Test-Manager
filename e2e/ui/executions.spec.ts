@@ -219,8 +219,9 @@ test.describe("auto bug-filing on Failed", () => {
       await page.getByRole("combobox").first().selectOption("Failed");
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
 
+      // Ten: the most a bug takes (it used to be twelve, before a bug was capped at ten files).
       await page.locator('input[type="file"]').setInputFiles(
-        Array.from({ length: 12 }, (_, i) => ({
+        Array.from({ length: 10 }, (_, i) => ({
           name: `evidence-${i}.png`,
           mimeType: "image/png",
           buffer: Buffer.from(`file contents ${i}`),
@@ -243,7 +244,7 @@ test.describe("auto bug-filing on Failed", () => {
         expect(matches, "the retry must reuse the bug from the failed attempt, not create a second one").toHaveLength(1);
 
         const bug = await (await api.get(`/api/bugs/${matches[0].id}`)).json();
-        expect(bug.attachments, "the retry must still deliver every staged file").toHaveLength(12);
+        expect(bug.attachments, "the retry must still deliver every staged file").toHaveLength(10);
       } finally {
         await api.dispose();
       }

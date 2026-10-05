@@ -117,7 +117,7 @@ test.describe("bug evidence validation", () => {
   test("BUG-U-03 an oversized file is refused with the limit, before any upload", { tag: '@tesbo.testId("TES-TC-1313")' }, async ({ page }) => {
     await openReportModal(page, projectId);
 
-    // Nothing should reach the API: the point of the client-side check is that a 26MB file is never
+    // Nothing should reach the API: the point of the client-side check is that a 21MB file is never
     // sent, so a request to the attachments endpoint is itself the failure.
     let uploadAttempted = false;
     await page.route("**/bugs/*/attachments", (route) => {
@@ -128,13 +128,14 @@ test.describe("bug evidence validation", () => {
     await fileInput(page).setInputFiles({
       name: "recording.mp4",
       mimeType: "video/mp4",
-      buffer: Buffer.alloc(26 * 1024 * 1024, 0x61),
+      // Over a bug's 20MB (though under the 25MB test-run evidence takes).
+      buffer: Buffer.alloc(21 * 1024 * 1024, 0x61),
     });
 
     const rejections = page.getByTestId("evidence-rejections");
     await expect(rejections).toBeVisible();
     await expect(rejections).toContainText("recording.mp4");
-    await expect(rejections).toContainText("25.0MB");
+    await expect(rejections).toContainText("20.0MB");
     expect(uploadAttempted, "an oversized file must not be uploaded before it is rejected").toBeFalsy();
   });
 
@@ -192,10 +193,10 @@ test.describe("bug evidence validation", () => {
    * followed it was refused outright by the server's ten-file-per-request cap, and the modal stayed
    * open with the files still staged — inviting a retry that called createBug() again and produced a
    * duplicate bug. lib/api.ts's uploadBugAttachments now splits anything over the cap into sequential
-   * requests, so this is the happy-path half of the fix: nothing above ten files should ever reach
-   * that cap in the first place, and one save action still produces exactly one bug.
+   * requests, so this is the happy-path half of the fix: one save action produces exactly one bug.
+   * A bug now holds at most ten files, so picking more stages ten and names the rest as refused.
    */
-  test("BUG-U-36 reporting a bug with more than ten attachments creates exactly one bug with every file attached", async ({ page }) => {
+  test("BUG-U-36 picking more than ten attachments stages ten, names the rest, and creates exactly one bug with those ten", async ({ page }) => {
     await openReportModal(page, projectId);
     const title = `E2E Many Attachments ${uniqueSuffix()}`;
     await page.getByPlaceholder("Brief summary of the bug…").fill(title);
@@ -206,6 +207,10 @@ test.describe("bug evidence validation", () => {
         buffer: Buffer.from(`file contents ${i}`),
       })),
     );
+    const rejections = page.getByTestId("evidence-rejections");
+    await expect(rejections).toContainText("evidence-10.png: a bug can have at most 10 attachments.");
+    await expect(rejections).toContainText("evidence-11.png");
+    await expect(rejections).not.toContainText("evidence-9.png");
 
     const submit = page.getByRole("button", { name: "Report Bug" }).last();
     await submit.click();
@@ -217,7 +222,7 @@ test.describe("bug evidence validation", () => {
     expect(matches, "a single save action must create exactly one bug").toHaveLength(1);
 
     const bug = await (await api.get(`/api/bugs/${matches[0].id}`)).json();
-    expect(bug.attachments, "every staged file must reach the bug, not just the first ten").toHaveLength(12);
+    expect(bug.attachments, "every staged file reaches the bug").toHaveLength(10);
   });
 
   /*
@@ -247,8 +252,9 @@ test.describe("bug evidence validation", () => {
     await openReportModal(page, projectId);
     const title = `E2E Duplicate Guard ${uniqueSuffix()}`;
     await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+    // Ten: the most a bug takes.
     await fileInput(page).setInputFiles(
-      Array.from({ length: 12 }, (_, i) => ({
+      Array.from({ length: 10 }, (_, i) => ({
         name: `evidence-${i}.png`,
         mimeType: "image/png",
         buffer: Buffer.from(`file contents ${i}`),
@@ -270,7 +276,7 @@ test.describe("bug evidence validation", () => {
     expect(matches, "the retry must reuse the bug from the failed attempt, not create a second one").toHaveLength(1);
 
     const bug = await (await api.get(`/api/bugs/${matches[0].id}`)).json();
-    expect(bug.attachments, "the retry must still deliver every staged file").toHaveLength(12);
+    expect(bug.attachments, "the retry must still deliver every staged file").toHaveLength(10);
   });
 });
 
@@ -2679,8 +2685,12 @@ test.describe("bug comments", () => {
         { name: "screen.png", mimeType: "image/png", buffer: pngFile().body },
         { name: "tool.exe", mimeType: "application/octet-stream", buffer: Buffer.from("MZ") },
         { name: "console.txt", mimeType: "text/plain", buffer: Buffer.from("TypeError") },
+        { name: "huge.png", mimeType: "image/png", buffer: Buffer.alloc(21 * 1024 * 1024, 0x61) },
       ]);
       await expect(section.getByTestId("bug-comment-file-rejections")).toContainText("tool.exe");
+      // 20MB a file, as on the bug itself.
+      await expect(section.getByTestId("bug-comment-file-rejections")).toContainText("huge.png");
+      await expect(section.getByTestId("bug-comment-file-rejections")).toContainText("20.0MB");
       await expect(section.getByTestId("bug-comment-staged-file")).toHaveCount(2);
       await section.getByRole("button", { name: "Remove console.txt" }).click();
       await expect(section.getByTestId("bug-comment-staged-file")).toHaveCount(1);
@@ -3297,6 +3307,26 @@ test.describe("bug attachments in Bug Details", () => {
     }
   });
 
+  test("BUG-U-105 Edit Bug counts the files a bug already has toward its ten", async ({ page }) => {
+    const bug = await bugWith("Nine Files", Array.from({ length: 9 }, (_, i) => textFile(`have-${i}.txt`)));
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      await expect(form.getByText("Up to 10 files, 20.0MB each", { exact: false })).toBeVisible();
+      await form.locator('input[type="file"]').setInputFiles([
+        { name: "tenth.txt", mimeType: "text/plain", buffer: Buffer.from("10") },
+        { name: "eleventh.txt", mimeType: "text/plain", buffer: Buffer.from("11") },
+      ]);
+      await expect(form.getByText("tenth.txt", { exact: true })).toBeVisible();
+      await expect(form.getByTestId("evidence-rejections")).toContainText("eleventh.txt: a bug can have at most 10 attachments.");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect(form).toHaveCount(0);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toHaveLength(10);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("BUG-U-78 a newly picked image is previewed before saving, and removing it removes the preview", async ({ page }) => {
     const bug = await createBug(api, projectId, { title: `E2E Attachments Staged ${uniqueSuffix()}` });
     try {
@@ -3324,15 +3354,16 @@ test.describe("bug attachments in Bug Details", () => {
   });
 
   test("BUG-U-76 many attachments wrap inside the panel without widening it", async ({ page }) => {
+    // Ten in all, the most a bug holds: nine images and one file.
     const files = [
-      ...Array.from({ length: 10 }, (_, i) => pngFile(`Screenshot 2026-09-11 1${String(i).padStart(5, "0")} with a long name.png`)),
+      ...Array.from({ length: 9 }, (_, i) => pngFile(`Screenshot 2026-09-11 1${String(i).padStart(5, "0")} with a long name.png`)),
       sizedFile("Tesbo_RAG_Testing_Report_with_a_very_long_file_name_indeed.docx", 1024, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
     ];
     const bug = await bugWith("Many", files);
     try {
       await openPanel(page, bug.title);
       const body = panelBody(page);
-      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(10);
+      await expect(body.getByTestId("bug-attachment-image")).toHaveCount(9);
       await expect(body.getByTestId("bug-attachment-file")).toHaveCount(1);
 
       // No horizontal overflow: the scroll area is no wider than the panel it sits in.

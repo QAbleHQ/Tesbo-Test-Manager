@@ -6733,7 +6733,7 @@ export class LegacyService implements OnModuleInit {
       });
     }
     if (!files.length) return;
-    LegacyService.assertValidEvidenceFiles(files);
+    LegacyService.assertValidEvidenceFiles(files, LegacyService.BUG_FILE_MAX_SIZE);
     await this.planLimits.assertStorageAvailable(organizationId, files.reduce((sum, file) => sum + file.size, 0));
   }
 
@@ -7171,6 +7171,12 @@ export class LegacyService implements OnModuleInit {
    */
   static readonly EVIDENCE_MAX_FILE_SIZE = Number(process.env.MAX_EVIDENCE_FILE_SIZE) || 25 * 1024 * 1024;
 
+  // Bugs and their comments take less than test-run evidence: 20MB a file, and at most ten files on
+  // a bug (its own evidence) or on any one comment (BUG_COMMENT_MAX_ATTACHMENTS). Test-run evidence
+  // keeps EVIDENCE_MAX_FILE_SIZE. MAX_BUG_FILE_SIZE overrides the size without a code change.
+  static readonly BUG_FILE_MAX_SIZE = Number(process.env.MAX_BUG_FILE_SIZE) || 20 * 1024 * 1024;
+  private static readonly BUG_MAX_ATTACHMENTS = 10;
+
   private static formatFileSize(bytes: number): string {
     if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
     return `${Math.max(1, Math.round(bytes / 1024))}KB`;
@@ -7181,7 +7187,10 @@ export class LegacyService implements OnModuleInit {
    * calling storage.put per file, so rejecting halfway would leave the accepted ones written and
    * billed while the request answers 400. All-or-nothing is the only defensible outcome.
    */
-  private static assertValidEvidenceFiles(files: Array<{ originalname: string; size: number }>) {
+  private static assertValidEvidenceFiles(
+    files: Array<{ originalname: string; size: number }>,
+    maxSize: number = LegacyService.EVIDENCE_MAX_FILE_SIZE
+  ) {
     const supported = [...LegacyService.KB_ALLOWED_EXTENSIONS].sort().join(", ");
     for (const file of files) {
       const name = LegacyService.displayFileName(file.originalname);
@@ -7197,11 +7206,11 @@ export class LegacyService implements OnModuleInit {
       // A zero-byte file is almost always a failed drag-and-drop or a still-being-written file, and
       // it stores nothing useful while still consuming an attachment row and a storage key.
       if (file.size <= 0) throw new BadRequestException({ error: `${name} is empty (0 bytes).` });
-      if (file.size > LegacyService.EVIDENCE_MAX_FILE_SIZE) {
+      if (file.size > maxSize) {
         throw new BadRequestException({
           error:
             `${name} is ${LegacyService.formatFileSize(file.size)}, which is over the ` +
-            `${LegacyService.formatFileSize(LegacyService.EVIDENCE_MAX_FILE_SIZE)} limit for evidence files.`
+            `${LegacyService.formatFileSize(maxSize)} limit for evidence files.`
         });
       }
     }
@@ -7225,7 +7234,16 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
     const bug = await this.db.query("SELECT b.id, b.title FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
     if (!bug.rows[0]) throw new NotFoundException({ error: "Bug not found" });
-    LegacyService.assertValidEvidenceFiles(files);
+    // Counted across every upload to this bug, not per request: Report Bug and Edit Bug send files
+    // in batches, so a per-request cap alone would never stop the eleventh.
+    const existing = await this.db.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM attachments WHERE entity_type = 'bug' AND entity_id = $1 AND deleted_at IS NULL",
+      [bugId]
+    );
+    if (Number(existing.rows[0].count) + files.length > LegacyService.BUG_MAX_ATTACHMENTS) {
+      throw new BadRequestException({ error: `A bug can have at most ${LegacyService.BUG_MAX_ATTACHMENTS} attachments.` });
+    }
+    LegacyService.assertValidEvidenceFiles(files, LegacyService.BUG_FILE_MAX_SIZE);
     await this.planLimits.assertStorageAvailable(
       project.organization_id,
       files.reduce((sum, file) => sum + file.size, 0)

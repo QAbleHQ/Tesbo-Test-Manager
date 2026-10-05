@@ -14,7 +14,8 @@ import { renderCommentMarkdown } from "@/lib/commentMarkdown";
 import { formatAbsolute } from "@/components/activity/activityShared";
 import {
   EVIDENCE_ACCEPT_ATTRIBUTE,
-  EVIDENCE_MAX_FILES_PER_REQUEST,
+  BUG_FILE_MAX_SIZE,
+  BUG_MAX_ATTACHMENTS,
   formatFileSizeShort,
   validateEvidenceFile,
 } from "@/lib/validation";
@@ -26,8 +27,9 @@ import { StagedThumbnail } from "@/components/BugEvidenceField";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
-// Mirrors BUG_COMMENT_MAX_ATTACHMENTS in legacy.service.ts — one request's worth of files, per comment.
-const MAX_COMMENT_FILES = EVIDENCE_MAX_FILES_PER_REQUEST;
+// Mirrors BUG_COMMENT_MAX_ATTACHMENTS and BUG_FILE_MAX_SIZE in legacy.service.ts: per comment or
+// reply, ten files of at most 20MB each.
+const MAX_COMMENT_FILES = BUG_MAX_ATTACHMENTS;
 
 /** Same collapse as the backend's normalizeRole: owners and managers may delete anyone's comment. */
 function canModerate(role: string | undefined): boolean {
@@ -43,7 +45,7 @@ function acceptFiles(picked: File[], alreadyAttached: number): { accepted: File[
   const accepted: File[] = [];
   const rejected: string[] = [];
   for (const file of picked) {
-    const problem = validateEvidenceFile(file);
+    const problem = validateEvidenceFile(file, BUG_FILE_MAX_SIZE);
     if (problem) rejected.push(problem);
     else if (alreadyAttached + accepted.length >= MAX_COMMENT_FILES) rejected.push(`${file.name}: a comment can have at most ${MAX_COMMENT_FILES} attachments.`);
     else accepted.push(file);
@@ -120,7 +122,13 @@ function AttachButton({ label, onFiles }: { label: string; onFiles: (files: File
           e.target.value = "";
         }}
       />
-      <Button type="button" size="sm" variant="secondary" onClick={() => inputRef.current?.click()}>
+      <Button
+        type="button"
+        size="sm"
+        variant="secondary"
+        onClick={() => inputRef.current?.click()}
+        title={`Up to ${MAX_COMMENT_FILES} files, ${formatFileSizeShort(BUG_FILE_MAX_SIZE)} each`}
+      >
         <IconPaperclip size={14} /> Attach
       </Button>
     </>

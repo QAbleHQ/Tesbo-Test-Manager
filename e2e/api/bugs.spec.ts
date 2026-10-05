@@ -10,7 +10,7 @@ import {
   type RbacTenant,
 } from "../utils/rbac-tenant";
 import { exec, literal, scalar } from "../utils/psql";
-import { filesForm, filesFormWith, pngFile, textFile, type UploadFile } from "../utils/uploads";
+import { filesForm, filesFormWith, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
@@ -1532,6 +1532,8 @@ test.describe("bug comments", () => {
         ["unsupported type", { body: "With an exe" }, [pngFile("ok.png"), { name: "setup.exe", mimeType: "application/octet-stream", body: Buffer.from("MZ") }], "aren't supported"],
         ["empty file", { body: "With an empty file" }, [{ name: "empty.txt", mimeType: "text/plain", body: Buffer.alloc(0) }], "empty"],
         ["no text", { body: "   " }, [pngFile("alone.png")], "Comment cannot be empty."],
+        // A comment's files share a bug's 20MB ceiling, not test-run evidence's 25MB.
+        ["over 20MB", { body: "Too big" }, [sizedFile("big.png", 20 * 1024 * 1024 + 1024, "image/png")], "20.0MB"],
       ];
       for (const [label, fields, files, error] of cases) {
         const res = await request.post(commentsUrl(bug.id), { multipart: filesFormWith(fields, files), failOnStatusCode: false });
