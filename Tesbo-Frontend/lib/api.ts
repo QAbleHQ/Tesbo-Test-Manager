@@ -2710,7 +2710,8 @@ export interface BugItem {
   description: string;
   externalUrl: string;
   status: string;
-  severity: BugSeverity;
+  /** null = not selected (V130), the same convention as priority. */
+  severity: BugSeverity | null;
   priority: BugPriority | null;
   executionId: string | null;
   testcaseId: string | null;
@@ -2788,7 +2789,8 @@ export async function updateBug(bugId: string, data: {
   description?: string;
   externalUrl?: string;
   status?: string;
-  severity?: BugSeverity;
+  // null clears it back to not selected; omitted leaves the stored value alone.
+  severity?: BugSeverity | null;
   // null clears it back to untriaged; omitted leaves the stored value alone.
   priority?: BugPriority | null;
   // null clears the assignee; omitted leaves the stored value alone.
@@ -3067,7 +3069,9 @@ export interface ProjectDashboardSummary {
   testCases: { total: number; addedThisWeek: number };
   passRate: { value: number | null; deltaThisWeek: number | null };
   executionProgress: { value: number };
-  openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number } };
+  // total counts every open bug; noSeverity is the part of it with no severity selected, which
+  // bySeverity's four buckets don't include.
+  openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number }; noSeverity?: number };
   coverage: { pct: number | null; totalRequirements: number };
   plans: number;
   suites: number;

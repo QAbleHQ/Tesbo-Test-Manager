@@ -132,7 +132,7 @@ function BugDetail({ data }: { data: BugItem }) {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-1.5">
-        <SeverityBadge severity={data.severity} />
+        {data.severity && <SeverityBadge severity={data.severity} />}
         {data.priority && <PriorityBadge priority={data.priority} />}
         <StatusChip tone="brand">{data.status}</StatusChip>
         <span className="font-mono text-[11px] text-[var(--muted)]">{data.externalId}</span>

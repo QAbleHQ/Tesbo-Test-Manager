@@ -6412,8 +6412,10 @@ export class LegacyService implements OnModuleInit {
     return match;
   }
 
-  private parseBugSeverity(severity: unknown): "Critical" | "High" | "Medium" | "Low" {
-    if (severity === undefined || severity === null || severity === "") return "Medium";
+  private parseBugSeverity(severity: unknown): "Critical" | "High" | "Medium" | "Low" | null {
+    // Absent, null and "" all mean "not selected" (V130), the same convention as parseBugPriority.
+    // This used to return "Medium", which stored a severity nobody had chosen.
+    if (severity === undefined || severity === null || severity === "") return null;
     const match = BUG_SEVERITIES.find((s) => s.toLowerCase() === String(severity).trim().toLowerCase());
     if (!match)
       throw new BadRequestException({
@@ -6684,8 +6686,10 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     const projectId = await this.requireBugAccess(userId, bugId);
     // Same refusal as createBug — an unknown severity on edit hit the same constraint and the same
-    // opaque 500. Absent/empty leaves the stored value alone via COALESCE, so it isn't parsed.
-    if (body.severity) this.parseBugSeverity(body.severity);
+    // opaque 500. Severity can be cleared since V130, with the same explicit-null-or-"" convention as
+    // priority below; an absent key still leaves the stored value alone.
+    const clearsSeverity = body.severity === null || body.severity === "";
+    const severity = this.parseBugSeverity(body.severity);
     validateBoundedField(body.title, "Bug title", BUG_TITLE_MAX_LENGTH);
     validateBoundedField(body.externalUrl, "External URL", BUG_EXTERNAL_URL_MAX_LENGTH);
     /*
@@ -6703,7 +6707,7 @@ export class LegacyService implements OnModuleInit {
     const before = await this.getBug(bugId);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
-       status=COALESCE($5,status), severity=COALESCE($6,severity), priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
+       status=COALESCE($5,status), severity=CASE WHEN $14::boolean THEN NULL ELSE COALESCE($6,severity) END, priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
        integration_provider=COALESCE($7,integration_provider), integration_issue_key=COALESCE($8,integration_issue_key),
        betterbugs_url=COALESCE($9,betterbugs_url),
        assignee_id=CASE WHEN $12::boolean THEN NULL ELSE COALESCE($13,assignee_id) END,
@@ -6714,14 +6718,15 @@ export class LegacyService implements OnModuleInit {
         body.description || null,
         body.externalUrl || null,
         body.status || null,
-        body.severity || null,
+        severity,
         body.integrationProvider || null,
         body.integrationIssueKey || null,
         body.betterbugsUrl || null,
         clearsPriority,
         priority,
         clearsAssignee,
-        assigneeId
+        assigneeId,
+        clearsSeverity
       ]
     );
     if (Array.isArray(body.links)) {
@@ -7759,7 +7764,7 @@ export class LegacyService implements OnModuleInit {
     const [counts, requirements, bugSeverity, activeRuns, addedThisWeek, passRateWindows] = await Promise.all([
       this.analytics(projectId),
       this.requirementsSummary(projectId, userId),
-      this.db.query<{ severity: string; count: string }>(
+      this.db.query<{ severity: string | null; count: string }>(
         `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND deleted_at IS NULL AND status IN ('Open', 'Reopened') GROUP BY severity`,
         [projectId]
       ),
@@ -7790,10 +7795,15 @@ export class LegacyService implements OnModuleInit {
     ]);
 
     const bySeverity = { Critical: 0, High: 0, Medium: 0, Low: 0 } as Record<string, number>;
+    // Severity is nullable since V130. Bugs with none get their own count, and the total is summed
+    // over every row — summing only the four buckets dropped them from "Open bugs" altogether.
+    let openBugsNoSeverity = 0;
+    let openBugsTotal = 0;
     for (const row of bugSeverity.rows) {
-      if (row.severity in bySeverity) bySeverity[row.severity] = Number(row.count);
+      openBugsTotal += Number(row.count);
+      if (row.severity === null) openBugsNoSeverity = Number(row.count);
+      else if (row.severity in bySeverity) bySeverity[row.severity] = Number(row.count);
     }
-    const openBugsTotal = Object.values(bySeverity).reduce((a, b) => a + b, 0);
 
     const metrics = LegacyService.computeExecutionMetrics({
       passed: counts.executionStatus.Passed || 0,
@@ -7818,7 +7828,7 @@ export class LegacyService implements OnModuleInit {
       testCases: { total: counts.testCaseCount, addedThisWeek: Number(addedThisWeek.rows[0]?.count || 0) },
       passRate: { value: metrics.passRate, deltaThisWeek: passRateDeltaThisWeek },
       executionProgress: { value: metrics.executionProgress },
-      openBugs: { total: openBugsTotal, bySeverity },
+      openBugs: { total: openBugsTotal, bySeverity, noSeverity: openBugsNoSeverity },
       coverage: { pct: coveragePct, totalRequirements },
       plans: counts.planCount,
       suites: counts.suiteCount,

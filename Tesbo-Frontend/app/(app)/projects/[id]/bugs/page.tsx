@@ -399,7 +399,7 @@ export default function BugsPage() {
   const [createTitle, setCreateTitle] = useState("");
   const [createDesc, setCreateDesc] = useState("");
   const [createPriority, setCreatePriority] = useState<BugPriority | "">("");
-  const [createSeverity, setCreateSeverity] = useState<BugSeverity>("Medium");
+  const [createSeverity, setCreateSeverity] = useState<BugSeverity | "">("");
   const [createLinks, setCreateLinks] = useState<LinkRow[]>([]);
   const [createDestination, setCreateDestination] = useState<TrackingDestination>("TESBO");
   const [createSelfSystem, setCreateSelfSystem] = useState<SelfLoggedSystem>("OTHER");
@@ -565,7 +565,7 @@ export default function BugsPage() {
     setCreateError(null);
     setCreateTitle("");
     setCreateDesc("");
-    setCreateSeverity("Medium");
+    setCreateSeverity("");
     setCreatePriority("");
     setCreateLinks([]);
     setCreateDestination("TESBO");
@@ -596,7 +596,8 @@ export default function BugsPage() {
         const bug = await createBug(projectId, {
           title: createTitle.trim(),
           description: createDesc.trim(),
-          severity: createSeverity,
+          // Not selected is stored as no severity (V130), the same as an untriaged priority.
+          severity: createSeverity || undefined,
           priority: createPriority || null,
           assigneeId: createAssigneeId || null,
           externalUrl: selfLogged ? createUrl.trim() : undefined,
@@ -1133,8 +1134,15 @@ export default function BugsPage() {
           </Field>
           <div className="grid grid-cols-3 gap-3">
             <Field>
+              {/* Neither Severity nor Priority is required, and both open on "Not selected" rather
+                  than a preselected value, so nothing is filed with a value nobody chose. */}
               <FieldLabel>Severity</FieldLabel>
-              <Select value={createSeverity} onChange={(e) => setCreateSeverity(e.target.value as BugSeverity)}>
+              <Select
+                value={createSeverity}
+                onChange={(e) => setCreateSeverity(e.target.value as BugSeverity | "")}
+                aria-label="Bug severity"
+              >
+                <option value="">Not selected</option>
                 {BUG_SEVERITIES.map((s) => (
                   <option key={s} value={s}>
                     {s}
@@ -1151,7 +1159,7 @@ export default function BugsPage() {
                 onChange={(e) => setCreatePriority(e.target.value as BugPriority | "")}
                 aria-label="Bug priority"
               >
-                <option value="">Not set</option>
+                <option value="">Not selected</option>
                 {BUG_PRIORITIES.map((p) => (
                   <option key={p} value={p}>
                     {p}

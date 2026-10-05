@@ -576,6 +576,100 @@ test.describe("bug priority", () => {
 });
 
 /*
+ * Severity is optional — "Priority and Severity Should Display 'Select' by Default When Logging a New
+ * Bug". Severity used to be NOT NULL DEFAULT 'Medium', so a bug nobody had judged was stored, listed
+ * and reported as Medium. V130 makes it nullable with the same contract priority already has: absent,
+ * null and "" all mean "not selected" on create; on edit an omitted key leaves it alone and an explicit
+ * null or "" clears it.
+ */
+test.describe("bug severity is optional", () => {
+  test("BUG-A-SEV-01 a bug created without a severity has none, rather than a defaulted Medium", async ({ request }) => {
+    const omitted = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug No Severity ${Date.now()}` } })
+    ).json();
+    const blank = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Blank Severity ${Date.now()}`, severity: "" },
+      })
+    ).json();
+    const explicitNull = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Null Severity ${Date.now()}`, severity: null },
+      })
+    ).json();
+    try {
+      for (const bug of [omitted, blank, explicitNull]) {
+        expect(bug.id, "the create succeeded").toBeTruthy();
+        expect(bug.severity).toBeNull();
+      }
+      const listed = await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+      const found = listed.find((b: { id: string }) => b.id === omitted.id);
+      expect(found.severity, "no severity has to survive the list endpoint, not just the create response").toBeNull();
+      // And the single-bug read.
+      expect((await (await request.get(`/api/bugs/${omitted.id}`)).json()).severity).toBeNull();
+    } finally {
+      for (const bug of [omitted, blank, explicitNull]) {
+        if (bug?.id) await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
+  test("BUG-A-SEV-02 severity can be set, changed, left alone, and cleared back to not selected", async ({ request }) => {
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Severity Edit ${Date.now()}` } })
+    ).json();
+    try {
+      const set = await (await request.patch(`/api/bugs/${bug.id}`, { data: { severity: "High" } })).json();
+      expect(set.severity).toBe("High");
+
+      const changed = await (await request.patch(`/api/bugs/${bug.id}`, { data: { severity: "low" } })).json();
+      expect(changed.severity, "matched case-insensitively and stored canonically").toBe("Low");
+
+      // Omitting the key leaves it alone.
+      const untouched = await (await request.patch(`/api/bugs/${bug.id}`, { data: { title: `${bug.title} v2` } })).json();
+      expect(untouched.severity).toBe("Low");
+
+      // An explicit null clears it…
+      const cleared = await (await request.patch(`/api/bugs/${bug.id}`, { data: { severity: null } })).json();
+      expect(cleared.severity).toBeNull();
+
+      // …and so does "", which is what the Edit form's "Not selected" option submits.
+      await request.patch(`/api/bugs/${bug.id}`, { data: { severity: "Critical" } });
+      const clearedByBlank = await (await request.patch(`/api/bugs/${bug.id}`, { data: { severity: "" } })).json();
+      expect(clearedByBlank.severity).toBeNull();
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).severity, "persisted, not just echoed").toBeNull();
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-A-SEV-03 an unknown severity is still refused by name on create and on edit, and changes nothing", async ({ request }) => {
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Bad Severity Edit ${Date.now()}`, severity: "High" },
+      })
+    ).json();
+    try {
+      for (const bad of ["Trivial", "Not selected", 3]) {
+        const createRes = await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+          data: { title: `E2E Bug Bad Severity ${Date.now()}`, severity: bad },
+          failOnStatusCode: false,
+        });
+        expect(createRes.status(), `create with severity ${JSON.stringify(bad)}`).toBe(400);
+        expect((await createRes.json()).field).toBe("severity");
+
+        const editRes = await request.patch(`/api/bugs/${bug.id}`, { data: { severity: bad }, failOnStatusCode: false });
+        expect(editRes.status(), `edit with severity ${JSON.stringify(bad)}`).toBe(400);
+        expect((await editRes.json()).field).toBe("severity");
+      }
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).severity, "a refused edit leaves the stored value").toBe("High");
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
  * Linking a bug marks the execution Failed — Basecamp 10226284379 and 10221755377, the same request
  * from two reporters.
  *

@@ -55,10 +55,9 @@ test.describe("auto bug-filing on Failed", () => {
       const titleInput = page.getByPlaceholder("Brief summary of the bug…");
       await expect(titleInput).toHaveValue(`Failed: ${title}`);
 
-      // Severity is mandatory and defaults to Medium so the dialog can always be filed without
-      // the reporter having to touch it.
+      // Severity opens on "Not selected" rather than a preselected value nobody chose.
       const severitySelect = page.getByRole("combobox", { name: "Severity" });
-      await expect(severitySelect).toHaveValue("Medium");
+      await expect(severitySelect).toHaveValue("");
       await severitySelect.selectOption("Critical");
 
       await page.getByRole("button", { name: "File Bug" }).click();
@@ -82,7 +81,7 @@ test.describe("auto bug-filing on Failed", () => {
     }
   });
 
-  test("the severity dropdown offers only the four valid values and resets to Medium for the next dialog", { tag: '@tesbo.testId("TES-TC-1333")' }, async ({
+  test("the severity dropdown offers Not selected plus the four valid values, resets, and is not required", { tag: '@tesbo.testId("TES-TC-1333")' }, async ({
     page,
   }) => {
     const stamp = Date.now();
@@ -111,18 +110,20 @@ test.describe("auto bug-filing on Failed", () => {
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
       const severitySelect = page.getByRole("combobox", { name: "Severity" });
 
-      // Mandatory dropdown: exactly the four backend-accepted values, no blank/empty option.
+      // Optional dropdown: "Not selected", then exactly the four backend-accepted values.
       const optionValues = await severitySelect.locator("option").allTextContents();
-      expect(optionValues).toEqual(["Critical", "High", "Medium", "Low"]);
+      expect(optionValues).toEqual(["Not selected", "Critical", "High", "Medium", "Low"]);
 
       await severitySelect.selectOption("Low");
       await page.getByRole("button", { name: "Skip", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
-      // Fail the second case — its dialog must default back to Medium, not inherit "Low".
+      // Fail the second case — its dialog must reset to Not selected, not inherit "Low". Severity is not
+      // required, so File Bug works without picking one.
       await page.getByRole("combobox").nth(1).selectOption("Failed");
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
-      await expect(page.getByRole("combobox", { name: "Severity" })).toHaveValue("Medium");
+      await expect(page.getByRole("combobox", { name: "Severity" })).toHaveValue("");
+      await expect(page.getByRole("button", { name: "File Bug" })).toBeEnabled();
       await page.getByRole("button", { name: "File Bug" }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
@@ -132,7 +133,9 @@ test.describe("auto bug-filing on Failed", () => {
         const bugs = await bugsRes.json();
         const filedBug = bugs.find((b: { title: string }) => b.title === `Failed: ${titleB}`);
         expect(filedBug).toBeTruthy();
-        expect(filedBug.severity).toBe("Medium");
+        // Left unselected, so it is stored as not selected (V130), the same as priority.
+        expect(filedBug.severity).toBeNull();
+        expect(filedBug.priority ?? null).toBeNull();
       } finally {
         await verifyApi.dispose();
       }
@@ -1964,9 +1967,13 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
       await expect(page.getByLabel("Severity")).toBeVisible();
       await expect(page.getByLabel("Bug priority")).toBeVisible();
-      // Same defaults as the Bugs page: severity Medium, priority untriaged.
-      await expect(page.getByLabel("Severity")).toHaveValue("Medium");
+      // Same as the Bugs page: both open on "Not selected", with no preselected value.
+      await expect(page.getByLabel("Severity")).toHaveValue("");
       await expect(page.getByLabel("Bug priority")).toHaveValue("");
+      await expect(page.getByLabel("Severity").locator("option").first()).toHaveText("Not selected");
+      await expect(page.getByLabel("Bug priority").locator("option").first()).toHaveText("Not selected");
+      // Not required any more, so the label carries no required marker.
+      await expect(page.getByText("Severity *")).toHaveCount(0);
     } finally {
       await cleanUp(cycle.id, testcase.id);
     }

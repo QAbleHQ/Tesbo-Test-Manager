@@ -514,17 +514,117 @@ test.describe("bug priority", () => {
     await expect(untriagedRow.getByText(/^P[0-3]$/)).toHaveCount(0);
   });
 
-  test("BUG-U-12 the report form offers priority, defaulting to not set", { tag: '@tesbo.testId("TES-TC-1322")' }, async ({ page }) => {
+  test("BUG-U-12 the report form offers priority, opening on Not selected", { tag: '@tesbo.testId("TES-TC-1322")' }, async ({ page }) => {
     await page.getByRole("button", { name: /report a bug/i }).first().click();
     await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
 
     const priority = page.getByLabel("Bug priority");
     await expect(priority).toBeVisible();
-    // Optional by design: "not triaged yet" has to be expressible on the form itself.
+    // Optional by design: "not triaged yet" has to be expressible on the form itself — and the empty
+    // choice reads "Not selected", the same wording severity uses.
     await expect(priority).toHaveValue("");
-    await expect(priority.locator("option")).toHaveCount(5);
-    for (const value of ["P0", "P1", "P2", "P3"]) {
-      await expect(priority.locator(`option[value="${value}"]`)).toHaveCount(1);
+    await expect(priority.locator("option")).toHaveText(["Not selected", "P0", "P1", "P2", "P3"]);
+  });
+
+  /*
+   * "Priority and Severity Should Display 'Select' by Default When Logging a New Bug". Severity used
+   * to open preselected on Medium, so a bug filed without touching it carried a severity nobody
+   * chose. Both fields now open on "Not selected", neither is required (product decision on the
+   * card), and leaving them alone files the bug with no severity and no priority (V130).
+   */
+  test("BUG-U-84 the report form opens Severity and Priority on Not selected, and neither is required", async ({ page }) => {
+    const title = `E2E Unselected severity ${uniqueSuffix()}`;
+    let bugId: string | undefined;
+    try {
+      await openReportModal(page, projectId);
+      const severity = page.getByLabel("Bug severity");
+      await expect(severity).toHaveValue("");
+      await expect(severity.locator("option")).toHaveText(["Not selected", "Critical", "High", "Medium", "Low"]);
+      await expect(page.getByLabel("Bug priority")).toHaveValue("");
+
+      await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+      // Two "Report Bug" buttons exist while the modal is open; the submit is the last in the DOM.
+      const submit = page.getByRole("button", { name: "Report Bug" }).last();
+      await expect(submit, "neither field is required, so the form submits as-is").toBeEnabled();
+      await submit.click();
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+      const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+      const bug = bugs.find((b: { title: string }) => b.title === title);
+      expect(bug, "the bug was filed").toBeTruthy();
+      bugId = bug.id;
+      // Stored as not selected, not as a Medium nobody picked.
+      expect(bug.severity).toBeNull();
+      expect(bug.priority ?? null).toBeNull();
+
+      // And the list says so, rather than inventing a badge.
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      const row = page.locator("tbody tr").filter({ hasText: title });
+      await expect(row.getByText(/^(Critical|High|Medium|Low)$/)).toHaveCount(0);
+    } finally {
+      if (bugId) await api.delete(`/api/bugs/${bugId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-85 severity and priority picked on the report form are what gets saved", async ({ page }) => {
+    const title = `E2E Chosen severity ${uniqueSuffix()}`;
+    let bugId: string | undefined;
+    try {
+      await openReportModal(page, projectId);
+      await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+      await page.getByLabel("Bug severity").selectOption("Critical");
+      await page.getByLabel("Bug priority").selectOption("P2");
+      await page.getByRole("button", { name: "Report Bug" }).last().click();
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+
+      const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+      const bug = bugs.find((b: { title: string }) => b.title === title);
+      expect(bug, "the bug was filed").toBeTruthy();
+      bugId = bug.id;
+      expect(bug.severity).toBe("Critical");
+      expect(bug.priority).toBe("P2");
+
+      // Reopening the form starts clean rather than carrying the last choice over.
+      await page.getByRole("button", { name: "Report Bug" }).first().click();
+      await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
+      await expect(page.getByLabel("Bug severity")).toHaveValue("");
+      await expect(page.getByLabel("Bug priority")).toHaveValue("");
+    } finally {
+      if (bugId) await api.delete(`/api/bugs/${bugId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-86 editing a bug can clear its severity to Not selected, and set it again", async ({ page }) => {
+    const title = `E2E Clear severity ${uniqueSuffix()}`;
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title, severity: "High" } })
+    ).json();
+    try {
+      await page.reload();
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      const row = page.locator("tbody tr").filter({ hasText: title });
+      await expect(row.getByText("High", { exact: true })).toBeVisible();
+
+      await row.getByRole("button", { name: "Edit bug" }).click();
+      const severity = page.getByLabel("Severity", { exact: true });
+      await expect(severity).toHaveValue("High");
+      await expect(severity.locator("option").first()).toHaveText("Not selected");
+      await expect(page.getByLabel("Bug priority").locator("option").first()).toHaveText("Not selected");
+      await severity.selectOption("");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+
+      await expect(row.getByText("High", { exact: true })).toHaveCount(0);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).severity).toBeNull();
+
+      // And back: clearing is not a one-way door.
+      await row.getByRole("button", { name: "Edit bug" }).click();
+      await expect(page.getByLabel("Severity", { exact: true })).toHaveValue("");
+      await page.getByLabel("Severity", { exact: true }).selectOption("Low");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect(row.getByText("Low", { exact: true })).toBeVisible();
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).severity).toBe("Low");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });
 
@@ -1842,7 +1942,8 @@ test.describe("bug details panel", () => {
     try {
       await openFromList(page, bug.title);
       const body = panelBody(page);
-      await expect(body.getByText("Not set", { exact: true })).toBeVisible();
+      // Neither severity nor priority was given, so both read "Not selected" (V130).
+      await expect(body.getByText("Not selected", { exact: true })).toHaveCount(2);
       await expect(body.getByText("Unassigned", { exact: true })).toBeVisible();
       await expect(body.getByText("Not linked", { exact: true })).toBeVisible();
       // No description was given, so the section is omitted rather than rendered empty.

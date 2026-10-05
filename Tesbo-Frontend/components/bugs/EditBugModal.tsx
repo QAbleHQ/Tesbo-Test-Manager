@@ -68,7 +68,7 @@ export default function EditBugModal({
   const [editTitle, setEditTitle] = useState(bug.title);
   const [editDesc, setEditDesc] = useState(bug.description);
   const [editPriority, setEditPriority] = useState<BugPriority | "">(bug.priority ?? "");
-  const [editSeverity, setEditSeverity] = useState<BugSeverity>(bug.severity);
+  const [editSeverity, setEditSeverity] = useState<BugSeverity | "">(bug.severity ?? "");
   const [editLinks, setEditLinks] = useState<LinkRow[]>(() =>
     bug.links.map((link) => ({
       cycleId: link.cycleId || "",
@@ -149,7 +149,8 @@ export default function EditBugModal({
         title: editTitle.trim(),
         description: editDesc.trim(),
         status: editStatus,
-        severity: editSeverity,
+        // null clears severity back to not selected, the same as priority.
+        severity: editSeverity || null,
         priority: editPriority || null,
         assigneeId: editAssigneeId || null,
         externalUrl: selfLogged ? editUrl.trim() : undefined,
@@ -227,7 +228,12 @@ export default function EditBugModal({
       <div className="grid grid-cols-3 gap-3">
         <Field>
           <FieldLabel>Severity</FieldLabel>
-          <Select value={editSeverity} onChange={(e) => setEditSeverity(e.target.value as BugSeverity)} aria-label="Severity">
+          <Select
+            value={editSeverity}
+            onChange={(e) => setEditSeverity(e.target.value as BugSeverity | "")}
+            aria-label="Severity"
+          >
+            <option value="">Not selected</option>
             {BUG_SEVERITIES.map((s) => (
               <option key={s} value={s}>
                 {s}
@@ -242,7 +248,7 @@ export default function EditBugModal({
             onChange={(e) => setEditPriority(e.target.value as BugPriority | "")}
             aria-label="Bug priority"
           >
-            <option value="">Not set</option>
+            <option value="">Not selected</option>
             {BUG_PRIORITIES.map((p) => (
               <option key={p} value={p}>
                 {p}
