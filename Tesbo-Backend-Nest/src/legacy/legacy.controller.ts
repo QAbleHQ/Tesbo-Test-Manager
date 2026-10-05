@@ -879,14 +879,41 @@ export class LegacyController {
     return this.legacy.listBugComments(projectId, req.userId, bugId);
   }
 
+  // JSON, or multipart with `body` + `files` when the comment carries attachments. Multer passes a
+  // non-multipart request straight through, so the JSON contract is unchanged.
   @Post("/api/projects/:projectId/bugs/:bugId/comments")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
   createBugComment(
     @Req() req: AuthenticatedRequest,
     @Param("projectId") projectId: string,
     @Param("bugId") bugId: string,
-    @Body() body: Record<string, any>
+    @Body() body: Record<string, any>,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
   ) {
-    return this.legacy.createBugComment(projectId, req.userId, bugId, body);
+    return this.legacy.createBugComment(projectId, req.userId, bugId, body, files);
+  }
+
+  @Patch("/api/projects/:projectId/bugs/:bugId/comments/:commentId")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  updateBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Param("commentId") commentId: string,
+    @Body() body: Record<string, any>,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.updateBugComment(projectId, req.userId, bugId, commentId, body, files);
+  }
+
+  @Delete("/api/projects/:projectId/bugs/:bugId/comments/:commentId")
+  deleteBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Param("commentId") commentId: string
+  ) {
+    return this.legacy.deleteBugComment(projectId, req.userId, bugId, commentId);
   }
 
   @Post("/api/projects/:projectId/bugs/:bugId/attachments")

@@ -6558,8 +6558,9 @@ export class LegacyService implements OnModuleInit {
   }
 
   /**
-   * Project members named in a comment as `@Display Name` or `@email`. There is no mention picker —
-   * the comment box is plain text — so this matches against the project's own members, longest
+   * Project members named in a comment as `@Display Name` or `@email`. The comment editor's picker
+   * inserts exactly that text (the stored body is Markdown, with no mention markup), and a typed one
+   * counts the same, so this matches against the project's own members, longest
    * name first so `@Ann Lee` is not also read as `@Ann`. The `@` must start a word, so the middle
    * of an email address typed as prose never counts as a mention.
    */
@@ -6596,13 +6597,27 @@ export class LegacyService implements OnModuleInit {
   // Routed under /api/projects/:projectId so ProjectWriteLockGuard covers the write, which is why
   // the bug is resolved against the URL's project rather than through requireBugAccess alone.
 
-  private bugCommentView(row: Body): Body {
+  private static readonly BUG_COMMENT_MAX_LENGTH = 10000;
+  // Per comment, across edits — the same ten FilesInterceptor allows in a single request.
+  private static readonly BUG_COMMENT_MAX_ATTACHMENTS = 10;
+  // How long after posting the author may still edit (text or files). Deleting has no limit.
+  private static readonly BUG_COMMENT_EDIT_WINDOW_MINUTES = 60;
+  private static readonly BUG_COMMENT_COLUMNS = "id, bug_id, author_id, body, created_at, updated_at";
+
+  private bugCommentView(row: Body, attachments: Body[] = []): Body {
     return {
       id: String(row.id),
       bugId: String(row.bug_id),
       authorId: row.author_id ? String(row.author_id) : null,
       authorName: row.author_name ? String(row.author_name) : "Unknown",
       body: String(row.body || ""),
+      // Both timestamps come from the same now() on insert, and updated_at only moves when an edit
+      // actually changes the text or the files (a no-op PATCH leaves it alone), so any gap means edited.
+      isEdited: new Date(row.updated_at).getTime() > new Date(row.created_at).getTime(),
+      // When the author's edit window closes, so the UI can stop offering Edit. Advisory only:
+      // updateBugComment enforces it against the database clock, not this value.
+      editableUntil: new Date(new Date(row.created_at).getTime() + LegacyService.BUG_COMMENT_EDIT_WINDOW_MINUTES * 60_000).toISOString(),
+      attachments,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString()
     };
@@ -6619,6 +6634,152 @@ export class LegacyService implements OnModuleInit {
     return res.rows[0];
   }
 
+  /** A live comment on this bug, or the 404 a missing one gets. */
+  private async bugCommentRow(bugId: string, commentId: string): Promise<Body> {
+    if (!isUuid(commentId)) throw new NotFoundException({ error: "Comment not found" });
+    const res = await this.db.query(
+      `SELECT c.id, c.bug_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name,
+              c.created_at > now() - make_interval(mins => $3) AS within_edit_window
+       FROM bug_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       WHERE c.id = $1 AND c.bug_id = $2 AND c.is_deleted = false`,
+      [commentId, bugId, LegacyService.BUG_COMMENT_EDIT_WINDOW_MINUTES]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+    return res.rows[0];
+  }
+
+  /*
+   * A comment's files live in the generic `attachments` table as entity_type='bug_comment', exactly
+   * as bug evidence does with 'bug'. Keeping them out of 'bug' is what keeps them out of the bug's
+   * own Attachments list and out of DELETE /api/bugs/attachments/:id, which any project member may
+   * call — removing a comment's file goes through the comment, under the comment's permissions.
+   */
+  private async bugCommentAttachments(commentIds: string[]): Promise<Map<string, Body[]>> {
+    const byComment = new Map<string, Body[]>();
+    if (!commentIds.length) return byComment;
+    const res = await this.db.query(
+      `SELECT id, entity_id, file_name, content_type, file_size, storage_path, created_at
+       FROM attachments
+       WHERE entity_type = 'bug_comment' AND entity_id = ANY($1::uuid[]) AND deleted_at IS NULL
+       ORDER BY created_at ASC, id ASC`,
+      [commentIds]
+    );
+    for (const row of res.rows) {
+      const key = String(row.entity_id);
+      const list = byComment.get(key) ?? [];
+      list.push({
+        id: String(row.id),
+        fileName: String(row.file_name),
+        contentType: row.content_type ? String(row.content_type) : "",
+        fileSize: Number(row.file_size ?? 0),
+        createdAt: new Date(row.created_at).toISOString(),
+        storagePath: String(row.storage_path)
+      });
+      byComment.set(key, list);
+    }
+    return byComment;
+  }
+
+  /** The client-facing shape: the storage key never leaves the server. */
+  private static publicCommentAttachments(list: Body[] = []): Body[] {
+    return list.map(({ storagePath: _storagePath, ...rest }) => rest);
+  }
+
+  /** Comment text, validated the same way on create and edit. */
+  private static bugCommentText(raw: unknown): string {
+    // String() would store an object as "[object Object]" and a number as its digits — refuse
+    // anything that is not text instead.
+    if (raw !== undefined && raw !== null && typeof raw !== "string") {
+      throw new BadRequestException({ error: "Comment must be text." });
+    }
+    const text = ((raw as string | null | undefined) ?? "").trim();
+    if (!text) throw new BadRequestException({ error: "Comment cannot be empty." });
+    if (text.length > LegacyService.BUG_COMMENT_MAX_LENGTH) {
+      throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+    }
+    return text;
+  }
+
+  /**
+   * `removeAttachmentIds` as JSON (an array) or as a multipart field (a JSON-encoded array, or one
+   * bare id). Anything else is a malformed request rather than "remove nothing".
+   */
+  private static attachmentIdList(raw: unknown): string[] {
+    if (raw === undefined || raw === null || raw === "") return [];
+    let value: unknown = raw;
+    if (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = [value];
+      }
+    }
+    if (typeof value === "string") value = [value];
+    if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) {
+      throw new BadRequestException({ error: "removeAttachmentIds must be a list of attachment ids." });
+    }
+    return Array.from(new Set(value as string[]));
+  }
+
+  /** Validates a batch of comment files before anything is stored — all or nothing, like bug evidence. */
+  private async assertBugCommentFiles(organizationId: string, files: Array<{ originalname: string; size: number }>, existing: number) {
+    if (existing + files.length > LegacyService.BUG_COMMENT_MAX_ATTACHMENTS) {
+      throw new BadRequestException({
+        error: `A comment can have at most ${LegacyService.BUG_COMMENT_MAX_ATTACHMENTS} attachments.`
+      });
+    }
+    if (!files.length) return;
+    LegacyService.assertValidEvidenceFiles(files);
+    await this.planLimits.assertStorageAvailable(organizationId, files.reduce((sum, file) => sum + file.size, 0));
+  }
+
+  /**
+   * Stores already-validated files against a comment. If any write fails, the objects and rows this
+   * call already made are removed again before the error propagates, so a failed upload never leaves
+   * half its files attached (or billed).
+   */
+  private async storeBugCommentFiles(
+    projectId: string,
+    bugId: string,
+    commentId: string,
+    uid: string,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    const stored: Array<{ key: string; id?: string }> = [];
+    try {
+      for (const file of files) {
+        const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
+        const entry: { key: string; id?: string } = {
+          key: `bugs/${projectId}/${bugId}/comments/${commentId}/${randomUUID()}${ext ? `.${ext}` : ""}`
+        };
+        await this.storage.put(entry.key, file.buffer, file.mimetype);
+        stored.push(entry);
+        const res = await this.db.query<{ id: string }>(
+          `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
+           VALUES ($1, 'bug_comment', $2, $3, $4, $5, $6, $7) RETURNING id`,
+          [projectId, commentId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, entry.key, uid]
+        );
+        entry.id = res.rows[0].id;
+      }
+    } catch (err) {
+      for (const entry of stored) {
+        await this.storage.delete(entry.key).catch(() => undefined);
+        if (entry.id) await this.db.query("DELETE FROM attachments WHERE id = $1", [entry.id]).catch(() => undefined);
+      }
+      throw err;
+    }
+  }
+
+  /** Destroys the stored objects and soft-deletes the rows, as deleteBugAttachment does for evidence. */
+  private async removeBugCommentFiles(files: Body[], uid: string) {
+    for (const file of files) {
+      await this.storage.delete(String(file.storagePath));
+      await this.db.query("UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [file.id, uid]);
+    }
+  }
+
   async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     await this.bugInProject(projectId, bugId);
@@ -6631,45 +6792,157 @@ export class LegacyService implements OnModuleInit {
        ORDER BY c.created_at ASC, c.id ASC`,
       [bugId]
     );
-    const list = res.rows.map((row) => this.bugCommentView(row));
+    const files = await this.bugCommentAttachments(res.rows.map((row) => String(row.id)));
+    const list = res.rows.map((row) => this.bugCommentView(row, LegacyService.publicCommentAttachments(files.get(String(row.id)))));
     return { list, total: list.length };
   }
 
-  async createBugComment(projectId: string, userId: string | null | undefined, bugId: string, body: Body) {
+  /**
+   * JSON `{ body }`, or multipart with a `body` field plus up to ten `files` — one request, so a
+   * comment and its files are saved together: if storing a file fails, the comment is removed again
+   * rather than left posted without the evidence it refers to.
+   */
+  async createBugComment(
+    projectId: string,
+    userId: string | null | undefined,
+    bugId: string,
+    body: Body,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }> = []
+  ) {
     const uid = this.requireUser(userId);
-    await this.requireProjectAccess(uid, projectId);
+    const project = await this.requireProjectAccess(uid, projectId);
     const bug = await this.bugInProject(projectId, bugId);
-
-    // String() would store an object as "[object Object]" and a number as its digits — refuse
-    // anything that is not text instead.
-    const raw = body?.body;
-    if (raw !== undefined && raw !== null && typeof raw !== "string") {
-      throw new BadRequestException({ error: "Comment must be text." });
-    }
-    const text = (raw ?? "").trim();
-    if (!text) throw new BadRequestException({ error: "Comment cannot be empty." });
-    if (text.length > 10000) throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+    const text = LegacyService.bugCommentText(body?.body);
+    const uploads = files ?? [];
+    await this.assertBugCommentFiles(String(project.organization_id), uploads, 0);
 
     const res = await this.db.query(
       `WITH inserted AS (
          INSERT INTO bug_comments (project_id, bug_id, author_id, body)
          VALUES ($1, $2, $3, $4)
-         RETURNING id, bug_id, author_id, body, created_at, updated_at
+         RETURNING ${LegacyService.BUG_COMMENT_COLUMNS}
        )
        SELECT i.*, COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
        FROM inserted i
        LEFT JOIN users a ON a.id = i.author_id`,
       [projectId, bugId, uid, text]
     );
-    await this.logProjectActivity(projectId, uid, "commented", "bug", bugId, bug.title, { commentId: res.rows[0].id });
+    const commentId = String(res.rows[0].id);
+    if (uploads.length) {
+      try {
+        await this.storeBugCommentFiles(projectId, bugId, commentId, uid, uploads);
+      } catch (err) {
+        await this.db.query("DELETE FROM bug_comments WHERE id = $1", [commentId]);
+        throw err;
+      }
+    }
+    await this.logProjectActivity(projectId, uid, "commented", "bug", bugId, bug.title, { commentId });
     for (const mentioned of await this.bugCommentMentions(projectId, text)) {
       await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
-        commentId: res.rows[0].id,
+        commentId,
         mentionedUserId: mentioned.id,
         mentionedName: mentioned.name
       });
     }
-    return this.bugCommentView(res.rows[0]);
+    const attached = await this.bugCommentAttachments([commentId]);
+    return this.bugCommentView(res.rows[0], LegacyService.publicCommentAttachments(attached.get(commentId)));
+  }
+
+  /**
+   * Edits a comment's text and/or its files (`removeAttachmentIds`, new multipart `files`). The
+   * author's alone, as in the Knowledge Base: a manager rewriting someone else's words would
+   * misattribute them. Moderation is deleteBugComment. Only within BUG_COMMENT_EDIT_WINDOW_MINUTES
+   * of posting, so a discussion can't be rewritten after others have read and replied to it.
+   */
+  async updateBugComment(
+    projectId: string,
+    userId: string | null | undefined,
+    bugId: string,
+    commentId: string,
+    body: Body,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }> = []
+  ) {
+    const uid = this.requireUser(userId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const comment = await this.bugCommentRow(bugId, commentId);
+    if (comment.author_id !== uid) throw new ForbiddenException({ error: "You can only edit your own comments" });
+    // Judged by the database clock (bugCommentRow), the same clock that stamped created_at.
+    if (!comment.within_edit_window) {
+      throw new ForbiddenException({ error: "Comments can only be edited within 1 hour of posting." });
+    }
+
+    const text = body?.body === undefined ? null : LegacyService.bugCommentText(body.body);
+    const removeIds = LegacyService.attachmentIdList(body?.removeAttachmentIds);
+    const current = (await this.bugCommentAttachments([commentId])).get(commentId) ?? [];
+    // Only this comment's own files can be removed through it — an id from another comment or from
+    // the bug's evidence is simply not found here.
+    const removing = current.filter((file) => removeIds.includes(String(file.id)));
+    if (removing.length !== removeIds.length) throw new NotFoundException({ error: "Attachment not found" });
+    const uploads = files ?? [];
+    await this.assertBugCommentFiles(String(project.organization_id), uploads, current.length - removing.length);
+
+    const textChanged = text !== null && text !== String(comment.body);
+    if (!textChanged && !removing.length && !uploads.length) {
+      return this.bugCommentView(comment, LegacyService.publicCommentAttachments(current));
+    }
+
+    // New files first: it is the step that can fail, and nothing destructive has happened yet.
+    if (uploads.length) await this.storeBugCommentFiles(projectId, bugId, commentId, uid, uploads);
+    await this.removeBugCommentFiles(removing, uid);
+    const updated = await this.db.query(
+      `UPDATE bug_comments SET body = COALESCE($2, body), updated_at = now()
+       WHERE id = $1 AND is_deleted = false
+       RETURNING ${LegacyService.BUG_COMMENT_COLUMNS}`,
+      [commentId, textChanged ? text : null]
+    );
+    // Deleted by someone else between the read above and this write.
+    if (!updated.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+
+    await this.logProjectActivity(projectId, uid, "comment_edited", "bug", bugId, bug.title, {
+      commentId,
+      ...(textChanged ? { textChanged: true } : {}),
+      ...(uploads.length ? { attachmentsAdded: uploads.length } : {}),
+      ...(removing.length ? { attachmentsRemoved: removing.length } : {})
+    });
+    // Only people the edit newly names — re-saving a comment must not log the same mention again.
+    if (textChanged) {
+      const before = new Set((await this.bugCommentMentions(projectId, String(comment.body))).map((m) => m.id));
+      for (const mentioned of await this.bugCommentMentions(projectId, text!)) {
+        if (before.has(mentioned.id)) continue;
+        await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
+          commentId,
+          mentionedUserId: mentioned.id,
+          mentionedName: mentioned.name
+        });
+      }
+    }
+    const attached = await this.bugCommentAttachments([commentId]);
+    return this.bugCommentView(
+      { ...updated.rows[0], author_name: comment.author_name },
+      LegacyService.publicCommentAttachments(attached.get(commentId))
+    );
+  }
+
+  /** Soft-deletes a comment and destroys its files. The author, or a project owner/manager. */
+  async deleteBugComment(projectId: string, userId: string | null | undefined, bugId: string, commentId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const comment = await this.bugCommentRow(bugId, commentId);
+    this.kbRequireMutateAccess(await this.kbProjectRole(uid, projectId), comment.author_id ? String(comment.author_id) : null, uid);
+
+    const deleted = await this.db.query(
+      "UPDATE bug_comments SET is_deleted = true, deleted_at = now(), updated_at = now() WHERE id = $1 AND is_deleted = false RETURNING id",
+      [commentId]
+    );
+    if (!deleted.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+    await this.removeBugCommentFiles((await this.bugCommentAttachments([commentId])).get(commentId) ?? [], uid);
+    await this.logProjectActivity(projectId, uid, "comment_deleted", "bug", bugId, bug.title, {
+      commentId,
+      authorId: comment.author_id ? String(comment.author_id) : null
+    });
+    return { success: true };
   }
 
   /**
@@ -6923,13 +7196,14 @@ export class LegacyService implements OnModuleInit {
 
   // `scopeProjectId` keeps a lookup by attachment id from crossing into another project's
   // evidence: the caller has already been authorized for that project, so the row has to
-  // belong to it too or it simply isn't found.
-  private async bugAttachment(attachmentId: string, scopeProjectId?: string): Promise<Body> {
+  // belong to it too or it simply isn't found. `entityTypes` is 'bug' unless the caller opts in:
+  // only the download widens it to comment files, so the delete route can never reach them.
+  private async bugAttachment(attachmentId: string, scopeProjectId?: string, entityTypes: string[] = ["bug"]): Promise<Body> {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
-      `SELECT * FROM attachments WHERE id = $1 AND entity_type = 'bug' AND deleted_at IS NULL
+      `SELECT * FROM attachments WHERE id = $1 AND entity_type = ANY($3::text[]) AND deleted_at IS NULL
        AND ($2::uuid IS NULL OR project_id = $2::uuid)`,
-      [attachmentId, scopeProjectId ?? null]
+      [attachmentId, scopeProjectId ?? null, entityTypes]
     );
     if (!res.rows[0]) throw new NotFoundException({ error: "Attachment not found" });
     return res.rows[0];
@@ -6939,7 +7213,7 @@ export class LegacyService implements OnModuleInit {
     // Bug evidence is confidential: an attachment id turning up in a link, a log line or an
     // exported report must not be enough to hand the file to whoever holds it.
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const file = await this.bugAttachment(attachmentId, projectId);
+    const file = await this.bugAttachment(attachmentId, projectId, ["bug", "bug_comment"]);
     if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
       throw new NotFoundException({ error: "File content is not available" });
     }

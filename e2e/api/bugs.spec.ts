@@ -10,6 +10,7 @@ import {
   type RbacTenant,
 } from "../utils/rbac-tenant";
 import { exec, literal, scalar } from "../utils/psql";
+import { filesForm, filesFormWith, pngFile, textFile, type UploadFile } from "../utils/uploads";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
@@ -1289,9 +1290,12 @@ test.describe("bug_links soft-delete (hard-delete remediation Phase 7)", () => {
 });
 
 /*
- * Comments on a bug (V129) — GET/POST /api/projects/:projectId/bugs/:bugId/comments. Flat and
- * chronological: no replies, edit, delete or resolve. The read-only plan lock on the POST is covered
- * in billing-lifecycle.spec.ts (BUGC-A-10), which owns the tenant that can be locked.
+ * Comments on a bug (V129) — GET/POST /api/projects/:projectId/bugs/:bugId/comments, and PATCH/DELETE
+ * …/comments/:commentId. Flat and chronological: no replies or resolve. The body is Markdown, stored
+ * exactly as sent; a comment can carry files (multipart, entity_type 'bug_comment' in attachments).
+ * Role rules (author edits; author/owner/manager deletes) are in "bug comment permissions" below.
+ * The read-only plan lock is covered in billing-lifecycle.spec.ts (BUGC-A-10), which owns the tenant
+ * that can be locked.
  */
 test.describe("bug comments", () => {
   let asB: APIRequestContext;
@@ -1475,6 +1479,406 @@ test.describe("bug comments", () => {
     await request.delete(`/api/bugs/${bug.id}`);
     const res = await request.get(commentsUrl(bug.id), { failOnStatusCode: false });
     expect(res.status()).toBe(404);
+  });
+
+  function commentUrl(bugId: string, commentId: string, projectId: string = ctx.projectId) {
+    return `${commentsUrl(bugId, projectId)}/${commentId}`;
+  }
+
+  function downloadUrl(attachmentId: string) {
+    return `/api/projects/${ctx.projectId}/bugs/attachments/${attachmentId}/download`;
+  }
+
+  /** A comment posted as multipart with these files, the way the comment box sends one. */
+  async function commentWithFiles(request: APIRequestContext, bugId: string, body: string, files: UploadFile[]) {
+    const res = await request.post(commentsUrl(bugId), { multipart: filesFormWith({ body }, files) });
+    expect(res.status(), await res.text()).toBe(201);
+    return res.json();
+  }
+
+  test("BUGC-A-11 a comment posted with files carries them, they download byte-for-byte, and they are not bug evidence", async ({ request }) => {
+    const bug = await newBug(request, "Files");
+    try {
+      const png = pngFile("screen.png");
+      const log = textFile("console.log.txt", "TypeError: x is undefined");
+      const created = await commentWithFiles(request, bug.id, "See the **screenshot** and log.", [png, log]);
+      expect(created.body).toBe("See the **screenshot** and log.");
+      expect(created.isEdited).toBe(false);
+      expect(created.attachments.map((a: { fileName: string }) => a.fileName)).toEqual(["screen.png", "console.log.txt"]);
+      expect(created.attachments[0]).toMatchObject({ contentType: "image/png", fileSize: png.body.length });
+      expect(created.attachments[0].storagePath, "the storage key must not leave the server").toBeUndefined();
+
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.list).toEqual([created]);
+
+      for (const [att, file] of [[created.attachments[0], png], [created.attachments[1], log]] as const) {
+        const download = await request.get(downloadUrl(att.id));
+        expect(download.ok(), `download ${att.fileName}: ${download.status()}`).toBeTruthy();
+        expect(Buffer.from(await download.body()).equals(file.body)).toBeTruthy();
+      }
+
+      // The bug's own Attachments list is evidence filed with the bug; a comment's files stay with the comment.
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).attachments).toEqual([]);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-12 a rejected file, or files with no text, refuses the whole comment and stores nothing", async ({ request }) => {
+    const bug = await newBug(request, "Files Invalid");
+    try {
+      const cases: Array<[string, Record<string, string>, UploadFile[], string]> = [
+        ["unsupported type", { body: "With an exe" }, [pngFile("ok.png"), { name: "setup.exe", mimeType: "application/octet-stream", body: Buffer.from("MZ") }], "aren't supported"],
+        ["empty file", { body: "With an empty file" }, [{ name: "empty.txt", mimeType: "text/plain", body: Buffer.alloc(0) }], "empty"],
+        ["no text", { body: "   " }, [pngFile("alone.png")], "Comment cannot be empty."],
+      ];
+      for (const [label, fields, files, error] of cases) {
+        const res = await request.post(commentsUrl(bug.id), { multipart: filesFormWith(fields, files), failOnStatusCode: false });
+        expect(res.status(), label).toBe(400);
+        expect((await res.json()).error, label).toContain(error);
+      }
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(0);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-13 the author edits a comment's text: it is saved, marked edited, and listed; validation matches create", async ({ request }) => {
+    const bug = await newBug(request, "Edit");
+    try {
+      const created = await (await request.post(commentsUrl(bug.id), { data: { body: "Fails on *Chrome*" } })).json();
+
+      // Saving the same text is not an edit.
+      const same = await request.patch(commentUrl(bug.id, created.id), { data: { body: "  Fails on *Chrome*  " } });
+      expect(same.status()).toBe(200);
+      expect(await same.json()).toEqual(created);
+
+      const res = await request.patch(commentUrl(bug.id, created.id), { data: { body: "  Fails on *Chrome* and **Firefox**\n- v126\n- v127  " } });
+      expect(res.status(), await res.text()).toBe(200);
+      const edited = await res.json();
+      expect(edited).toMatchObject({ id: created.id, authorId: created.authorId, body: "Fails on *Chrome* and **Firefox**\n- v126\n- v127", isEdited: true });
+      expect(edited.createdAt).toBe(created.createdAt);
+      expect(Date.parse(edited.updatedAt)).toBeGreaterThan(Date.parse(created.updatedAt));
+      expect((await (await request.get(commentsUrl(bug.id))).json()).list).toEqual([edited]);
+
+      for (const [data, error] of [
+        [{ body: "" }, "Comment cannot be empty."],
+        [{ body: " \n " }, "Comment cannot be empty."],
+        [{ body: null }, "Comment cannot be empty."],
+        [{ body: 7 }, "Comment must be text."],
+        [{ body: { text: "x" } }, "Comment must be text."],
+        [{ body: "x".repeat(10_001) }, "10,000"],
+      ] as const) {
+        const bad = await request.patch(commentUrl(bug.id, created.id), { data, failOnStatusCode: false });
+        expect(bad.status(), JSON.stringify(data).slice(0, 60)).toBe(400);
+        expect((await bad.json()).error).toContain(error);
+      }
+      expect((await (await request.get(commentsUrl(bug.id))).json()).list[0].body, "a refused edit changes nothing").toBe(edited.body);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-14 editing adds and removes a comment's files; only its own files can be removed, and at most ten kept", async ({ request }) => {
+    const bug = await newBug(request, "Edit Files");
+    try {
+      const evidence = await request.post(`/api/projects/${ctx.projectId}/bugs/${bug.id}/attachments`, { multipart: filesForm([textFile("bug-evidence.txt")]) });
+      const evidenceId = (await evidence.json()).list[0].id;
+      const other = await commentWithFiles(request, bug.id, "Another comment", [textFile("other.txt")]);
+      const created = await commentWithFiles(request, bug.id, "Two files", [textFile("keep.txt"), textFile("drop.txt")]);
+      const [keep, drop] = created.attachments;
+
+      // Ids that belong to the bug's evidence, to another comment, or to nothing are not this comment's.
+      for (const id of [evidenceId, other.attachments[0].id, "00000000-0000-0000-0000-000000000000", "not-a-uuid"]) {
+        const res = await request.patch(commentUrl(bug.id, created.id), { data: { removeAttachmentIds: [id] }, failOnStatusCode: false });
+        expect(res.status(), id).toBe(404);
+      }
+      const malformed = await request.patch(commentUrl(bug.id, created.id), { data: { removeAttachmentIds: [42] }, failOnStatusCode: false });
+      expect(malformed.status()).toBe(400);
+      expect((await request.get(downloadUrl(evidenceId))).ok(), "bug evidence is untouched").toBeTruthy();
+
+      const res = await request.patch(commentUrl(bug.id, created.id), {
+        multipart: filesFormWith({ removeAttachmentIds: JSON.stringify([drop.id]) }, [pngFile("added.png")]),
+      });
+      expect(res.status(), await res.text()).toBe(200);
+      const edited = await res.json();
+      expect(edited.body, "files-only edit keeps the text").toBe("Two files");
+      expect(edited.isEdited).toBe(true);
+      expect(edited.attachments.map((a: { fileName: string }) => a.fileName)).toEqual(["keep.txt", "added.png"]);
+      expect(edited.attachments[0].id).toBe(keep.id);
+      expect((await request.get(downloadUrl(drop.id), { failOnStatusCode: false })).status(), "a removed file is gone").toBe(404);
+
+      // Two kept + nine new is eleven: refused whole, nothing added.
+      const tooMany = Array.from({ length: 9 }, (_, i) => textFile(`extra-${i}.txt`));
+      const over = await request.patch(commentUrl(bug.id, created.id), { multipart: filesFormWith({}, tooMany), failOnStatusCode: false });
+      expect(over.status()).toBe(400);
+      expect((await over.json()).error).toContain("at most 10");
+      const after = (await (await request.get(commentsUrl(bug.id))).json()).list.find((c: { id: string }) => c.id === created.id);
+      expect(after.attachments).toHaveLength(2);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-15 deleting a comment removes it and its files; a second delete or a later edit is a 404", async ({ request }) => {
+    const bug = await newBug(request, "Delete");
+    try {
+      const kept = await (await request.post(commentsUrl(bug.id), { data: { body: "Stays" } })).json();
+      const doomed = await commentWithFiles(request, bug.id, "Goes", [textFile("goes.txt")]);
+
+      const res = await request.delete(commentUrl(bug.id, doomed.id));
+      expect(res.status(), await res.text()).toBe(200);
+      expect(await res.json()).toEqual({ success: true });
+
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.list.map((c: { id: string }) => c.id)).toEqual([kept.id]);
+      expect((await request.get(downloadUrl(doomed.attachments[0].id), { failOnStatusCode: false })).status()).toBe(404);
+
+      expect((await request.delete(commentUrl(bug.id, doomed.id), { failOnStatusCode: false })).status()).toBe(404);
+      expect((await request.patch(commentUrl(bug.id, doomed.id), { data: { body: "Back" }, failOnStatusCode: false })).status()).toBe(404);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-16 a comment's file cannot be deleted through the bug-evidence delete route", async ({ request }) => {
+    const bug = await newBug(request, "Evidence Route");
+    try {
+      const created = await commentWithFiles(request, bug.id, "Mine", [textFile("mine.txt")]);
+      const res = await request.delete(`/api/bugs/attachments/${created.attachments[0].id}`, { failOnStatusCode: false });
+      expect(res.status()).toBe(404);
+      expect((await request.get(downloadUrl(created.attachments[0].id))).ok()).toBeTruthy();
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-17 edit and delete 404 for an unknown, malformed or other bug's comment, and through another project", async ({ request }) => {
+    const bug = await newBug(request, "Edit 404");
+    const otherBug = await newBug(request, "Edit 404 Other");
+    const otherProject = await (
+      await request.post("/api/projects", {
+        data: { name: `E2E Bug Comments Edit Other ${Date.now()}`, projectKey: `BE${Date.now().toString(36).toUpperCase()}`, projectType: "tesbox" },
+      })
+    ).json();
+    try {
+      const comment = await (await request.post(commentsUrl(bug.id), { data: { body: "Original" } })).json();
+      const cases: Array<[string, string]> = [
+        ["unknown", commentUrl(bug.id, "00000000-0000-0000-0000-000000000000")],
+        ["malformed", commentUrl(bug.id, "not-a-uuid")],
+        ["addressed through another bug", commentUrl(otherBug.id, comment.id)],
+        ["addressed through another project", commentUrl(bug.id, comment.id, otherProject.id)],
+      ];
+      for (const [label, url] of cases) {
+        expect((await request.patch(url, { data: { body: "Changed" }, failOnStatusCode: false })).status(), `edit: ${label}`).toBe(404);
+        expect((await request.delete(url, { failOnStatusCode: false })).status(), `delete: ${label}`).toBe(404);
+      }
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.list.map((c: { body: string }) => c.body)).toEqual(["Original"]);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/bugs/${otherBug.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${otherProject.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-18 another workspace and an anonymous caller can neither edit nor delete a comment, nor download its files", async ({ request }) => {
+    const bug = await newBug(request, "Edit Authz");
+    try {
+      const comment = await commentWithFiles(request, bug.id, "Account A only", [textFile("a-only.txt")]);
+      for (const [label, caller] of [["account B", asB], ["anonymous", anon]] as const) {
+        const edit = await caller.patch(commentUrl(bug.id, comment.id), { data: { body: `From ${label}` }, failOnStatusCode: false });
+        expect([401, 403, 404], `${label} edit`).toContain(edit.status());
+        const del = await caller.delete(commentUrl(bug.id, comment.id), { failOnStatusCode: false });
+        expect([401, 403, 404], `${label} delete`).toContain(del.status());
+        const download = await caller.get(downloadUrl(comment.attachments[0].id), { failOnStatusCode: false });
+        expect([401, 403, 404], `${label} download`).toContain(download.status());
+      }
+      const listed = await (await request.get(commentsUrl(bug.id))).json();
+      expect(listed.list).toEqual([comment]);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-22 the author can edit for an hour after posting; after that every edit is refused and changes nothing, but delete still works", async ({ request }) => {
+    const bug = await newBug(request, "Edit Window");
+    // Only created_at moves: the window is measured from posting, by the database clock.
+    const postedMinutesAgo = (commentId: string, minutes: number) =>
+      exec(`UPDATE bug_comments SET created_at = now() - make_interval(mins => ${minutes}) WHERE id = ${literal(commentId)};`);
+    try {
+      const created = await commentWithFiles(request, bug.id, "Posted a while ago", [textFile("kept.txt")]);
+      expect(Date.parse(created.editableUntil) - Date.parse(created.createdAt)).toBe(60 * 60_000);
+
+      postedMinutesAgo(created.id, 59);
+      const inside = await request.patch(commentUrl(bug.id, created.id), { data: { body: "Edited at 59 minutes" } });
+      expect(inside.status(), await inside.text()).toBe(200);
+
+      postedMinutesAgo(created.id, 61);
+      const attempts: Array<[string, Parameters<APIRequestContext["patch"]>[1]]> = [
+        ["new text", { data: { body: "Edited at 61 minutes" } }],
+        ["the same text", { data: { body: "Edited at 59 minutes" } }],
+        ["removing a file", { data: { removeAttachmentIds: [created.attachments[0].id] } }],
+        ["adding a file", { multipart: filesFormWith({}, [textFile("late.txt")]) }],
+      ];
+      for (const [label, options] of attempts) {
+        const res = await request.patch(commentUrl(bug.id, created.id), { ...options, failOnStatusCode: false });
+        expect(res.status(), label).toBe(403);
+        expect((await res.json()).error, label).toBe("Comments can only be edited within 1 hour of posting.");
+      }
+
+      const after = (await (await request.get(commentsUrl(bug.id))).json()).list[0];
+      expect(after.body).toBe("Edited at 59 minutes");
+      expect(after.attachments.map((a: { fileName: string }) => a.fileName)).toEqual(["kept.txt"]);
+      expect(Date.parse(after.editableUntil)).toBeLessThan(Date.now());
+
+      // The limit is on rewriting, not on removing: the author can still delete it.
+      expect((await request.delete(commentUrl(bug.id, created.id))).status()).toBe(200);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * Who may change a bug comment: only its author edits it (a manager rewriting someone's words would
+ * misattribute them), while the author or a project owner/manager may delete it. Same tenant as
+ * "bug activity" — owner, manager and QA all in one project, plus a guest outside it — so each rule
+ * is exercised by a real second account rather than inferred.
+ */
+test.describe("bug comment permissions", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let asManager: APIRequestContext;
+  let asQa: APIRequestContext;
+  let asGuest: APIRequestContext;
+
+  type Activity = { action: string; actorId: string | null; diff: string | null };
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("bugs-assignee");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    asManager = await loginAs(tenant.manager);
+    asQa = await loginAs(tenant.qa);
+    asGuest = await loginAs(tenant.guest);
+  });
+
+  test.afterAll(async () => {
+    if (tenant) resetRbacMembership(tenant);
+    await asOwner?.dispose();
+    await asManager?.dispose();
+    await asQa?.dispose();
+    await asGuest?.dispose();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  const commentsUrl = (bugId: string) => `/api/projects/${tenant!.mainProjectId}/bugs/${bugId}/comments`;
+  const commentUrl = (bugId: string, commentId: string) => `${commentsUrl(bugId)}/${commentId}`;
+
+  async function newBug(label: string): Promise<{ id: string; title: string }> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, {
+      data: { title: `E2E Bug Comment Perms ${label} ${Date.now()}` },
+    });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  async function comment(as: APIRequestContext, bugId: string, body: string): Promise<{ id: string; body: string }> {
+    const res = await as.post(commentsUrl(bugId), { data: { body } });
+    expect(res.status(), await res.text()).toBe(201);
+    return res.json();
+  }
+
+  async function activityOf(bugId: string): Promise<Activity[]> {
+    const res = await asOwner.get(`/api/projects/${tenant!.mainProjectId}/activity`, {
+      params: { entityType: "bug", entityId: bugId, limit: "100" },
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    return ((await res.json()).list as Activity[]).slice().reverse();
+  }
+
+  const diffOf = (row: Activity) => JSON.parse(row.diff || "{}");
+
+  test("BUGC-A-19 only the author may edit; QA and even the owner or a manager are refused, and nothing changes", async () => {
+    const bug = await newBug("Edit");
+    try {
+      const byQa = await comment(asQa, bug.id, "QA's words");
+      for (const [label, as] of [["owner", asOwner], ["manager", asManager]] as const) {
+        const res = await as.patch(commentUrl(bug.id, byQa.id), { data: { body: `Rewritten by ${label}` }, failOnStatusCode: false });
+        expect(res.status(), label).toBe(403);
+        expect((await res.json()).error).toContain("your own comments");
+      }
+      const byOwner = await comment(asOwner, bug.id, "Owner's words");
+      expect((await asQa.patch(commentUrl(bug.id, byOwner.id), { data: { body: "Rewritten by QA" }, failOnStatusCode: false })).status()).toBe(403);
+      // A guest outside the project does not learn the comment exists.
+      expect((await asGuest.patch(commentUrl(bug.id, byOwner.id), { data: { body: "x" }, failOnStatusCode: false })).status()).toBe(404);
+
+      const own = await asQa.patch(commentUrl(bug.id, byQa.id), { data: { body: "QA's words, revised" } });
+      expect(own.status()).toBe(200);
+
+      const listed = (await (await asOwner.get(commentsUrl(bug.id))).json()).list;
+      expect(listed.map((c: { body: string }) => c.body)).toEqual(["QA's words, revised", "Owner's words"]);
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-20 the author, the owner or a manager may delete; another QA engineer's or a guest's attempt is refused", async () => {
+    const bug = await newBug("Delete");
+    try {
+      const byOwner = await comment(asOwner, bug.id, "Owner's comment");
+      const res = await asQa.delete(commentUrl(bug.id, byOwner.id), { failOnStatusCode: false });
+      expect(res.status()).toBe(403);
+      expect((await asGuest.delete(commentUrl(bug.id, byOwner.id), { failOnStatusCode: false })).status()).toBe(404);
+
+      const forManager = await comment(asQa, bug.id, "Removed by the manager");
+      const forOwner = await comment(asQa, bug.id, "Removed by the owner");
+      const forSelf = await comment(asQa, bug.id, "Removed by its author");
+      expect((await asManager.delete(commentUrl(bug.id, forManager.id))).status()).toBe(200);
+      expect((await asOwner.delete(commentUrl(bug.id, forOwner.id))).status()).toBe(200);
+      expect((await asQa.delete(commentUrl(bug.id, forSelf.id))).status()).toBe(200);
+
+      const listed = (await (await asOwner.get(commentsUrl(bug.id))).json()).list;
+      expect(listed.map((c: { id: string }) => c.id)).toEqual([byOwner.id]);
+
+      // A moderator's delete is attributed to the moderator, and names whose comment it was.
+      const deletions = (await activityOf(bug.id)).filter((r) => r.action === "comment_deleted");
+      const byManager = deletions.find((r) => diffOf(r).commentId === forManager.id)!;
+      expect(byManager.actorId).toBe(tenant!.manager.userId);
+      expect(diffOf(byManager).authorId).toBe(tenant!.qa.userId);
+      expect(deletions).toHaveLength(3);
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-21 an edit logs comment_edited, and @mentions only the people it newly names — once", async () => {
+    const bug = await newBug("Mentions");
+    try {
+      const created = await comment(asOwner, bug.id, "Looping in @E2E bugs-assignee QA");
+      await asOwner.patch(commentUrl(bug.id, created.id), {
+        data: { body: `Looping in @E2E bugs-assignee QA and @${tenant!.manager.email}` },
+      });
+      // Re-saving with only formatting changed names nobody new.
+      await asOwner.patch(commentUrl(bug.id, created.id), {
+        data: { body: `Looping in **@E2E bugs-assignee QA** and @${tenant!.manager.email}` },
+      });
+
+      const rows = await activityOf(bug.id);
+      const edits = rows.filter((r) => r.action === "comment_edited");
+      expect(edits).toHaveLength(2);
+      expect(edits.every((r) => r.actorId === tenant!.owner.userId && diffOf(r).commentId === created.id)).toBe(true);
+
+      const mentioned = rows.filter((r) => r.action === "bug_mentioned").map((r) => diffOf(r).mentionedUserId);
+      expect(mentioned.sort()).toEqual([tenant!.manager.userId, tenant!.qa.userId].sort());
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
   });
 });
 

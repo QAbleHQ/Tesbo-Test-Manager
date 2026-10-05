@@ -1,6 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
-import { filesForm, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
+import { filesForm, filesFormWith, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 import {
   createBug,
   createProject,
@@ -2272,8 +2272,9 @@ test.describe("bug comments", () => {
         await expect(items.nth(i).locator("time")).toHaveAttribute("datetime", c.createdAt);
       }
       await expect(items.nth(0)).toContainText("First look: reproduces on Chrome.");
-      // Line breaks in a comment survive (whitespace-pre-wrap), rather than collapsing into one line.
-      await expect(items.nth(1).getByText(/Second look:\s+also on Firefox\./)).toBeVisible();
+      // Line breaks in a comment survive: the body is Markdown, rendered one block per line, rather
+      // than collapsing into one line.
+      await expect(items.nth(1).getByTestId("bug-comment-body").locator("p")).toHaveText(["Second look:", "also on Firefox."]);
 
       // Placement: after the last details field, inside the scrolling body, above the footer.
       const reportedOn = (await panelBody(page).getByText("Reported On", { exact: true }).boundingBox())!;
@@ -2327,7 +2328,7 @@ test.describe("bug comments", () => {
       await expect(items.first()).toContainText(body);
       await expect(section.getByText("No comments yet.")).toHaveCount(0);
       await expect(section.getByText("Comments (1)")).toBeVisible();
-      await expect(section.getByLabel("Add a comment")).toHaveValue("");
+      await expect(section.getByLabel("Add a comment")).toHaveText("");
       expect(listFetches).toBe(0);
 
       const persisted = await (await api.get(commentsUrl(bug.id))).json();
@@ -2360,7 +2361,7 @@ test.describe("bug comments", () => {
       await section.getByRole("button", { name: "Add Comment" }).click();
 
       await expect(section.getByTestId("bug-comment-error")).toContainText("Comment service unavailable.");
-      await expect(section.getByLabel("Add a comment")).toHaveValue(body);
+      await expect(section.getByLabel("Add a comment")).toHaveText(body);
       await expect(section.getByTestId("bug-comment")).toHaveCount(0);
       await expect(section.getByRole("button", { name: "Add Comment" })).toBeEnabled();
 
@@ -2422,7 +2423,7 @@ test.describe("bug comments", () => {
       const section = comments(panelBody(page));
       await expect(section.getByText("No comments yet.")).toBeVisible();
       await expect(section.getByText("Only on bug A")).toHaveCount(0);
-      await expect(section.getByLabel("Add a comment")).toHaveValue("");
+      await expect(section.getByLabel("Add a comment")).toHaveText("");
     } finally {
       await api.delete(`/api/bugs/${a.id}`, { failOnStatusCode: false });
       await api.delete(`/api/bugs/${b.id}`, { failOnStatusCode: false });
@@ -2447,6 +2448,379 @@ test.describe("bug comments", () => {
       const persisted = await (await api.get(commentsUrl(bug.id))).json();
       expect(persisted.list.map((c: { body: string }) => c.body)).toEqual(["Seeded before opening", body]);
     } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  /** The composer's rich-text box: a contenteditable labelled like the old textarea. */
+  function composer(section: Locator): Locator {
+    return section.getByRole("textbox", { name: "Add a comment" });
+  }
+
+  async function seedCommentWithFiles(bugId: string, body: string, files: UploadFile[]): Promise<SeededComment & { attachments: Attachment[] }> {
+    const res = await api.post(commentsUrl(bugId), { multipart: filesFormWith({ body }, files) });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  type Attachment = { id: string; fileName: string };
+
+  test("BUG-U-87 bold, italic, line breaks, both list kinds and a link are written with the toolbar and keyboard, stored as Markdown, and shown formatted", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Rich ${uniqueSuffix()}` });
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      const box = composer(section);
+      await box.click();
+
+      await page.keyboard.press("ControlOrMeta+b");
+      await page.keyboard.type("Bold words");
+      await page.keyboard.press("ControlOrMeta+b");
+      await page.keyboard.type(" then ");
+      await section.getByRole("button", { name: "Italic" }).click();
+      await page.keyboard.type("italic");
+      await section.getByRole("button", { name: "Italic" }).click();
+      await page.keyboard.press("Shift+Enter");
+      await page.keyboard.type("second line");
+      await page.keyboard.press("Enter");
+      await section.getByRole("button", { name: "Bullet list" }).click();
+      await page.keyboard.type("first");
+      await page.keyboard.press("Enter");
+      await page.keyboard.type("second");
+      // Enter on an empty item leaves the list.
+      await page.keyboard.press("Enter");
+      await page.keyboard.press("Enter");
+      await section.getByRole("button", { name: "Numbered list" }).click();
+      await page.keyboard.type("step one");
+      await page.keyboard.press("Enter");
+      await page.keyboard.press("Enter");
+      await page.keyboard.type("docs");
+      for (let i = 0; i < 4; i++) await page.keyboard.press("Shift+ArrowLeft");
+      page.once("dialog", (dialog) => void dialog.accept("https://example.com/docs"));
+      await section.getByRole("button", { name: "Link", exact: true }).click();
+
+      await section.getByRole("button", { name: "Add Comment" }).click();
+      const item = section.getByTestId("bug-comment");
+      await expect(item).toHaveCount(1);
+
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list[0].body).toBe(
+        "**Bold words** then *italic*\nsecond line\n- first\n- second\n1. step one\n[docs](https://example.com/docs)",
+      );
+
+      const shown = item.getByTestId("bug-comment-body");
+      await expect(shown.locator("strong")).toHaveText("Bold words");
+      await expect(shown.locator("em")).toHaveText("italic");
+      await expect(shown.locator("ul > li")).toHaveText(["first", "second"]);
+      await expect(shown.locator("ol > li")).toHaveText(["step one"]);
+      await expect(shown.getByRole("link", { name: "docs" })).toHaveAttribute("href", "https://example.com/docs");
+      await expect(shown.getByText("second line")).toBeVisible();
+      // The box is cleared for the next comment.
+      await expect(box).toHaveText("");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-88 pasting rich text keeps its formatting, Markdown pasted as text is parsed, and unsupported formatting becomes plain text", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Paste ${uniqueSuffix()}` });
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      const box = composer(section);
+      await box.click();
+
+      // A synthetic paste event carries both flavours a browser copy would; ProseMirror reads
+      // event.clipboardData, so this goes through the same handler a real Ctrl+V does.
+      const paste = (html: string, text: string) =>
+        box.evaluate(
+          (el, data) => {
+            const dt = new DataTransfer();
+            if (data.html) dt.setData("text/html", data.html);
+            dt.setData("text/plain", data.text);
+            el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+          },
+          { html, text },
+        );
+
+      await paste(
+        "<p><strong>Copied bold</strong> and <em>copied italic</em></p><ul><li>web item</li></ul><h2>A heading</h2><p><u>underlined</u></p>",
+        "Copied bold and copied italic",
+      );
+      await page.keyboard.press("Enter");
+      await paste("", "**md bold**\n1. md step");
+
+      await section.getByRole("button", { name: "Add Comment" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list[0].body).toBe("**Copied bold** and *copied italic*\n- web item\nA heading\nunderlined\n**md bold**\n1. md step");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-89 a comment's text is never rendered as HTML", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Escape ${uniqueSuffix()}` });
+    try {
+      await seedComment(bug.id, `<img src=x onerror="window.__commentXss=1"> <b>not bold</b> [x](javascript:alert(1))`);
+      await openPanel(page, bug.title);
+      const shown = comments(panelBody(page)).getByTestId("bug-comment-body");
+      await expect(shown).toContainText("<b>not bold</b>");
+      await expect(shown.locator("img, b")).toHaveCount(0);
+      await expect(shown.getByRole("link"), "only http(s) links render").toHaveCount(0);
+      expect(await page.evaluate(() => (window as unknown as { __commentXss?: number }).__commentXss)).toBeUndefined();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-90 typing @ offers project members; picking one inserts their name and the comment records the mention", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Mention ${uniqueSuffix()}` });
+    try {
+      const members = (await (await api.get(`/api/projects/${projectId}/members`)).json()) as Array<{ userId: string; name: string; email: string }>;
+      const me = members[0];
+      const label = me.name || me.email;
+
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      const box = composer(section);
+      await box.click();
+      await page.keyboard.type(`Over to @${label.slice(0, 3)}`);
+      const picker = section.getByRole("listbox", { name: "Mention a project member" });
+      await expect(picker.getByRole("option").first()).toContainText(label);
+
+      // Escape dismisses it without inserting anything — and without closing the side panel, which
+      // closes on any Escape that reaches the document.
+      await page.keyboard.press("Escape");
+      await expect(picker).toHaveCount(0);
+      await expect(panelBody(page)).toBeVisible();
+      await expect(box).toHaveText(`Over to @${label.slice(0, 3)}`);
+
+      // It stays closed for that "@"; a fresh one opens it again, and Enter picks the highlighted
+      // member instead of starting a new line.
+      await page.keyboard.type(" x");
+      await expect(picker).toHaveCount(0);
+      for (let i = 0; i < 6; i++) await page.keyboard.press("Backspace");
+      await page.keyboard.type(`@${label.slice(0, 3)}`);
+      await expect(picker).toBeVisible();
+      await page.keyboard.press("Enter");
+      await expect(picker).toHaveCount(0);
+      await page.keyboard.type("please check");
+      await expect(box).toHaveText(`Over to @${label} please check`);
+
+      await section.getByRole("button", { name: "Add Comment" }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list[0].body).toBe(`Over to @${label} please check`);
+
+      const feed = await (await api.get(`/api/projects/${projectId}/activity`, { params: { entityType: "bug", entityId: bug.id, limit: "50" } })).json();
+      const mention = feed.list.find((r: { action: string }) => r.action === "bug_mentioned");
+      expect(mention, "the picked member is recorded as mentioned").toBeTruthy();
+      expect(JSON.parse(mention.diff).mentionedUserId).toBe(me.userId);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-91 files attach to a comment: a bad file is refused at once, the rest post with it and show under the comment, not as bug evidence", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Files ${uniqueSuffix()}` });
+    try {
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      // The input is hidden behind the Attach button, so it is found by its label attribute.
+      const input = section.locator('input[type="file"][aria-label="Attach files to comment"]');
+
+      await input.setInputFiles([
+        { name: "screen.png", mimeType: "image/png", buffer: pngFile().body },
+        { name: "tool.exe", mimeType: "application/octet-stream", buffer: Buffer.from("MZ") },
+        { name: "console.txt", mimeType: "text/plain", buffer: Buffer.from("TypeError") },
+      ]);
+      await expect(section.getByTestId("bug-comment-file-rejections")).toContainText("tool.exe");
+      await expect(section.getByTestId("bug-comment-staged-file")).toHaveCount(2);
+      await section.getByRole("button", { name: "Remove console.txt" }).click();
+      await expect(section.getByTestId("bug-comment-staged-file")).toHaveCount(1);
+      await input.setInputFiles([{ name: "console.txt", mimeType: "text/plain", buffer: Buffer.from("TypeError") }]);
+
+      await composer(section).click();
+      await page.keyboard.type("Evidence attached");
+      await section.getByRole("button", { name: "Add Comment" }).click();
+
+      const item = section.getByTestId("bug-comment");
+      await expect(item).toHaveCount(1);
+      const files = item.getByTestId("bug-comment-attachments");
+      await expect(files.getByTestId("bug-attachment-image")).toHaveCount(1);
+      await expect(files.getByTestId("bug-attachment-file")).toContainText("console.txt");
+      // Read-only under the comment: its files are removed by editing it.
+      await expect(files.getByRole("button", { name: /^Delete / })).toHaveCount(0);
+      await expect(section.getByTestId("bug-comment-staged-file"), "the composer is cleared").toHaveCount(0);
+
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list[0].attachments.map((a: Attachment) => a.fileName)).toEqual(["screen.png", "console.txt"]);
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).attachments).toEqual([]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-92 the author edits a comment in place: Cancel changes nothing; Save updates the text and files and shows Edited", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Edit ${uniqueSuffix()}` });
+    try {
+      const seeded = await seedCommentWithFiles(bug.id, "Original *wording*", [textFile("keep.txt"), textFile("drop.txt")]);
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      const item = section.getByTestId("bug-comment");
+      await expect(item.getByTestId("bug-comment-edited")).toHaveCount(0);
+
+      await item.getByRole("button", { name: "Edit this comment" }).click();
+      const editBox = item.getByRole("textbox", { name: "Edit comment" });
+      // The editor opens on the comment as formatted, not as raw Markdown.
+      await expect(editBox.locator("em")).toHaveText("wording");
+      await editBox.click();
+      await page.keyboard.press("ControlOrMeta+a");
+      await page.keyboard.type("Discarded");
+      await item.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(item.getByTestId("bug-comment-body")).toHaveText("Original wording");
+      await expect(item.getByTestId("bug-comment-edited")).toHaveCount(0);
+
+      await item.getByRole("button", { name: "Edit this comment" }).click();
+      await item.getByRole("textbox", { name: "Edit comment" }).click();
+      await page.keyboard.press("ControlOrMeta+a");
+      await page.keyboard.type("Revised wording");
+      await item.getByRole("button", { name: "Remove drop.txt" }).click();
+      await item.locator('input[type="file"][aria-label="Attach files to this comment"]').setInputFiles([{ name: "added.txt", mimeType: "text/plain", buffer: Buffer.from("new") }]);
+      await item.getByRole("button", { name: "Save", exact: true }).click();
+
+      await expect(item.getByRole("textbox", { name: "Edit comment" })).toHaveCount(0);
+      await expect(item.getByTestId("bug-comment-body")).toHaveText("Revised wording");
+      await expect(item.getByTestId("bug-comment-edited")).toHaveText("Edited");
+      await expect(item.getByTestId("bug-attachment-file")).toHaveText(["keep.txt", "added.txt"].map((n) => new RegExp(n)));
+
+      const persisted = (await (await api.get(commentsUrl(bug.id))).json()).list[0];
+      expect(persisted).toMatchObject({ id: seeded.id, body: "Revised wording", isEdited: true });
+      expect(persisted.attachments.map((a: Attachment) => a.fileName)).toEqual(["keep.txt", "added.txt"]);
+
+      // Still marked edited after a reload — it comes from the server, not local state.
+      await openPanel(page, bug.title);
+      await expect(comments(panelBody(page)).getByTestId("bug-comment-edited")).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-93 deleting a comment asks first; Cancel keeps it, confirming removes it from the panel and the server", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Delete ${uniqueSuffix()}` });
+    try {
+      await seedCommentWithFiles(bug.id, "Delete me", [textFile("goes.txt")]);
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+
+      await section.getByRole("button", { name: "Delete this comment" }).click();
+      await expect(page.getByText("Delete this comment and its 1 attachment? This can't be undone.")).toBeVisible();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(1);
+
+      await section.getByRole("button", { name: "Delete this comment" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(0);
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+      expect((await (await api.get(commentsUrl(bug.id))).json()).total).toBe(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-94 Edit is offered on your own comments only; as the project owner you may still delete someone else's", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Perms ${uniqueSuffix()}` });
+    try {
+      const mine = await seedComment(bug.id, "Mine");
+      // Nobody else is a member of this project, so another author's comment is served from a stub.
+      await page.route(commentsRoute(bug.id), async (route) => {
+        if (route.request().method() !== "GET") return route.continue();
+        const real = await (await route.fetch()).json();
+        const theirs = { ...mine, id: "00000000-0000-4000-8000-000000000001", authorId: "00000000-0000-4000-8000-000000000002", authorName: "Someone Else", body: "Theirs" };
+        return route.fulfill({ json: { list: [...real.list, theirs], total: real.total + 1 } });
+      });
+      await openPanel(page, bug.title);
+      const items = comments(panelBody(page)).getByTestId("bug-comment");
+      await expect(items).toHaveCount(2);
+      await expect(items.nth(0).getByRole("button", { name: "Edit this comment" })).toBeVisible();
+      await expect(items.nth(0).getByRole("button", { name: "Delete this comment" })).toBeVisible();
+      await expect(items.nth(1).getByRole("button", { name: "Edit this comment" })).toHaveCount(0);
+      await expect(items.nth(1).getByRole("button", { name: "Delete this comment" })).toBeVisible();
+    } finally {
+      await page.unroute(commentsRoute(bug.id));
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-95 a failed edit keeps the editor open with the server's reason; a failed delete keeps the comment and says why", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Edit Error ${uniqueSuffix()}` });
+    try {
+      const seeded = await seedComment(bug.id, "Unchanged on the server");
+      const one = `**/api/projects/${projectId}/bugs/${bug.id}/comments/${seeded.id}`;
+      await page.route(one, (route) =>
+        route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Comment store unavailable." }) }),
+      );
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      const item = section.getByTestId("bug-comment");
+
+      await item.getByRole("button", { name: "Edit this comment" }).click();
+      await item.getByRole("textbox", { name: "Edit comment" }).click();
+      await page.keyboard.press("ControlOrMeta+a");
+      await page.keyboard.type("Attempted edit");
+      await item.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(item.getByTestId("bug-comment-edit-error")).toContainText("Comment store unavailable.");
+      await expect(item.getByRole("textbox", { name: "Edit comment" })).toHaveText("Attempted edit");
+      await item.getByRole("button", { name: "Cancel", exact: true }).click();
+
+      await item.getByRole("button", { name: "Delete this comment" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(section.getByTestId("bug-comment-action-error")).toContainText("Comment store unavailable.");
+      await expect(item).toHaveCount(1);
+
+      const persisted = await (await api.get(commentsUrl(bug.id))).json();
+      expect(persisted.list[0]).toMatchObject({ body: "Unchanged on the server", isEdited: false });
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-96 Edit is offered only within an hour of posting, and disappears by itself when that hour runs out", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Comments Edit Window ${uniqueSuffix()}` });
+    try {
+      await seedComment(bug.id, "Window already closed");
+      await seedComment(bug.id, "Window closing now");
+      // Waiting out a real hour is not an option, so the list's editableUntil is rewritten: one comment
+      // past its window, one whose window closes a few seconds from now. The server's own refusal
+      // after the hour is BUGC-A-22.
+      const closesAt = Date.now() + 4_000;
+      await page.route(commentsRoute(bug.id), async (route) => {
+        if (route.request().method() !== "GET") return route.continue();
+        const real = await (await route.fetch()).json();
+        const [closed, closing] = real.list;
+        return route.fulfill({
+          json: {
+            ...real,
+            list: [
+              { ...closed, editableUntil: new Date(Date.now() - 60_000).toISOString() },
+              { ...closing, editableUntil: new Date(closesAt).toISOString() },
+            ],
+          },
+        });
+      });
+      await openPanel(page, bug.title);
+      const items = comments(panelBody(page)).getByTestId("bug-comment");
+      await expect(items).toHaveCount(2);
+
+      await expect(items.nth(0).getByRole("button", { name: "Edit this comment" })).toHaveCount(0);
+      await expect(items.nth(0).getByRole("button", { name: "Delete this comment" }), "deleting has no time limit").toBeVisible();
+
+      await expect(items.nth(1).getByRole("button", { name: "Edit this comment" })).toBeVisible();
+      await expect(items.nth(1).getByRole("button", { name: "Edit this comment" })).toHaveCount(0, { timeout: 15_000 });
+      await expect(items.nth(1).getByRole("button", { name: "Delete this comment" })).toBeVisible();
+    } finally {
+      await page.unroute(commentsRoute(bug.id));
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });

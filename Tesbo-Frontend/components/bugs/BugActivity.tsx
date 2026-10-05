@@ -86,6 +86,10 @@ function describe(item: ActivityLogItem): ReactNode {
       );
     case "commented":
       return "added a comment";
+    case "comment_edited":
+      return "edited a comment";
+    case "comment_deleted":
+      return "deleted a comment";
     case "bug_mentioned":
       return (
         <>

@@ -27,7 +27,7 @@ const THUMB_CLASS = "h-9 w-9 shrink-0 rounded-[4px] border border-[var(--border-
  * than an object URL: nothing to revoke, so StrictMode's double-run effects cannot revoke a URL the
  * <img> is still showing, and a removed row leaves no blob behind.
  */
-function StagedThumbnail({ file }: { file: File }) {
+export function StagedThumbnail({ file }: { file: File }) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;

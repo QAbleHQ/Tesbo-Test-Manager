@@ -2757,17 +2757,62 @@ export interface BugComment {
   authorId: string | null;
   /** Name, else email; "Unknown" once the author's account is gone. */
   authorName: string;
+  /** Markdown — render with renderMarkdown (lib/markdown.ts), never as raw HTML. */
   body: string;
+  /** True once the text or the files have been changed after posting. */
+  isEdited: boolean;
+  /** The author may edit until this moment (an hour after posting); the server enforces it. */
+  editableUntil: string;
+  /** The comment's own files; downloaded through the same route as bug evidence. */
+  attachments: BugAttachment[];
   createdAt: string;
   updatedAt: string;
 }
 
-export async function listBugComments(projectId: string, bugId: string): Promise<{ list: BugComment[]; total: number }> {
-  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`);
+const bugCommentsPath = (projectId: string, bugId: string) => `/api/projects/${projectId}/bugs/${bugId}/comments`;
+
+/** A comment write that carries files goes as multipart; the server reads `body` and the rest from fields. */
+async function sendBugCommentForm(path: string, method: "POST" | "PATCH", form: FormData): Promise<BugComment> {
+  const res = await fetchWithNetworkErrorMessage(`${API_BASE}${path}`, { method, credentials: "include", body: form });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as ApiErrorBody;
+    throw new Error(formatApiError(res.status, err));
+  }
+  return res.json();
 }
 
-export async function createBugComment(projectId: string, bugId: string, body: string): Promise<BugComment> {
-  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`, { method: "POST", body: { body } });
+export async function listBugComments(projectId: string, bugId: string): Promise<{ list: BugComment[]; total: number }> {
+  return api(bugCommentsPath(projectId, bugId));
+}
+
+export async function createBugComment(projectId: string, bugId: string, body: string, files: File[] = []): Promise<BugComment> {
+  if (!files.length) return api(bugCommentsPath(projectId, bugId), { method: "POST", body: { body } });
+  const form = new FormData();
+  form.append("body", body);
+  for (const file of files) form.append("files", file);
+  return sendBugCommentForm(bugCommentsPath(projectId, bugId), "POST", form);
+}
+
+/** Author only. Omitted fields are left as they are. */
+export async function updateBugComment(
+  projectId: string,
+  bugId: string,
+  commentId: string,
+  changes: { body?: string; removeAttachmentIds?: string[]; files?: File[] }
+): Promise<BugComment> {
+  const path = `${bugCommentsPath(projectId, bugId)}/${commentId}`;
+  const { files = [], ...json } = changes;
+  if (!files.length) return api(path, { method: "PATCH", body: json });
+  const form = new FormData();
+  if (json.body !== undefined) form.append("body", json.body);
+  if (json.removeAttachmentIds?.length) form.append("removeAttachmentIds", JSON.stringify(json.removeAttachmentIds));
+  for (const file of files) form.append("files", file);
+  return sendBugCommentForm(path, "PATCH", form);
+}
+
+/** The author, or a project owner/manager. */
+export async function deleteBugComment(projectId: string, bugId: string, commentId: string): Promise<void> {
+  await api(`${bugCommentsPath(projectId, bugId)}/${commentId}`, { method: "DELETE" });
 }
 
 export async function createBug(projectId: string, data: {
