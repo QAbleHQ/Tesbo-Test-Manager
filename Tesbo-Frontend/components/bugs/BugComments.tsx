@@ -10,7 +10,8 @@ import {
   type BugAttachment,
   type BugComment,
 } from "@/lib/api";
-import { renderMarkdown } from "@/lib/markdown";
+import { renderCommentMarkdown } from "@/lib/commentMarkdown";
+import { formatAbsolute } from "@/components/activity/activityShared";
 import {
   EVIDENCE_ACCEPT_ATTRIBUTE,
   EVIDENCE_MAX_FILES_PER_REQUEST,
@@ -411,9 +412,15 @@ export default function BugComments({
     }
   }
 
-  const linkAction = "inline-flex items-center gap-1 text-[12px] text-[var(--muted)]";
+  // Quiet text actions under the body, as in most threads: they never wrap onto their own line
+  // above the text, and they read as part of the comment rather than as a toolbar.
+  const action =
+    "inline-flex items-center gap-1 rounded px-1 py-0.5 text-[12px] font-medium text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)]";
 
-  /** One comment or reply: author line, actions, then the body — or the editor while editing it. */
+  // Highlighted the same way Activity shows "@Name": the names and emails the server matches.
+  const mentionLabels = useMemo(() => projectMembers.flatMap((m) => [m.name, m.email]).filter(Boolean), [projectMembers]);
+
+  /** One comment or reply: author line, the body (or the editor while editing it), then actions. */
   function renderComment(comment: BugComment) {
     const isReply = !!comment.parentCommentId;
     const noun = isReply ? "reply" : "comment";
@@ -425,55 +432,25 @@ export default function BugComments({
     const threadId = comment.parentCommentId ?? comment.id;
     return (
       <div className="flex items-start gap-2.5">
-        <MemberAvatar name={comment.authorName} seed={comment.authorId} size={isReply ? 20 : 24} />
+        <MemberAvatar name={comment.authorName} seed={comment.authorId} size={isReply ? 22 : 28} />
         <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <span className="text-[13px] font-semibold text-[var(--foreground)]">{comment.authorName}</span>
-            <time dateTime={comment.createdAt} className="text-[11px] text-[var(--muted-soft)]">
-              {new Date(comment.createdAt).toLocaleString()}
+            {/* Same short form as the Activity column beside this; the full time is on hover. */}
+            <time dateTime={comment.createdAt} title={new Date(comment.createdAt).toLocaleString()} className="text-[11.5px] text-[var(--muted-soft)]">
+              {formatAbsolute(comment.createdAt)}
             </time>
             {comment.isEdited && (
-              <span
-                data-testid="bug-comment-edited"
-                title={`Edited ${new Date(comment.updatedAt).toLocaleString()}`}
-                className="text-[11px] italic text-[var(--muted-soft)]"
-              >
-                Edited
-              </span>
-            )}
-            {!isEditing && (
-              <span className="ml-auto flex items-center gap-3">
-                <button
-                  type="button"
-                  // Named apart from the panel's own Edit/Delete (the bug's), which sit in the same
-                  // region, and a reply's apart from its thread's.
-                  aria-label={isReply ? "Reply in this thread" : "Reply to this comment"}
-                  onClick={() => setReplyingTo(threadId)}
-                  className={`${linkAction} hover:text-[var(--foreground)]`}
+              <>
+                <span aria-hidden className="text-[11.5px] text-[var(--muted-soft)]">·</span>
+                <span
+                  data-testid="bug-comment-edited"
+                  title={`Edited ${new Date(comment.updatedAt).toLocaleString()}`}
+                  className="text-[11.5px] text-[var(--muted-soft)]"
                 >
-                  <IconCornerDownRight size={12} /> Reply
-                </button>
-                {canEdit && (
-                  <button
-                    type="button"
-                    aria-label={`Edit this ${noun}`}
-                    onClick={() => startEdit(comment)}
-                    className={`${linkAction} hover:text-[var(--foreground)]`}
-                  >
-                    <IconPencil size={12} /> Edit
-                  </button>
-                )}
-                {canDelete && (
-                  <button
-                    type="button"
-                    aria-label={`Delete this ${noun}`}
-                    onClick={() => setConfirmingDelete(comment)}
-                    className={`${linkAction} hover:text-[var(--error-foreground)]`}
-                  >
-                    <IconTrash size={12} /> Delete
-                  </button>
-                )}
-              </span>
+                  Edited
+                </span>
+              </>
             )}
           </div>
 
@@ -518,14 +495,46 @@ export default function BugComments({
               {/* renderMarkdown escapes the text before adding any markup, so this is safe to inject. */}
               <div
                 data-testid="bug-comment-body"
-                className="zyra-prose mt-1 break-words text-[13px] text-[var(--foreground)]"
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(comment.body) }}
+                className="zyra-prose mt-0.5 break-words text-[13.5px] leading-[1.55] text-[var(--foreground)]"
+                dangerouslySetInnerHTML={{ __html: renderCommentMarkdown(comment.body, mentionLabels) }}
               />
               {comment.attachments.length > 0 && (
                 <div className="mt-2" data-testid="bug-comment-attachments">
                   <BugAttachments projectId={projectId} attachments={comment.attachments} readOnly />
                 </div>
               )}
+              <div className="-ml-1 mt-1.5 flex items-center gap-1">
+                <button
+                  type="button"
+                  // Named apart from the panel's own Edit/Delete (the bug's), which sit in the same
+                  // region, and a reply's apart from its thread's.
+                  aria-label={isReply ? "Reply in this thread" : "Reply to this comment"}
+                  onClick={() => setReplyingTo(threadId)}
+                  className={`${action} hover:text-[var(--foreground)]`}
+                >
+                  <IconCornerDownRight size={13} /> Reply
+                </button>
+                {canEdit && (
+                  <button
+                    type="button"
+                    aria-label={`Edit this ${noun}`}
+                    onClick={() => startEdit(comment)}
+                    className={`${action} hover:text-[var(--foreground)]`}
+                  >
+                    <IconPencil size={13} /> Edit
+                  </button>
+                )}
+                {canDelete && (
+                  <button
+                    type="button"
+                    aria-label={`Delete this ${noun}`}
+                    onClick={() => setConfirmingDelete(comment)}
+                    className={`${action} hover:text-[var(--error-foreground)]`}
+                  >
+                    <IconTrash size={13} /> Delete
+                  </button>
+                )}
+              </div>
             </>
           )}
         </div>
@@ -575,13 +584,15 @@ export default function BugComments({
               <li
                 key={root.id}
                 data-testid="bug-comment"
-                className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-3.5 py-3"
+                className="rounded-[12px] border border-[var(--border)] bg-[var(--surface)] px-4 py-3.5"
               >
                 {renderComment(root)}
                 {(replies.length > 0 || replyingTo === root.id) && (
-                  <div className="ml-[34px] mt-3 space-y-3 border-l border-[var(--border-subtle)] pl-3">
+                  // Indented to line up under the comment text (28px avatar + 10px gap), with a rail
+                  // that ties the replies to the comment they answer.
+                  <div className="ml-[38px] mt-3 space-y-3 border-l-2 border-[var(--border-subtle)] pl-4">
                     {replies.length > 0 && (
-                      <ul aria-label="Replies" className="space-y-3">
+                      <ul aria-label="Replies" className="space-y-3.5">
                         {replies.map((reply) => (
                           <li key={reply.id} data-testid="bug-comment-reply">
                             {renderComment(reply)}

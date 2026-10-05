@@ -83,6 +83,39 @@ export function commentDocToMarkdown(doc: JSONContent): string {
   return lines.join("\n").replace(/^\s*\n/, "").trimEnd();
 }
 
+const escapeHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * A comment for display: renderMarkdown's HTML with each "@Name" / "@email" of a project member
+ * highlighted, by the same rule the server uses to log mentions (the "@" starts a word, longest
+ * label first). Only text between tags is touched, never a tag or a link's text, and the labels are
+ * matched in their escaped form because renderMarkdown has already escaped the text.
+ */
+export function renderCommentMarkdown(markdown: string, mentionLabels: string[]): string {
+  const html = renderMarkdown(markdown);
+  const labels = Array.from(new Set(mentionLabels.map((l) => l.trim()).filter(Boolean)));
+  if (!labels.length || !html.includes("@")) return html;
+  const alternatives = labels
+    .map(escapeHtml)
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegex)
+    .join("|");
+  const mention = new RegExp(String.raw`(^|[^\p{L}\p{N}_.@])@(${alternatives})(?![\p{L}\p{N}_])`, "giu");
+  let insideLink = false;
+  return html
+    .split(/(<[^>]+>)/)
+    .map((part) => {
+      if (part.startsWith("<")) {
+        if (/^<a[\s>]/i.test(part)) insideLink = true;
+        else if (/^<\/a>/i.test(part)) insideLink = false;
+        return part;
+      }
+      return insideLink ? part : part.replace(mention, (_m, lead: string, name: string) => `${lead}<span class="font-medium text-[var(--accent-light)]">@${name}</span>`);
+    })
+    .join("");
+}
+
 /**
  * Stored Markdown as HTML the comment editor can load. renderMarkdown marks a blank line with a
  * bare <br/> between blocks; loaded as-is, that becomes a paragraph holding a hard break, which

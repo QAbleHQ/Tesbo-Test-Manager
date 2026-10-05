@@ -50,7 +50,6 @@ import {
 import BugActivity from "@/components/bugs/BugActivity";
 import BugComments from "@/components/bugs/BugComments";
 import BugDetailsBody from "@/components/bugs/BugDetailsBody";
-import EditBugModal from "@/components/bugs/EditBugModal";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 interface BugsData {
@@ -435,8 +434,6 @@ export default function BugsPage() {
    */
   const createdBugIdRef = useRef<string | null>(null);
 
-  /* edit modal — its form state lives in EditBugModal */
-  const [editBug, setEditBug] = useState<BugItem | null>(null);
   /*
    * Basecamp 10226296533: createBug/updateBug succeeded, uploadBugAttachments then threw, and the
    * throw went nowhere — `finally` cleared the spinner but the modal stayed open unchanged with no
@@ -632,9 +629,13 @@ export default function BugsPage() {
     }
   }
 
-  /* open edit */
+  /*
+   * The pencil on a List row or a Board card opens the full bug page straight into its in-place
+   * edit form, as the side panel's Edit button does, rather than the Edit Bug dialog — one place
+   * to edit a bug, with its comments and history beside the form.
+   */
   function openEdit(bug: BugItem) {
-    setEditBug(bug);
+    router.push(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
   }
 
   /* delete */
@@ -1279,20 +1280,6 @@ export default function BugsPage() {
           </div>
         </div>
       </Modal>
-
-      {/* ───── Edit Bug Modal ───── */}
-      {editBug && (
-        <EditBugModal
-          key={editBug.id}
-          projectId={projectId}
-          bug={editBug}
-          jiraConnected={jiraConnected}
-          linearConnected={linearConnected}
-          hasTestRuns={hasTestRuns}
-          onClose={() => setEditBug(null)}
-          onChanged={load}
-        />
-      )}
 
       {/* ───── Delete Confirm Modal ───── */}
       <Modal

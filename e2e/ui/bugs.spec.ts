@@ -37,6 +37,25 @@ function fileInput(page: Page) {
   return page.locator('input[type="file"]');
 }
 
+/**
+ * A List row's or Board card's pencil opens the full bug page in its in-place edit form
+ * (`?edit=1`), the same form the side panel's Edit opens — it used to open the Edit Bug dialog.
+ * Clicks it, checks where it landed, and returns the form.
+ */
+async function editFromList(page: Page, scope: Locator): Promise<Locator> {
+  await scope.getByRole("button", { name: "Edit bug" }).click();
+  await expect(page).toHaveURL(/\/bugs\/[0-9a-f-]{36}\?edit=1$/);
+  const form = page.getByRole("region", { name: "Edit bug" });
+  await expect(form).toBeVisible();
+  return form;
+}
+
+/** Back to the bugs list in List view: saving on the full page leaves you on that page. */
+async function openBugsList(page: Page, projectId: string): Promise<void> {
+  await page.goto(`/projects/${projectId}/bugs`);
+  await page.getByRole("button", { name: "List", exact: true }).click();
+}
+
 async function openReportModal(page: Page, projectId: string): Promise<void> {
   await page.goto(`/projects/${projectId}/bugs`);
   // The page's button is "Report Bug"; "Report a Bug" is the MODAL TITLE. Matching the title here
@@ -353,6 +372,25 @@ test.describe("bugs list — controls and filters", () => {
     expect(deleteColor, "delete should be distinguishable from edit by colour").not.toBe(editColor);
   });
 
+  test("BUG-U-103 the board card's edit icon opens that bug's full page in its edit form, not the side panel", async ({ page }) => {
+    await page.getByRole("button", { name: "Board", exact: true }).click();
+    const card = page.locator('[role="button"]').filter({ hasText: "E2E Low sev bug" }).first();
+    await card.hover();
+    const form = await editFromList(page, card);
+
+    const bugId = new URL(page.url()).pathname.split("/").pop()!;
+    const bug = await (await api.get(`/api/bugs/${bugId}`)).json();
+    expect(bug.title, "it opened the bug whose card was clicked").toContain("E2E Low sev bug");
+    await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+    await expect(form.getByRole("heading", { name: "Edit Bug" })).toBeVisible();
+
+    // Cancel stays on that bug's page, now showing it rather than the form.
+    await page.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(form).toHaveCount(0);
+    await expect(page).toHaveURL(new RegExp(`/bugs/${bugId}$`));
+    await expect(page.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
+  });
+
   test("BUG-U-07 a long title is clamped and carries its full text as a tooltip", { tag: '@tesbo.testId("TES-TC-1317")' }, async ({ page }) => {
     const title = page.locator("td span[title]").filter({ hasText: "E2E long bug title" }).first();
     await expect(title).toBeVisible();
@@ -439,21 +477,17 @@ test.describe("bugs list — controls and filters", () => {
     await expect(clearAll).toBeHidden();
   });
 
-  test("BUG-U-10 the edit modal scrolls to its own footer instead of the page behind it", { tag: '@tesbo.testId("TES-TC-1320")' }, async ({ page }) => {
+  test("BUG-U-10 the row's edit icon opens the full-page edit form, whose Save is reachable", { tag: '@tesbo.testId("TES-TC-1320")' }, async ({ page }) => {
     /*
-     * Basecamp 10217828537 — "Bug edit pop up is not scrollable thus not able to update bug". Fixed
-     * upstream in components/ui/Modal.tsx (dev commit e95da92) by locking the app-shell scroller and
-     * putting the overflow on the dialog body; pinned here because it is a shared component and the
-     * failure mode — a Save button you cannot reach — silently blocks every edit on the screen.
+     * Basecamp 10217828537 — "Bug edit pop up is not scrollable thus not able to update bug". The
+     * failure it pinned — a Save button you cannot reach — silently blocks every edit. The pencil
+     * now opens the full bug page's edit form instead of that pop-up, so there is no dialog to lock
+     * the page behind; the page itself scrolls, and Save has to be reachable on it.
      */
-    await page.getByRole("button", { name: "Edit bug" }).first().click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    await editFromList(page, page.locator("tbody tr").first());
+    const shell = await page.evaluate(() => getComputedStyle(document.documentElement).overflow);
+    expect(shell, "no dialog is holding the page's scroll").not.toBe("hidden");
 
-    // The shell behind the dialog is locked while it is open.
-    const shellLocked = await page.evaluate(() => getComputedStyle(document.documentElement).overflow);
-    expect(shellLocked).toBe("hidden");
-
-    // And the footer is reachable inside the dialog.
     const save = page.getByRole("button", { name: "Save Changes" });
     await save.scrollIntoViewIfNeeded();
     await expect(save).toBeVisible();
@@ -605,22 +639,26 @@ test.describe("bug priority", () => {
       const row = page.locator("tbody tr").filter({ hasText: title });
       await expect(row.getByText("High", { exact: true })).toBeVisible();
 
-      await row.getByRole("button", { name: "Edit bug" }).click();
-      const severity = page.getByLabel("Severity", { exact: true });
+      let form = await editFromList(page, row);
+      const severity = form.getByLabel("Severity", { exact: true });
       await expect(severity).toHaveValue("High");
       await expect(severity.locator("option").first()).toHaveText("Not selected");
-      await expect(page.getByLabel("Bug priority").locator("option").first()).toHaveText("Not selected");
+      await expect(form.getByLabel("Bug priority").locator("option").first()).toHaveText("Not selected");
       await severity.selectOption("");
       await page.getByRole("button", { name: "Save Changes" }).click();
-
-      await expect(row.getByText("High", { exact: true })).toHaveCount(0);
+      await expect(form, "saved, the page goes back to showing the bug").toHaveCount(0);
       expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).severity).toBeNull();
 
+      await openBugsList(page, projectId);
+      await expect(row.getByText("High", { exact: true })).toHaveCount(0);
+
       // And back: clearing is not a one-way door.
-      await row.getByRole("button", { name: "Edit bug" }).click();
-      await expect(page.getByLabel("Severity", { exact: true })).toHaveValue("");
-      await page.getByLabel("Severity", { exact: true }).selectOption("Low");
+      form = await editFromList(page, row);
+      await expect(form.getByLabel("Severity", { exact: true })).toHaveValue("");
+      await form.getByLabel("Severity", { exact: true }).selectOption("Low");
       await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect(form).toHaveCount(0);
+      await openBugsList(page, projectId);
       await expect(row.getByText("Low", { exact: true })).toBeVisible();
       expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).severity).toBe("Low");
     } finally {
@@ -630,19 +668,23 @@ test.describe("bug priority", () => {
 
   test("BUG-U-13 editing a bug changes its priority and can clear it again", { tag: '@tesbo.testId("TES-TC-1323")' }, async ({ page }) => {
     const row = page.locator("tbody tr").filter({ hasText: triagedTitle });
-    await row.getByRole("button", { name: "Edit bug" }).click();
+    let form = await editFromList(page, row);
 
-    const priority = page.getByLabel("Bug priority");
+    const priority = form.getByLabel("Bug priority");
     await expect(priority).toHaveValue("P1");
     await priority.selectOption("P0");
     await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(form).toHaveCount(0);
 
+    await openBugsList(page, projectId);
     await expect(row.getByText("P0", { exact: true })).toBeVisible();
 
     // And back to untriaged, which the API expresses as an explicit null rather than an omission.
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await page.getByLabel("Bug priority").selectOption("");
+    form = await editFromList(page, row);
+    await form.getByLabel("Bug priority").selectOption("");
     await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(form).toHaveCount(0);
+    await openBugsList(page, projectId);
     await expect(row.getByText(/^P[0-3]$/)).toHaveCount(0);
   });
 
@@ -749,10 +791,9 @@ test.describe("bug assignee", () => {
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    let form = await editFromList(page, row);
 
-    const assign = page.getByLabel("Assign to");
+    const assign = form.getByLabel("Assign to");
     await expect(assign).toHaveValue("");
     await assign.selectOption({ label: selfLabel });
     await page.getByRole("button", { name: "Save Changes" }).click();
@@ -761,9 +802,10 @@ test.describe("bug assignee", () => {
     let after = await (await api.get(`/api/bugs/${bug.id}`)).json();
     expect(after.assigneeId).toBe(selfUserId);
 
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByLabel("Assign to")).toHaveValue(selfUserId);
-    await page.getByLabel("Assign to").selectOption("");
+    await openBugsList(page, projectId);
+    form = await editFromList(page, row);
+    await expect(form.getByLabel("Assign to")).toHaveValue(selfUserId);
+    await form.getByLabel("Assign to").selectOption("");
     await page.getByRole("button", { name: "Save Changes" }).click();
     await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
 
@@ -1282,13 +1324,13 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    // The page header and breadcrumb show the bug's ticket key too, so the form's own display is checked.
+    const form = await editFromList(page, row);
 
     // The currently linked ticket is shown without having to open the picker.
-    await expect(page.getByText("KAN-9", { exact: false })).toBeVisible();
+    await expect(form.getByText("KAN-9", { exact: false })).toBeVisible();
 
-    await page.getByRole("button", { name: "Change issue" }).click();
+    await form.getByRole("button", { name: "Change issue" }).click();
     await expect(page.getByRole("heading", { name: "Select Jira ticket" })).toBeVisible();
     const picker = page.getByTestId("issue-picker");
     // Selected by default, as a single-select radio row — not the multi-select checkbox flow.
@@ -1296,7 +1338,7 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await picker.locator("label", { hasText: "Replacement ticket" }).click();
     await picker.getByRole("button", { name: "Select" }).click();
 
-    await expect(page.getByText("KAN-10", { exact: false })).toBeVisible();
+    await expect(form.getByText("KAN-10", { exact: false })).toBeVisible();
     await page.getByRole("button", { name: "Save Changes" }).click();
     await expect(page.getByText("Edit Bug", { exact: true })).toBeHidden();
 
@@ -1306,8 +1348,9 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     expect(afterSave.externalUrl).toBe("https://e2e.atlassian.net/browse/KAN-10");
 
     // Reopening shows the new ticket as current; the old one is gone, not just unshown.
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("KAN-10", { exact: false })).toBeVisible();
+    await openBugsList(page, projectId);
+    const reopened = await editFromList(page, row);
+    await expect(reopened.getByText("KAN-10", { exact: false })).toBeVisible();
     await expect(page.getByText("KAN-9", { exact: true })).toHaveCount(0);
   });
 
@@ -1341,10 +1384,9 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    const form = await editFromList(page, row);
 
-    await page.getByRole("button", { name: "Change issue" }).click();
+    await form.getByRole("button", { name: "Change issue" }).click();
     await expect(page.getByRole("heading", { name: "Select Linear ticket" })).toBeVisible();
     const picker = page.getByTestId("issue-picker");
     await picker.locator("label", { hasText: "Replacement linear ticket" }).click();
@@ -1373,12 +1415,11 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    const form = await editFromList(page, row);
 
-    await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
-    await page.getByRole("button", { name: "Jira", exact: true }).click();
-    await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
+    await form.getByRole("button", { name: /log it in my task management system myself/i }).click();
+    await form.getByRole("button", { name: "Jira", exact: true }).click();
+    await expect(form.getByText("No issue selected.", { exact: true })).toBeVisible();
 
     await page.getByRole("button", { name: "Select issue" }).click();
     const picker = page.getByTestId("issue-picker");
@@ -1422,13 +1463,13 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
-    await expect(page.getByText("KAN-30", { exact: false })).toBeVisible();
+    // Form-scoped: until the switch is saved, the page header still (correctly) shows KAN-30.
+    const form = await editFromList(page, row);
+    await expect(form.getByText("KAN-30", { exact: false })).toBeVisible();
 
-    await page.getByRole("button", { name: "Linear", exact: true }).click();
+    await form.getByRole("button", { name: "Linear", exact: true }).click();
     // The stale Jira key must not still be shown as "current" under Linear.
-    await expect(page.getByText("KAN-30", { exact: false })).toHaveCount(0);
+    await expect(form.getByText("KAN-30", { exact: false })).toHaveCount(0);
     await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
 
     // Requirement: switching providers "requires selecting an issue from the new provider" — Save
@@ -1479,19 +1520,18 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    const form = await editFromList(page, row);
 
     // "Jira" reads as the selected system (highlighted like the other "primary"-variant selected
     // buttons elsewhere on this page), not "Other" — and the current ticket is shown.
-    const jiraButton = page.getByRole("button", { name: "Jira", exact: true });
-    const otherButton = page.getByRole("button", { name: "Other", exact: true });
+    const jiraButton = form.getByRole("button", { name: "Jira", exact: true });
+    const otherButton = form.getByRole("button", { name: "Other", exact: true });
     const jiraColor = await jiraButton.evaluate((el) => getComputedStyle(el).backgroundColor);
     const otherColor = await otherButton.evaluate((el) => getComputedStyle(el).backgroundColor);
     expect(jiraColor, "Jira must read as the selected system, not look identical to unselected Other").not.toBe(otherColor);
 
-    await expect(page.getByText("KAN-40", { exact: false })).toBeVisible();
-    await expect(page.getByText("Change issue", { exact: true })).toBeVisible();
+    await expect(form.getByText("KAN-40", { exact: false })).toBeVisible();
+    await expect(form.getByText("Change issue", { exact: true })).toBeVisible();
     // The plain URL box (what "Other" would show instead) must not be the field in play here.
     await expect(page.getByPlaceholder("https://example.com/browse/BUG-123")).toBeHidden();
   });
@@ -1685,10 +1725,10 @@ test.describe("bug — field order matches between Report a Bug and Edit Bug", (
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    await row.getByRole("button", { name: "Edit bug" }).click();
-    await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
+    await editFromList(page, row);
     await page.getByRole("button", { name: /log it in my task management system myself/i }).click();
 
+    // The full-page form keeps the "Edit Bug" heading directly above the same fields block.
     const labels = await modalFieldLabels(page, "Edit Bug");
     assertAscending(labels, COMMON_ORDER);
 
@@ -2612,6 +2652,10 @@ test.describe("bug comments", () => {
       await expect(section.getByTestId("bug-comment")).toHaveCount(1);
       const persisted = await (await api.get(commentsUrl(bug.id))).json();
       expect(persisted.list[0].body).toBe(`Over to @${label} please check`);
+      // Shown highlighted, as Activity shows a mention — a span of its own, not just inline text.
+      const shownMention = section.getByTestId("bug-comment").getByTestId("bug-comment-body").locator("span", { hasText: `@${label}` });
+      await expect(shownMention).toHaveText(`@${label}`);
+      await expect(shownMention).toHaveClass(/accent-light/);
 
       const feed = await (await api.get(`/api/projects/${projectId}/activity`, { params: { entityType: "bug", entityId: bug.id, limit: "50" } })).json();
       const mention = feed.list.find((r: { action: string }) => r.action === "bug_mentioned");
@@ -3234,7 +3278,7 @@ test.describe("bug attachments in Bug Details", () => {
   test("BUG-U-77 the Edit Bug form shows thumbnails for existing image attachments, and none for other files", async ({ page }) => {
     const bug = await bugWith("Edit Thumbs", [pngFile("edit-shot.png"), sizedFile("edit-notes.pdf", 1024, "application/pdf")]);
     try {
-      // Both ways into Edit Bug render the same field: the full-page form and the list's dialog.
+      // Both ways into Edit Bug land on the same form: the ?edit=1 link and the list row's pencil.
       await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
       const form = page.getByRole("region", { name: "Edit bug" });
       await expect(form.getByTestId("evidence-thumbnail")).toHaveCount(1);
@@ -3242,12 +3286,10 @@ test.describe("bug attachments in Bug Details", () => {
       await expect(form.getByRole("img", { name: "edit-notes.pdf" })).toHaveCount(0);
       await expect(form.getByRole("link", { name: "edit-notes.pdf" })).toBeVisible();
 
-      await page.goto(`/projects/${projectId}/bugs`);
-      await page.getByRole("button", { name: "List", exact: true }).click();
-      await page.locator("tbody tr").filter({ hasText: bug.title }).getByRole("button", { name: "Edit bug" }).click();
-      await expect(page.getByText("Edit Bug", { exact: true })).toBeVisible();
-      await expectDecoded(page.getByRole("img", { name: "edit-shot.png" }));
-      await expect(page.getByTestId("evidence-thumbnail")).toHaveCount(1);
+      await openBugsList(page, projectId);
+      const viaPencil = await editFromList(page, page.locator("tbody tr").filter({ hasText: bug.title }));
+      await expectDecoded(viaPencil.getByRole("img", { name: "edit-shot.png" }));
+      await expect(viaPencil.getByTestId("evidence-thumbnail")).toHaveCount(1);
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
@@ -3311,7 +3353,7 @@ test.describe("bug attachments in Bug Details", () => {
 
 /*
  * Bug Details' Activity section: the bug's own history (from the project activity feed, filtered
- * to this bug) beside Comments on the full page, stacked under it in the narrow side panel. The
+ * to this bug), under Comments on both the full page and the side panel. The
  * logging itself — which actions, which actor — is specified in api/bugs.spec.ts "bug activity";
  * these tests are about what the screen shows.
  */
@@ -3353,7 +3395,7 @@ test.describe("bug activity", () => {
     return page.getByRole("region", { name: "Bug details" });
   }
 
-  test("BUG-U-79 the full page shows Activity beside Comments, oldest first, naming the actor of each entry", async ({ page }) => {
+  test("BUG-U-79 the full page shows Activity under Comments, oldest first, naming the actor of each entry", async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     const bug = await seedBug("Page");
     try {
@@ -3369,11 +3411,13 @@ test.describe("bug activity", () => {
       await expect(entries.nth(2)).toContainText(`${actorName} changed priority from None to P1`);
       await expect(entries.nth(0).locator("time")).toHaveAttribute("datetime", /\d{4}-\d{2}-\d{2}T/);
 
-      // Side by side: same row, Activity to the right of Comments.
+      // Stacked even on a wide screen (it used to sit beside Comments): Activity starts below the end
+      // of Comments, and both span the same full width.
       const c = (await comments.boundingBox())!;
       const a = (await activity.boundingBox())!;
-      expect(Math.abs(a.y - c.y)).toBeLessThan(4);
-      expect(a.x).toBeGreaterThan(c.x + c.width - 4);
+      expect(a.y).toBeGreaterThanOrEqual(c.y + c.height - 1);
+      expect(Math.abs(a.x - c.x)).toBeLessThan(4);
+      expect(Math.abs(a.width - c.width)).toBeLessThan(4);
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }

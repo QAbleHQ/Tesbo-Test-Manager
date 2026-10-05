@@ -175,16 +175,15 @@ export default function BugDetailPage() {
             className="space-y-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
           >
             <BugDetailsBody bug={bug} projectId={projectId} onAttachmentDeleted={load} />
-            {/* Comments and Activity side by side on wide screens, stacked below lg. */}
-            <div className="grid grid-cols-1 gap-x-8 lg:grid-cols-2">
-              <BugComments key={bug.id} projectId={projectId} bugId={bug.id} onCommentAdded={() => setCommentTick((n) => n + 1)} />
-              <BugActivity
-                key={`activity-${bug.id}`}
-                projectId={projectId}
-                bugId={bug.id}
-                refreshKey={`${bug.updatedAt}|${bug.attachments.length}|${commentTick}`}
-              />
-            </div>
+            {/* Activity under Comments at every width, as in the side panel: the discussion keeps
+                the full width, and the history reads after it. */}
+            <BugComments key={bug.id} projectId={projectId} bugId={bug.id} onCommentAdded={() => setCommentTick((n) => n + 1)} />
+            <BugActivity
+              key={`activity-${bug.id}`}
+              projectId={projectId}
+              bugId={bug.id}
+              refreshKey={`${bug.updatedAt}|${bug.attachments.length}|${commentTick}`}
+            />
           </section>
         )}
       </main>

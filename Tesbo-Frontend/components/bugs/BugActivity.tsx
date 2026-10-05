@@ -109,7 +109,7 @@ function describe(item: ActivityLogItem): ReactNode {
 }
 
 /**
- * The bug's history, oldest first, beside Comments on Bug Details. Reads the project activity feed
+ * The bug's history, oldest first, under Comments on Bug Details. Reads the project activity feed
  * filtered to this bug rather than a bug-specific endpoint — the rows are the same audit_logs rows
  * the Activity stream shows. `refreshKey` changes whenever the caller knows the bug has changed
  * (edited, file removed, comment posted) so the list is re-read.
