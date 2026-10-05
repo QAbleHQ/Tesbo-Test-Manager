@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconCornerDownRight, IconMessage, IconPaperclip, IconPencil, IconTrash, IconX } from "@tabler/icons-react";
+import { IconCornerDownRight, IconPaperclip, IconPencil, IconTrash, IconX } from "@tabler/icons-react";
 import {
   createBugComment,
   deleteBugComment,
@@ -276,11 +276,14 @@ export default function BugComments({
   projectId,
   bugId,
   onCommentAdded,
+  onCountChange,
 }: {
   projectId: string;
   bugId: string;
-  /** Any comment change (add, reply, edit, delete), so the Activity section beside this one re-reads. */
+  /** Any comment change (add, reply, edit, delete), so the Activity tab re-reads. */
   onCommentAdded?: () => void;
+  /** Comments plus replies, for the tab label; null while loading or after a failed load. */
+  onCountChange?: (count: number | null) => void;
 }) {
   const { currentUser } = useAppData();
   const { projectMembers } = useProjectData();
@@ -322,6 +325,12 @@ export default function BugComments({
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Counts replies too: everything said on the bug.
+  const count = loading || loadError ? null : comments.length;
+  useEffect(() => {
+    onCountChange?.(count);
+  }, [count, onCountChange]);
 
   // Edit is offered only inside the hour after posting. Re-render when the soonest of your own open
   // windows closes, so the button disappears on time rather than on the next unrelated render. A
@@ -549,12 +558,8 @@ export default function BugComments({
   const deletingNoun = confirmingDelete?.parentCommentId ? "reply" : "comment";
 
   return (
-    <section aria-label="Comments" className="border-t border-[var(--border)] pt-5">
-      <h4 className="mb-3 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-        <IconMessage size={14} stroke={1.75} />
-        {/* Counts replies too: everything said on the bug. */}
-        Comments{!loading && !loadError && comments.length > 0 ? ` (${comments.length})` : ""}
-      </h4>
+    // Titled by its tab in BugDiscussion, which also shows the count.
+    <section aria-label="Comments">
 
       {actionError && (
         <p role="alert" data-testid="bug-comment-action-error" className="mb-2 text-[13px] text-[var(--error-foreground)]">

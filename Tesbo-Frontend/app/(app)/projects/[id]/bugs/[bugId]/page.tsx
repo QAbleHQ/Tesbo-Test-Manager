@@ -16,8 +16,7 @@ import { Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { BugStatusBadge } from "@/components/bugs/BugBadges";
-import BugActivity from "@/components/bugs/BugActivity";
-import BugComments from "@/components/bugs/BugComments";
+import BugDiscussion from "@/components/bugs/BugDiscussion";
 import BugDetailsBody from "@/components/bugs/BugDetailsBody";
 import EditBugModal from "@/components/bugs/EditBugModal";
 
@@ -43,8 +42,6 @@ export default function BugDetailPage() {
   const [editing, setEditing] = useState(searchParams.get("edit") === "1");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  // Bumped when a comment is posted, so the Activity section re-reads its entries.
-  const [commentTick, setCommentTick] = useState(0);
 
   /* Same gates the bugs list passes to Edit Bug. */
   const [jiraConnected, setJiraConnected] = useState(false);
@@ -175,15 +172,8 @@ export default function BugDetailPage() {
             className="space-y-5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5"
           >
             <BugDetailsBody bug={bug} projectId={projectId} onAttachmentDeleted={load} />
-            {/* Activity under Comments at every width, as in the side panel: the discussion keeps
-                the full width, and the history reads after it. */}
-            <BugComments key={bug.id} projectId={projectId} bugId={bug.id} onCommentAdded={() => setCommentTick((n) => n + 1)} />
-            <BugActivity
-              key={`activity-${bug.id}`}
-              projectId={projectId}
-              bugId={bug.id}
-              refreshKey={`${bug.updatedAt}|${bug.attachments.length}|${commentTick}`}
-            />
+            {/* Comments and Activity as tabs, Comments first — the same as the side panel. */}
+            <BugDiscussion key={bug.id} projectId={projectId} bugId={bug.id} refreshKey={`${bug.updatedAt}|${bug.attachments.length}`} />
           </section>
         )}
       </main>

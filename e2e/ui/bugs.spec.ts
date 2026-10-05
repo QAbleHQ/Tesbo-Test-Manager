@@ -2304,7 +2304,8 @@ test.describe("bug comments", () => {
       await openPanel(page, bug.title);
 
       const section = comments(panelBody(page));
-      await expect(section.getByText("Comments (2)")).toBeVisible();
+      // The count is on the Comments tab now, not a heading inside the section.
+      await expect(panelBody(page).getByRole("tab", { name: "Comments (2)" })).toBeVisible();
       const items = section.getByTestId("bug-comment");
       await expect(items).toHaveCount(2);
       for (const [i, c] of [first, second].entries()) {
@@ -2367,7 +2368,7 @@ test.describe("bug comments", () => {
       await expect(items).toHaveCount(1);
       await expect(items.first()).toContainText(body);
       await expect(section.getByText("No comments yet.")).toHaveCount(0);
-      await expect(section.getByText("Comments (1)")).toBeVisible();
+      await expect(panelBody(page).getByRole("tab", { name: "Comments (1)" })).toBeVisible();
       await expect(section.getByLabel("Add a comment")).toHaveText("");
       expect(listFetches).toBe(0);
 
@@ -2901,7 +2902,8 @@ test.describe("bug comments", () => {
       await expect(replyBodies(thread).locator("strong")).toHaveText("Confirmed");
       await expect(replyBox, "the reply box closes once the reply is saved").toHaveCount(0);
       await expect(section.getByTestId("bug-comment"), "a reply is not a new top-level comment").toHaveCount(1);
-      await expect(section.getByText("Comments (2)")).toBeVisible();
+      // The count is on the Comments tab now, not a heading inside the section.
+      await expect(panelBody(page).getByRole("tab", { name: "Comments (2)" })).toBeVisible();
       await expect(composer(section), "the main box is untouched").toHaveText("");
 
       const persisted = (await (await api.get(commentsUrl(bug.id))).json()).list;
@@ -3352,8 +3354,8 @@ test.describe("bug attachments in Bug Details", () => {
 });
 
 /*
- * Bug Details' Activity section: the bug's own history (from the project activity feed, filtered
- * to this bug), under Comments on both the full page and the side panel. The
+ * Bug Details' Activity tab: the bug's own history (from the project activity feed, filtered to
+ * this bug), a tab beside Comments on both the full page and the side panel, Comments open first. The
  * logging itself — which actions, which actor — is specified in api/bugs.spec.ts "bug activity";
  * these tests are about what the screen shows.
  */
@@ -3395,15 +3397,42 @@ test.describe("bug activity", () => {
     return page.getByRole("region", { name: "Bug details" });
   }
 
-  test("BUG-U-79 the full page shows Activity under Comments, oldest first, naming the actor of each entry", async ({ page }) => {
+  function tab(page: Page, name: RegExp): Locator {
+    return detailsRegion(page).getByRole("tab", { name });
+  }
+
+  /** Opens the Activity tab and returns its section. */
+  async function openActivity(page: Page): Promise<Locator> {
+    await tab(page, /^Activity/).click();
+    const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+    await expect(activity).toBeVisible();
+    return activity;
+  }
+
+  test("BUG-U-79 the full page shows Comments and Activity as two tabs, Comments open; Activity lists entries oldest first, naming the actor", async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     const bug = await seedBug("Page");
     try {
       await api.patch(`/api/bugs/${bug.id}`, { data: { status: "In Progress", priority: "P1" } });
       await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
 
-      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
       const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      // Two tabs side by side, Comments selected and showing; Activity's count is there before it is opened.
+      const commentsTab = tab(page, /^Comments/);
+      const activityTab = tab(page, /^Activity/);
+      await expect(commentsTab).toHaveAttribute("aria-selected", "true");
+      await expect(activityTab).toHaveAttribute("aria-selected", "false");
+      await expect(activityTab).toHaveAccessibleName("Activity (3)");
+      const ct = (await commentsTab.boundingBox())!;
+      const at = (await activityTab.boundingBox())!;
+      expect(Math.abs(at.y - ct.y)).toBeLessThan(4);
+      expect(at.x).toBeGreaterThan(ct.x + ct.width - 4);
+      await expect(comments).toBeVisible();
+      await expect(detailsRegion(page).getByRole("region", { name: "Activity" })).toBeHidden();
+
+      const activity = await openActivity(page);
+      await expect(activityTab).toHaveAttribute("aria-selected", "true");
+      await expect(comments, "only one tab's content shows at a time").toBeHidden();
       const entries = activity.getByTestId("bug-activity");
       await expect(entries).toHaveCount(3);
       await expect(entries.nth(0)).toContainText(`${actorName} created the bug`);
@@ -3411,13 +3440,9 @@ test.describe("bug activity", () => {
       await expect(entries.nth(2)).toContainText(`${actorName} changed priority from None to P1`);
       await expect(entries.nth(0).locator("time")).toHaveAttribute("datetime", /\d{4}-\d{2}-\d{2}T/);
 
-      // Stacked even on a wide screen (it used to sit beside Comments): Activity starts below the end
-      // of Comments, and both span the same full width.
-      const c = (await comments.boundingBox())!;
-      const a = (await activity.boundingBox())!;
-      expect(a.y).toBeGreaterThanOrEqual(c.y + c.height - 1);
-      expect(Math.abs(a.x - c.x)).toBeLessThan(4);
-      expect(Math.abs(a.width - c.width)).toBeLessThan(4);
+      await commentsTab.click();
+      await expect(comments).toBeVisible();
+      await expect(activity).toBeHidden();
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
@@ -3428,13 +3453,17 @@ test.describe("bug activity", () => {
     const bug = await seedBug("Comment");
     try {
       await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
-      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
       const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
-      await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
+      await expect(tab(page, /^Activity/)).toHaveAccessibleName("Activity (1)");
 
       await comments.getByLabel("Add a comment").fill("Seen again on build 12");
       await comments.getByRole("button", { name: "Add Comment" }).click();
       await expect(comments.getByTestId("bug-comment")).toHaveCount(1);
+      // Both counts move without a reload, while the Activity tab is still closed.
+      await expect(tab(page, /^Comments/)).toHaveAccessibleName("Comments (1)");
+      await expect(tab(page, /^Activity/)).toHaveAccessibleName("Activity (2)");
+
+      const activity = await openActivity(page);
       await expect(activity.getByTestId("bug-activity").last()).toContainText(`${actorName} added a comment`);
 
       const persisted = await (await api.get(`/api/projects/${projectId}/bugs/${bug.id}/comments`)).json();
@@ -3444,24 +3473,23 @@ test.describe("bug activity", () => {
     }
   });
 
-  test("BUG-U-81 on a narrow screen Activity stacks below Comments", async ({ page }) => {
+  test("BUG-U-81 on a narrow screen the two tabs still fit side by side and switch, with no horizontal scroll", async ({ page }) => {
     await page.setViewportSize({ width: 800, height: 900 });
     const bug = await seedBug("Narrow");
     try {
       await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
-      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
-      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      const ct = (await tab(page, /^Comments/).boundingBox())!;
+      const at = (await tab(page, /^Activity/).boundingBox())!;
+      expect(Math.abs(at.y - ct.y)).toBeLessThan(4);
+      const activity = await openActivity(page);
       await expect(activity.getByTestId("bug-activity")).toHaveCount(1);
-      const c = (await comments.boundingBox())!;
-      const a = (await activity.boundingBox())!;
-      expect(a.y).toBeGreaterThanOrEqual(c.y + c.height - 1);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), "no horizontal scroll").toBe(true);
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });
 
-  test("BUG-U-82 the side panel shows the bug's Activity under its Comments", async ({ page }) => {
+  test("BUG-U-82 the side panel has the same tabs: Comments open, Activity one click away", async ({ page }) => {
     const bug = await seedBug("Panel");
     try {
       await api.patch(`/api/bugs/${bug.id}`, { data: { status: "Closed" } });
@@ -3469,13 +3497,47 @@ test.describe("bug activity", () => {
       await page.getByRole("button", { name: "List", exact: true }).click();
       await page.locator("tbody tr").filter({ hasText: bug.title }).click();
 
-      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
+      await expect(tab(page, /^Comments/)).toHaveAttribute("aria-selected", "true");
+      await expect(detailsRegion(page).getByRole("region", { name: "Comments" })).toBeVisible();
+      const activity = await openActivity(page);
       await expect(activity.getByTestId("bug-activity")).toHaveCount(2);
       await expect(activity.getByTestId("bug-activity").last()).toContainText(`${actorName} closed the bug (was Open)`);
-      const c = (await detailsRegion(page).getByRole("region", { name: "Comments" }).boundingBox())!;
-      expect((await activity.boundingBox())!.y).toBeGreaterThan(c.y);
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-104 switching tabs keeps an unsent comment, arrow keys move between tabs, and the next bug opens on Comments", async ({ page }) => {
+    const first = await seedBug("Tabs A");
+    const second = await seedBug("Tabs B");
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: first.title }).click();
+      const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      await comments.getByLabel("Add a comment").fill("Half-written note");
+
+      await openActivity(page);
+      await tab(page, /^Comments/).click();
+      await expect(comments.getByLabel("Add a comment"), "the draft survives a trip to Activity").toHaveText("Half-written note");
+
+      // Keyboard: the selected tab is focusable, and arrows move the selection.
+      await tab(page, /^Comments/).focus();
+      await page.keyboard.press("ArrowRight");
+      await expect(tab(page, /^Activity/)).toHaveAttribute("aria-selected", "true");
+      await expect(tab(page, /^Activity/)).toBeFocused();
+      await page.keyboard.press("ArrowLeft");
+      await expect(tab(page, /^Comments/)).toHaveAttribute("aria-selected", "true");
+
+      // Left on Activity, the next bug still opens on Comments.
+      await openActivity(page);
+      await detailsRegion(page).getByRole("button", { name: "Close", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: second.title }).click();
+      await expect(tab(page, /^Comments/)).toHaveAttribute("aria-selected", "true");
+      await expect(detailsRegion(page).getByRole("region", { name: "Comments" })).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${first.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/bugs/${second.id}`, { failOnStatusCode: false });
     }
   });
 
@@ -3488,9 +3550,11 @@ test.describe("bug activity", () => {
         fail ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Boom" }) }) : route.continue(),
       );
       await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
-      const activity = detailsRegion(page).getByRole("region", { name: "Activity" });
-      await expect(activity.getByRole("alert")).toContainText("Couldn't load activity");
       await expect(detailsRegion(page).getByRole("region", { name: "Comments" }).getByText("No comments yet.")).toBeVisible();
+      // A failed load shows no count on the tab rather than a wrong one.
+      await expect(tab(page, /^Activity/)).toHaveAccessibleName("Activity");
+      const activity = await openActivity(page);
+      await expect(activity.getByRole("alert")).toContainText("Couldn't load activity");
 
       fail = false;
       await activity.getByRole("button", { name: "Retry" }).click();

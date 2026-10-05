@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { IconHistory } from "@tabler/icons-react";
 import { listActivity, type ActivityLogItem } from "@/lib/api";
 import { Button } from "@/components/ui";
 import { ActorAvatar, formatAbsolute, safeParseDiff, titleCase } from "@/components/activity/activityShared";
@@ -109,12 +108,23 @@ function describe(item: ActivityLogItem): ReactNode {
 }
 
 /**
- * The bug's history, oldest first, under Comments on Bug Details. Reads the project activity feed
- * filtered to this bug rather than a bug-specific endpoint — the rows are the same audit_logs rows
+ * The bug's history, oldest first, in the Activity tab of Bug Details (BugDiscussion). Reads the
+ * project activity feed filtered to this bug rather than a bug-specific endpoint — the rows are the same audit_logs rows
  * the Activity stream shows. `refreshKey` changes whenever the caller knows the bug has changed
  * (edited, file removed, comment posted) so the list is re-read.
  */
-export default function BugActivity({ projectId, bugId, refreshKey }: { projectId: string; bugId: string; refreshKey?: string | number }) {
+export default function BugActivity({
+  projectId,
+  bugId,
+  refreshKey,
+  onCountChange,
+}: {
+  projectId: string;
+  bugId: string;
+  refreshKey?: string | number;
+  /** Number of entries, for the tab label; null while loading or after a failed load. */
+  onCountChange?: (count: number | null) => void;
+}) {
   const [items, setItems] = useState<ActivityLogItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -140,13 +150,14 @@ export default function BugActivity({ projectId, bugId, refreshKey }: { projectI
     void load();
   }, [load, refreshKey]);
 
-  return (
-    <section aria-label="Activity" className="border-t border-[var(--border)] pt-5">
-      <h4 className="mb-3 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
-        <IconHistory size={14} stroke={1.75} />
-        Activity{!loading && !loadError && items.length > 0 ? ` (${items.length})` : ""}
-      </h4>
+  const count = loading || loadError ? null : items.length;
+  useEffect(() => {
+    onCountChange?.(count);
+  }, [count, onCountChange]);
 
+  return (
+    // Titled by its tab in BugDiscussion, which also shows the count.
+    <section aria-label="Activity">
       {loading ? (
         <p className="text-[13px] text-[var(--muted)]">Loading activity…</p>
       ) : loadError ? (
