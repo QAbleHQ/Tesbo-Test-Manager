@@ -962,6 +962,7 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     // ZYRA_PLAN_BATCH_SIZE, leaving 2 for the background loop's one remaining batch).
     ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
     ai.queueReply({ scenarios: Array.from({ length: 7 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] }); // the planner's top-up round finds nothing more — see ZCC-B-19
     ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
     // Found by review: generateZyraChatTestcasesWithAi unconditionally calls rememberZyraTurn right
     // after this (synchronous) first batch, BEFORE the background loop even starts — without this
@@ -1025,16 +1026,18 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
 
     ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
     ai.queueReply({ scenarios: Array.from({ length: 12 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] }); // the planner's top-up round finds nothing more — see ZCC-B-19
     ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
     const turn1 = await sendMessage(sessionId, "Generate all possible test cases for the login flow.");
     expect(turn1.status, JSON.stringify(turn1.body)).toBeLessThan(300);
-    // 4 requests so far: router, scenario plan, first (synchronous) batch, and — easy to miss —
+    // 5 requests so far: router, scenario plan, the plan's top-up round (12 is below the 90-scenario
+    // floor — see ZCC-B-19), first (synchronous) batch, and — easy to miss —
     // generateZyraChatTestcasesWithAi unconditionally calls rememberZyraTurn after every successful
     // generation (its own summarization call to the same provider). Nothing was queued for it here,
     // so it took the fake server's harmless "no scripted response" default — safe, since nothing
     // else is queued yet for it to steal.
     const requestsAfterTurn1 = ai.requests.length;
-    expect(requestsAfterTurn1).toBe(4);
+    expect(requestsAfterTurn1).toBe(5);
 
     // The background loop's first batch (5 of the remaining 7 scenarios) — held open so this test
     // can observe it arriving before deciding to stop. A placeholder reply is queued for THIS
@@ -1094,6 +1097,9 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
     const messages = (await session.json()).messages as Array<Record<string, unknown>>;
     expect(messages.some((m) => String(m.content || "").includes("Stopped at your request")), "the stop endpoint's own message must still post").toBe(true);
+    // A status-only plan message stages nothing, so it must not point at a review batch.
+    const stopMessage = messages.find((m) => String(m.content || "").includes("Stopped at your request"))!;
+    expect(stopMessage.reviewRequestId ?? null, "a status message carries no review link").toBeNull();
 
     // Resuming picks up exactly where Stop actually left it — the 2 scenarios the third batch would
     // have covered, using the reply already queued above (still unconsumed). Its own rememberZyraTurn
@@ -1120,6 +1126,7 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
 
     ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
     ai.queueReply({ scenarios: Array.from({ length: 7 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] }); // the planner's top-up round finds nothing more — see ZCC-B-19
     ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
     // See ZCC-B-08's identical comment — the first batch's own rememberZyraTurn call fires
     // synchronously right after it, before the background loop starts, and would otherwise consume
@@ -1280,7 +1287,9 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const hugeTurn = await generateWithRange(huge, 100, { requestedCount: 100 });
     expect(reviewRequestFor(huge)!.payloadLength, "a count above the ceiling is clamped to 50").toBe(50);
     expectNothingDropped(hugeTurn);
-    expect(ai.requests.some((r) => JSON.stringify(r.messages).includes("List up to")), "a named count must never run the 'all' scenario planner").toBe(false);
+    // "planning exhaustive test coverage" is the planner's own system prompt — it used to match on
+    // "List up to", which the planner no longer says, and would then have passed vacuously.
+    expect(ai.requests.some((r) => JSON.stringify(r.messages).includes("planning exhaustive test coverage")), "a named count must never run the 'all' scenario planner").toBe(false);
     expect(scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(huge)};`), "a named count must not start a batch plan").toBeNull();
   });
 
@@ -1302,7 +1311,9 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const turn = await sendMessage(sessionId, "Generate test cases for OTP login.");
     expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
 
-    expect(JSON.stringify(ai.requests[1].messages), "the planner must be told the 'all' ceiling").toContain("List up to 100 scenarios");
+    expect(JSON.stringify(ai.requests[1].messages), "the planner must be told the 'all' ceiling").toContain("List 100 scenarios");
+    // 120 is already past the target, so no top-up call is made.
+    expect(ai.requests.filter((r) => JSON.stringify(r.messages).includes("Scenarios already planned")), "a full plan is never topped up").toHaveLength(0);
     const messages = (await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json()).messages as Array<Record<string, unknown>>;
     const first = messages.find((m) => m.role === "assistant")!;
     expect(String(first.content || ""), "a 120-scenario plan is trimmed to 100 — it used to stop at 40").toContain("I identified 100 distinct scenarios");
@@ -1311,6 +1322,183 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
 
     // Let the background loop settle (paused on the unscripted batch, or stopped here) before purge()
     // deletes the session out from under it.
+    await asOwner.post(url(`/chat/sessions/${sessionId}/stop-plan`), { failOnStatusCode: false });
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(active_plan->>'status', 'none') FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must stop running before cleanup",
+        timeout: 30_000,
+      })
+      .not.toBe("running");
+  });
+
+  /*
+   * "All – Exhaustive" showed "5 test cases drafted for review" on every batch after the first with
+   * nothing under it: postZyraPlanMessage never stored the batch's review_request_id, and the chat
+   * only renders proposed rows inside a review panel addressed by that column. The first batch goes
+   * through the interactive turn's insert, which always stored it — so a single-batch generation
+   * never showed the problem. Three batches (5 sync + 5 + 2 background) so more than one background
+   * message is checked, and so batch N's link can't be confused with batch N-1's.
+   */
+  test("ZCC-B-17 every batch of an exhaustive plan is linked to its own pending review batch", async () => {
+    await allocateFakeAiKey();
+    await setRange("all");
+    const sessionId = await newSession("E2E ZCC plan batches are reviewable");
+
+    ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false });
+    ai.queueReply({ scenarios: Array.from({ length: 12 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] }); // the planner's top-up round finds nothing more — see ZCC-B-19
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    ai.queueReply("Noted."); // first batch's rememberZyraTurn — see ZCC-B-08
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 6}`)) });
+    ai.queueReply("Noted."); // second batch's own rememberZyraTurn — see ZCC-B-09
+    ai.queueReply({ drafts: Array.from({ length: 2 }, (_, i) => scenarioDraft(`Scenario ${i + 11}`)) });
+
+    const turn = await sendMessage(sessionId, "Generate test cases for OTP login.");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must clear itself once the last batch is posted",
+        timeout: 45_000,
+      })
+      .toBeNull();
+
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    const batches = messages.filter((m) => m.role === "assistant");
+    expect(batches.length, "one message per batch").toBe(3);
+    expect(String(batches[1].content || "")).toContain("10/12 scenarios covered so far");
+    expect(String(batches[2].content || "")).toContain("all 12 scenarios are now covered");
+
+    const linked = batches.map((m) => m.reviewRequestId as string | null);
+    for (const [i, id] of linked.entries()) {
+      expect(id, `batch ${i + 1} must link the review batch its drafts are staged in`).toBeTruthy();
+    }
+    expect(new Set(linked).size, "every batch is its own review batch, never another batch's").toBe(3);
+
+    const titles: string[] = [];
+    for (const [i, message] of batches.entries()) {
+      const rows = message.testcases as Array<{ title: string; action: string; reviewRequestId?: string; draftIndex?: number }>;
+      expect(rows.length, `batch ${i + 1}'s drafts`).toBe([5, 5, 2][i]);
+      for (const row of rows) {
+        expect(row.action).toBe("proposed-create");
+        expect(row.reviewRequestId, "a row and its message must point at the same batch").toBe(linked[i]);
+      }
+      titles.push(...rows.map((row) => row.title));
+      // The same stored batch the panel loads (getZyraTask) — still pending, holding exactly these drafts.
+      const task = await asOwner.get(url(`/tasks/${linked[i]}`), { failOnStatusCode: false });
+      expect(task.status(), `reading batch ${i + 1}'s review task — ${await task.text()}`).toBe(200);
+      expect((await task.json()).taskStatus).toBe("in_review");
+      expect(
+        Number(scalar(`SELECT jsonb_array_length(generated_payload) FROM ai_generation_requests WHERE id = ${literal(linked[i]!)} AND chat_session_id = ${literal(sessionId)};`)),
+      ).toBe(rows.length);
+    }
+    // The complete set, and no scenario staged twice across batches.
+    expect(titles.length).toBe(12);
+    expect(new Set(titles).size, "no draft may appear in two batches").toBe(12);
+    expect(Number(scalar(`SELECT COUNT(*) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`))).toBe(3);
+
+    // A caller outside the project cannot reach a batch through the id the message now exposes.
+    const asGuest = await loginAs(tenant!.guest);
+    try {
+      const res = await asGuest.get(url(`/tasks/${linked[1]}`), { failOnStatusCode: false });
+      expect([401, 403, 404], `a non-member read a plan batch: ${await res.text()}`).toContain(res.status());
+    } finally {
+      await asGuest.dispose();
+    }
+  });
+
+  /*
+   * A real exhaustive run drafted 4 test cases for 5 scenarios in most batches, and nothing knew
+   * which scenario was missing — it was neither retried nor reported, and the count still advanced
+   * by 5. Each draft now names the scenario it covers (zyraBatchMessage), so the missing one goes back
+   * in the queue once, progress counts only covered scenarios, and a scenario that comes back empty
+   * on its retry is skipped and said so. Scripted: batch 1 drops scenario 3; batch 3 (11, 12 and the
+   * retried 3) drops it again.
+   */
+  test("ZCC-B-18 a scenario that comes back without a test case is retried once, then reported, and never counted as covered", async () => {
+    await allocateFakeAiKey();
+    await setRange("all");
+    const sessionId = await newSession("E2E ZCC plan retries a dropped scenario");
+    const numbered = (title: string, scenario: number) => ({ ...scenarioDraft(title), scenario });
+
+    ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false });
+    ai.queueReply({ scenarios: Array.from({ length: 12 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] }); // the planner's top-up round finds nothing more — see ZCC-B-19
+    ai.queueReply({ drafts: [1, 2, 4, 5].map((n) => numbered(`Scenario ${n}`, n)) }); // scenario 3 dropped
+    ai.queueReply("Noted."); // first batch's rememberZyraTurn — see ZCC-B-08
+    ai.queueReply({ drafts: [6, 7, 8, 9, 10].map((n, i) => numbered(`Scenario ${n}`, i + 1)) });
+    ai.queueReply("Noted."); // second batch's own rememberZyraTurn — see ZCC-B-09
+    ai.queueReply({ drafts: [numbered("Scenario 11", 1), numbered("Scenario 12", 2)] }); // the retried scenario 3 dropped again
+
+    const turn = await sendMessage(sessionId, "Generate test cases for OTP login.");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must clear itself once the retried scenario has had its one retry",
+        timeout: 45_000,
+      })
+      .toBeNull();
+
+    // Every batch asks for numbered drafts; the third carries the dropped scenario back.
+    const batchPrompts = ai.requests.map((r) => JSON.stringify(r.messages)).filter((m) => m.includes("Generate exactly one distinct testcase for each of these scenarios"));
+    expect(batchPrompts.length, "one generation call per batch").toBe(3);
+    for (const prompt of batchPrompts) expect(prompt).toContain('Set \\"scenario\\" on every draft');
+    expect(batchPrompts[2], "the retry batch must include the dropped scenario").toContain("3. Scenario 3");
+
+    const messages = (await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json()).messages as Array<Record<string, unknown>>;
+    const batches = messages.filter((m) => m.role === "assistant");
+    expect(batches.length).toBe(3);
+    expect(batches.map((m) => (m.testcases as unknown[]).length), "what each batch actually staged").toEqual([4, 5, 2]);
+
+    const [first, second, last] = batches.map((m) => String(m.content || ""));
+    expect(first).toContain("Here are 4 test case(s) for the first 5 — 1 scenario(s) came back without a test case and will be retried in a later batch.");
+    expect(first, "7 not yet started + the 1 retry").toContain("(8 more)");
+    expect(second, "9 scenarios have a test case, not the 10 handed out").toContain("Here are 5 more test case(s) — 9/12 scenarios covered so far. Still working on the remaining 3;");
+    expect(last).toContain("11 of 12 scenarios are covered; 1 produced no test case.");
+    expect(last).toContain("1 scenario(s) still produced no test case after a retry and were skipped.");
+    expect(last).not.toContain("now covered");
+
+    // The retry batch's trace stays within the plan's 12 and says it carries a retry.
+    const retryStep = ((batches[2].trace as { steps?: Array<{ stage: string; meta?: Record<string, unknown> }> } | null)?.steps || []).find((s) => s.stage === "plan:batch");
+    expect(retryStep?.meta).toMatchObject({ fromScenario: 11, toScenario: 12, totalCount: 12, retrying: 1 });
+
+    // Staged drafts agree with the messages — the dropped scenario was never staged twice or invented.
+    expect(Number(scalar(`SELECT COALESCE(SUM(jsonb_array_length(generated_payload)), 0) FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)};`))).toBe(11);
+  });
+
+  /*
+   * "All – Exhaustive" should land close to 100 test cases. The planner was told "List up to 100"
+   * and a real run planned 49. It is now asked for the target, and a plan that still stops below 90
+   * gets one top-up call that sees the list so far. Scripted: 40, then 55 more of which 5 repeat.
+   */
+  test("ZCC-B-19 an 'all' plan that stops well short of 100 is topped up once, without repeats", async () => {
+    await allocateFakeAiKey();
+    await setRange("all");
+    const sessionId = await newSession("E2E ZCC plan top-up");
+
+    ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false });
+    ai.queueReply({ scenarios: Array.from({ length: 40 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: ["scenario 1", "Scenario  2", "Scenario 3", "Scenario 4", "Scenario 5", ...Array.from({ length: 50 }, (_, i) => `Scenario ${i + 41}`)] });
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    ai.queueReply("Noted."); // first batch's rememberZyraTurn — see ZCC-B-08
+    // Nothing queued for the background batches: this test is about the plan's size (see ZCC-B-16).
+
+    const turn = await sendMessage(sessionId, "Generate test cases for OTP login.");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+
+    const planPrompt = JSON.stringify(ai.requests[1].messages);
+    expect(planPrompt, "the planner is asked for the target, not 'up to' it").toContain("List 100 scenarios");
+    expect(planPrompt).toContain("until you reach 100");
+    const topUp = JSON.stringify(ai.requests[2].messages);
+    expect(topUp, "the top-up sees what is already planned").toContain("40. Scenario 40");
+    expect(topUp).toContain("up to 60 MORE distinct scenarios");
+
+    const messages = (await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json()).messages as Array<Record<string, unknown>>;
+    const first = messages.find((m) => m.role === "assistant")!;
+    expect(String(first.content || ""), "40 + 50 new — the 5 repeats are dropped").toContain("I identified 90 distinct scenarios");
+    expect(Number(scalar(`SELECT active_plan->>'totalCount' FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`))).toBe(90);
+
+    // Settle the background loop before purge() deletes the session (same as ZCC-B-16).
     await asOwner.post(url(`/chat/sessions/${sessionId}/stop-plan`), { failOnStatusCode: false });
     await expect
       .poll(() => scalar(`SELECT COALESCE(active_plan->>'status', 'none') FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {

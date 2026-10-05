@@ -587,6 +587,36 @@ test.describe("project dashboard — runs, bugs and activity panels", () => {
     }
   });
 
+  test("DSH-U-27b open bugs with no severity get a Not selected row, and the rows add up to the total", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await createBug(api, project.id, { severity: "High" });
+      await createBug(api, project.id, {});
+
+      await page.goto(`/projects/${project.id}/dashboard`);
+      await expect(page.getByText("Bug severity breakdown")).toBeVisible();
+      await expect(page.getByText("2 open")).toBeVisible();
+      await expect(page.getByText("Not selected", { exact: true })).toBeVisible();
+      // The stat card's chip names the worst real severity, never "not selected".
+      await expect(page.getByText("1 high", { exact: true })).toBeVisible();
+      await expect(page.getByText(/not selected/)).toHaveCount(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-U-27c the Not selected row is absent when every open bug has a severity", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await createBug(api, project.id, { severity: "Low" });
+      await page.goto(`/projects/${project.id}/dashboard`);
+      await expect(page.getByText("1 open")).toBeVisible();
+      await expect(page.getByText("Not selected", { exact: true })).toHaveCount(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
   test("DSH-U-29/30 the activity feed describes real events and counts what it shows", { tag: '@tesbo.testId("TES-TC-747")' }, async ({ page }) => {
     const project = await createProject(api);
     try {

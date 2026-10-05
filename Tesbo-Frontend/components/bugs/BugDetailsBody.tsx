@@ -90,7 +90,11 @@ export default function BugDetailsBody({
           <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
             Severity
           </p>
-          <BugSeverityBadge severity={bug.severity} />
+          {bug.severity ? (
+            <BugSeverityBadge severity={bug.severity} />
+          ) : (
+            <span className="text-sm text-[var(--muted-soft)]">Not selected</span>
+          )}
         </div>
         <div>
           <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
@@ -99,7 +103,7 @@ export default function BugDetailsBody({
           {bug.priority ? (
             <BugPriorityBadge priority={bug.priority} />
           ) : (
-            <span className="text-sm text-[var(--muted-soft)]">Not set</span>
+            <span className="text-sm text-[var(--muted-soft)]">Not selected</span>
           )}
         </div>
         <div>

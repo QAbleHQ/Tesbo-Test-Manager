@@ -1133,6 +1133,8 @@ export interface ZyraChatActivePlan {
   batchSize: number;
   doneCount: number;
   totalCount: number;
+  /** Scenarios that have a test case — what progress shows. doneCount is the batch cursor, which grows with retries. Absent on plans started before it existed. */
+  coveredCount?: number;
 }
 
 export interface ZyraChatSession {
@@ -2710,7 +2712,8 @@ export interface BugItem {
   description: string;
   externalUrl: string;
   status: string;
-  severity: BugSeverity;
+  /** null = not selected (V130), the same convention as priority. */
+  severity: BugSeverity | null;
   priority: BugPriority | null;
   executionId: string | null;
   testcaseId: string | null;
@@ -2747,24 +2750,84 @@ export async function getBug(bugId: string): Promise<BugItem> {
   return api(`/api/bugs/${bugId}`);
 }
 
-/** One comment on a bug. Flat and chronological — no replies or resolution (see V129). */
+/**
+ * One comment on a bug, or a reply to one (V131). The list is flat and oldest first; replies carry
+ * their thread's top comment as `parentCommentId` and nest only one level deep. No resolution.
+ */
 export interface BugComment {
   id: string;
   bugId: string;
+  /** null for a top-level comment. */
+  parentCommentId: string | null;
   authorId: string | null;
   /** Name, else email; "Unknown" once the author's account is gone. */
   authorName: string;
+  /** Markdown — render with renderMarkdown (lib/markdown.ts), never as raw HTML. */
   body: string;
+  /** True once the text or the files have been changed after posting. */
+  isEdited: boolean;
+  /** The author may edit until this moment (an hour after posting); the server enforces it. */
+  editableUntil: string;
+  /** The comment's own files; downloaded through the same route as bug evidence. */
+  attachments: BugAttachment[];
   createdAt: string;
   updatedAt: string;
 }
 
-export async function listBugComments(projectId: string, bugId: string): Promise<{ list: BugComment[]; total: number }> {
-  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`);
+const bugCommentsPath = (projectId: string, bugId: string) => `/api/projects/${projectId}/bugs/${bugId}/comments`;
+
+/** A comment write that carries files goes as multipart; the server reads `body` and the rest from fields. */
+async function sendBugCommentForm(path: string, method: "POST" | "PATCH", form: FormData): Promise<BugComment> {
+  const res = await fetchWithNetworkErrorMessage(`${API_BASE}${path}`, { method, credentials: "include", body: form });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as ApiErrorBody;
+    throw new Error(formatApiError(res.status, err));
+  }
+  return res.json();
 }
 
-export async function createBugComment(projectId: string, bugId: string, body: string): Promise<BugComment> {
-  return api(`/api/projects/${projectId}/bugs/${bugId}/comments`, { method: "POST", body: { body } });
+export async function listBugComments(projectId: string, bugId: string): Promise<{ list: BugComment[]; total: number }> {
+  return api(bugCommentsPath(projectId, bugId));
+}
+
+/** With `parentCommentId` the comment is a reply; it must name a top-level comment (one level deep). */
+export async function createBugComment(
+  projectId: string,
+  bugId: string,
+  body: string,
+  files: File[] = [],
+  parentCommentId: string | null = null
+): Promise<BugComment> {
+  if (!files.length) {
+    return api(bugCommentsPath(projectId, bugId), { method: "POST", body: { body, ...(parentCommentId ? { parentCommentId } : {}) } });
+  }
+  const form = new FormData();
+  form.append("body", body);
+  if (parentCommentId) form.append("parentCommentId", parentCommentId);
+  for (const file of files) form.append("files", file);
+  return sendBugCommentForm(bugCommentsPath(projectId, bugId), "POST", form);
+}
+
+/** Author only. Omitted fields are left as they are. */
+export async function updateBugComment(
+  projectId: string,
+  bugId: string,
+  commentId: string,
+  changes: { body?: string; removeAttachmentIds?: string[]; files?: File[] }
+): Promise<BugComment> {
+  const path = `${bugCommentsPath(projectId, bugId)}/${commentId}`;
+  const { files = [], ...json } = changes;
+  if (!files.length) return api(path, { method: "PATCH", body: json });
+  const form = new FormData();
+  if (json.body !== undefined) form.append("body", json.body);
+  if (json.removeAttachmentIds?.length) form.append("removeAttachmentIds", JSON.stringify(json.removeAttachmentIds));
+  for (const file of files) form.append("files", file);
+  return sendBugCommentForm(path, "PATCH", form);
+}
+
+/** The author, or a project owner/manager. */
+export async function deleteBugComment(projectId: string, bugId: string, commentId: string): Promise<void> {
+  await api(`${bugCommentsPath(projectId, bugId)}/${commentId}`, { method: "DELETE" });
 }
 
 export async function createBug(projectId: string, data: {
@@ -2788,7 +2851,8 @@ export async function updateBug(bugId: string, data: {
   description?: string;
   externalUrl?: string;
   status?: string;
-  severity?: BugSeverity;
+  // null clears it back to not selected; omitted leaves the stored value alone.
+  severity?: BugSeverity | null;
   // null clears it back to untriaged; omitted leaves the stored value alone.
   priority?: BugPriority | null;
   // null clears the assignee; omitted leaves the stored value alone.
@@ -3067,7 +3131,9 @@ export interface ProjectDashboardSummary {
   testCases: { total: number; addedThisWeek: number };
   passRate: { value: number | null; deltaThisWeek: number | null };
   executionProgress: { value: number };
-  openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number } };
+  // total counts every open bug; noSeverity is the part of it with no severity selected, which
+  // bySeverity's four buckets don't include.
+  openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number }; noSeverity?: number };
   coverage: { pct: number | null; totalRequirements: number };
   plans: number;
   suites: number;

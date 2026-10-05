@@ -321,6 +321,10 @@ type ZyraChatDecision = {
   // see ZyraTurnContextRefs). Set by buildZyraChatDecision on every decision it returns, persisted to
   // zyra_chat_messages.context_refs by insertZyraAssistantMessage.
   contextRefs?: ZyraTurnContextRefs;
+  // Set by generateZyraChatTestcasesWithAi: per draft (same order as its operations/testcases), the
+  // plan-batch scenario number the model said it covers, or null. Read only by the plan flow
+  // (zyraPlanBatchOutcome) to tell which scenarios of a batch came back without a draft.
+  draftScenarios?: Array<number | null>;
 };
 
 // Which sources a chat turn resolved, by reference only — re-fetched (project-scoped) by the next
@@ -6412,8 +6416,10 @@ export class LegacyService implements OnModuleInit {
     return match;
   }
 
-  private parseBugSeverity(severity: unknown): "Critical" | "High" | "Medium" | "Low" {
-    if (severity === undefined || severity === null || severity === "") return "Medium";
+  private parseBugSeverity(severity: unknown): "Critical" | "High" | "Medium" | "Low" | null {
+    // Absent, null and "" all mean "not selected" (V130), the same convention as parseBugPriority.
+    // This used to return "Medium", which stored a severity nobody had chosen.
+    if (severity === undefined || severity === null || severity === "") return null;
     const match = BUG_SEVERITIES.find((s) => s.toLowerCase() === String(severity).trim().toLowerCase());
     if (!match)
       throw new BadRequestException({
@@ -6552,8 +6558,9 @@ export class LegacyService implements OnModuleInit {
   }
 
   /**
-   * Project members named in a comment as `@Display Name` or `@email`. There is no mention picker —
-   * the comment box is plain text — so this matches against the project's own members, longest
+   * Project members named in a comment as `@Display Name` or `@email`. The comment editor's picker
+   * inserts exactly that text (the stored body is Markdown, with no mention markup), and a typed one
+   * counts the same, so this matches against the project's own members, longest
    * name first so `@Ann Lee` is not also read as `@Ann`. The `@` must start a word, so the middle
    * of an email address typed as prose never counts as a mention.
    */
@@ -6590,13 +6597,29 @@ export class LegacyService implements OnModuleInit {
   // Routed under /api/projects/:projectId so ProjectWriteLockGuard covers the write, which is why
   // the bug is resolved against the URL's project rather than through requireBugAccess alone.
 
-  private bugCommentView(row: Body): Body {
+  private static readonly BUG_COMMENT_MAX_LENGTH = 10000;
+  // Per comment, across edits — the same ten FilesInterceptor allows in a single request.
+  private static readonly BUG_COMMENT_MAX_ATTACHMENTS = 10;
+  // How long after posting the author may still edit (text or files). Deleting has no limit.
+  private static readonly BUG_COMMENT_EDIT_WINDOW_MINUTES = 60;
+  private static readonly BUG_COMMENT_COLUMNS = "id, bug_id, parent_comment_id, author_id, body, created_at, updated_at";
+
+  private bugCommentView(row: Body, attachments: Body[] = []): Body {
     return {
       id: String(row.id),
       bugId: String(row.bug_id),
+      // null for a top-level comment; replies are one level deep (V131).
+      parentCommentId: row.parent_comment_id ? String(row.parent_comment_id) : null,
       authorId: row.author_id ? String(row.author_id) : null,
       authorName: row.author_name ? String(row.author_name) : "Unknown",
       body: String(row.body || ""),
+      // Both timestamps come from the same now() on insert, and updated_at only moves when an edit
+      // actually changes the text or the files (a no-op PATCH leaves it alone), so any gap means edited.
+      isEdited: new Date(row.updated_at).getTime() > new Date(row.created_at).getTime(),
+      // When the author's edit window closes, so the UI can stop offering Edit. Advisory only:
+      // updateBugComment enforces it against the database clock, not this value.
+      editableUntil: new Date(new Date(row.created_at).getTime() + LegacyService.BUG_COMMENT_EDIT_WINDOW_MINUTES * 60_000).toISOString(),
+      attachments,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString()
     };
@@ -6613,57 +6636,369 @@ export class LegacyService implements OnModuleInit {
     return res.rows[0];
   }
 
-  async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
-    await this.requireProjectAccess(this.requireUser(userId), projectId);
-    await this.bugInProject(projectId, bugId);
+  /** A live comment on this bug, or the 404 a missing one gets. */
+  private async bugCommentRow(bugId: string, commentId: string): Promise<Body> {
+    if (!isUuid(commentId)) throw new NotFoundException({ error: "Comment not found" });
     const res = await this.db.query(
-      `SELECT c.id, c.bug_id, c.author_id, c.body, c.created_at, c.updated_at,
-              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+      `SELECT c.id, c.bug_id, c.parent_comment_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name,
+              c.created_at > now() - make_interval(mins => $3) AS within_edit_window
        FROM bug_comments c
        LEFT JOIN users a ON a.id = c.author_id
-       WHERE c.bug_id = $1 AND c.is_deleted = false
-       ORDER BY c.created_at ASC, c.id ASC`,
-      [bugId]
+       WHERE c.id = $1 AND c.bug_id = $2 AND c.is_deleted = false`,
+      [commentId, bugId, LegacyService.BUG_COMMENT_EDIT_WINDOW_MINUTES]
     );
-    const list = res.rows.map((row) => this.bugCommentView(row));
-    return { list, total: list.length };
+    if (!res.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+    return res.rows[0];
   }
 
-  async createBugComment(projectId: string, userId: string | null | undefined, bugId: string, body: Body) {
-    const uid = this.requireUser(userId);
-    await this.requireProjectAccess(uid, projectId);
-    const bug = await this.bugInProject(projectId, bugId);
+  /*
+   * A comment's files live in the generic `attachments` table as entity_type='bug_comment', exactly
+   * as bug evidence does with 'bug'. Keeping them out of 'bug' is what keeps them out of the bug's
+   * own Attachments list and out of DELETE /api/bugs/attachments/:id, which any project member may
+   * call — removing a comment's file goes through the comment, under the comment's permissions.
+   */
+  private async bugCommentAttachments(commentIds: string[]): Promise<Map<string, Body[]>> {
+    const byComment = new Map<string, Body[]>();
+    if (!commentIds.length) return byComment;
+    const res = await this.db.query(
+      `SELECT id, entity_id, file_name, content_type, file_size, storage_path, created_at
+       FROM attachments
+       WHERE entity_type = 'bug_comment' AND entity_id = ANY($1::uuid[]) AND deleted_at IS NULL
+       ORDER BY created_at ASC, id ASC`,
+      [commentIds]
+    );
+    for (const row of res.rows) {
+      const key = String(row.entity_id);
+      const list = byComment.get(key) ?? [];
+      list.push({
+        id: String(row.id),
+        fileName: String(row.file_name),
+        contentType: row.content_type ? String(row.content_type) : "",
+        fileSize: Number(row.file_size ?? 0),
+        createdAt: new Date(row.created_at).toISOString(),
+        storagePath: String(row.storage_path)
+      });
+      byComment.set(key, list);
+    }
+    return byComment;
+  }
 
+  /** The client-facing shape: the storage key never leaves the server. */
+  private static publicCommentAttachments(list: Body[] = []): Body[] {
+    return list.map(({ storagePath: _storagePath, ...rest }) => rest);
+  }
+
+  /** Comment text, validated the same way on create and edit. */
+  private static bugCommentText(raw: unknown): string {
     // String() would store an object as "[object Object]" and a number as its digits — refuse
     // anything that is not text instead.
-    const raw = body?.body;
     if (raw !== undefined && raw !== null && typeof raw !== "string") {
       throw new BadRequestException({ error: "Comment must be text." });
     }
-    const text = (raw ?? "").trim();
+    const text = ((raw as string | null | undefined) ?? "").trim();
     if (!text) throw new BadRequestException({ error: "Comment cannot be empty." });
-    if (text.length > 10000) throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+    if (text.length > LegacyService.BUG_COMMENT_MAX_LENGTH) {
+      throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+    }
+    return text;
+  }
 
+  /**
+   * `removeAttachmentIds` as JSON (an array) or as a multipart field (a JSON-encoded array, or one
+   * bare id). Anything else is a malformed request rather than "remove nothing".
+   */
+  private static attachmentIdList(raw: unknown): string[] {
+    if (raw === undefined || raw === null || raw === "") return [];
+    let value: unknown = raw;
+    if (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = [value];
+      }
+    }
+    if (typeof value === "string") value = [value];
+    if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) {
+      throw new BadRequestException({ error: "removeAttachmentIds must be a list of attachment ids." });
+    }
+    return Array.from(new Set(value as string[]));
+  }
+
+  /** Validates a batch of comment files before anything is stored — all or nothing, like bug evidence. */
+  private async assertBugCommentFiles(organizationId: string, files: Array<{ originalname: string; size: number }>, existing: number) {
+    if (existing + files.length > LegacyService.BUG_COMMENT_MAX_ATTACHMENTS) {
+      throw new BadRequestException({
+        error: `A comment can have at most ${LegacyService.BUG_COMMENT_MAX_ATTACHMENTS} attachments.`
+      });
+    }
+    if (!files.length) return;
+    LegacyService.assertValidEvidenceFiles(files, LegacyService.BUG_FILE_MAX_SIZE);
+    await this.planLimits.assertStorageAvailable(organizationId, files.reduce((sum, file) => sum + file.size, 0));
+  }
+
+  /**
+   * Stores already-validated files against a comment. If any write fails, the objects and rows this
+   * call already made are removed again before the error propagates, so a failed upload never leaves
+   * half its files attached (or billed).
+   */
+  private async storeBugCommentFiles(
+    projectId: string,
+    bugId: string,
+    commentId: string,
+    uid: string,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    const stored: Array<{ key: string; id?: string }> = [];
+    try {
+      for (const file of files) {
+        const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
+        const entry: { key: string; id?: string } = {
+          key: `bugs/${projectId}/${bugId}/comments/${commentId}/${randomUUID()}${ext ? `.${ext}` : ""}`
+        };
+        await this.storage.put(entry.key, file.buffer, file.mimetype);
+        stored.push(entry);
+        const res = await this.db.query<{ id: string }>(
+          `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
+           VALUES ($1, 'bug_comment', $2, $3, $4, $5, $6, $7) RETURNING id`,
+          [projectId, commentId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, entry.key, uid]
+        );
+        entry.id = res.rows[0].id;
+      }
+    } catch (err) {
+      for (const entry of stored) {
+        await this.storage.delete(entry.key).catch(() => undefined);
+        if (entry.id) await this.db.query("DELETE FROM attachments WHERE id = $1", [entry.id]).catch(() => undefined);
+      }
+      throw err;
+    }
+  }
+
+  /** Destroys the stored objects and soft-deletes the rows, as deleteBugAttachment does for evidence. */
+  private async removeBugCommentFiles(files: Body[], uid: string) {
+    for (const file of files) {
+      await this.storage.delete(String(file.storagePath));
+      await this.db.query("UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [file.id, uid]);
+    }
+  }
+
+  async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    await this.bugInProject(projectId, bugId);
+    // Flat and oldest first, replies included: grouped by parentCommentId, that is each thread's
+    // replies in date order. A reply whose parent has been deleted is left out — deleteBugComment
+    // removes a thread's replies with it, so this only covers a reply racing that delete.
+    const res = await this.db.query(
+      `SELECT c.id, c.bug_id, c.parent_comment_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM bug_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       LEFT JOIN bug_comments p ON p.id = c.parent_comment_id
+       WHERE c.bug_id = $1 AND c.is_deleted = false
+         AND (c.parent_comment_id IS NULL OR p.is_deleted = false)
+       ORDER BY c.created_at ASC, c.id ASC`,
+      [bugId]
+    );
+    const files = await this.bugCommentAttachments(res.rows.map((row) => String(row.id)));
+    const list = res.rows.map((row) => this.bugCommentView(row, LegacyService.publicCommentAttachments(files.get(String(row.id)))));
+    return { list, total: list.length };
+  }
+
+  /**
+   * `parentCommentId` as sent (JSON or a multipart field): null for a top-level comment, otherwise
+   * a live, top-level comment on this bug — the same rules and messages as Knowledge Base replies.
+   */
+  private async bugCommentParent(bugId: string, raw: unknown): Promise<string | null> {
+    if (raw === undefined || raw === null || raw === "") return null;
+    if (typeof raw !== "string") throw new BadRequestException({ error: "parentCommentId must be a comment id." });
+    const gone = new NotFoundException({ error: "The comment you're replying to no longer exists." });
+    if (!isUuid(raw)) throw gone;
+    const parent = await this.db.query<{ parent_comment_id: string | null }>(
+      "SELECT parent_comment_id FROM bug_comments WHERE id = $1 AND bug_id = $2 AND is_deleted = false",
+      [raw, bugId]
+    );
+    if (!parent.rows[0]) throw gone;
+    // Threads stay one level deep. The UI never sends this — Reply on a reply targets the thread's
+    // top comment — so it only reaches a caller of the API itself.
+    if (parent.rows[0].parent_comment_id) {
+      throw new BadRequestException({ error: "Reply to the top comment of the thread instead of to another reply." });
+    }
+    return raw;
+  }
+
+  /**
+   * JSON `{ body }`, or multipart with a `body` field plus up to ten `files` — one request, so a
+   * comment and its files are saved together: if storing a file fails, the comment is removed again
+   * rather than left posted without the evidence it refers to. With `parentCommentId` it is a reply.
+   */
+  async createBugComment(
+    projectId: string,
+    userId: string | null | undefined,
+    bugId: string,
+    body: Body,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }> = []
+  ) {
+    const uid = this.requireUser(userId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const text = LegacyService.bugCommentText(body?.body);
+    const parentCommentId = await this.bugCommentParent(bugId, body?.parentCommentId);
+    const uploads = files ?? [];
+    await this.assertBugCommentFiles(String(project.organization_id), uploads, 0);
+
+    // The parent is re-checked in the INSERT itself, so a thread deleted since bugCommentParent
+    // read it gets the same 404 rather than a reply nobody can see.
     const res = await this.db.query(
       `WITH inserted AS (
-         INSERT INTO bug_comments (project_id, bug_id, author_id, body)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, bug_id, author_id, body, created_at, updated_at
+         INSERT INTO bug_comments (project_id, bug_id, parent_comment_id, author_id, body)
+         -- Typed explicitly: INSERT … SELECT does not infer parameter types from the target columns.
+         SELECT $1::uuid, $2::uuid, $5::uuid, $3::uuid, $4::text
+         WHERE $5::uuid IS NULL OR EXISTS (
+           SELECT 1 FROM bug_comments p
+           WHERE p.id = $5::uuid AND p.bug_id = $2::uuid AND p.is_deleted = false AND p.parent_comment_id IS NULL
+         )
+         RETURNING ${LegacyService.BUG_COMMENT_COLUMNS}
        )
        SELECT i.*, COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
        FROM inserted i
        LEFT JOIN users a ON a.id = i.author_id`,
-      [projectId, bugId, uid, text]
+      [projectId, bugId, uid, text, parentCommentId]
     );
-    await this.logProjectActivity(projectId, uid, "commented", "bug", bugId, bug.title, { commentId: res.rows[0].id });
+    if (!res.rows[0]) throw new NotFoundException({ error: "The comment you're replying to no longer exists." });
+    const commentId = String(res.rows[0].id);
+    if (uploads.length) {
+      try {
+        await this.storeBugCommentFiles(projectId, bugId, commentId, uid, uploads);
+      } catch (err) {
+        await this.db.query("DELETE FROM bug_comments WHERE id = $1", [commentId]);
+        throw err;
+      }
+    }
+    // "replied", as Knowledge Base replies are logged.
+    await this.logProjectActivity(projectId, uid, parentCommentId ? "replied" : "commented", "bug", bugId, bug.title, {
+      commentId,
+      ...(parentCommentId ? { parentCommentId } : {})
+    });
     for (const mentioned of await this.bugCommentMentions(projectId, text)) {
       await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
-        commentId: res.rows[0].id,
+        commentId,
         mentionedUserId: mentioned.id,
         mentionedName: mentioned.name
       });
     }
-    return this.bugCommentView(res.rows[0]);
+    const attached = await this.bugCommentAttachments([commentId]);
+    return this.bugCommentView(res.rows[0], LegacyService.publicCommentAttachments(attached.get(commentId)));
+  }
+
+  /**
+   * Edits a comment's text and/or its files (`removeAttachmentIds`, new multipart `files`). The
+   * author's alone, as in the Knowledge Base: a manager rewriting someone else's words would
+   * misattribute them. Moderation is deleteBugComment. Only within BUG_COMMENT_EDIT_WINDOW_MINUTES
+   * of posting, so a discussion can't be rewritten after others have read and replied to it.
+   */
+  async updateBugComment(
+    projectId: string,
+    userId: string | null | undefined,
+    bugId: string,
+    commentId: string,
+    body: Body,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }> = []
+  ) {
+    const uid = this.requireUser(userId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const comment = await this.bugCommentRow(bugId, commentId);
+    if (comment.author_id !== uid) throw new ForbiddenException({ error: "You can only edit your own comments" });
+    // Judged by the database clock (bugCommentRow), the same clock that stamped created_at.
+    if (!comment.within_edit_window) {
+      throw new ForbiddenException({ error: "Comments can only be edited within 1 hour of posting." });
+    }
+
+    const text = body?.body === undefined ? null : LegacyService.bugCommentText(body.body);
+    const removeIds = LegacyService.attachmentIdList(body?.removeAttachmentIds);
+    const current = (await this.bugCommentAttachments([commentId])).get(commentId) ?? [];
+    // Only this comment's own files can be removed through it — an id from another comment or from
+    // the bug's evidence is simply not found here.
+    const removing = current.filter((file) => removeIds.includes(String(file.id)));
+    if (removing.length !== removeIds.length) throw new NotFoundException({ error: "Attachment not found" });
+    const uploads = files ?? [];
+    await this.assertBugCommentFiles(String(project.organization_id), uploads, current.length - removing.length);
+
+    const textChanged = text !== null && text !== String(comment.body);
+    if (!textChanged && !removing.length && !uploads.length) {
+      return this.bugCommentView(comment, LegacyService.publicCommentAttachments(current));
+    }
+
+    // New files first: it is the step that can fail, and nothing destructive has happened yet.
+    if (uploads.length) await this.storeBugCommentFiles(projectId, bugId, commentId, uid, uploads);
+    await this.removeBugCommentFiles(removing, uid);
+    const updated = await this.db.query(
+      `UPDATE bug_comments SET body = COALESCE($2, body), updated_at = now()
+       WHERE id = $1 AND is_deleted = false
+       RETURNING ${LegacyService.BUG_COMMENT_COLUMNS}`,
+      [commentId, textChanged ? text : null]
+    );
+    // Deleted by someone else between the read above and this write.
+    if (!updated.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+
+    await this.logProjectActivity(projectId, uid, "comment_edited", "bug", bugId, bug.title, {
+      commentId,
+      ...(comment.parent_comment_id ? { parentCommentId: String(comment.parent_comment_id) } : {}),
+      ...(textChanged ? { textChanged: true } : {}),
+      ...(uploads.length ? { attachmentsAdded: uploads.length } : {}),
+      ...(removing.length ? { attachmentsRemoved: removing.length } : {})
+    });
+    // Only people the edit newly names — re-saving a comment must not log the same mention again.
+    if (textChanged) {
+      const before = new Set((await this.bugCommentMentions(projectId, String(comment.body))).map((m) => m.id));
+      for (const mentioned of await this.bugCommentMentions(projectId, text!)) {
+        if (before.has(mentioned.id)) continue;
+        await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
+          commentId,
+          mentionedUserId: mentioned.id,
+          mentionedName: mentioned.name
+        });
+      }
+    }
+    const attached = await this.bugCommentAttachments([commentId]);
+    return this.bugCommentView(
+      { ...updated.rows[0], author_name: comment.author_name },
+      LegacyService.publicCommentAttachments(attached.get(commentId))
+    );
+  }
+
+  /**
+   * Soft-deletes a comment and destroys its files. The author, or a project owner/manager. A
+   * top-level comment takes its whole thread with it — replies and their files — as Knowledge Base
+   * threads do, so no reply is left hanging under a comment that is gone.
+   */
+  async deleteBugComment(projectId: string, userId: string | null | undefined, bugId: string, commentId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const comment = await this.bugCommentRow(bugId, commentId);
+    this.kbRequireMutateAccess(await this.kbProjectRole(uid, projectId), comment.author_id ? String(comment.author_id) : null, uid);
+
+    // A reply has no replies of its own, so for one this matches only itself.
+    const deleted = await this.db.query<{ id: string }>(
+      `UPDATE bug_comments SET is_deleted = true, deleted_at = now(), updated_at = now()
+       WHERE (id = $1 OR parent_comment_id = $1) AND is_deleted = false
+       RETURNING id`,
+      [commentId]
+    );
+    const deletedIds = deleted.rows.map((row) => String(row.id));
+    // Deleted by someone else between the read above and this write.
+    if (!deletedIds.includes(commentId)) throw new NotFoundException({ error: "Comment not found" });
+    const files = await this.bugCommentAttachments(deletedIds);
+    await this.removeBugCommentFiles(deletedIds.flatMap((id) => files.get(id) ?? []), uid);
+    const repliesDeleted = deletedIds.length - 1;
+    await this.logProjectActivity(projectId, uid, "comment_deleted", "bug", bugId, bug.title, {
+      commentId,
+      authorId: comment.author_id ? String(comment.author_id) : null,
+      ...(comment.parent_comment_id ? { parentCommentId: String(comment.parent_comment_id) } : {}),
+      ...(repliesDeleted ? { repliesDeleted } : {})
+    });
+    return { success: true };
   }
 
   /**
@@ -6684,8 +7019,10 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     const projectId = await this.requireBugAccess(userId, bugId);
     // Same refusal as createBug — an unknown severity on edit hit the same constraint and the same
-    // opaque 500. Absent/empty leaves the stored value alone via COALESCE, so it isn't parsed.
-    if (body.severity) this.parseBugSeverity(body.severity);
+    // opaque 500. Severity can be cleared since V130, with the same explicit-null-or-"" convention as
+    // priority below; an absent key still leaves the stored value alone.
+    const clearsSeverity = body.severity === null || body.severity === "";
+    const severity = this.parseBugSeverity(body.severity);
     validateBoundedField(body.title, "Bug title", BUG_TITLE_MAX_LENGTH);
     validateBoundedField(body.externalUrl, "External URL", BUG_EXTERNAL_URL_MAX_LENGTH);
     /*
@@ -6703,7 +7040,7 @@ export class LegacyService implements OnModuleInit {
     const before = await this.getBug(bugId);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
-       status=COALESCE($5,status), severity=COALESCE($6,severity), priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
+       status=COALESCE($5,status), severity=CASE WHEN $14::boolean THEN NULL ELSE COALESCE($6,severity) END, priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
        integration_provider=COALESCE($7,integration_provider), integration_issue_key=COALESCE($8,integration_issue_key),
        betterbugs_url=COALESCE($9,betterbugs_url),
        assignee_id=CASE WHEN $12::boolean THEN NULL ELSE COALESCE($13,assignee_id) END,
@@ -6714,14 +7051,15 @@ export class LegacyService implements OnModuleInit {
         body.description || null,
         body.externalUrl || null,
         body.status || null,
-        body.severity || null,
+        severity,
         body.integrationProvider || null,
         body.integrationIssueKey || null,
         body.betterbugsUrl || null,
         clearsPriority,
         priority,
         clearsAssignee,
-        assigneeId
+        assigneeId,
+        clearsSeverity
       ]
     );
     if (Array.isArray(body.links)) {
@@ -6833,6 +7171,12 @@ export class LegacyService implements OnModuleInit {
    */
   static readonly EVIDENCE_MAX_FILE_SIZE = Number(process.env.MAX_EVIDENCE_FILE_SIZE) || 25 * 1024 * 1024;
 
+  // Bugs and their comments take less than test-run evidence: 20MB a file, and at most ten files on
+  // a bug (its own evidence) or on any one comment (BUG_COMMENT_MAX_ATTACHMENTS). Test-run evidence
+  // keeps EVIDENCE_MAX_FILE_SIZE. MAX_BUG_FILE_SIZE overrides the size without a code change.
+  static readonly BUG_FILE_MAX_SIZE = Number(process.env.MAX_BUG_FILE_SIZE) || 20 * 1024 * 1024;
+  private static readonly BUG_MAX_ATTACHMENTS = 10;
+
   private static formatFileSize(bytes: number): string {
     if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
     return `${Math.max(1, Math.round(bytes / 1024))}KB`;
@@ -6843,7 +7187,10 @@ export class LegacyService implements OnModuleInit {
    * calling storage.put per file, so rejecting halfway would leave the accepted ones written and
    * billed while the request answers 400. All-or-nothing is the only defensible outcome.
    */
-  private static assertValidEvidenceFiles(files: Array<{ originalname: string; size: number }>) {
+  private static assertValidEvidenceFiles(
+    files: Array<{ originalname: string; size: number }>,
+    maxSize: number = LegacyService.EVIDENCE_MAX_FILE_SIZE
+  ) {
     const supported = [...LegacyService.KB_ALLOWED_EXTENSIONS].sort().join(", ");
     for (const file of files) {
       const name = LegacyService.displayFileName(file.originalname);
@@ -6859,11 +7206,11 @@ export class LegacyService implements OnModuleInit {
       // A zero-byte file is almost always a failed drag-and-drop or a still-being-written file, and
       // it stores nothing useful while still consuming an attachment row and a storage key.
       if (file.size <= 0) throw new BadRequestException({ error: `${name} is empty (0 bytes).` });
-      if (file.size > LegacyService.EVIDENCE_MAX_FILE_SIZE) {
+      if (file.size > maxSize) {
         throw new BadRequestException({
           error:
             `${name} is ${LegacyService.formatFileSize(file.size)}, which is over the ` +
-            `${LegacyService.formatFileSize(LegacyService.EVIDENCE_MAX_FILE_SIZE)} limit for evidence files.`
+            `${LegacyService.formatFileSize(maxSize)} limit for evidence files.`
         });
       }
     }
@@ -6887,7 +7234,16 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
     const bug = await this.db.query("SELECT b.id, b.title FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
     if (!bug.rows[0]) throw new NotFoundException({ error: "Bug not found" });
-    LegacyService.assertValidEvidenceFiles(files);
+    // Counted across every upload to this bug, not per request: Report Bug and Edit Bug send files
+    // in batches, so a per-request cap alone would never stop the eleventh.
+    const existing = await this.db.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM attachments WHERE entity_type = 'bug' AND entity_id = $1 AND deleted_at IS NULL",
+      [bugId]
+    );
+    if (Number(existing.rows[0].count) + files.length > LegacyService.BUG_MAX_ATTACHMENTS) {
+      throw new BadRequestException({ error: `A bug can have at most ${LegacyService.BUG_MAX_ATTACHMENTS} attachments.` });
+    }
+    LegacyService.assertValidEvidenceFiles(files, LegacyService.BUG_FILE_MAX_SIZE);
     await this.planLimits.assertStorageAvailable(
       project.organization_id,
       files.reduce((sum, file) => sum + file.size, 0)
@@ -6914,13 +7270,14 @@ export class LegacyService implements OnModuleInit {
 
   // `scopeProjectId` keeps a lookup by attachment id from crossing into another project's
   // evidence: the caller has already been authorized for that project, so the row has to
-  // belong to it too or it simply isn't found.
-  private async bugAttachment(attachmentId: string, scopeProjectId?: string): Promise<Body> {
+  // belong to it too or it simply isn't found. `entityTypes` is 'bug' unless the caller opts in:
+  // only the download widens it to comment files, so the delete route can never reach them.
+  private async bugAttachment(attachmentId: string, scopeProjectId?: string, entityTypes: string[] = ["bug"]): Promise<Body> {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
-      `SELECT * FROM attachments WHERE id = $1 AND entity_type = 'bug' AND deleted_at IS NULL
+      `SELECT * FROM attachments WHERE id = $1 AND entity_type = ANY($3::text[]) AND deleted_at IS NULL
        AND ($2::uuid IS NULL OR project_id = $2::uuid)`,
-      [attachmentId, scopeProjectId ?? null]
+      [attachmentId, scopeProjectId ?? null, entityTypes]
     );
     if (!res.rows[0]) throw new NotFoundException({ error: "Attachment not found" });
     return res.rows[0];
@@ -6930,7 +7287,7 @@ export class LegacyService implements OnModuleInit {
     // Bug evidence is confidential: an attachment id turning up in a link, a log line or an
     // exported report must not be enough to hand the file to whoever holds it.
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const file = await this.bugAttachment(attachmentId, projectId);
+    const file = await this.bugAttachment(attachmentId, projectId, ["bug", "bug_comment"]);
     if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
@@ -7759,7 +8116,7 @@ export class LegacyService implements OnModuleInit {
     const [counts, requirements, bugSeverity, activeRuns, addedThisWeek, passRateWindows] = await Promise.all([
       this.analytics(projectId),
       this.requirementsSummary(projectId, userId),
-      this.db.query<{ severity: string; count: string }>(
+      this.db.query<{ severity: string | null; count: string }>(
         `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND deleted_at IS NULL AND status IN ('Open', 'Reopened') GROUP BY severity`,
         [projectId]
       ),
@@ -7790,10 +8147,15 @@ export class LegacyService implements OnModuleInit {
     ]);
 
     const bySeverity = { Critical: 0, High: 0, Medium: 0, Low: 0 } as Record<string, number>;
+    // Severity is nullable since V130. Bugs with none get their own count, and the total is summed
+    // over every row — summing only the four buckets dropped them from "Open bugs" altogether.
+    let openBugsNoSeverity = 0;
+    let openBugsTotal = 0;
     for (const row of bugSeverity.rows) {
-      if (row.severity in bySeverity) bySeverity[row.severity] = Number(row.count);
+      openBugsTotal += Number(row.count);
+      if (row.severity === null) openBugsNoSeverity = Number(row.count);
+      else if (row.severity in bySeverity) bySeverity[row.severity] = Number(row.count);
     }
-    const openBugsTotal = Object.values(bySeverity).reduce((a, b) => a + b, 0);
 
     const metrics = LegacyService.computeExecutionMetrics({
       passed: counts.executionStatus.Passed || 0,
@@ -7818,7 +8180,7 @@ export class LegacyService implements OnModuleInit {
       testCases: { total: counts.testCaseCount, addedThisWeek: Number(addedThisWeek.rows[0]?.count || 0) },
       passRate: { value: metrics.passRate, deltaThisWeek: passRateDeltaThisWeek },
       executionProgress: { value: metrics.executionProgress },
-      openBugs: { total: openBugsTotal, bySeverity },
+      openBugs: { total: openBugsTotal, bySeverity, noSeverity: openBugsNoSeverity },
       coverage: { pct: coveragePct, totalRequirements },
       plans: counts.planCount,
       suites: counts.suiteCount,
@@ -12458,8 +12820,10 @@ export class LegacyService implements OnModuleInit {
       await this.zyraPlanTransition(sessionId, String(plan.planId || ""), null, async (client, current) => {
         // Report progress from the LOCKED read, not the fast-path one above — a batch may have
         // just committed doneCount forward between the two.
-        const doneCount = Number(current.doneCount || 0);
+        // Covered scenarios, and the real queue length — retried scenarios make totalCount - doneCount wrong.
+        const doneCount = LegacyService.zyraPlanCovered(current);
         const totalCount = Number(current.totalCount || 0);
+        const remainingCount = normalizeJsonArray(current.remainingScenarios).length;
         await client.query(
           "UPDATE zyra_chat_sessions SET active_plan = $2::jsonb WHERE id = $1",
           [sessionId, JSON.stringify({ ...current, status: "paused" })]
@@ -12469,11 +12833,11 @@ export class LegacyService implements OnModuleInit {
           projectId,
           sessionId,
           uid,
-          `Stopped at your request — ${doneCount}/${totalCount} scenarios covered. Say "continue" any time and I'll pick back up with the remaining ${totalCount - doneCount}.`,
+          `Stopped at your request — ${doneCount}/${totalCount} scenarios covered. Say "continue" any time and I'll pick back up with the remaining ${remainingCount}.`,
           [],
           [],
           "answer",
-          LegacyService.zyraSingleStepTrace("plan:stop", { doneCount, totalCount, remainingCount: totalCount - doneCount })
+          LegacyService.zyraSingleStepTrace("plan:stop", { doneCount, totalCount, remainingCount })
         );
       });
     }
@@ -12508,7 +12872,7 @@ export class LegacyService implements OnModuleInit {
     let totalCount = 0;
     let scenariosRemaining = 0;
     const resumed = await this.zyraPlanTransition(sessionId, String(plan.planId || ""), null, async (client, current) => {
-      doneCount = Number(current.doneCount || 0);
+      doneCount = LegacyService.zyraPlanCovered(current);
       totalCount = Number(current.totalCount || 0);
       scenariosRemaining = normalizeJsonArray(current.remainingScenarios).length;
       if (current.status !== "paused" || !scenariosRemaining) throw new Error("ZYRA_PLAN_NOT_PAUSED");
@@ -14137,7 +14501,8 @@ export class LegacyService implements OnModuleInit {
           reason: "Generated by AI from Zyra chat context."
         };
       }),
-      testcases: finalResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context."))
+      testcases: finalResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context.")),
+      draftScenarios: finalResult.drafts.map((draft) => (typeof draft.scenario === "number" ? draft.scenario : null))
     };
   }
 
@@ -14309,6 +14674,10 @@ export class LegacyService implements OnModuleInit {
   // than "extensive". Each batch is its own generation call, so a larger plan only adds batches; it
   // never enlarges any single call. The planner's output budget in zyraJsonCompletion is sized for it.
   private static readonly ZYRA_PLAN_MAX_SCENARIOS = 100;
+  // A plan below this share of ZYRA_PLAN_MAX_SCENARIOS gets one top-up planning call (planZyraChatScenarios).
+  private static readonly ZYRA_PLAN_TOPUP_BELOW = 0.9;
+  // What the planner works through before it may stop short of the target.
+  private static readonly ZYRA_PLAN_COVERAGE_AREAS = "happy paths, alternative flows, negative paths, field validation, boundary values, roles and permissions, state transitions, error handling, data variations, UI behaviour and integrations";
   // The most testcases one chat generation can ask for: the top of the 30-50 tier, and the clamp
   // chatTestcasePlan applies to an explicit count.
   private static readonly ZYRA_CHAT_MAX_REQUESTED = 50;
@@ -14329,13 +14698,68 @@ export class LegacyService implements OnModuleInit {
    */
   private static readonly ZYRA_MEMORY_DOC_TITLE = "Zyra AI Memory";
 
+  // The scenario list was planned against the existing testcases already (planZyraChatScenarios is
+  // told to avoid scenarios that have coverage). Without saying so, the generation prompt's general
+  // "not a duplicate of existing testcases" rule re-judged each scenario and the model silently
+  // dropped one in most batches — 4 drafts for 5 scenarios — while the plan still counted all 5.
+  // Each draft also names the scenario it covers, so a dropped scenario can be identified and retried
+  // (zyraPlanBatchOutcome) rather than only noticed as a short count.
   private zyraBatchMessage(originalMessage: string, batch: string[]): string {
     return [
       originalMessage,
       "",
       "Generate exactly one distinct testcase for each of these scenarios (do not add extras, do not skip any):",
-      ...batch.map((scenario, index) => `${index + 1}. ${scenario}`)
+      ...batch.map((scenario, index) => `${index + 1}. ${scenario}`),
+      "",
+      "These scenarios were already checked against the existing testcases when this plan was made, so each one is new coverage. If an existing testcase looks related, make the draft's title and steps clearly distinct from it instead of dropping or merging the scenario.",
+      `Set "scenario" on every draft to the number (1-${batch.length}) of the scenario above that it covers.`
     ].join("\n");
+  }
+
+  /*
+   * Which of a batch's scenarios actually got a draft. A batch is one model call asked for one draft
+   * per scenario, and it does not always comply — a real run drafted 4 for 5 in most batches. When
+   * every draft names a valid scenario number, the missing ones are known: each goes back in the
+   * queue once (`requeue`), and one that comes back empty again is given up (`skipped`), so a
+   * scenario the model keeps refusing cannot loop forever. When the drafts can't be mapped (a draft
+   * with no valid number), nothing can be retried — the shortfall is only counted (`unmapped`).
+   */
+  private static zyraPlanBatchOutcome(batch: string[], draftScenarios: Array<number | null>, retried: string[]): { covered: number; requeue: string[]; skipped: number; unmapped: number } {
+    const mapped = draftScenarios.every((n) => n !== null && Number.isInteger(n) && n >= 1 && n <= batch.length);
+    if (!mapped) {
+      const covered = Math.min(draftScenarios.length, batch.length);
+      return { covered, requeue: [], skipped: 0, unmapped: batch.length - covered };
+    }
+    const hit = new Set(draftScenarios as number[]);
+    const missing = batch.filter((_, index) => !hit.has(index + 1));
+    const requeue = missing.filter((scenario) => !retried.includes(scenario));
+    return { covered: batch.length - missing.length, requeue, skipped: missing.length - requeue.length, unmapped: 0 };
+  }
+
+  /** Scenarios that have a test case. A plan started before coveredCount existed only tracked doneCount. */
+  private static zyraPlanCovered(plan: Body): number {
+    return Number(plan.coveredCount ?? plan.doneCount ?? 0);
+  }
+
+  /*
+   * The reply posted with each plan batch. "X/Y scenarios covered" counts scenarios that actually
+   * have a test case — doneCount (scenarios handed to a batch, which grows with retries) is the plan's
+   * internal cursor and zyraPlanTransition's guard, not progress. A batch that fully delivered keeps
+   * the original wording; anything retried, given up or unaccounted for is said, never implied covered.
+   */
+  private static zyraPlanBatchReply(p: { drafted: number; covered: number; totalCount: number; remaining: number; requeued: number; skipped: number; unmapped: number }): string {
+    const notes = [
+      p.requeued ? ` ${p.requeued} scenario(s) in this batch came back without a test case and will be retried in a later batch.` : "",
+      p.skipped ? ` ${p.skipped} scenario(s) still produced no test case after a retry and were skipped.` : "",
+      p.unmapped ? ` ${p.unmapped} scenario(s) in this batch did not produce a test case.` : ""
+    ].join("");
+    if (p.remaining) {
+      return `Here are ${p.drafted} more test case(s) — ${p.covered}/${p.totalCount} scenarios covered so far.${notes} Still working on the remaining ${p.remaining}; I'll post the next batch shortly.`;
+    }
+    if (p.covered >= p.totalCount) {
+      return `Here are the final ${p.drafted} test case(s) — all ${p.totalCount} scenarios are now covered. Feel free to review and let me know if you'd like any changes.`;
+    }
+    return `Here are the final ${p.drafted} test case(s) — ${p.covered} of ${p.totalCount} scenarios are covered; ${p.totalCount - p.covered} produced no test case.${notes} Feel free to review and let me know if you'd like any changes.`;
   }
 
   // "All possible cases" no longer asks the model for everything in one shot (that instruction
@@ -14406,7 +14830,6 @@ export class LegacyService implements OnModuleInit {
     }
 
     const firstBatch = scenarios.slice(0, LegacyService.ZYRA_PLAN_BATCH_SIZE);
-    const remaining = scenarios.slice(LegacyService.ZYRA_PLAN_BATCH_SIZE);
     const decision = await this.generateZyraChatTestcasesWithAi({
       projectId: params.projectId,
       userId: params.userId,
@@ -14427,6 +14850,9 @@ export class LegacyService implements OnModuleInit {
       knowledgeConfidence: params.knowledgeConfidence
     });
 
+    // A first-batch scenario that came back without a draft goes to the end of the queue for one retry.
+    const first = LegacyService.zyraPlanBatchOutcome(firstBatch, decision.draftScenarios ?? [], []);
+    const remaining = [...scenarios.slice(LegacyService.ZYRA_PLAN_BATCH_SIZE), ...first.requeue];
     if (!remaining.length) return decision;
 
     const planId = randomUUID();
@@ -14444,14 +14870,24 @@ export class LegacyService implements OnModuleInit {
         remainingScenarios: remaining,
         batchSize: LegacyService.ZYRA_PLAN_BATCH_SIZE,
         doneCount: firstBatch.length,
-        totalCount: scenarios.length
+        totalCount: scenarios.length,
+        // Scenarios that have a test case — what progress shows (see zyraPlanBatchReply). doneCount
+        // stays the cursor zyraPlanTransition guards on.
+        coveredCount: first.covered,
+        // Scenarios already put back once; one that comes back empty again is skipped, not retried.
+        retriedScenarios: first.requeue
       })]
     );
     void this.continueZyraChatPlan(params.projectId, params.userId, params.sessionId, planId).catch(() => undefined);
 
+    const firstIntro = first.requeue.length
+      ? `Here are ${decision.testcases.length} test case(s) for the first ${firstBatch.length} — ${first.requeue.length} scenario(s) came back without a test case and will be retried in a later batch.`
+      : first.unmapped
+        ? `Here are ${decision.testcases.length} test case(s) for the first ${firstBatch.length} — ${first.unmapped} of those scenario(s) did not produce a test case.`
+        : `Here are the first ${firstBatch.length}.`;
     return {
       ...decision,
-      reply: `I identified ${scenarios.length} distinct scenarios to cover. Here are the first ${firstBatch.length} — I'll keep generating the rest (${remaining.length} more) and post them here as they're ready; feel free to review these in the meantime.\n\n${decision.reply}`
+      reply: `I identified ${scenarios.length} distinct scenarios to cover. ${firstIntro} I'll keep generating the rest (${remaining.length} more) and post them here as they're ready; feel free to review these in the meantime.\n\n${decision.reply}`
     };
   }
 
@@ -14470,12 +14906,16 @@ export class LegacyService implements OnModuleInit {
    */
   // `trace`: a plan message answers no user message of its own, so it carries its own trace — what
   // this batch (or this stop/resume) actually did.
-  private async postZyraPlanMessage(client: ZyraQueryClient, projectId: string, sessionId: string, userId: string | null, reply: string, testcases: Body[], activity: Body[], actionType: "create" | "answer" = "answer", trace: ZyraTurnTrace | null = null): Promise<void> {
+  // `reviewRequestId`: the ai_generation_requests row applyZyraChatOperations staged this batch's
+  // proposed drafts into. The frontend only renders proposed rows inside a review panel addressed by
+  // the message's review_request_id — omitting it (as every batch after the first once did) left
+  // "N test cases drafted for review" with nothing under it. Status-only messages pass null.
+  private async postZyraPlanMessage(client: ZyraQueryClient, projectId: string, sessionId: string, userId: string | null, reply: string, testcases: Body[], activity: Body[], actionType: "create" | "answer" = "answer", trace: ZyraTurnTrace | null = null, reviewRequestId: string | null = null): Promise<void> {
     await client.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, trace)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb,$9::jsonb)`,
-      [sessionId, projectId, userId, reply, "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity), trace ? JSON.stringify(trace) : null]
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, trace, review_request_id)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb,$9::jsonb,$10)`,
+      [sessionId, projectId, userId, reply, "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity), trace ? JSON.stringify(trace) : null, reviewRequestId]
     );
     await client.query("UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = $1", [sessionId]);
   }
@@ -14577,6 +15017,7 @@ export class LegacyService implements OnModuleInit {
       const batch = remainingScenarios.slice(0, batchSize);
       const doneCount = Number(plan.doneCount || 0);
       const totalCount = Number(plan.totalCount || 0);
+      const retried = normalizeJsonArray(plan.retriedScenarios).map(String);
       if (!batch.length) {
         await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
           await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
@@ -14589,7 +15030,15 @@ export class LegacyService implements OnModuleInit {
       // batch whose commit is discarded (superseded, stale) posts nothing, trace included.
       const recorder = new ZyraTurnTraceRecorder();
       const stage = recorder.onStage;
-      stage("plan:batch", { fromScenario: doneCount + 1, toScenario: doneCount + batch.length, totalCount });
+      // doneCount runs past totalCount once retried scenarios come round again — the label stays
+      // within the plan's size and says how many of this batch are retries.
+      const retrying = batch.filter((scenario) => retried.includes(scenario)).length;
+      stage("plan:batch", {
+        fromScenario: Math.min(doneCount + 1, totalCount),
+        toScenario: Math.min(doneCount + batch.length, totalCount),
+        totalCount,
+        ...(retrying ? { retrying } : {})
+      });
 
       // Hoisted so the catch block below can still record tokens from a billed-but-unparsed
       // response even though provider/model are only known once the allocation resolves.
@@ -14673,17 +15122,20 @@ export class LegacyService implements OnModuleInit {
         });
         const batchTrace = recorder.finish();
 
+        // doneCount is the cursor zyraPlanTransition guards on, so it advances by every scenario this
+        // batch was handed even when some go back in the queue; coveredCount is what progress shows.
         const newDoneCount = doneCount + batch.length;
-        const remaining = remainingScenarios.slice(batch.length);
+        const outcome = LegacyService.zyraPlanBatchOutcome(batch, decision.draftScenarios ?? [], retried);
+        const remaining = [...remainingScenarios.slice(batch.length), ...outcome.requeue];
+        const newCovered = LegacyService.zyraPlanCovered(plan) + outcome.covered;
         // Never announce a batch that wrote nothing — the same false-success trap the chat path had.
         const reply = !testcases.length
           ? [
               `⚠️ This batch saved nothing — none of the ${batch.length} scenario(s) produced a stored test case.`,
+              outcome.requeue.length ? `${outcome.requeue.length} of them will be retried in a later batch.` : "",
               remaining.length ? `Continuing with the remaining ${remaining.length}.` : "That was the last batch."
-            ].join(" ")
-          : remaining.length
-            ? `Here are ${testcases.length} more test case(s) — ${newDoneCount}/${totalCount} scenarios covered so far. Still working on the remaining ${remaining.length}; I'll post the next batch shortly.`
-            : `Here are the final ${testcases.length} test case(s) — all ${totalCount} scenarios are now covered. Feel free to review and let me know if you'd like any changes.`;
+            ].filter(Boolean).join(" ")
+          : LegacyService.zyraPlanBatchReply({ drafted: testcases.length, covered: newCovered, totalCount, remaining: remaining.length, requeued: outcome.requeue.length, skipped: outcome.skipped, unmapped: outcome.unmapped });
 
         // The atomic commit: re-checks planId AND doneCount under the row lock, then posts the
         // message and advances (or clears) active_plan in the same transaction. If this returns
@@ -14694,7 +15146,7 @@ export class LegacyService implements OnModuleInit {
           // 'create' only when this batch genuinely produced staged rows — a "saved nothing" batch
           // (testcases.length === 0) gets 'answer' via the default, matching how a zero-mutation
           // reply is classified everywhere else in this file.
-          await this.postZyraPlanMessage(client, projectId, sessionId, userId, reply, testcases, applied.activity, testcases.length ? "create" : "answer", batchTrace);
+          await this.postZyraPlanMessage(client, projectId, sessionId, userId, reply, testcases, applied.activity, testcases.length ? "create" : "answer", batchTrace, applied.reviewRequestId);
           if (!remaining.length) {
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           } else {
@@ -14705,7 +15157,7 @@ export class LegacyService implements OnModuleInit {
             // independently of doneCount would silently roll back under a live batch.
             await client.query(
               "UPDATE zyra_chat_sessions SET active_plan = $2::jsonb, updated_at = now() WHERE id = $1",
-              [sessionId, JSON.stringify({ ...current, remainingScenarios: remaining, doneCount: newDoneCount })]
+              [sessionId, JSON.stringify({ ...current, remainingScenarios: remaining, doneCount: newDoneCount, coveredCount: newCovered, retriedScenarios: [...retried, ...outcome.requeue] })]
             );
           }
         });
@@ -14721,7 +15173,7 @@ export class LegacyService implements OnModuleInit {
         // `detail` is already what the pause message itself tells the user.
         const failedTrace = recorder.fail(detail || "This batch did not complete.");
         await this.zyraPlanTransition(sessionId, planId, doneCount, async (client, current) => {
-          await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${doneCount}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], [], "answer", failedTrace);
+          await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${LegacyService.zyraPlanCovered(plan)}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], [], "answer", failedTrace);
           // Spread the locked read, not the outer closure's `plan` — same reasoning as the
           // success-path commit above.
           await client.query(
@@ -17509,7 +17961,10 @@ export class LegacyService implements OnModuleInit {
         // Raw, unvalidated labels straight from the model — sanitizeZyraSourceRefs (called by
         // whichever generation path has the turn's known-label index in scope) is what turns this
         // into a trustworthy citation list. Never rendered or persisted as-is.
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : [],
+        // Only a plan batch asks for it (zyraBatchMessage): which listed scenario this draft covers.
+        // Added only when present, so every other generation path's drafts are unchanged.
+        ...(Number.isInteger(Number(draft.scenario)) && Number(draft.scenario) > 0 ? { scenario: Number(draft.scenario) } : {})
       };
     });
   }
@@ -17805,12 +18260,49 @@ export class LegacyService implements OnModuleInit {
       "Existing testcases (avoid proposing scenarios that already have coverage):",
       params.existingTestcases.map((tc) => `${tc.externalId} | ${tc.title}`).join("\n") || "None.",
       "",
-      `Return ONLY JSON: {"scenarios": ["short scenario label", ...]}. List up to ${params.maxScenarios} scenarios, ordered from most to least important. No markdown, no commentary.`
+      // A target, not a ceiling: "List up to 100" let the model stop wherever it felt done — a real
+      // "All – Exhaustive" run planned 49 — so the tier meant as "everything" fell well short of it.
+      `Return ONLY JSON: {"scenarios": ["short scenario label", ...]}. List ${params.maxScenarios} scenarios, ordered from most to least important. This is exhaustive coverage: keep working through ${LegacyService.ZYRA_PLAN_COVERAGE_AREAS} until you reach ${params.maxScenarios}. Stop short only if the feature genuinely has no more distinct scenarios that the existing testcases do not already cover. No markdown, no commentary.`
     ].join("\n");
     const parsed = await this.zyraJsonCompletion(params.provider, params.model, params.key, systemPrompt, userPrompt);
     await this.recordZyraTokenUsage(params.projectId, "chat_plan", params.provider, params.model, parsed.__zyraUsage || {});
-    const scenarios = normalizeJsonArray(parsed.scenarios).map((item) => String(item || "").trim()).filter(Boolean);
-    return scenarios.slice(0, params.maxScenarios);
+    const scenarios = LegacyService.mergeZyraScenarios([], parsed.scenarios, params.maxScenarios);
+
+    // One top-up round when the first answer still stops well short of the target — models tend to
+    // end a long list early. It sees the list so far and may answer [] when nothing distinct is left,
+    // so a small feature is never padded with filler. Bounded to one call; a failure keeps the plan.
+    if (scenarios.length >= 2 && scenarios.length < Math.ceil(params.maxScenarios * LegacyService.ZYRA_PLAN_TOPUP_BELOW)) {
+      try {
+        const topUpPrompt = [
+          userPrompt,
+          "",
+          "Scenarios already planned (do not repeat or reword any of these):",
+          scenarios.map((scenario, index) => `${index + 1}. ${scenario}`).join("\n"),
+          "",
+          `Return ONLY JSON: {"scenarios": [...]} with up to ${params.maxScenarios - scenarios.length} MORE distinct scenarios that neither the list above nor the existing testcases cover, ordered from most to least important. Return {"scenarios": []} if there are genuinely none left.`
+        ].join("\n");
+        const more = await this.zyraJsonCompletion(params.provider, params.model, params.key, systemPrompt, topUpPrompt);
+        await this.recordZyraTokenUsage(params.projectId, "chat_plan", params.provider, params.model, more.__zyraUsage || {});
+        return LegacyService.mergeZyraScenarios(scenarios, more.scenarios, params.maxScenarios);
+      } catch (err) {
+        this.logger.warn(`Scenario top-up failed for project ${params.projectId}, keeping the ${scenarios.length}-scenario plan: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    return scenarios;
+  }
+
+  /** Appends `raw` labels to `base`, dropping blanks and case/spacing-insensitive repeats, capped at `max`. */
+  private static mergeZyraScenarios(base: string[], raw: unknown, max: number): string[] {
+    const key = (label: string) => label.toLowerCase().replace(/\s+/g, " ");
+    const seen = new Set(base.map(key));
+    const merged = [...base];
+    for (const item of normalizeJsonArray(raw)) {
+      const label = String(item || "").trim();
+      if (!label || seen.has(key(label))) continue;
+      seen.add(key(label));
+      merged.push(label);
+    }
+    return merged.slice(0, max);
   }
 
   private async generateZyraWithOpenAi(params: {

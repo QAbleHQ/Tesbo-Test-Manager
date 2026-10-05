@@ -39,7 +39,7 @@ export type RichTextEditorHandle = {
   getText: () => string;
 };
 
-function ToolbarButton({
+export function ToolbarButton({
   onClick,
   active,
   disabled,

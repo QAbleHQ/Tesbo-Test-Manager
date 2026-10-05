@@ -24,15 +24,17 @@ import {
   type ZyraTicketComment,
 } from "@/lib/api";
 import { IconSparkles, IconUser } from "@tabler/icons-react";
-import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, SeverityBadge, type Severity } from "@/components/ui";
+import { Button, Card, CopyButton, Field, FieldError, FieldHint, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, SeverityBadge, type Severity } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
+import { SUITE_NAME_MAX_LENGTH, validateSuiteName } from "@/lib/validation";
 import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
 import { ACTION_LABEL, TechniqueBadges } from "@/components/agents/ZyraChatReviewPanel";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
-type SaveMode = "existing" | "new";
+// "" is the unchosen "Select suite" placeholder — never submittable. "none" saves unassigned.
+type SaveMode = "" | "none" | "existing" | "new";
 type DetailTab = "testcases" | "feedback" | "activities" | "sources";
 
 const TICKET_COMMENT_STATUS: Record<ZyraTicketComment["status"], { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" }> = {
@@ -144,7 +146,7 @@ export default function ZyraTaskDetailPage() {
   const [selectedLinearKeys, setSelectedLinearKeys] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<DetailTab>("testcases");
   const [savingOpen, setSavingOpen] = useState(false);
-  const [saveMode, setSaveMode] = useState<SaveMode>("existing");
+  const [saveMode, setSaveMode] = useState<SaveMode>("");
   const [targetSuiteId, setTargetSuiteId] = useState("");
   const [newSuiteName, setNewSuiteName] = useState("");
   const [savingDraftIndexes, setSavingDraftIndexes] = useState<number[] | null>(null);
@@ -268,8 +270,22 @@ export default function ZyraTaskDetailPage() {
     setSelectedDrafts([]);
   }
 
+  // The one rule for whether the Save modal can submit — the button's disabled state and
+  // handleSave's guard both read it, so they can't drift apart.
+  const newSuiteNameError = saveMode === "new" ? validateSuiteName(newSuiteName) : "";
+  const saveTargetValid =
+    saveMode === "none" ||
+    (saveMode === "existing" && Boolean(targetSuiteId)) ||
+    (saveMode === "new" && !newSuiteNameError);
+  const canSave = !working && (savingDraftIndexes || selectedDrafts).length > 0 && saveTargetValid;
+
   function openSaveModal(indexes?: number[]) {
     setSavingDraftIndexes(indexes || selectedDrafts);
+    // Every save starts from "Select suite": a target left over from a cancelled attempt would
+    // otherwise be one click from filing these drafts somewhere nobody chose this time.
+    setSaveMode("");
+    setTargetSuiteId("");
+    setNewSuiteName("");
     setSaveError(null);
     setSavingOpen(true);
   }
@@ -346,15 +362,17 @@ export default function ZyraTaskDetailPage() {
   }
 
   async function handleSave() {
-    if (!task) return;
+    if (!task || !canSave) return;
     const indexes = savingDraftIndexes || selectedDrafts;
     setWorking(true);
     setMessage(null);
     setError(null);
     setSaveError(null);
     try {
+      // Only the chosen path contributes a suite, so a pick abandoned by switching to "No suite"
+      // can't ride along.
       let suiteId = saveMode === "existing" ? targetSuiteId : "";
-      if (saveMode === "new" && newSuiteName.trim()) {
+      if (saveMode === "new") {
         const suite = await createSuite(projectId, { name: newSuiteName.trim() });
         suiteId = suite.id;
       }
@@ -806,32 +824,39 @@ export default function ZyraTaskDetailPage() {
 
       <Modal open={savingOpen} onClose={closeSaveModal} title="Save generated testcases">
         <div className="space-y-4">
-          <p className="text-sm text-[var(--muted)]">Save {(savingDraftIndexes || selectedDrafts).length} selected testcase draft(s) into a suite.</p>
+          <p className="text-sm text-[var(--muted)]">Save {(savingDraftIndexes || selectedDrafts).length} selected testcase draft(s).</p>
           {saveError && <p role="alert" className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">{saveError}</p>}
           <Field>
             <FieldLabel>Suite target</FieldLabel>
             <Select value={saveMode} onChange={(event) => setSaveMode(event.target.value as SaveMode)}>
+              {/* Disabled so it can't be re-picked once a real target is chosen. */}
+              <option value="" disabled>Select suite</option>
+              <option value="none">No suite</option>
               <option value="existing">Existing suite</option>
-              <option value="new">Create suite</option>
+              <option value="new">Create new suite</option>
             </Select>
           </Field>
-          {saveMode === "existing" ? (
+          {saveMode === "existing" && (
             <Field>
-              <FieldLabel>Existing suite</FieldLabel>
+              <FieldLabel>Select existing suite</FieldLabel>
               <Select value={targetSuiteId} onChange={(event) => setTargetSuiteId(event.target.value)}>
-                <option value="">No suite</option>
+                <option value="" disabled>Select a suite</option>
                 {suites.map((suite) => <option key={suite.id} value={suite.id}>{suite.name}</option>)}
               </Select>
+              {suites.length === 0 && <FieldHint>This project has no suites yet — choose Create new suite instead.</FieldHint>}
             </Field>
-          ) : (
+          )}
+          {saveMode === "new" && (
             <Field>
               <FieldLabel>New suite name</FieldLabel>
-              <Input value={newSuiteName} onChange={(event) => setNewSuiteName(event.target.value)} placeholder="AI generated regression" />
+              <Input value={newSuiteName} onChange={(event) => setNewSuiteName(event.target.value)} placeholder="AI generated regression" maxLength={SUITE_NAME_MAX_LENGTH} />
+              {/* Shown once something is typed, so a freshly opened field isn't already in error. */}
+              {newSuiteName && newSuiteNameError && <FieldError>{newSuiteNameError}</FieldError>}
             </Field>
           )}
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={closeSaveModal} disabled={working}>Cancel</Button>
-            <Button onClick={handleSave} disabled={working || (savingDraftIndexes || selectedDrafts).length === 0 || (saveMode === "new" && !newSuiteName.trim())}>{working ? "Saving..." : "Save"}</Button>
+            <Button onClick={handleSave} disabled={!canSave}>{working ? "Saving..." : "Save"}</Button>
           </div>
         </div>
       </Modal>

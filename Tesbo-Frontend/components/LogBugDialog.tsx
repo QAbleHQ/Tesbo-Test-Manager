@@ -192,7 +192,7 @@ export function useLogBugDialog(params: {
   const [showBugDialog, setShowBugDialog] = useState(false);
   const [bugExecution, setBugExecution] = useState<ExecutionItem | null>(null);
   const [bugTitle, setBugTitle] = useState("");
-  const [bugSeverity, setBugSeverity] = useState<BugSeverity>("Medium");
+  const [bugSeverity, setBugSeverity] = useState<BugSeverity | "">("");
   const [bugPriority, setBugPriority] = useState<BugPriority | "">("");
   const [bugDesc, setBugDesc] = useState("");
   const [bugAssigneeId, setBugAssigneeId] = useState("");
@@ -235,7 +235,7 @@ export function useLogBugDialog(params: {
     setBugExecution(exec);
     setBugTitle(`${titlePrefix}: ${exec.title || exec.snapshotTitle || "Untitled test case"}`);
     setBugDesc("");
-    setBugSeverity("Medium");
+    setBugSeverity("");
     setBugPriority("");
     setBugAssigneeId("");
     setBugAlreadyLogged(false);
@@ -265,7 +265,7 @@ export function useLogBugDialog(params: {
     setShowBugDialog(false);
     setBugExecution(null);
     setBugTitle("");
-    setBugSeverity("Medium");
+    setBugSeverity("");
     setBugPriority("");
     setBugDesc("");
     setBugAssigneeId("");
@@ -301,7 +301,7 @@ export function useLogBugDialog(params: {
    * elsewhere via the self-logged fields). "Yes, link existing" never reaches this: it goes
    * through handleLinkExisting below regardless of which tab (Tesbo/Jira/Linear) is active. ───── */
   async function handleBugSubmit() {
-    if (!bugExecution || !bugTitle.trim() || !bugSeverity || bugSelfIssueRequired) return;
+    if (!bugExecution || !bugTitle.trim() || bugSelfIssueRequired) return;
     // Belt-and-suspenders alongside the button's `disabled={bugSaving}`: guards a re-entrant call
     // that lands before the disabled state has re-rendered.
     if (bugSaving) return;
@@ -316,7 +316,7 @@ export function useLogBugDialog(params: {
         const bug = await createBug(projectId, {
           title: bugTitle.trim(),
           description: bugDesc.trim(),
-          severity: bugSeverity,
+          severity: bugSeverity || undefined,
           priority: bugPriority || null,
           assigneeId: bugAssigneeId || null,
           externalUrl: selfLogged ? bugUrl.trim() : undefined,
@@ -383,7 +383,7 @@ export function useLogBugDialog(params: {
         await createBug(projectId, {
           title: bugTitle.trim(),
           description: bugDesc.trim(),
-          severity: bugSeverity,
+          severity: bugSeverity || undefined,
           priority: bugPriority || null,
           externalUrl: issue.url,
           integrationProvider: issue.provider,
@@ -594,22 +594,23 @@ export function useLogBugDialog(params: {
                 />
               </div>
               {/*
-                * Severity carries dev's required marker (48363ea/10226268634 — the run's modal used
-                * to collect no severity at all, so every bug filed from a run took the column
-                * default), paired with Priority from 10226247009 and Assign to, matching
+                * Severity (48363ea/10226268634 — the run's modal used to collect no severity at all)
+                * and Priority (10226247009) are both optional and open on "Not selected", so
+                * nothing is filed with a value nobody chose. Assign to completes the row, matching
                 * projects/[id]/bugs/page.tsx's 3-column layout. Evidence keeps its own full-width
                 * row below rather than sharing this grid — the file list needs the width.
                 */}
               <div className="grid grid-cols-3 gap-3">
                 <div>
                   <label className="block text-sm font-medium text-[var(--muted)] mb-1">
-                    Severity <span className="text-[var(--error-foreground)]">*</span>
+                    Severity
                   </label>
                   <Select
                     value={bugSeverity}
-                    onChange={(e) => setBugSeverity(e.target.value as BugSeverity)}
+                    onChange={(e) => setBugSeverity(e.target.value as BugSeverity | "")}
                     aria-label="Severity"
                   >
+                    <option value="">Not selected</option>
                     {BUG_SEVERITIES.map((severity) => (
                       <option key={severity} value={severity}>
                         {severity}
@@ -624,7 +625,7 @@ export function useLogBugDialog(params: {
                     onChange={(e) => setBugPriority(e.target.value as BugPriority | "")}
                     aria-label="Bug priority"
                   >
-                    <option value="">Not set</option>
+                    <option value="">Not selected</option>
                     {BUG_PRIORITIES.map((priority) => (
                       <option key={priority} value={priority}>
                         {priority}
@@ -746,7 +747,7 @@ export function useLogBugDialog(params: {
               <Button
                 variant="destructive"
                 onClick={handleBugSubmit}
-                disabled={bugSaving || !bugTitle.trim() || !bugSeverity || bugSelfIssueRequired}
+                disabled={bugSaving || !bugTitle.trim() || bugSelfIssueRequired}
               >
                 {bugSaving ? (
                   "Filing…"

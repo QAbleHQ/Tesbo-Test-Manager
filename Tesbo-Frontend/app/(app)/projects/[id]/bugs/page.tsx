@@ -47,10 +47,8 @@ import {
   BugStatusBadge,
   MemberAvatar,
 } from "@/components/bugs/BugBadges";
-import BugActivity from "@/components/bugs/BugActivity";
-import BugComments from "@/components/bugs/BugComments";
+import BugDiscussion from "@/components/bugs/BugDiscussion";
 import BugDetailsBody from "@/components/bugs/BugDetailsBody";
-import EditBugModal from "@/components/bugs/EditBugModal";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 interface BugsData {
@@ -399,7 +397,7 @@ export default function BugsPage() {
   const [createTitle, setCreateTitle] = useState("");
   const [createDesc, setCreateDesc] = useState("");
   const [createPriority, setCreatePriority] = useState<BugPriority | "">("");
-  const [createSeverity, setCreateSeverity] = useState<BugSeverity>("Medium");
+  const [createSeverity, setCreateSeverity] = useState<BugSeverity | "">("");
   const [createLinks, setCreateLinks] = useState<LinkRow[]>([]);
   const [createDestination, setCreateDestination] = useState<TrackingDestination>("TESBO");
   const [createSelfSystem, setCreateSelfSystem] = useState<SelfLoggedSystem>("OTHER");
@@ -435,8 +433,6 @@ export default function BugsPage() {
    */
   const createdBugIdRef = useRef<string | null>(null);
 
-  /* edit modal — its form state lives in EditBugModal */
-  const [editBug, setEditBug] = useState<BugItem | null>(null);
   /*
    * Basecamp 10226296533: createBug/updateBug succeeded, uploadBugAttachments then threw, and the
    * throw went nowhere — `finally` cleared the spinner but the modal stayed open unchanged with no
@@ -448,8 +444,6 @@ export default function BugsPage() {
 
   /* detail view modal */
   const [viewBug, setViewBug] = useState<BugItem | null>(null);
-  // Bumped when a comment is posted in the panel, so its Activity section re-reads its entries.
-  const [commentTick, setCommentTick] = useState(0);
 
   /* delete confirm */
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -565,7 +559,7 @@ export default function BugsPage() {
     setCreateError(null);
     setCreateTitle("");
     setCreateDesc("");
-    setCreateSeverity("Medium");
+    setCreateSeverity("");
     setCreatePriority("");
     setCreateLinks([]);
     setCreateDestination("TESBO");
@@ -596,7 +590,8 @@ export default function BugsPage() {
         const bug = await createBug(projectId, {
           title: createTitle.trim(),
           description: createDesc.trim(),
-          severity: createSeverity,
+          // Not selected is stored as no severity (V130), the same as an untriaged priority.
+          severity: createSeverity || undefined,
           priority: createPriority || null,
           assigneeId: createAssigneeId || null,
           externalUrl: selfLogged ? createUrl.trim() : undefined,
@@ -631,9 +626,13 @@ export default function BugsPage() {
     }
   }
 
-  /* open edit */
+  /*
+   * The pencil on a List row or a Board card opens the full bug page straight into its in-place
+   * edit form, as the side panel's Edit button does, rather than the Edit Bug dialog — one place
+   * to edit a bug, with its comments and history beside the form.
+   */
   function openEdit(bug: BugItem) {
-    setEditBug(bug);
+    router.push(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
   }
 
   /* delete */
@@ -1031,13 +1030,12 @@ export default function BugsPage() {
                   load();
                 }}
               />
-              <BugComments key={viewBug.id} projectId={projectId} bugId={viewBug.id} onCommentAdded={() => setCommentTick((n) => n + 1)} />
-              {/* The panel is too narrow for side by side, so Activity stacks under Comments here. */}
-              <BugActivity
-                key={`activity-${viewBug.id}`}
+              {/* Comments and Activity as tabs, Comments first; keyed so each bug opens on Comments. */}
+              <BugDiscussion
+                key={viewBug.id}
                 projectId={projectId}
                 bugId={viewBug.id}
-                refreshKey={`${viewBug.updatedAt}|${viewBug.attachments.length}|${commentTick}`}
+                refreshKey={`${viewBug.updatedAt}|${viewBug.attachments.length}`}
               />
             </div>
 
@@ -1133,8 +1131,15 @@ export default function BugsPage() {
           </Field>
           <div className="grid grid-cols-3 gap-3">
             <Field>
+              {/* Neither Severity nor Priority is required, and both open on "Not selected" rather
+                  than a preselected value, so nothing is filed with a value nobody chose. */}
               <FieldLabel>Severity</FieldLabel>
-              <Select value={createSeverity} onChange={(e) => setCreateSeverity(e.target.value as BugSeverity)}>
+              <Select
+                value={createSeverity}
+                onChange={(e) => setCreateSeverity(e.target.value as BugSeverity | "")}
+                aria-label="Bug severity"
+              >
+                <option value="">Not selected</option>
                 {BUG_SEVERITIES.map((s) => (
                   <option key={s} value={s}>
                     {s}
@@ -1151,7 +1156,7 @@ export default function BugsPage() {
                 onChange={(e) => setCreatePriority(e.target.value as BugPriority | "")}
                 aria-label="Bug priority"
               >
-                <option value="">Not set</option>
+                <option value="">Not selected</option>
                 {BUG_PRIORITIES.map((p) => (
                   <option key={p} value={p}>
                     {p}
@@ -1271,20 +1276,6 @@ export default function BugsPage() {
           </div>
         </div>
       </Modal>
-
-      {/* ───── Edit Bug Modal ───── */}
-      {editBug && (
-        <EditBugModal
-          key={editBug.id}
-          projectId={projectId}
-          bug={editBug}
-          jiraConnected={jiraConnected}
-          linearConnected={linearConnected}
-          hasTestRuns={hasTestRuns}
-          onClose={() => setEditBug(null)}
-          onChanged={load}
-        />
-      )}
 
       {/* ───── Delete Confirm Modal ───── */}
       <Modal

@@ -2712,7 +2712,7 @@ export default function TestCasesPage() {
                                     <p className="text-sm font-semibold text-[var(--foreground)]">{bug.title}</p>
                                     <div className="flex items-center gap-2">
                                       <StatusChip tone="neutral">{bug.status}</StatusChip>
-                                      <SeverityBadge severity={bug.severity} />
+                                      {bug.severity && <SeverityBadge severity={bug.severity} />}
                                     </div>
                                   </div>
                                   <div className="grid gap-3 sm:grid-cols-2">

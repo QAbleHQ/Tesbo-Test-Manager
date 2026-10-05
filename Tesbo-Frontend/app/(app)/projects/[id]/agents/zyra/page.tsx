@@ -445,6 +445,11 @@ function MessageBubble({
   // save) instead of the plain read-only table, and don't count toward "View test cases" below.
   const proposedRows = testcases.filter((row) => typeof row.action === "string" && row.action.startsWith("proposed-"));
   const appliedRows = testcases.filter((row) => !(typeof row.action === "string" && row.action.startsWith("proposed-")));
+  // Batch messages of an exhaustive plan posted before the backend stored review_request_id on them
+  // still stamp it on every proposed row. Fall back to it only when the rows agree on a single id —
+  // a mixed set has no one batch the panel could act on, so it is not guessed at.
+  const rowReviewIds = Array.from(new Set(proposedRows.map((row) => row.reviewRequestId).filter((id): id is string => Boolean(id))));
+  const reviewRequestId = message.reviewRequestId || (rowReviewIds.length === 1 ? rowReviewIds[0] : null);
   // Defense-in-depth, independent of the backend guard: a reply that routed as a mutation but carries
   // no rows and no review panel to show is a sign something upstream failed silently — surface that
   // instead of leaving the bubble looking like an ordinary, uneventful answer. Never fires for a
@@ -461,7 +466,7 @@ function MessageBubble({
     !isUser &&
     ["create", "update", "archive", "mixed"].includes(message.actionType || "") &&
     testcases.length === 0 &&
-    !message.reviewRequestId;
+    !reviewRequestId;
 
   return (
     <article className="flex flex-col gap-2.5">
@@ -490,8 +495,8 @@ function MessageBubble({
       />
 
       <TestcaseTable rows={appliedRows} projectId={projectId} />
-      {message.reviewRequestId && proposedRows.length > 0 && (
-        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={message.reviewRequestId} initialRows={proposedRows} />
+      {reviewRequestId && proposedRows.length > 0 && (
+        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={reviewRequestId} initialRows={proposedRows} />
       )}
       {missingStructuredData && (
         <p className="mt-1 flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
@@ -726,7 +731,7 @@ function zyraBacklogSummary(step: ZyraBacklogStep): string {
     return `${meta.requestedCount} requested${meta.suiteName ? ` into "${String(meta.suiteName)}"` : ""}${meta.retry ? " · smaller retry" : ""}`;
   }
   if (typeof meta.fromScenario === "number" && typeof meta.toScenario === "number") {
-    return `scenarios ${meta.fromScenario}–${meta.toScenario}${typeof meta.totalCount === "number" ? ` of ${meta.totalCount}` : ""}`;
+    return `scenarios ${meta.fromScenario}–${meta.toScenario}${typeof meta.totalCount === "number" ? ` of ${meta.totalCount}` : ""}${typeof meta.retrying === "number" ? ` · ${meta.retrying} retried` : ""}`;
   }
   if (typeof meta.doneCount === "number" && typeof meta.totalCount === "number") return `${meta.doneCount}/${meta.totalCount} scenarios covered`;
   if (step.stage === "resuming" && typeof meta.attempt === "number") return `attempt ${meta.attempt}`;
@@ -899,14 +904,15 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
 }
 
 // ─── PlanProgressBubble ───────────────────────────────────────────────────────
-function PlanProgressBubble({ plan }: { plan: { doneCount: number; totalCount: number } }) {
-  const pct = plan.totalCount > 0 ? Math.round((plan.doneCount / plan.totalCount) * 100) : 0;
+function PlanProgressBubble({ plan }: { plan: { doneCount: number; totalCount: number; coveredCount?: number } }) {
+  const covered = plan.coveredCount ?? plan.doneCount;
+  const pct = plan.totalCount > 0 ? Math.round((covered / plan.totalCount) * 100) : 0;
   return (
     <div className="flex items-start gap-2">
       <ZyraMark size={24} />
       <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5 text-xs text-[var(--muted)]">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--brand-primary)] animate-pulse" />
-        Generating remaining scenarios — {plan.doneCount}/{plan.totalCount} covered ({pct}%). Review what&apos;s in so far; more will appear here shortly.
+        Generating remaining scenarios — {covered}/{plan.totalCount} covered ({pct}%). Review what&apos;s in so far; more will appear here shortly.
       </div>
     </div>
   );
@@ -1754,7 +1760,7 @@ export default function ZyraChatPage() {
                 {activeSession?.activePlan?.status === "paused" && (
                   <div className="mb-2.5 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                     <span>
-                      Paused — {activeSession.activePlan.doneCount}/{activeSession.activePlan.totalCount} scenarios covered.
+                      Paused — {activeSession.activePlan.coveredCount ?? activeSession.activePlan.doneCount}/{activeSession.activePlan.totalCount} scenarios covered.
                     </span>
                     <Button type="button" size="sm" variant="secondary" onClick={handleResumePlan} disabled={stoppingPlan}>
                       {stoppingPlan ? "Resuming…" : "Resume"}

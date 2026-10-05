@@ -1175,7 +1175,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "update_bug",
       description:
-        "Update a bug in the token's project. Required: bugId. Optional: title, description, status, severity (Critical/High/Medium/Low), priority (P0/P1/P2/P3 — pass null or \"\" to clear it back to untriaged), externalUrl, assigneeId (must already be a member of this project; pass null or \"\" to unassign), links (array of {testcaseId, cycleId, executionId} — replaces the bug's existing links entirely when present, it does not merge with them). Fields you omit keep their current value, except priority/assigneeId which use the explicit-clear convention above.",
+        "Update a bug in the token's project. Required: bugId. Optional: title, description, status, severity (Critical/High/Medium/Low — pass null or \"\" to clear it back to not selected), priority (P0/P1/P2/P3 — pass null or \"\" to clear it back to untriaged), externalUrl, assigneeId (must already be a member of this project; pass null or \"\" to unassign), links (array of {testcaseId, cycleId, executionId} — replaces the bug's existing links entirely when present, it does not merge with them). Fields you omit keep their current value, except severity/priority/assigneeId which use the explicit-clear convention above.",
       requiredScope: "write",
       inputSchema: {
         type: "object",
@@ -1184,7 +1184,7 @@ export function buildMcpTools(): McpTool[] {
           title: { type: "string" },
           description: { type: "string" },
           status: { type: "string" },
-          severity: { type: "string" },
+          severity: { type: ["string", "null"] },
           priority: { type: ["string", "null"] },
           externalUrl: { type: "string" },
           assigneeId: { type: ["string", "null"] },
