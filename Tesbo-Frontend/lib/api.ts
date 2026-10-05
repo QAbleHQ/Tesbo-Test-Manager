@@ -2750,10 +2750,15 @@ export async function getBug(bugId: string): Promise<BugItem> {
   return api(`/api/bugs/${bugId}`);
 }
 
-/** One comment on a bug. Flat and chronological — no replies or resolution (see V129). */
+/**
+ * One comment on a bug, or a reply to one (V131). The list is flat and oldest first; replies carry
+ * their thread's top comment as `parentCommentId` and nest only one level deep. No resolution.
+ */
 export interface BugComment {
   id: string;
   bugId: string;
+  /** null for a top-level comment. */
+  parentCommentId: string | null;
   authorId: string | null;
   /** Name, else email; "Unknown" once the author's account is gone. */
   authorName: string;
@@ -2785,10 +2790,20 @@ export async function listBugComments(projectId: string, bugId: string): Promise
   return api(bugCommentsPath(projectId, bugId));
 }
 
-export async function createBugComment(projectId: string, bugId: string, body: string, files: File[] = []): Promise<BugComment> {
-  if (!files.length) return api(bugCommentsPath(projectId, bugId), { method: "POST", body: { body } });
+/** With `parentCommentId` the comment is a reply; it must name a top-level comment (one level deep). */
+export async function createBugComment(
+  projectId: string,
+  bugId: string,
+  body: string,
+  files: File[] = [],
+  parentCommentId: string | null = null
+): Promise<BugComment> {
+  if (!files.length) {
+    return api(bugCommentsPath(projectId, bugId), { method: "POST", body: { body, ...(parentCommentId ? { parentCommentId } : {}) } });
+  }
   const form = new FormData();
   form.append("body", body);
+  if (parentCommentId) form.append("parentCommentId", parentCommentId);
   for (const file of files) form.append("files", file);
   return sendBugCommentForm(bugCommentsPath(projectId, bugId), "POST", form);
 }

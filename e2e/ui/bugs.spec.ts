@@ -2824,6 +2824,210 @@ test.describe("bug comments", () => {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });
+
+  async function seedReply(bugId: string, parentCommentId: string, body: string): Promise<SeededComment> {
+    const res = await api.post(commentsUrl(bugId), { data: { body, parentCommentId } });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  /** Each reply's rendered body, in the order shown under the thread. */
+  function replyBodies(thread: Locator): Locator {
+    return thread.getByTestId("bug-comment-reply").getByTestId("bug-comment-body");
+  }
+
+  test("BUG-U-97 Reply opens a box under the comment; the reply posts with its formatting, shows indented in that thread, and survives a reload", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Replies Post ${uniqueSuffix()}` });
+    try {
+      const top = await seedComment(bug.id, "Top comment");
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      const thread = section.getByTestId("bug-comment");
+
+      await thread.getByRole("button", { name: "Reply to this comment" }).click();
+      const replyBox = thread.getByRole("textbox", { name: "Write a reply" });
+      await replyBox.click();
+      await page.keyboard.press("ControlOrMeta+b");
+      await page.keyboard.type("Confirmed");
+      await page.keyboard.press("ControlOrMeta+b");
+      await page.keyboard.type(" on staging");
+      await thread.getByRole("button", { name: "Reply", exact: true }).click();
+
+      await expect(thread.getByTestId("bug-comment-reply")).toHaveCount(1);
+      await expect(replyBodies(thread).locator("strong")).toHaveText("Confirmed");
+      await expect(replyBox, "the reply box closes once the reply is saved").toHaveCount(0);
+      await expect(section.getByTestId("bug-comment"), "a reply is not a new top-level comment").toHaveCount(1);
+      await expect(section.getByText("Comments (2)")).toBeVisible();
+      await expect(composer(section), "the main box is untouched").toHaveText("");
+
+      const persisted = (await (await api.get(commentsUrl(bug.id))).json()).list;
+      expect(persisted[1]).toMatchObject({ parentCommentId: top.id, body: "**Confirmed** on staging" });
+
+      await openPanel(page, bug.title);
+      await expect(comments(panelBody(page)).getByTestId("bug-comment").getByTestId("bug-comment-reply")).toHaveCount(1);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-98 replies show oldest first under their own comment; Reply on a reply joins the same thread; one reply box is open at a time", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Replies Threads ${uniqueSuffix()}` });
+    try {
+      const a = await seedComment(bug.id, "Thread A");
+      const b = await seedComment(bug.id, "Thread B");
+      await seedReply(bug.id, a.id, "A first");
+      await seedReply(bug.id, b.id, "B first");
+      await seedReply(bug.id, a.id, "A second");
+
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+      const [threadA, threadB] = [section.getByTestId("bug-comment").nth(0), section.getByTestId("bug-comment").nth(1)];
+      await expect(replyBodies(threadA)).toHaveText(["A first", "A second"]);
+      await expect(replyBodies(threadB)).toHaveText(["B first"]);
+
+      // Opening a second reply box closes the first.
+      await threadB.getByRole("button", { name: "Reply to this comment" }).click();
+      await expect(threadB.getByRole("textbox", { name: "Write a reply" })).toBeVisible();
+      await threadA.getByTestId("bug-comment-reply").first().getByRole("button", { name: "Reply in this thread" }).click();
+      await expect(threadB.getByRole("textbox", { name: "Write a reply" })).toHaveCount(0);
+      await expect(section.getByRole("textbox", { name: "Write a reply" })).toHaveCount(1);
+
+      await threadA.getByRole("textbox", { name: "Write a reply" }).click();
+      await page.keyboard.type("A third, from a reply");
+      await threadA.getByRole("button", { name: "Reply", exact: true }).click();
+      await expect(replyBodies(threadA)).toHaveText(["A first", "A second", "A third, from a reply"]);
+
+      const persisted = (await (await api.get(commentsUrl(bug.id))).json()).list as Array<{ body: string; parentCommentId: string | null }>;
+      expect(persisted.find((c) => c.body === "A third, from a reply")!.parentCommentId, "attached to the top comment, not to the reply").toBe(a.id);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-99 a reply can @mention a member and carry a file, like a comment", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Replies Mention ${uniqueSuffix()}` });
+    try {
+      const members = (await (await api.get(`/api/projects/${projectId}/members`)).json()) as Array<{ userId: string; name: string; email: string }>;
+      const label = members[0].name || members[0].email;
+      await seedComment(bug.id, "Needs a log");
+      await openPanel(page, bug.title);
+      const thread = comments(panelBody(page)).getByTestId("bug-comment");
+
+      await thread.getByRole("button", { name: "Reply to this comment" }).click();
+      await thread.getByRole("textbox", { name: "Write a reply" }).click();
+      await page.keyboard.type(`@${label.slice(0, 3)}`);
+      await expect(thread.getByRole("listbox", { name: "Mention a project member" })).toBeVisible();
+      await page.keyboard.press("Enter");
+      await page.keyboard.type("log attached");
+      // Hidden behind the Attach button, so found by its label attribute.
+      await thread.locator('input[type="file"][aria-label="Attach files to reply"]').setInputFiles([
+        { name: "console.txt", mimeType: "text/plain", buffer: Buffer.from("TypeError") },
+      ]);
+      await thread.getByRole("button", { name: "Reply", exact: true }).click();
+
+      const posted = thread.getByTestId("bug-comment-reply");
+      await expect(posted).toHaveCount(1);
+      await expect(posted.getByTestId("bug-attachment-file")).toContainText("console.txt");
+
+      const saved = (await (await api.get(commentsUrl(bug.id))).json()).list[1];
+      expect(saved.body).toBe(`@${label} log attached`);
+      expect(saved.attachments.map((a: Attachment) => a.fileName)).toEqual(["console.txt"]);
+      const feed = await (await api.get(`/api/projects/${projectId}/activity`, { params: { entityType: "bug", entityId: bug.id, limit: "50" } })).json();
+      const mention = feed.list.find((r: { action: string; diff: string }) => r.action === "bug_mentioned" && JSON.parse(r.diff).commentId === saved.id);
+      expect(mention, "the reply's mention is recorded").toBeTruthy();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-100 your own reply can be edited (marked Edited) and deleted on its own, leaving the thread", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Replies Edit ${uniqueSuffix()}` });
+    try {
+      const top = await seedComment(bug.id, "Top stays");
+      await seedReply(bug.id, top.id, "Reply as posted");
+      await seedReply(bug.id, top.id, "Sibling stays");
+      await openPanel(page, bug.title);
+      const thread = comments(panelBody(page)).getByTestId("bug-comment");
+      const target = thread.getByTestId("bug-comment-reply").first();
+
+      await target.getByRole("button", { name: "Edit this reply" }).click();
+      await target.getByRole("textbox", { name: "Edit reply" }).click();
+      await page.keyboard.press("ControlOrMeta+a");
+      await page.keyboard.type("Reply revised");
+      await target.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(target.getByTestId("bug-comment-body")).toHaveText("Reply revised");
+      await expect(target.getByTestId("bug-comment-edited")).toBeVisible();
+      await expect(thread.getByTestId("bug-comment-edited"), "only the reply is marked").toHaveCount(1);
+
+      await target.getByRole("button", { name: "Delete this reply" }).click();
+      await expect(page.getByText("Delete this reply? This can't be undone.")).toBeVisible();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(replyBodies(thread)).toHaveText(["Sibling stays"]);
+      await expect(thread.getByTestId("bug-comment-body").first()).toHaveText("Top stays");
+
+      const persisted = (await (await api.get(commentsUrl(bug.id))).json()).list as Array<{ body: string }>;
+      expect(persisted.map((c) => c.body)).toEqual(["Top stays", "Sibling stays"]);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-101 deleting a comment says it takes its replies and their files, then removes the whole thread", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Replies Cascade ${uniqueSuffix()}` });
+    try {
+      const top = await seedComment(bug.id, "Thread to delete");
+      const withFile = await api.post(commentsUrl(bug.id), { multipart: filesFormWith({ body: "Reply with a file", parentCommentId: top.id }, [textFile("r.txt")]) });
+      expect(withFile.ok(), await withFile.text()).toBeTruthy();
+      await seedReply(bug.id, top.id, "Plain reply");
+      await openPanel(page, bug.title);
+      const section = comments(panelBody(page));
+
+      await section.getByRole("button", { name: "Delete this comment" }).click();
+      await expect(page.getByText("Delete this comment and its 2 replies and 1 attachment? This can't be undone.")).toBeVisible();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(section.getByTestId("bug-comment")).toHaveCount(0);
+      await expect(section.getByText("No comments yet.")).toBeVisible();
+      expect((await (await api.get(commentsUrl(bug.id))).json()).total).toBe(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-102 a failed reply keeps its draft and shows why, a retry posts it; Cancel closes the box without posting", async ({ page }) => {
+    const bug = await createBug(api, projectId, { title: `E2E Replies Error ${uniqueSuffix()}` });
+    try {
+      await seedComment(bug.id, "Top");
+      await page.route(commentsRoute(bug.id), (route) =>
+        route.request().method() === "POST"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Reply service unavailable." }) })
+          : route.continue(),
+      );
+      await openPanel(page, bug.title);
+      const thread = comments(panelBody(page)).getByTestId("bug-comment");
+
+      await thread.getByRole("button", { name: "Reply to this comment" }).click();
+      const replyBox = thread.getByRole("textbox", { name: "Write a reply" });
+      await replyBox.click();
+      await page.keyboard.type("Retry me");
+      await thread.getByRole("button", { name: "Reply", exact: true }).click();
+      await expect(thread.getByTestId("bug-comment-reply-error")).toContainText("Reply service unavailable.");
+      await expect(replyBox).toHaveText("Retry me");
+      await expect(thread.getByTestId("bug-comment-reply")).toHaveCount(0);
+
+      await page.unroute(commentsRoute(bug.id));
+      await thread.getByRole("button", { name: "Reply", exact: true }).click();
+      await expect(thread.getByTestId("bug-comment-reply")).toHaveCount(1);
+
+      await thread.getByRole("button", { name: "Reply to this comment" }).click();
+      await thread.getByRole("textbox", { name: "Write a reply" }).click();
+      await page.keyboard.type("Never sent");
+      await thread.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(thread.getByRole("textbox", { name: "Write a reply" })).toHaveCount(0);
+      expect((await (await api.get(commentsUrl(bug.id))).json()).total).toBe(2);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
 });
 
 /*

@@ -680,7 +680,7 @@ test.describe("payment lifecycle", () => {
       expect(nested.status()).toBe(403);
     });
 
-    test("BUGC-A-10 a locked project's bug comments stay readable, but a new comment, an edit or a delete is refused", async () => {
+    test("BUGC-A-10 a locked project's bug comments stay readable, but a new comment, a reply, an edit or a delete is refused", async () => {
       // Bug comments are routed under /api/projects/:projectId precisely so ProjectWriteLockGuard
       // covers them (the older /api/bugs/:bugId routes sit outside it). Seed while the grace window
       // is still open, then close it.
@@ -710,6 +710,11 @@ test.describe("payment lifecycle", () => {
         expect((await edit.json()).error).toContain("read-only");
         const del = await asBilling.delete(commentUrl, { failOnStatusCode: false });
         expect(del.status()).toBe(403);
+        const reply = await asBilling.post(`/api/projects/${locked}/bugs/${bug.id}/comments`, {
+          data: { body: "Reply after the lock", parentCommentId: commentUrl.split("/").pop() },
+          failOnStatusCode: false,
+        });
+        expect(reply.status()).toBe(403);
 
         const read = await asBilling.get(`/api/projects/${locked}/bugs/${bug.id}/comments`);
         expect(read.ok()).toBeTruthy();

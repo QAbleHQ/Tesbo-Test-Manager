@@ -86,10 +86,15 @@ function describe(item: ActivityLogItem): ReactNode {
       );
     case "commented":
       return "added a comment";
+    case "replied":
+      return "replied to a comment";
     case "comment_edited":
-      return "edited a comment";
-    case "comment_deleted":
-      return "deleted a comment";
+      return diff.parentCommentId ? "edited a reply" : "edited a comment";
+    case "comment_deleted": {
+      if (diff.parentCommentId) return "deleted a reply";
+      const replies = typeof diff.repliesDeleted === "number" ? diff.repliesDeleted : 0;
+      return replies ? `deleted a comment and its ${replies} ${replies === 1 ? "reply" : "replies"}` : "deleted a comment";
+    }
     case "bug_mentioned":
       return (
         <>

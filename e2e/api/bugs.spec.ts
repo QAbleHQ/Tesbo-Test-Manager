@@ -1291,7 +1291,8 @@ test.describe("bug_links soft-delete (hard-delete remediation Phase 7)", () => {
 
 /*
  * Comments on a bug (V129) — GET/POST /api/projects/:projectId/bugs/:bugId/comments, and PATCH/DELETE
- * …/comments/:commentId. Flat and chronological: no replies or resolve. The body is Markdown, stored
+ * …/comments/:commentId. Chronological, with replies one level deep (V131, `parentCommentId`); no
+ * resolve. The body is Markdown, stored
  * exactly as sent; a comment can carry files (multipart, entity_type 'bug_comment' in attachments).
  * Role rules (author edits; author/owner/manager deletes) are in "bug comment permissions" below.
  * The read-only plan lock is covered in billing-lifecycle.spec.ts (BUGC-A-10), which owns the tenant
@@ -1738,6 +1739,186 @@ test.describe("bug comments", () => {
       await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });
+
+  async function reply(request: APIRequestContext, bugId: string, parentCommentId: string, body: string) {
+    const res = await request.post(commentsUrl(bugId), { data: { body, parentCommentId } });
+    expect(res.status(), await res.text()).toBe(201);
+    return res.json();
+  }
+
+  test("BUGC-A-23 replies attach to their comment, several per comment, and the flat list keeps every thread in date order", async ({ request }) => {
+    const bug = await newBug(request, "Replies");
+    try {
+      const a = await (await request.post(commentsUrl(bug.id), { data: { body: "Comment A" } })).json();
+      const b = await (await request.post(commentsUrl(bug.id), { data: { body: "Comment B" } })).json();
+      expect(a.parentCommentId).toBeNull();
+      // Interleaved across threads on purpose: order is by time, grouping is by parent.
+      const a1 = await reply(request, bug.id, a.id, "Reply A1");
+      const b1 = await reply(request, bug.id, b.id, "Reply B1");
+      const a2 = await reply(request, bug.id, a.id, "Reply A2");
+      expect(a1).toMatchObject({ parentCommentId: a.id, body: "Reply A1", isEdited: false, attachments: [] });
+
+      const listed = (await (await request.get(commentsUrl(bug.id))).json()) as { list: Array<{ id: string; parentCommentId: string | null }>; total: number };
+      expect(listed.total, "total counts replies too").toBe(5);
+      expect(listed.list.map((c) => c.id)).toEqual([a.id, b.id, a1.id, b1.id, a2.id]);
+      expect(listed.list.filter((c) => c.parentCommentId === a.id).map((c) => c.id)).toEqual([a1.id, a2.id]);
+      expect(listed.list.filter((c) => c.parentCommentId === b.id).map((c) => c.id)).toEqual([b1.id]);
+
+      const feed = await (await request.get(`/api/projects/${ctx.projectId}/activity`, { params: { entityType: "bug", entityId: bug.id, limit: "100" } })).json();
+      const replied = feed.list.filter((r: { action: string }) => r.action === "replied");
+      expect(replied).toHaveLength(3);
+      expect(replied.map((r: { diff: string }) => JSON.parse(r.diff)).find((d: { commentId: string }) => d.commentId === a1.id)).toEqual({
+        commentId: a1.id,
+        parentCommentId: a.id,
+      });
+      expect(feed.list.filter((r: { action: string }) => r.action === "commented"), "a reply is not logged as a new comment").toHaveLength(2);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-24 a reply to a missing, deleted, other-bug or malformed comment is a 404; to a reply, a 400 — and nothing is stored", async ({ request }) => {
+    const bug = await newBug(request, "Reply Invalid");
+    const otherBug = await newBug(request, "Reply Invalid Other");
+    try {
+      const top = await (await request.post(commentsUrl(bug.id), { data: { body: "Top" } })).json();
+      const child = await reply(request, bug.id, top.id, "Child");
+      const deleted = await (await request.post(commentsUrl(bug.id), { data: { body: "Deleted" } })).json();
+      await request.delete(commentUrl(bug.id, deleted.id));
+      const elsewhere = await (await request.post(commentsUrl(otherBug.id), { data: { body: "On another bug" } })).json();
+
+      const gone = "The comment you're replying to no longer exists.";
+      const cases: Array<[string, unknown, number, string]> = [
+        ["unknown", "00000000-0000-0000-0000-000000000000", 404, gone],
+        ["malformed", "not-a-uuid", 404, gone],
+        ["deleted", deleted.id, 404, gone],
+        ["another bug's comment", elsewhere.id, 404, gone],
+        ["a reply", child.id, 400, "Reply to the top comment of the thread instead of to another reply."],
+        ["not text", 42, 400, "parentCommentId must be a comment id."],
+      ];
+      for (const [label, parentCommentId, status, error] of cases) {
+        const res = await request.post(commentsUrl(bug.id), { data: { body: `Reply to ${label}`, parentCommentId }, failOnStatusCode: false });
+        expect(res.status(), label).toBe(status);
+        expect((await res.json()).error, label).toBe(error);
+      }
+      // Same rule through multipart, the route a reply with files takes.
+      const viaForm = await request.post(commentsUrl(bug.id), {
+        multipart: filesFormWith({ body: "Nested with a file", parentCommentId: child.id }, [textFile("nested.txt")]),
+        failOnStatusCode: false,
+      });
+      expect(viaForm.status()).toBe(400);
+
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(2);
+      expect((await (await request.get(commentsUrl(otherBug.id))).json()).total).toBe(1);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/bugs/${otherBug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-25 a reply carries Markdown and files like a comment, under the same validation", async ({ request }) => {
+    const bug = await newBug(request, "Reply Files");
+    try {
+      const top = await (await request.post(commentsUrl(bug.id), { data: { body: "Top" } })).json();
+      const res = await request.post(commentsUrl(bug.id), {
+        multipart: filesFormWith({ body: "Retested: **still fails**\n- on v127", parentCommentId: top.id }, [pngFile("retest.png")]),
+      });
+      expect(res.status(), await res.text()).toBe(201);
+      const created = await res.json();
+      expect(created).toMatchObject({ parentCommentId: top.id, body: "Retested: **still fails**\n- on v127" });
+      expect(created.attachments.map((a: { fileName: string }) => a.fileName)).toEqual(["retest.png"]);
+      expect((await request.get(downloadUrl(created.attachments[0].id))).ok()).toBeTruthy();
+
+      for (const [data, error] of [
+        [{ body: "  ", parentCommentId: top.id }, "Comment cannot be empty."],
+        [{ body: "x".repeat(10_001), parentCommentId: top.id }, "10,000"],
+      ] as const) {
+        const bad = await request.post(commentsUrl(bug.id), { data, failOnStatusCode: false });
+        expect(bad.status()).toBe(400);
+        expect((await bad.json()).error).toContain(error);
+      }
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(2);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-26 the author edits a reply (marked edited, still in its thread, an hour at most); deleting a reply leaves the rest of the thread", async ({ request }) => {
+    const bug = await newBug(request, "Reply Edit");
+    try {
+      const top = await (await request.post(commentsUrl(bug.id), { data: { body: "Top" } })).json();
+      const other = await (await request.post(commentsUrl(bug.id), { data: { body: "Other top" } })).json();
+      const first = await reply(request, bug.id, top.id, "First reply");
+      const second = await reply(request, bug.id, top.id, "Second reply");
+
+      // An edit can't move a reply to another thread: parentCommentId is not an editable field.
+      const res = await request.patch(commentUrl(bug.id, first.id), { data: { body: "First reply, corrected", parentCommentId: other.id } });
+      expect(res.status(), await res.text()).toBe(200);
+      expect(await res.json()).toMatchObject({ id: first.id, parentCommentId: top.id, body: "First reply, corrected", isEdited: true });
+
+      exec(`UPDATE bug_comments SET created_at = now() - interval '61 minutes' WHERE id = ${literal(second.id)};`);
+      const late = await request.patch(commentUrl(bug.id, second.id), { data: { body: "Too late" }, failOnStatusCode: false });
+      expect(late.status()).toBe(403);
+      expect((await late.json()).error).toBe("Comments can only be edited within 1 hour of posting.");
+
+      expect((await request.delete(commentUrl(bug.id, first.id))).status()).toBe(200);
+      const listed = (await (await request.get(commentsUrl(bug.id))).json()).list as Array<{ id: string; body: string }>;
+      expect(listed.map((c) => c.id)).toEqual([top.id, other.id, second.id]);
+      expect(listed.find((c) => c.id === second.id)!.body).toBe("Second reply");
+
+      const feed = await (await request.get(`/api/projects/${ctx.projectId}/activity`, { params: { entityType: "bug", entityId: bug.id, limit: "100" } })).json();
+      const deletion = feed.list.find((r: { action: string }) => r.action === "comment_deleted");
+      expect(JSON.parse(deletion.diff)).toMatchObject({ commentId: first.id, parentCommentId: top.id });
+      expect(JSON.parse(deletion.diff).repliesDeleted, "deleting a reply deletes nothing else").toBeUndefined();
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-27 deleting a comment deletes its replies and their files; the thread can then be neither replied to nor edited", async ({ request }) => {
+    const bug = await newBug(request, "Reply Cascade");
+    try {
+      const top = await commentWithFiles(request, bug.id, "Top with a file", [textFile("top.txt")]);
+      const kept = await (await request.post(commentsUrl(bug.id), { data: { body: "Unrelated thread" } })).json();
+      const keptReply = await reply(request, bug.id, kept.id, "Unrelated reply");
+      const withFile = await (
+        await request.post(commentsUrl(bug.id), { multipart: filesFormWith({ body: "Reply with a file", parentCommentId: top.id }, [textFile("reply.txt")]) })
+      ).json();
+      const plain = await reply(request, bug.id, top.id, "Plain reply");
+
+      expect((await request.delete(commentUrl(bug.id, top.id))).status()).toBe(200);
+
+      const listed = (await (await request.get(commentsUrl(bug.id))).json()).list as Array<{ id: string }>;
+      expect(listed.map((c) => c.id)).toEqual([kept.id, keptReply.id]);
+      for (const att of [top.attachments[0], withFile.attachments[0]]) {
+        expect((await request.get(downloadUrl(att.id), { failOnStatusCode: false })).status(), att.fileName).toBe(404);
+      }
+      expect(scalar(`SELECT COUNT(*)::text FROM bug_comments WHERE id IN (${literal(withFile.id)}, ${literal(plain.id)}) AND is_deleted`)).toBe("2");
+
+      expect((await request.post(commentsUrl(bug.id), { data: { body: "Late reply", parentCommentId: top.id }, failOnStatusCode: false })).status()).toBe(404);
+      expect((await request.patch(commentUrl(bug.id, plain.id), { data: { body: "Edit after cascade" }, failOnStatusCode: false })).status()).toBe(404);
+
+      const feed = await (await request.get(`/api/projects/${ctx.projectId}/activity`, { params: { entityType: "bug", entityId: bug.id, limit: "100" } })).json();
+      const deletion = feed.list.find((r: { action: string; diff: string }) => r.action === "comment_deleted" && JSON.parse(r.diff).commentId === top.id);
+      expect(JSON.parse(deletion.diff).repliesDeleted).toBe(2);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-28 another workspace and an anonymous caller can't reply", async ({ request }) => {
+    const bug = await newBug(request, "Reply Authz");
+    try {
+      const top = await (await request.post(commentsUrl(bug.id), { data: { body: "Account A only" } })).json();
+      for (const [label, caller] of [["account B", asB], ["anonymous", anon]] as const) {
+        const res = await caller.post(commentsUrl(bug.id), { data: { body: `From ${label}`, parentCommentId: top.id }, failOnStatusCode: false });
+        expect([401, 403, 404], label).toContain(res.status());
+      }
+      expect((await (await request.get(commentsUrl(bug.id))).json()).total).toBe(1);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
 });
 
 /*
@@ -1876,6 +2057,37 @@ test.describe("bug comment permissions", () => {
 
       const mentioned = rows.filter((r) => r.action === "bug_mentioned").map((r) => diffOf(r).mentionedUserId);
       expect(mentioned.sort()).toEqual([tenant!.manager.userId, tenant!.qa.userId].sort());
+    } finally {
+      await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUGC-A-29 replies follow the comment rules: any member replies, only the author edits, author/owner/manager deletes — and a thread's author deletes everyone's replies", async () => {
+    const bug = await newBug("Replies");
+    try {
+      const reply = async (as: APIRequestContext, parentCommentId: string, body: string) => {
+        const res = await as.post(commentsUrl(bug.id), { data: { body, parentCommentId } });
+        expect(res.status(), await res.text()).toBe(201);
+        return res.json() as Promise<{ id: string }>;
+      };
+      const byOwner = await comment(asOwner, bug.id, "Owner's thread");
+      const qaReply = await reply(asQa, byOwner.id, "QA replies");
+      const managerReply = await reply(asManager, byOwner.id, "Manager replies");
+      expect((await asGuest.post(commentsUrl(bug.id), { data: { body: "Guest", parentCommentId: byOwner.id }, failOnStatusCode: false })).status()).toBe(404);
+
+      expect((await asOwner.patch(commentUrl(bug.id, qaReply.id), { data: { body: "Owner rewrites" }, failOnStatusCode: false })).status()).toBe(403);
+      expect((await asQa.patch(commentUrl(bug.id, qaReply.id), { data: { body: "QA revises" } })).status()).toBe(200);
+      expect((await asQa.delete(commentUrl(bug.id, managerReply.id), { failOnStatusCode: false })).status()).toBe(403);
+      expect((await asManager.delete(commentUrl(bug.id, qaReply.id))).status()).toBe(200);
+
+      // Decided: a thread goes with its top comment, as in the Knowledge Base — even when the one
+      // deleting it wrote only the top comment and others wrote the replies.
+      const byQa = await comment(asQa, bug.id, "QA's thread");
+      await reply(asOwner, byQa.id, "Owner replies to QA");
+      expect((await asQa.delete(commentUrl(bug.id, byQa.id))).status()).toBe(200);
+
+      const listed = (await (await asOwner.get(commentsUrl(bug.id))).json()).list as Array<{ body: string }>;
+      expect(listed.map((c) => c.body)).toEqual(["Owner's thread", "Manager replies"]);
     } finally {
       await asOwner.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }

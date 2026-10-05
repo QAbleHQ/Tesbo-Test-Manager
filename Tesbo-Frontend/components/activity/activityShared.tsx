@@ -93,6 +93,7 @@ const ACTION_META: Record<string, [string, StatusChipProps["tone"]]> = {
   custom_field_deleted: ["Deleted", "error"],
   testcase_custom_field_updated: ["Custom field updated", "info"],
   commented: ["Commented", "neutral"],
+  replied: ["Replied", "neutral"],
   comment_edited: ["Comment edited", "info"],
   comment_deleted: ["Comment deleted", "error"],
   bug_created: ["Created", "success"],

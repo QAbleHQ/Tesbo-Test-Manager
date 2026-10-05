@@ -6602,12 +6602,14 @@ export class LegacyService implements OnModuleInit {
   private static readonly BUG_COMMENT_MAX_ATTACHMENTS = 10;
   // How long after posting the author may still edit (text or files). Deleting has no limit.
   private static readonly BUG_COMMENT_EDIT_WINDOW_MINUTES = 60;
-  private static readonly BUG_COMMENT_COLUMNS = "id, bug_id, author_id, body, created_at, updated_at";
+  private static readonly BUG_COMMENT_COLUMNS = "id, bug_id, parent_comment_id, author_id, body, created_at, updated_at";
 
   private bugCommentView(row: Body, attachments: Body[] = []): Body {
     return {
       id: String(row.id),
       bugId: String(row.bug_id),
+      // null for a top-level comment; replies are one level deep (V131).
+      parentCommentId: row.parent_comment_id ? String(row.parent_comment_id) : null,
       authorId: row.author_id ? String(row.author_id) : null,
       authorName: row.author_name ? String(row.author_name) : "Unknown",
       body: String(row.body || ""),
@@ -6638,7 +6640,7 @@ export class LegacyService implements OnModuleInit {
   private async bugCommentRow(bugId: string, commentId: string): Promise<Body> {
     if (!isUuid(commentId)) throw new NotFoundException({ error: "Comment not found" });
     const res = await this.db.query(
-      `SELECT c.id, c.bug_id, c.author_id, c.body, c.created_at, c.updated_at,
+      `SELECT c.id, c.bug_id, c.parent_comment_id, c.author_id, c.body, c.created_at, c.updated_at,
               COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name,
               c.created_at > now() - make_interval(mins => $3) AS within_edit_window
        FROM bug_comments c
@@ -6783,12 +6785,17 @@ export class LegacyService implements OnModuleInit {
   async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     await this.bugInProject(projectId, bugId);
+    // Flat and oldest first, replies included: grouped by parentCommentId, that is each thread's
+    // replies in date order. A reply whose parent has been deleted is left out — deleteBugComment
+    // removes a thread's replies with it, so this only covers a reply racing that delete.
     const res = await this.db.query(
-      `SELECT c.id, c.bug_id, c.author_id, c.body, c.created_at, c.updated_at,
+      `SELECT c.id, c.bug_id, c.parent_comment_id, c.author_id, c.body, c.created_at, c.updated_at,
               COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
        FROM bug_comments c
        LEFT JOIN users a ON a.id = c.author_id
+       LEFT JOIN bug_comments p ON p.id = c.parent_comment_id
        WHERE c.bug_id = $1 AND c.is_deleted = false
+         AND (c.parent_comment_id IS NULL OR p.is_deleted = false)
        ORDER BY c.created_at ASC, c.id ASC`,
       [bugId]
     );
@@ -6798,9 +6805,31 @@ export class LegacyService implements OnModuleInit {
   }
 
   /**
+   * `parentCommentId` as sent (JSON or a multipart field): null for a top-level comment, otherwise
+   * a live, top-level comment on this bug — the same rules and messages as Knowledge Base replies.
+   */
+  private async bugCommentParent(bugId: string, raw: unknown): Promise<string | null> {
+    if (raw === undefined || raw === null || raw === "") return null;
+    if (typeof raw !== "string") throw new BadRequestException({ error: "parentCommentId must be a comment id." });
+    const gone = new NotFoundException({ error: "The comment you're replying to no longer exists." });
+    if (!isUuid(raw)) throw gone;
+    const parent = await this.db.query<{ parent_comment_id: string | null }>(
+      "SELECT parent_comment_id FROM bug_comments WHERE id = $1 AND bug_id = $2 AND is_deleted = false",
+      [raw, bugId]
+    );
+    if (!parent.rows[0]) throw gone;
+    // Threads stay one level deep. The UI never sends this — Reply on a reply targets the thread's
+    // top comment — so it only reaches a caller of the API itself.
+    if (parent.rows[0].parent_comment_id) {
+      throw new BadRequestException({ error: "Reply to the top comment of the thread instead of to another reply." });
+    }
+    return raw;
+  }
+
+  /**
    * JSON `{ body }`, or multipart with a `body` field plus up to ten `files` — one request, so a
    * comment and its files are saved together: if storing a file fails, the comment is removed again
-   * rather than left posted without the evidence it refers to.
+   * rather than left posted without the evidence it refers to. With `parentCommentId` it is a reply.
    */
   async createBugComment(
     projectId: string,
@@ -6813,20 +6842,29 @@ export class LegacyService implements OnModuleInit {
     const project = await this.requireProjectAccess(uid, projectId);
     const bug = await this.bugInProject(projectId, bugId);
     const text = LegacyService.bugCommentText(body?.body);
+    const parentCommentId = await this.bugCommentParent(bugId, body?.parentCommentId);
     const uploads = files ?? [];
     await this.assertBugCommentFiles(String(project.organization_id), uploads, 0);
 
+    // The parent is re-checked in the INSERT itself, so a thread deleted since bugCommentParent
+    // read it gets the same 404 rather than a reply nobody can see.
     const res = await this.db.query(
       `WITH inserted AS (
-         INSERT INTO bug_comments (project_id, bug_id, author_id, body)
-         VALUES ($1, $2, $3, $4)
+         INSERT INTO bug_comments (project_id, bug_id, parent_comment_id, author_id, body)
+         -- Typed explicitly: INSERT … SELECT does not infer parameter types from the target columns.
+         SELECT $1::uuid, $2::uuid, $5::uuid, $3::uuid, $4::text
+         WHERE $5::uuid IS NULL OR EXISTS (
+           SELECT 1 FROM bug_comments p
+           WHERE p.id = $5::uuid AND p.bug_id = $2::uuid AND p.is_deleted = false AND p.parent_comment_id IS NULL
+         )
          RETURNING ${LegacyService.BUG_COMMENT_COLUMNS}
        )
        SELECT i.*, COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
        FROM inserted i
        LEFT JOIN users a ON a.id = i.author_id`,
-      [projectId, bugId, uid, text]
+      [projectId, bugId, uid, text, parentCommentId]
     );
+    if (!res.rows[0]) throw new NotFoundException({ error: "The comment you're replying to no longer exists." });
     const commentId = String(res.rows[0].id);
     if (uploads.length) {
       try {
@@ -6836,7 +6874,11 @@ export class LegacyService implements OnModuleInit {
         throw err;
       }
     }
-    await this.logProjectActivity(projectId, uid, "commented", "bug", bugId, bug.title, { commentId });
+    // "replied", as Knowledge Base replies are logged.
+    await this.logProjectActivity(projectId, uid, parentCommentId ? "replied" : "commented", "bug", bugId, bug.title, {
+      commentId,
+      ...(parentCommentId ? { parentCommentId } : {})
+    });
     for (const mentioned of await this.bugCommentMentions(projectId, text)) {
       await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
         commentId,
@@ -6901,6 +6943,7 @@ export class LegacyService implements OnModuleInit {
 
     await this.logProjectActivity(projectId, uid, "comment_edited", "bug", bugId, bug.title, {
       commentId,
+      ...(comment.parent_comment_id ? { parentCommentId: String(comment.parent_comment_id) } : {}),
       ...(textChanged ? { textChanged: true } : {}),
       ...(uploads.length ? { attachmentsAdded: uploads.length } : {}),
       ...(removing.length ? { attachmentsRemoved: removing.length } : {})
@@ -6924,7 +6967,11 @@ export class LegacyService implements OnModuleInit {
     );
   }
 
-  /** Soft-deletes a comment and destroys its files. The author, or a project owner/manager. */
+  /**
+   * Soft-deletes a comment and destroys its files. The author, or a project owner/manager. A
+   * top-level comment takes its whole thread with it — replies and their files — as Knowledge Base
+   * threads do, so no reply is left hanging under a comment that is gone.
+   */
   async deleteBugComment(projectId: string, userId: string | null | undefined, bugId: string, commentId: string) {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
@@ -6932,15 +6979,24 @@ export class LegacyService implements OnModuleInit {
     const comment = await this.bugCommentRow(bugId, commentId);
     this.kbRequireMutateAccess(await this.kbProjectRole(uid, projectId), comment.author_id ? String(comment.author_id) : null, uid);
 
-    const deleted = await this.db.query(
-      "UPDATE bug_comments SET is_deleted = true, deleted_at = now(), updated_at = now() WHERE id = $1 AND is_deleted = false RETURNING id",
+    // A reply has no replies of its own, so for one this matches only itself.
+    const deleted = await this.db.query<{ id: string }>(
+      `UPDATE bug_comments SET is_deleted = true, deleted_at = now(), updated_at = now()
+       WHERE (id = $1 OR parent_comment_id = $1) AND is_deleted = false
+       RETURNING id`,
       [commentId]
     );
-    if (!deleted.rows[0]) throw new NotFoundException({ error: "Comment not found" });
-    await this.removeBugCommentFiles((await this.bugCommentAttachments([commentId])).get(commentId) ?? [], uid);
+    const deletedIds = deleted.rows.map((row) => String(row.id));
+    // Deleted by someone else between the read above and this write.
+    if (!deletedIds.includes(commentId)) throw new NotFoundException({ error: "Comment not found" });
+    const files = await this.bugCommentAttachments(deletedIds);
+    await this.removeBugCommentFiles(deletedIds.flatMap((id) => files.get(id) ?? []), uid);
+    const repliesDeleted = deletedIds.length - 1;
     await this.logProjectActivity(projectId, uid, "comment_deleted", "bug", bugId, bug.title, {
       commentId,
-      authorId: comment.author_id ? String(comment.author_id) : null
+      authorId: comment.author_id ? String(comment.author_id) : null,
+      ...(comment.parent_comment_id ? { parentCommentId: String(comment.parent_comment_id) } : {}),
+      ...(repliesDeleted ? { repliesDeleted } : {})
     });
     return { success: true };
   }

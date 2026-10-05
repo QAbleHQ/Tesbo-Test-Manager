@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconMessage, IconPaperclip, IconPencil, IconTrash, IconX } from "@tabler/icons-react";
+import { IconCornerDownRight, IconMessage, IconPaperclip, IconPencil, IconTrash, IconX } from "@tabler/icons-react";
 import {
   createBugComment,
   deleteBugComment,
@@ -128,13 +128,148 @@ function AttachButton({ label, onFiles }: { label: string; onFiles: (files: File
 
 type EditState = { id: string; draft: string; removeIds: string[]; staged: File[]; rejections: string[] };
 
+type ComposerLabels = {
+  box: string;
+  placeholder: string;
+  attach: string;
+  submit: string;
+  submitting: string;
+  errorTestId: string;
+};
+
 /**
- * Comments on one bug, at the bottom of Bug Details (side panel and full page). Flat, no replies or
- * resolve — a bug's status already says whether it is resolved. Comments are Markdown written with
- * a small rich-text editor and shown through the shared renderMarkdown; each can carry files. The
- * author may edit for an hour after posting; the author or a project owner/manager may delete at any
- * time. Render with `key={bugId}` so
- * switching bugs starts clean.
+ * The write box — the one at the foot of the list, and the one under a thread when replying. Owns
+ * its draft and staged files, so a failed post keeps both for a retry, and a reply box opening or
+ * closing never disturbs the main one.
+ */
+function CommentComposer({
+  projectId,
+  bugId,
+  members,
+  parentCommentId = null,
+  labels,
+  autoFocus = false,
+  onPosted,
+  onCancel,
+}: {
+  projectId: string;
+  bugId: string;
+  members: MentionMember[];
+  /** Set for a reply: always the thread's top-level comment. */
+  parentCommentId?: string | null;
+  labels: ComposerLabels;
+  autoFocus?: boolean;
+  onPosted: (created: BugComment) => void;
+  onCancel?: () => void;
+}) {
+  const [draft, setDraft] = useState("");
+  // Bumped to remount (and so clear) the editor once the post is saved.
+  const [editorKey, setEditorKey] = useState(0);
+  const [staged, setStaged] = useState<File[]>([]);
+  const [rejections, setRejections] = useState<string[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  function stage(files: File[]) {
+    const { accepted, rejected } = acceptFiles(files, staged.length);
+    setRejections(rejected);
+    if (accepted.length) setStaged((prev) => [...prev, ...accepted]);
+  }
+
+  async function submit() {
+    const body = draft.trim();
+    if (!body || submitting) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const created = await createBugComment(projectId, bugId, body, staged, parentCommentId);
+      setDraft("");
+      setStaged([]);
+      setRejections([]);
+      setEditorKey((k) => k + 1);
+      onPosted(created);
+    } catch (err) {
+      // The draft and its files are kept, so a failed post can be retried without redoing either.
+      setSubmitError(err instanceof Error ? err.message : "Failed to add comment.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-secondary)] p-3">
+      <CommentEditor
+        key={editorKey}
+        onChange={setDraft}
+        onSubmit={() => void submit()}
+        onPasteFiles={stage}
+        members={members}
+        ariaLabel={labels.box}
+        placeholder={labels.placeholder}
+        autoFocus={autoFocus}
+      />
+      <CommentFiles
+        staged={staged}
+        onRemoveStaged={(index) => {
+          setRejections([]);
+          setStaged((prev) => prev.filter((_, i) => i !== index));
+        }}
+        rejections={rejections}
+      />
+      {submitError && (
+        <p role="alert" data-testid={labels.errorTestId} className="mt-2 text-[13px] text-[var(--error-foreground)]">
+          {submitError}
+        </p>
+      )}
+      <div className="mt-2 flex items-center justify-end gap-2">
+        <AttachButton label={labels.attach} onFiles={stage} />
+        {onCancel && (
+          <Button size="sm" variant="secondary" onClick={onCancel} disabled={submitting}>
+            Cancel
+          </Button>
+        )}
+        <Button size="sm" onClick={() => void submit()} disabled={submitting || !draft.trim()}>
+          {submitting ? labels.submitting : labels.submit}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+const COMMENT_COMPOSER_LABELS: ComposerLabels = {
+  box: "Add a comment",
+  placeholder: "Add a comment… Type @ to mention someone.",
+  attach: "Attach files to comment",
+  submit: "Add Comment",
+  submitting: "Adding…",
+  errorTestId: "bug-comment-error",
+};
+
+const REPLY_COMPOSER_LABELS: ComposerLabels = {
+  box: "Write a reply",
+  placeholder: "Reply… Type @ to mention someone.",
+  attach: "Attach files to reply",
+  submit: "Reply",
+  submitting: "Replying…",
+  errorTestId: "bug-comment-reply-error",
+};
+
+/** "and its 2 replies and 1 attachment", or "" — what else a delete takes with it. */
+function deleteExtras(replies: number, attachments: number): string {
+  const parts = [
+    replies ? `${replies} ${replies === 1 ? "reply" : "replies"}` : "",
+    attachments ? `${attachments} attachment${attachments === 1 ? "" : "s"}` : "",
+  ].filter(Boolean);
+  return parts.length ? ` and its ${parts.join(" and ")}` : "";
+}
+
+/**
+ * Comments on one bug, at the bottom of Bug Details (side panel and full page), with replies one
+ * level deep beneath each. No resolve — a bug's status already says whether it is resolved.
+ * Comments and replies are Markdown written with a small rich-text editor and shown through the
+ * shared renderMarkdown; each can carry files. The author may edit for an hour after posting; the
+ * author or a project owner/manager may delete at any time, and deleting a comment deletes its
+ * replies. Render with `key={bugId}` so switching bugs starts clean.
  */
 export default function BugComments({
   projectId,
@@ -143,7 +278,7 @@ export default function BugComments({
 }: {
   projectId: string;
   bugId: string;
-  /** Any comment change (add, edit, delete), so the Activity section beside this one re-reads. */
+  /** Any comment change (add, reply, edit, delete), so the Activity section beside this one re-reads. */
   onCommentAdded?: () => void;
 }) {
   const { currentUser } = useAppData();
@@ -159,13 +294,8 @@ export default function BugComments({
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const [draft, setDraft] = useState("");
-  // Bumped to remount (and so clear) the composer's editor once a comment is posted.
-  const [composerKey, setComposerKey] = useState(0);
-  const [staged, setStaged] = useState<File[]>([]);
-  const [rejections, setRejections] = useState<string[]>([]);
-  const [submitting, setSubmitting] = useState(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
+  // The top-level comment whose reply box is open; one at a time.
+  const [replyingTo, setReplyingTo] = useState<string | null>(null);
 
   const [editing, setEditing] = useState<EditState | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
@@ -207,32 +337,22 @@ export default function BugComments({
     return () => clearTimeout(timer);
   }, [comments, currentUserId, now]);
 
-  function stageComposerFiles(files: File[]) {
-    const { accepted, rejected } = acceptFiles(files, staged.length);
-    setRejections(rejected);
-    if (accepted.length) setStaged((prev) => [...prev, ...accepted]);
-  }
-
-  async function submit() {
-    const body = draft.trim();
-    if (!body || submitting) return;
-    setSubmitting(true);
-    setSubmitError(null);
-    try {
-      const created = await createBugComment(projectId, bugId, body, staged);
-      // Appended from the POST response rather than refetched, so it shows the moment it is saved.
-      setComments((prev) => [...prev, created]);
-      setDraft("");
-      setStaged([]);
-      setRejections([]);
-      setComposerKey((k) => k + 1);
-      onCommentAdded?.();
-    } catch (err) {
-      // The draft and its files are kept, so a failed post can be retried without redoing either.
-      setSubmitError(err instanceof Error ? err.message : "Failed to add comment.");
-    } finally {
-      setSubmitting(false);
+  // The list arrives flat and oldest first, so grouping by parent keeps each thread in date order.
+  // A new post is appended, which is also its place in time.
+  const { roots, repliesOf } = useMemo(() => {
+    const repliesOf = new Map<string, BugComment[]>();
+    for (const c of comments) {
+      if (!c.parentCommentId) continue;
+      repliesOf.set(c.parentCommentId, [...(repliesOf.get(c.parentCommentId) ?? []), c]);
     }
+    return { roots: comments.filter((c) => !c.parentCommentId), repliesOf };
+  }, [comments]);
+
+  function posted(created: BugComment) {
+    // Appended from the POST response rather than refetched, so it shows the moment it is saved.
+    setComments((prev) => [...prev, created]);
+    if (created.parentCommentId) setReplyingTo(null);
+    onCommentAdded?.();
   }
 
   function startEdit(comment: BugComment) {
@@ -277,8 +397,11 @@ export default function BugComments({
     setActionError(null);
     try {
       await deleteBugComment(projectId, bugId, target.id);
-      setComments((prev) => prev.filter((c) => c.id !== target.id));
-      if (editing?.id === target.id) setEditing(null);
+      // A top-level comment goes with its replies, as the server deleted them too.
+      const gone = (c: BugComment) => c.id === target.id || c.parentCommentId === target.id;
+      setComments((prev) => prev.filter((c) => !gone(c)));
+      if (editing && comments.some((c) => c.id === editing.id && gone(c))) setEditing(null);
+      if (replyingTo === target.id) setReplyingTo(null);
       onCommentAdded?.();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Failed to delete the comment.");
@@ -290,10 +413,137 @@ export default function BugComments({
 
   const linkAction = "inline-flex items-center gap-1 text-[12px] text-[var(--muted)]";
 
+  /** One comment or reply: author line, actions, then the body — or the editor while editing it. */
+  function renderComment(comment: BugComment) {
+    const isReply = !!comment.parentCommentId;
+    const noun = isReply ? "reply" : "comment";
+    const isAuthor = !!currentUserId && comment.authorId === currentUserId;
+    const canEdit = isAuthor && Date.parse(comment.editableUntil) > now;
+    const canDelete = isAuthor || moderator;
+    const isEditing = editing?.id === comment.id;
+    // Reply on a reply joins the same thread: threads are one level deep.
+    const threadId = comment.parentCommentId ?? comment.id;
+    return (
+      <div className="flex items-start gap-2.5">
+        <MemberAvatar name={comment.authorName} seed={comment.authorId} size={isReply ? 20 : 24} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[13px] font-semibold text-[var(--foreground)]">{comment.authorName}</span>
+            <time dateTime={comment.createdAt} className="text-[11px] text-[var(--muted-soft)]">
+              {new Date(comment.createdAt).toLocaleString()}
+            </time>
+            {comment.isEdited && (
+              <span
+                data-testid="bug-comment-edited"
+                title={`Edited ${new Date(comment.updatedAt).toLocaleString()}`}
+                className="text-[11px] italic text-[var(--muted-soft)]"
+              >
+                Edited
+              </span>
+            )}
+            {!isEditing && (
+              <span className="ml-auto flex items-center gap-3">
+                <button
+                  type="button"
+                  // Named apart from the panel's own Edit/Delete (the bug's), which sit in the same
+                  // region, and a reply's apart from its thread's.
+                  aria-label={isReply ? "Reply in this thread" : "Reply to this comment"}
+                  onClick={() => setReplyingTo(threadId)}
+                  className={`${linkAction} hover:text-[var(--foreground)]`}
+                >
+                  <IconCornerDownRight size={12} /> Reply
+                </button>
+                {canEdit && (
+                  <button
+                    type="button"
+                    aria-label={`Edit this ${noun}`}
+                    onClick={() => startEdit(comment)}
+                    className={`${linkAction} hover:text-[var(--foreground)]`}
+                  >
+                    <IconPencil size={12} /> Edit
+                  </button>
+                )}
+                {canDelete && (
+                  <button
+                    type="button"
+                    aria-label={`Delete this ${noun}`}
+                    onClick={() => setConfirmingDelete(comment)}
+                    className={`${linkAction} hover:text-[var(--error-foreground)]`}
+                  >
+                    <IconTrash size={12} /> Delete
+                  </button>
+                )}
+              </span>
+            )}
+          </div>
+
+          {isEditing && editing ? (
+            <div className="mt-2">
+              <CommentEditor
+                key={`edit-${comment.id}`}
+                initialMarkdown={comment.body}
+                onChange={(markdown) => setEditing((prev) => (prev ? { ...prev, draft: markdown } : prev))}
+                onSubmit={() => void saveEdit(comment)}
+                onPasteFiles={(files) => stageEditFiles(comment, files)}
+                members={members}
+                ariaLabel={`Edit ${noun}`}
+                autoFocus
+              />
+              <CommentFiles
+                existing={comment.attachments.filter((att) => !editing.removeIds.includes(att.id))}
+                onRemoveExisting={(id) => setEditing((prev) => (prev ? { ...prev, removeIds: [...prev.removeIds, id] } : prev))}
+                staged={editing.staged}
+                onRemoveStaged={(index) =>
+                  setEditing((prev) => (prev ? { ...prev, staged: prev.staged.filter((_, i) => i !== index), rejections: [] } : prev))
+                }
+                rejections={editing.rejections}
+              />
+              {editError && (
+                <p role="alert" data-testid="bug-comment-edit-error" className="mt-2 text-[13px] text-[var(--error-foreground)]">
+                  {editError}
+                </p>
+              )}
+              <div className="mt-2 flex items-center justify-end gap-2">
+                <AttachButton label={`Attach files to this ${noun}`} onFiles={(files) => stageEditFiles(comment, files)} />
+                <Button size="sm" variant="secondary" onClick={() => setEditing(null)} disabled={savingEdit}>
+                  Cancel
+                </Button>
+                <Button size="sm" onClick={() => void saveEdit(comment)} disabled={savingEdit || !editing.draft.trim()}>
+                  {savingEdit ? "Saving…" : "Save"}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* renderMarkdown escapes the text before adding any markup, so this is safe to inject. */}
+              <div
+                data-testid="bug-comment-body"
+                className="zyra-prose mt-1 break-words text-[13px] text-[var(--foreground)]"
+                dangerouslySetInnerHTML={{ __html: renderMarkdown(comment.body) }}
+              />
+              {comment.attachments.length > 0 && (
+                <div className="mt-2" data-testid="bug-comment-attachments">
+                  <BugAttachments projectId={projectId} attachments={comment.attachments} readOnly />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const deletingReplies = confirmingDelete ? (repliesOf.get(confirmingDelete.id) ?? []) : [];
+  const deletingFiles = confirmingDelete
+    ? confirmingDelete.attachments.length + deletingReplies.reduce((sum, reply) => sum + reply.attachments.length, 0)
+    : 0;
+  const deletingNoun = confirmingDelete?.parentCommentId ? "reply" : "comment";
+
   return (
     <section aria-label="Comments" className="border-t border-[var(--border)] pt-5">
       <h4 className="mb-3 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
         <IconMessage size={14} stroke={1.75} />
+        {/* Counts replies too: everything said on the bug. */}
         Comments{!loading && !loadError && comments.length > 0 ? ` (${comments.length})` : ""}
       </h4>
 
@@ -315,161 +565,61 @@ export default function BugComments({
             Retry
           </Button>
         </div>
-      ) : comments.length === 0 ? (
+      ) : roots.length === 0 ? (
         <p className="text-[13px] text-[var(--muted-soft)]">No comments yet.</p>
       ) : (
         <ul className="space-y-3">
-          {comments.map((comment) => {
-            const isAuthor = !!currentUserId && comment.authorId === currentUserId;
-            const canEdit = isAuthor && Date.parse(comment.editableUntil) > now;
-            const canDelete = isAuthor || moderator;
-            const isEditing = editing?.id === comment.id;
+          {roots.map((root) => {
+            const replies = repliesOf.get(root.id) ?? [];
             return (
               <li
-                key={comment.id}
+                key={root.id}
                 data-testid="bug-comment"
-                className="flex items-start gap-2.5 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-3.5 py-3"
+                className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-3.5 py-3"
               >
-                <MemberAvatar name={comment.authorName} seed={comment.authorId} size={24} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-[13px] font-semibold text-[var(--foreground)]">{comment.authorName}</span>
-                    <time dateTime={comment.createdAt} className="text-[11px] text-[var(--muted-soft)]">
-                      {new Date(comment.createdAt).toLocaleString()}
-                    </time>
-                    {comment.isEdited && (
-                      <span
-                        data-testid="bug-comment-edited"
-                        title={`Edited ${new Date(comment.updatedAt).toLocaleString()}`}
-                        className="text-[11px] italic text-[var(--muted-soft)]"
-                      >
-                        Edited
-                      </span>
+                {renderComment(root)}
+                {(replies.length > 0 || replyingTo === root.id) && (
+                  <div className="ml-[34px] mt-3 space-y-3 border-l border-[var(--border-subtle)] pl-3">
+                    {replies.length > 0 && (
+                      <ul aria-label="Replies" className="space-y-3">
+                        {replies.map((reply) => (
+                          <li key={reply.id} data-testid="bug-comment-reply">
+                            {renderComment(reply)}
+                          </li>
+                        ))}
+                      </ul>
                     )}
-                    {!isEditing && (canEdit || canDelete) && (
-                      <span className="ml-auto flex items-center gap-3">
-                        {canEdit && (
-                          <button type="button" aria-label="Edit this comment" onClick={() => startEdit(comment)} className={`${linkAction} hover:text-[var(--foreground)]`}>
-                            <IconPencil size={12} /> Edit
-                          </button>
-                        )}
-                        {canDelete && (
-                          <button
-                            type="button"
-                            // Named apart from the panel's own Edit/Delete (the bug's), which sit in the same region.
-                            aria-label="Delete this comment"
-                            onClick={() => setConfirmingDelete(comment)}
-                            className={`${linkAction} hover:text-[var(--error-foreground)]`}
-                          >
-                            <IconTrash size={12} /> Delete
-                          </button>
-                        )}
-                      </span>
+                    {replyingTo === root.id && (
+                      <CommentComposer
+                        key={root.id}
+                        projectId={projectId}
+                        bugId={bugId}
+                        members={members}
+                        parentCommentId={root.id}
+                        labels={REPLY_COMPOSER_LABELS}
+                        autoFocus
+                        onPosted={posted}
+                        onCancel={() => setReplyingTo(null)}
+                      />
                     )}
                   </div>
-
-                  {isEditing && editing ? (
-                    <div className="mt-2">
-                      <CommentEditor
-                        key={`edit-${comment.id}`}
-                        initialMarkdown={comment.body}
-                        onChange={(markdown) => setEditing((prev) => (prev ? { ...prev, draft: markdown } : prev))}
-                        onSubmit={() => void saveEdit(comment)}
-                        onPasteFiles={(files) => stageEditFiles(comment, files)}
-                        members={members}
-                        ariaLabel="Edit comment"
-                        autoFocus
-                      />
-                      <CommentFiles
-                        existing={comment.attachments.filter((att) => !editing.removeIds.includes(att.id))}
-                        onRemoveExisting={(id) => setEditing((prev) => (prev ? { ...prev, removeIds: [...prev.removeIds, id] } : prev))}
-                        staged={editing.staged}
-                        onRemoveStaged={(index) =>
-                          setEditing((prev) => (prev ? { ...prev, staged: prev.staged.filter((_, i) => i !== index), rejections: [] } : prev))
-                        }
-                        rejections={editing.rejections}
-                      />
-                      {editError && (
-                        <p role="alert" data-testid="bug-comment-edit-error" className="mt-2 text-[13px] text-[var(--error-foreground)]">
-                          {editError}
-                        </p>
-                      )}
-                      <div className="mt-2 flex items-center justify-end gap-2">
-                        <AttachButton
-                          label="Attach files to this comment"
-                          onFiles={(files) => stageEditFiles(comment, files)}
-                        />
-                        <Button size="sm" variant="secondary" onClick={() => setEditing(null)} disabled={savingEdit}>
-                          Cancel
-                        </Button>
-                        <Button size="sm" onClick={() => void saveEdit(comment)} disabled={savingEdit || !editing.draft.trim()}>
-                          {savingEdit ? "Saving…" : "Save"}
-                        </Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      {/* renderMarkdown escapes the text before adding any markup, so this is safe to inject. */}
-                      <div
-                        data-testid="bug-comment-body"
-                        className="zyra-prose mt-1 break-words text-[13px] text-[var(--foreground)]"
-                        dangerouslySetInnerHTML={{ __html: renderMarkdown(comment.body) }}
-                      />
-                      {comment.attachments.length > 0 && (
-                        <div className="mt-2" data-testid="bug-comment-attachments">
-                          <BugAttachments projectId={projectId} attachments={comment.attachments} readOnly />
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
+                )}
               </li>
             );
           })}
         </ul>
       )}
 
-      <div className="mt-4 rounded-[10px] border border-[var(--border)] bg-[var(--surface-secondary)] p-3">
-        <CommentEditor
-          key={composerKey}
-          onChange={setDraft}
-          onSubmit={() => void submit()}
-          onPasteFiles={stageComposerFiles}
-          members={members}
-          ariaLabel="Add a comment"
-          placeholder="Add a comment… Type @ to mention someone."
-        />
-        <CommentFiles
-          staged={staged}
-          onRemoveStaged={(index) => {
-            setRejections([]);
-            setStaged((prev) => prev.filter((_, i) => i !== index));
-          }}
-          rejections={rejections}
-        />
-        {submitError && (
-          <p role="alert" data-testid="bug-comment-error" className="mt-2 text-[13px] text-[var(--error-foreground)]">
-            {submitError}
-          </p>
-        )}
-        <div className="mt-2 flex items-center justify-end gap-2">
-          <AttachButton label="Attach files to comment" onFiles={stageComposerFiles} />
-          <Button size="sm" onClick={() => void submit()} disabled={submitting || !draft.trim()}>
-            {submitting ? "Adding…" : "Add Comment"}
-          </Button>
-        </div>
+      <div className="mt-4">
+        <CommentComposer projectId={projectId} bugId={bugId} members={members} labels={COMMENT_COMPOSER_LABELS} onPosted={posted} />
       </div>
 
       <ConfirmModal
         open={!!confirmingDelete}
-        title="Delete comment"
+        title={`Delete ${deletingNoun}`}
         message={
           confirmingDelete
-            ? `Delete this comment${
-                confirmingDelete.attachments.length
-                  ? ` and its ${confirmingDelete.attachments.length} attachment${confirmingDelete.attachments.length === 1 ? "" : "s"}`
-                  : ""
-              }? This can't be undone.`
+            ? `Delete this ${deletingNoun}${deleteExtras(deletingReplies.length, deletingFiles)}? This can't be undone.`
             : ""
         }
         confirmLabel="Delete"
