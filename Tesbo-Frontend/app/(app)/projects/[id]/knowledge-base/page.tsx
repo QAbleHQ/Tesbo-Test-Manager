@@ -70,6 +70,7 @@ import {
 } from "@/lib/validation";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+import { formatDate as formatDateShared } from "@/lib/date";
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
@@ -239,7 +240,7 @@ function formatDate(value: string): string {
   const date = new Date(value);
   const now = new Date();
   if (date.toDateString() === now.toDateString()) return "Today";
-  return date.toLocaleDateString();
+  return formatDateShared(date);
 }
 
 function clamp(value: number, min: number, max: number): number {

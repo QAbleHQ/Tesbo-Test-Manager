@@ -22,6 +22,7 @@ import { Drawer, PriorityBadge, SeverityBadge, StatusChip, type Priority, type S
 import { formatCustomFieldValueForDisplay, isCustomFieldValueEmpty } from "@/components/customFields/customFieldTypes";
 import { renderMarkdown } from "@/lib/markdown";
 import { useZyraText } from "@/lib/zyra-i18n";
+import { formatDate, formatDateTime } from "@/lib/date";
 
 // Document-type labels: same 5 entries as the Knowledge Base document page's own DOC_TYPE_LABELS,
 // kept in lib/zyra-i18n.ts as "doctype.<type>" so they localize with the surrounding Zyra session.
@@ -168,7 +169,7 @@ function BugDetail({ data }: { data: BugItem }) {
       <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-[var(--muted)]">
         {data.reporterName && <span>{t("drawer.reportedBy")}<span className="text-[var(--foreground)]">{data.reporterName}</span></span>}
         {data.assigneeName && <span>{t("drawer.assignedTo")}<span className="text-[var(--foreground)]">{data.assigneeName}</span></span>}
-        <span>{t("drawer.created")}<span className="text-[var(--foreground)]">{new Date(data.createdAt).toLocaleDateString(t.locale)}</span></span>
+        <span>{t("drawer.created")}<span className="text-[var(--foreground)]">{formatDate(data.createdAt, t.locale)}</span></span>
       </div>
       {data.attachments.length > 0 && (
         <div>
@@ -213,10 +214,10 @@ function KnowledgeDocumentDetail({ data, projectId }: { data: KnowledgeDocument;
           <span>
             {t("drawer.syncedFrom", { provider: providerLabel })}
             {data.syncedByName ? t("drawer.syncedBy", { name: data.syncedByName }) : ""}
-            {data.sourceSyncedAt ? t("drawer.syncedOn", { date: new Date(data.sourceSyncedAt).toLocaleString(t.locale) }) : ""}
+            {data.sourceSyncedAt ? t("drawer.syncedOn", { date: formatDateTime(data.sourceSyncedAt, t.locale) }) : ""}
           </span>
         )}
-        {data.reviewedAt && <span>{t("drawer.reviewedOn")}<span className="text-[var(--foreground)]">{new Date(data.reviewedAt).toLocaleDateString(t.locale)}</span></span>}
+        {data.reviewedAt && <span>{t("drawer.reviewedOn")}<span className="text-[var(--foreground)]">{formatDate(data.reviewedAt, t.locale)}</span></span>}
       </div>
       <Link
         href={`/projects/${projectId}/knowledge-base/documents/${data.id}`}
@@ -238,7 +239,7 @@ function KnowledgeFileDetail({ data, projectId }: { data: KnowledgeFile; project
       <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-[var(--muted)]">
         <span>{t("drawer.type")}<span className="text-[var(--foreground)]">{data.mimeType || t("drawer.unknown")}</span></span>
         {data.fileSize != null && <span>{t("drawer.size")}<span className="text-[var(--foreground)]">{Math.round(data.fileSize / 1024)} {t("drawer.kb")}</span></span>}
-        <span>{t("drawer.uploaded")}<span className="text-[var(--foreground)]">{new Date(data.createdAt).toLocaleDateString(t.locale)}</span></span>
+        <span>{t("drawer.uploaded")}<span className="text-[var(--foreground)]">{formatDate(data.createdAt, t.locale)}</span></span>
       </div>
       <a
         href={getKnowledgeFileDownloadUrl(projectId, data.id)}
@@ -272,7 +273,7 @@ function JiraTicketDetail({ data }: { data: JiraTicket }) {
         {data.reporter && <span>{t("drawer.reporter")}<span className="text-[var(--foreground)]">{data.reporter}</span></span>}
         {data.assignee && <span>{t("drawer.assignee")}<span className="text-[var(--foreground)]">{data.assignee}</span></span>}
         {data.labels && <span>{t("drawer.labels")}<span className="text-[var(--foreground)]">{data.labels}</span></span>}
-        {data.jiraUpdatedAt && <span>{t("drawer.updated")}<span className="text-[var(--foreground)]">{new Date(data.jiraUpdatedAt).toLocaleDateString(t.locale)}</span></span>}
+        {data.jiraUpdatedAt && <span>{t("drawer.updated")}<span className="text-[var(--foreground)]">{formatDate(data.jiraUpdatedAt, t.locale)}</span></span>}
       </div>
       {data.jiraUrl && (
         <a href={data.jiraUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs font-medium text-[var(--accent-light)] hover:underline">

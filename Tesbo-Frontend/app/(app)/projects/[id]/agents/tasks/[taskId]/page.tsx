@@ -32,6 +32,7 @@ import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
 import { TechniqueBadges } from "@/components/agents/ZyraChatReviewPanel";
 import { ZyraSeverityBadge } from "@/components/agents/ZyraContextDrawer";
 import { ZyraLanguageContext, zyraLanguage, zyraText } from "@/lib/zyra-i18n";
+import { formatDateTime } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
@@ -496,7 +497,7 @@ export default function ZyraTaskDetailPage() {
                 generated: task.generatedCount,
                 saved: task.savedCount,
                 tokens: task.tokenUsage.total,
-                date: new Date(task.updatedAt).toLocaleString(t.locale),
+                date: formatDateTime(task.updatedAt, t.locale),
               })}
             </p>
             {(task.jiraIssueKeys.length > 0 || (task.linearIssueKeys ?? []).length > 0) && (
@@ -549,7 +550,7 @@ export default function ZyraTaskDetailPage() {
                       <span className="font-medium text-[var(--foreground)]">{comment.provider === "jira" ? "Jira" : "Linear"} {comment.issueKey}</span>
                       <StatusChip tone={status.tone}>{t.opt(`task.commentStatus.${comment.status}`) ?? status.label}</StatusChip>
                       <span className="text-xs text-[var(--muted)]">
-                        {t("task.commentCount", { n: comment.testcaseCount })} · {new Date(comment.postedAt || comment.updatedAt).toLocaleString(t.locale)}
+                        {t("task.commentCount", { n: comment.testcaseCount })} · {formatDateTime(comment.postedAt || comment.updatedAt, t.locale)}
                       </span>
                     </div>
                     {comment.status === "failed" && comment.reason && (
@@ -698,7 +699,7 @@ export default function ZyraTaskDetailPage() {
                       {isAgent ? "Zyra" : t("you")}
                     </span>
                     <span className="text-[11px] text-[var(--muted-soft)]">
-                      {activity.createdAt ? new Date(activity.createdAt).toLocaleString(t.locale) : ""}
+                      {activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}
                     </span>
                   </div>
                   <p className="mt-1 whitespace-pre-wrap text-sm text-[var(--muted)]">{activity.detail || activity.title}</p>
@@ -801,7 +802,7 @@ export default function ZyraTaskDetailPage() {
             <div key={`${activity.title}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{activity.actor} - {(activity.stage || "").replaceAll("_", " ")}</span>
-                <span className="text-[11px] text-[var(--muted-soft)]">{activity.createdAt ? new Date(activity.createdAt).toLocaleString(t.locale) : ""}</span>
+                <span className="text-[11px] text-[var(--muted-soft)]">{activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}</span>
               </div>
               <h3 className="mt-1 text-sm font-semibold text-[var(--foreground)]">{activity.title}</h3>
               <p className="mt-1 whitespace-pre-wrap text-sm text-[var(--muted)]">{activity.detail}</p>

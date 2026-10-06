@@ -445,7 +445,7 @@ export default function PlanDetailPage() {
               <div className="mt-2.5 flex flex-wrap items-center gap-4">
                 <span className="flex items-center gap-1.5 text-[12px] text-[var(--muted)]">
                   <IconCalendarEvent size={13} stroke={1.75} className="text-[var(--muted-soft)]" />
-                  Created {plan.createdAt ? new Date(plan.createdAt as string).toLocaleDateString() : "—"}
+                  Created {plan.createdAt ? formatDate(plan.createdAt as string) : "—"}
                 </span>
                 <span className="flex items-center gap-1.5 text-[12px] text-[var(--muted)]">
                   <IconClock size={13} stroke={1.75} className="text-[var(--muted-soft)]" />

@@ -101,6 +101,7 @@ import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import { toTsv } from "@/lib/tsv";
 import { SUITE_NAME_MAX_LENGTH, validateSuiteName } from "@/lib/validation";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+import { formatDate } from "@/lib/date";
 
 // 500 is the server's per-request ceiling (listTestCases clamps `limit`), so it is the largest
 // page we can offer. Paired with "select all matching" below, a 500-case suite no longer has to
@@ -684,7 +685,7 @@ export default function TestCasesPage() {
           tc.type,
           tc.automationStatus,
           tc.status,
-          tc.updatedAt ? new Date(tc.updatedAt).toLocaleDateString() : "",
+          tc.updatedAt ? formatDate(tc.updatedAt) : "",
         ])
       ),
     [copyableCases, suiteNameMap]

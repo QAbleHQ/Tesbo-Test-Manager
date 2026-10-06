@@ -52,6 +52,7 @@ import { ZyraChatReviewPanel } from "@/components/agents/ZyraChatReviewPanel";
 import { ZyraCitationsList } from "@/components/agents/ZyraCitations";
 import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
+import { formatDateTime } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { ZyraLanguageContext, useZyraText, zyraLanguage, zyraText, type ZyraT } from "@/lib/zyra-i18n";
@@ -76,9 +77,7 @@ const QUICK_ACTIONS = ["smoke", "gaps", "negative", "expected", "regression", "r
 // ─── Utilities ────────────────────────────────────────────────────────────────
 function formatTime(value?: string, locale?: string) {
   if (!value) return "";
-  return new Intl.DateTimeFormat(locale, {
-    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
-  }).format(new Date(value));
+  return formatDateTime(value, locale);
 }
 
 function firstStepPreview(value: unknown): string {

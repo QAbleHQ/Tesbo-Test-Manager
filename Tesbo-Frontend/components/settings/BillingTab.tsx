@@ -18,10 +18,11 @@ import { Button, Card, PageLoader } from "@/components/ui";
 import { cx } from "@/components/ui/cx";
 import PricingModal from "@/components/PricingModal";
 import { useAppData } from "@/components/app/AppDataProvider";
+import { formatDate as formatDateShared, formatDateTime } from "@/lib/date";
 
 function formatDate(iso: string | null): string {
   if (!iso) return "";
-  return new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+  return formatDateShared(iso);
 }
 
 /** Minor units (paise / cents) to a display string, matching the currency actually charged. */
@@ -426,15 +427,7 @@ export default function BillingTab() {
                 />
                 <div className="min-w-0">
                   <p className="text-[13px] text-[var(--foreground)]">{entry.summary}</p>
-                  <p className="text-[12px] text-[var(--muted-soft)]">
-                    {new Date(entry.at).toLocaleString(undefined, {
-                      year: "numeric",
-                      month: "short",
-                      day: "numeric",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </p>
+                  <p className="text-[12px] text-[var(--muted-soft)]">{formatDateTime(entry.at)}</p>
                 </div>
               </li>
             ))}

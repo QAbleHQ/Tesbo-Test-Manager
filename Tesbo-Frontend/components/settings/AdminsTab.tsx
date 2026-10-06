@@ -8,6 +8,7 @@ import {
   removePlatformAdmin,
 } from "@/lib/api";
 import { avatarColor } from "@/lib/avatarColors";
+import { formatDate } from "@/lib/date";
 
 type PlatformAdmin = {
   id: string;
@@ -201,13 +202,7 @@ export default function AdminsTab() {
                     Added by {admin.grantedBy.name || admin.grantedBy.email}
                   </p>
                 )}
-                <p className="text-[12px] text-[var(--muted)]">
-                  {new Date(admin.createdAt).toLocaleDateString("en-US", {
-                    year: "numeric",
-                    month: "short",
-                    day: "numeric",
-                  })}
-                </p>
+                <p className="text-[12px] text-[var(--muted)]">{formatDate(admin.createdAt)}</p>
               </div>
 
               {isOwner && admin.role !== "owner" && (

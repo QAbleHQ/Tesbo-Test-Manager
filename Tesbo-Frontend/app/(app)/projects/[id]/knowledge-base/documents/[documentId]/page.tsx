@@ -33,6 +33,7 @@ import RichTextEditor from "@/components/knowledge-base/RichTextEditor";
 import { DocumentComments } from "@/components/knowledge-base/DocumentComments";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { blankDocumentFlagKey } from "@/lib/validation";
+import { formatDateTime } from "@/lib/date";
 import { Breadcrumbs, type BreadcrumbItem } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -541,7 +542,7 @@ export default function KnowledgeDocumentPage() {
     historyModalBody = (
       <div className="space-y-4">
         <p className="text-[13px] text-[var(--foreground)]">
-          Restore to the version from <span className="font-medium">{new Date(confirmTarget.createdAt).toLocaleString()}</span>?
+          Restore to the version from <span className="font-medium">{formatDateTime(confirmTarget.createdAt)}</span>?
           The current content will be saved as a new version first, so this can be undone.
         </p>
         {restorePhase === "error" && restoreError && (
@@ -669,7 +670,7 @@ export default function KnowledgeDocumentPage() {
           </p>
           <p className="mt-1 text-[12px] text-[var(--muted)]">
             {doc.syncedByName ? `Last synced by ${doc.syncedByName}` : "Last synced"}
-            {doc.sourceSyncedAt ? ` on ${new Date(doc.sourceSyncedAt).toLocaleString()}` : ""}
+            {doc.sourceSyncedAt ? ` on ${formatDateTime(doc.sourceSyncedAt)}` : ""}
             {". "}
             The body is read-only, but comments are not — select any passage to comment on it, or{" "}
             <button

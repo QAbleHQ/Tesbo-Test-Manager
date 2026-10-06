@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { IconCalendar, IconClock } from "@tabler/icons-react";
 import { getKnowledgeDocumentHistory, type KnowledgeDocumentHistoryEntry } from "@/lib/api";
+import { formatDate, formatTime } from "@/lib/date";
 import { ChangeDiffModal } from "./ChangeDiffModal";
 
 /**
@@ -19,25 +20,11 @@ export const CHANGE_HISTORY_PAGE_SIZE = 5;
 // one-glance sentence — short single-field edits keep today's plain, button-less row.
 const LARGE_CHANGE_THRESHOLD = 160;
 
-// DD/MM/YYYY and 12-hour HH:MM:SS AM/PM — a fixed format, deliberately not locale-dependent.
-// Exported for ChangeDiffModal, which formats the same way wherever a diff's own field label is
-// a raw timestamp (a Zyra AI Memory entry's heading — see formatFieldLabel there).
-export function formatEventDate(value: string): string {
-  const date = new Date(value);
-  const dd = String(date.getDate()).padStart(2, "0");
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  return `${dd}/${mm}/${date.getFullYear()}`;
-}
-
-export function formatEventTime(value: string): string {
-  const date = new Date(value);
-  const hours24 = date.getHours();
-  const period = hours24 >= 12 ? "PM" : "AM";
-  const hours12 = hours24 % 12 || 12;
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  const ss = String(date.getSeconds()).padStart(2, "0");
-  return `${String(hours12).padStart(2, "0")}:${mm}:${ss} ${period}`;
-}
+// Sitewide standard date/time format (lib/date.ts). Exported for ChangeDiffModal, which formats
+// the same way wherever a diff's own field label is a raw timestamp (a Zyra AI Memory entry's
+// heading — see formatFieldLabel there).
+export const formatEventDate = formatDate;
+export const formatEventTime = formatTime;
 
 // A Zyra AI Memory document's changedSummary can itself be (or contain) a raw section-heading
 // timestamp — groupSections (text-diff.util.ts) labels those sections by their own `## <ISO
@@ -45,8 +32,8 @@ export function formatEventTime(value: string): string {
 // backend-side. Rows written before this existed also have the raw string already cached in
 // changed_summary, so the fix has to happen here at render time (covers old and new rows alike)
 // rather than in the summary-generation code, which only reaches future writes. Same target shape
-// and same DD/MM/YYYY, hh:mm:ss AM/PM output as formatFieldLabel in ChangeDiffModal, which does the
-// equivalent job for an individual field's label.
+// as formatFieldLabel in ChangeDiffModal, which does the equivalent job for an individual field's
+// label.
 const ISO_TIMESTAMP_IN_TEXT_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g;
 
 export function formatIsoTimestampsInText(text: string): string {

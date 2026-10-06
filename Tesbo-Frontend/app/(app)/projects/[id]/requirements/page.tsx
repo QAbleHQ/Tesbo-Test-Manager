@@ -24,6 +24,7 @@ import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/components/agents/TaskQuickViewPanel";
+import { formatDate } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
@@ -1039,10 +1040,10 @@ export default function RequirementsPage() {
                                   <span>Labels: <span className="text-[var(--muted)]">{ticket.labels}</span></span>
                                 )}
                                 {ticket.createdAt && (
-                                  <span>Created: <span className="text-[var(--muted)]">{new Date(ticket.createdAt).toLocaleDateString()}</span></span>
+                                  <span>Created: <span className="text-[var(--muted)]">{formatDate(ticket.createdAt)}</span></span>
                                 )}
                                 {ticket.updatedAt && (
-                                  <span>Updated: <span className="text-[var(--muted)]">{new Date(ticket.updatedAt).toLocaleDateString()}</span></span>
+                                  <span>Updated: <span className="text-[var(--muted)]">{formatDate(ticket.updatedAt)}</span></span>
                                 )}
                               </div>
                               <a

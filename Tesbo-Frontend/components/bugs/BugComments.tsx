@@ -454,7 +454,7 @@ export default function BugComments({
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
             <span className="text-[13px] font-semibold text-[var(--foreground)]">{comment.authorName}</span>
             {/* Same short form as the Activity column beside this; the full time is on hover. */}
-            <time dateTime={comment.createdAt} title={new Date(comment.createdAt).toLocaleString()} className="text-[11.5px] text-[var(--muted-soft)]">
+            <time dateTime={comment.createdAt} title={formatAbsolute(comment.createdAt)} className="text-[11.5px] text-[var(--muted-soft)]">
               {formatAbsolute(comment.createdAt)}
             </time>
             {comment.isEdited && (
@@ -462,7 +462,7 @@ export default function BugComments({
                 <span aria-hidden className="text-[11.5px] text-[var(--muted-soft)]">·</span>
                 <span
                   data-testid="bug-comment-edited"
-                  title={`Edited ${new Date(comment.updatedAt).toLocaleString()}`}
+                  title={`Edited ${formatAbsolute(comment.updatedAt)}`}
                   className="text-[11.5px] text-[var(--muted-soft)]"
                 >
                   Edited

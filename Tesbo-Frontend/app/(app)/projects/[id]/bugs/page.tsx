@@ -37,6 +37,7 @@ import TrackingDestinationField, { type TrackingDestination } from "@/components
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import IssuePickerModal from "@/components/IssuePickerModal";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
+import { formatDate } from "@/lib/date";
 import {
   BUG_PRIORITIES,
   BUG_SEVERITIES,
@@ -215,7 +216,7 @@ function KanbanCard({
         <div className="flex items-center gap-1.5">
           {bug.assigneeId && bug.assigneeName && <MemberAvatar name={bug.assigneeName} seed={bug.assigneeId} size={16} />}
           <span className="text-[10px] text-[var(--muted-soft)]">
-            {new Date(bug.createdAt).toLocaleDateString()}
+            {formatDate(bug.createdAt)}
           </span>
         </div>
       </div>
@@ -937,7 +938,7 @@ export default function BugsPage() {
                               <BugAssignee id={b.assigneeId} name={b.assigneeName} />
                             </td>
                             <td className="text-xs text-[var(--muted-soft)] whitespace-nowrap">
-                              {new Date(b.createdAt).toLocaleDateString()}
+                              {formatDate(b.createdAt)}
                             </td>
                             <td>
                               <div

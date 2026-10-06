@@ -9,6 +9,7 @@ import { Button, CopyButton, StatusChip, PriorityBadge, type Priority, type Seve
 import { toTsv } from "@/lib/tsv";
 import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
 import { ZyraLanguageContext, zyraLanguage, zyraText } from "@/lib/zyra-i18n";
+import { formatDateTime } from "@/lib/date";
 import { TechniqueBadges } from "./ZyraChatReviewPanel";
 import { ZyraSeverityBadge } from "./ZyraContextDrawer";
 
@@ -334,7 +335,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                       </div>
                       <span className="text-[12px] font-medium text-[var(--foreground)]">{isAgent ? "Zyra" : t("you")}</span>
                       <span className="ml-auto font-mono text-[11px] text-[var(--muted-soft)]">
-                        {activity.createdAt ? new Date(activity.createdAt).toLocaleString(t.locale) : ""}
+                        {activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}
                       </span>
                     </div>
                     <p className="text-[12px] leading-relaxed text-[var(--muted)]">{activity.detail || activity.title}</p>
@@ -374,7 +375,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                       {activity.actor} · {(activity.stage || "").replaceAll("_", " ")}
                     </span>
                     <span className="font-mono text-[11px] text-[var(--muted-soft)]">
-                      {activity.createdAt ? new Date(activity.createdAt).toLocaleString(t.locale) : ""}
+                      {activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}
                     </span>
                   </div>
                   <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{activity.title}</h3>
