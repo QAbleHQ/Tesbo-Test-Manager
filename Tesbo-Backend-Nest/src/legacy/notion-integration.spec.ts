@@ -329,7 +329,7 @@ describe("Notion OAuth: token exchange and connection upsert", () => {
 
 describe("plan gating", () => {
   function planService(effectivePlan: "launch" | "pro") {
-    const svc = new PlanLimitsService({} as never, {} as never, {} as never, {} as never, {} as never);
+    const svc = new PlanLimitsService({} as never, { isStripeBillingEnabled: true } as never, {} as never, {} as never, {} as never);
     jest.spyOn(svc as any, "getEntitlement").mockResolvedValue({ effectivePlan });
     return svc;
   }
