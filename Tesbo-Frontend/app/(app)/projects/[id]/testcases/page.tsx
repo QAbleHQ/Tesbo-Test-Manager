@@ -495,6 +495,7 @@ export default function TestCasesPage() {
   const [bulkStatus, setBulkStatus] = useState("Draft");
   const [bulkPriority, setBulkPriority] = useState("P2");
   const [bulkAutomationStatus, setBulkAutomationStatus] = useState("Not Automated");
+  const [bulkSeverity, setBulkSeverity] = useState("Medium");
   const [bulkTargetSuiteId, setBulkTargetSuiteId] = useState("");
 
   const [deleteSuiteId, setDeleteSuiteId] = useState<string | null>(null);
@@ -1189,6 +1190,7 @@ export default function TestCasesPage() {
     setBulkStatus(BULK_NO_CHANGE);
     setBulkPriority(BULK_NO_CHANGE);
     setBulkAutomationStatus(BULK_NO_CHANGE);
+    setBulkSeverity(BULK_NO_CHANGE);
     setIsBulkActionModalOpen(true);
   }
 
@@ -1217,6 +1219,7 @@ export default function TestCasesPage() {
           ...(bulkStatus !== BULK_NO_CHANGE ? { status: bulkStatus } : {}),
           ...(bulkPriority !== BULK_NO_CHANGE ? { priority: bulkPriority } : {}),
           ...(bulkAutomationStatus !== BULK_NO_CHANGE ? { automationStatus: bulkAutomationStatus } : {}),
+          ...(bulkSeverity !== BULK_NO_CHANGE ? { severity: bulkSeverity } : {}),
         });
       } else if (bulkAction === "move") {
         // An empty target used to become `undefined`, which the API COALESCE'd back to each case's
@@ -2974,7 +2977,7 @@ export default function TestCasesPage() {
           >
             <option value="">Select an action…</option>
             <option value="move">Move to suite</option>
-            <option value="update">Update status / priority / automation type</option>
+            <option value="update">Update status / priority / severity / automation type</option>
             <option value="archive">Archive</option>
             <option value="delete">Delete</option>
           </Select>
@@ -3017,6 +3020,13 @@ export default function TestCasesPage() {
               <Select value={bulkAutomationStatus} onChange={(e) => setBulkAutomationStatus(e.target.value)}>
                 <option value={BULK_NO_CHANGE}>Leave unchanged</option>
                 {TESTCASE_AUTOMATION_TYPES.map((a) => <option key={a} value={a}>{a}</option>)}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Severity</FieldLabel>
+              <Select value={bulkSeverity} onChange={(e) => setBulkSeverity(e.target.value)}>
+                <option value={BULK_NO_CHANGE}>Leave unchanged</option>
+                {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
               </Select>
             </Field>
           </div>

@@ -5242,6 +5242,7 @@ export class LegacyService implements OnModuleInit {
       `UPDATE testcases SET priority=COALESCE($2,priority),
        suite_id = CASE WHEN $8::boolean THEN NULL ELSE COALESCE($3::uuid, suite_id) END,
        status=COALESCE($4,status), owner_id=COALESCE($5,owner_id), automation_status=COALESCE($6,automation_status),
+       severity=COALESCE($9,severity),
        updated_by=$7, updated_at=now()
        WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL`,
       [
@@ -5252,12 +5253,13 @@ export class LegacyService implements OnModuleInit {
         body.ownerId || null,
         body.automationStatus || null,
         uid,
-        clearSuite
+        clearSuite,
+        body.severity || null
       ]
     );
     await this.logProjectActivity(projectId, uid, "testcase_bulk_updated", "testcase", null, null, {
       testcaseIds: ids,
-      fields: { priority: body.priority || null, suiteId: body.suiteId || null, status: body.status || null, ownerId: body.ownerId || null, automationStatus: body.automationStatus || null }
+      fields: { priority: body.priority || null, suiteId: body.suiteId || null, status: body.status || null, ownerId: body.ownerId || null, automationStatus: body.automationStatus || null, severity: body.severity || null }
     });
     await this.suitesCache.invalidate(projectId);
     await this.testcasesListCache.invalidate(projectId);

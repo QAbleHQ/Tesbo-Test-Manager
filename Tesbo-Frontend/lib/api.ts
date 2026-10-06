@@ -1607,7 +1607,7 @@ export async function duplicateTestCase(projectId: string, testcaseId: string): 
   return api(`/api/projects/${projectId}/testcases/${testcaseId}/duplicate`, { method: "POST" });
 }
 
-export async function bulkUpdateTestCases(projectId: string, data: { testcaseIds: string[]; priority?: string; suiteId?: string; status?: string; ownerId?: string; automationStatus?: string }): Promise<void> {
+export async function bulkUpdateTestCases(projectId: string, data: { testcaseIds: string[]; priority?: string; suiteId?: string; status?: string; ownerId?: string; automationStatus?: string; severity?: string }): Promise<void> {
   await api(`/api/projects/${projectId}/testcases/bulk-update`, { method: "POST", body: data });
 }
 
