@@ -4433,28 +4433,384 @@ test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
     expect(ledger(first)[0].save_event_id).not.toBe(row.save_event_id);
   });
 
+  // ─── Several tickets on one task ──────────────────────────────────────────
+  //
+  // "[Zyra] Test Cases Generated and Saved from Linked Tickets Are Not Posted Back to Their Respective
+  // Jira/Linear Tickets" — a task naming several tickets (the Feedback tab's pickers, or several keys
+  // sent to createZyraTask) used to link EVERY saved test case to the first key of each provider: one
+  // ticket's comment listed all of them, the others got nothing, and with Jira + Linear both tickets
+  // listed everything. Each draft is now attributed at generation time to the one ticket it cites
+  // (zyraAttributeDraftsToTickets), and the save writes that key per draft.
+
+  /** A ticket key unique to this run, so linked-row lookups never see another test's rows. */
+  function ticketKey(prefix: string): string {
+    return `${prefix}-${Date.now().toString().slice(-7)}${Math.floor(Math.random() * 90 + 10)}`;
+  }
+
+  /** Scripts one generation whose drafts cite the given labels (the model's raw sourceRefs). */
+  function queueCitedGeneration(drafts: Array<{ title: string; refs: string[] }>): void {
+    ai.queueReply({ drafts: drafts.map(({ title, refs }) => ({ ...draft(title), sourceRefs: refs })) });
+    ai.queueReply("- Generated multi-ticket test cases.");
+    queued += 2;
+  }
+
+  /** Generates through the real route for an explicit multi-ticket selection; returns the task id. */
+  async function generateForTickets(keys: { jira?: string[]; linear?: string[] }, drafts: Array<{ title: string; refs: string[] }>): Promise<string> {
+    await allocateFakeAiKey();
+    queueCitedGeneration(drafts);
+    const created = await createTask({ jiraIssueKeys: keys.jira ?? [], linearIssueKeys: keys.linear ?? [] });
+    const taskId = created.generationRequestId;
+    expect(await waitForTaskSettled(taskId), "generation must complete").toBe("in_review");
+    return taskId;
+  }
+
+  /** An in-review task whose drafts already carry their attributed keys — for the save-only cases. */
+  function seedMultiTicketReviewTask(
+    drafts: Array<{ title: string; jiraIssueKey?: string; linearIssueKey?: string }>,
+    keys: { jira?: string[]; linear?: string[] },
+  ): string {
+    const payload = drafts.map(({ title, jiraIssueKey, linearIssueKey }) => ({ ...draft(title), jiraIssueKey: jiraIssueKey ?? null, linearIssueKey: linearIssueKey ?? null }));
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, requested_count, " +
+        "generated_count, saved_count, generated_payload, agent_name, task_status, jira_issue_keys, linear_issue_keys) VALUES (" +
+        `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', 'E2E multi-ticket', ` +
+        `${payload.length}, ${payload.length}, 0, ${literal(JSON.stringify(payload))}::jsonb, 'Zyra the Test Generator', 'in_review', ` +
+        `${literal(JSON.stringify(keys.jira ?? []))}::jsonb, ${literal(JSON.stringify(keys.linear ?? []))}::jsonb);`,
+    );
+    return scalar(`SELECT id FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`);
+  }
+
+  async function saveAll(taskId: string): Promise<Map<string, string>> {
+    const res = await save(taskId);
+    expect(res.status(), `saving — ${await res.text()}`).toBe(201);
+    const saved = await res.json();
+    return new Map((saved.testcases as Array<{ id: string; title: string }>).map((t) => [t.title, t.id]));
+  }
+
+  function commentFor(rows: LedgerRow[], provider: "jira" | "linear", key: string): LedgerRow {
+    const row = rows.find((r) => r.provider === provider && r.issue_key === key);
+    expect(row, `a ${provider} comment for ${key}`).toBeTruthy();
+    return row!;
+  }
+
+  test("ZYR-AC-31 single Linear ticket by explicit key: every draft links to it even when none cites it, and one Linear comment lists them", async () => {
+    seedConnection("linear");
+    await setAutoComment({ linearAutoComment: true });
+    const key = ticketKey("LIN");
+    const taskId = await generateForTickets({ linear: [key] }, [
+      { title: "Single Linear uncited A", refs: [] },
+      { title: "Single Linear uncited B", refs: [] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    for (const id of ids.values()) {
+      expect(linkedKey(id, "linear_issue_key"), "a single-ticket task links every draft to its ticket").toBe(key);
+      expect(linkedKey(id, "jira_issue_key")).toBe("");
+    }
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: "linear", issue_key: key });
+    expect([...rows[0].testcase_ids].sort()).toEqual([...ids.values()].sort());
+    expect(activityTitles(taskId)).not.toContain("Some drafts not linked to a ticket");
+  });
+
+  test("ZYR-AC-32 single Jira ticket by explicit key: unchanged — every draft links, one Jira comment", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: true });
+    const key = ticketKey("JRA");
+    const taskId = await generateForTickets({ jira: [key] }, [
+      { title: "Single Jira cited", refs: [key] },
+      { title: "Single Jira uncited", refs: [] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    for (const id of ids.values()) expect(linkedKey(id)).toBe(key);
+    const rows = await waitForDelivery(taskId);
+    expect(rows.map((r) => `${r.provider}:${r.issue_key}`)).toEqual([`jira:${key}`]);
+    expect(rows[0].testcase_ids).toHaveLength(2);
+  });
+
+  test("ZYR-AC-33 two Jira tickets: each test case links to the ticket it cites, and each ticket's comment lists only its own", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: true });
+    const [j1, j2] = [ticketKey("JA"), ticketKey("JB")];
+    const taskId = await generateForTickets({ jira: [j1, j2] }, [
+      { title: "Multi Jira one first", refs: [j1, "KB 1"] },
+      { title: "Multi Jira two only", refs: [j2] },
+      { title: "Multi Jira one second", refs: [j1] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get("Multi Jira one first")!)).toBe(j1);
+    expect(linkedKey(ids.get("Multi Jira one second")!)).toBe(j1);
+    expect(linkedKey(ids.get("Multi Jira two only")!), "the second ticket's case must not inherit the first key").toBe(j2);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    const first = commentFor(rows, "jira", j1);
+    const second = commentFor(rows, "jira", j2);
+    expect([...first.testcase_ids].sort()).toEqual([ids.get("Multi Jira one first"), ids.get("Multi Jira one second")].sort());
+    expect(second.testcase_ids).toEqual([ids.get("Multi Jira two only")]);
+    expect(first.comment_text).not.toContain("Multi Jira two only");
+    expect(second.comment_text).not.toContain("Multi Jira one");
+  });
+
+  test("ZYR-AC-34 two Linear tickets: same per-ticket split, on Linear", async () => {
+    seedConnection("linear");
+    await setAutoComment({ linearAutoComment: true });
+    const [l1, l2] = [ticketKey("LA"), ticketKey("LB")];
+    const taskId = await generateForTickets({ linear: [l1, l2] }, [
+      { title: "Multi Linear one", refs: [l1] },
+      // Labels are matched case-insensitively — the model sometimes changes a key's case.
+      { title: "Multi Linear two", refs: [l2.toLowerCase()] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get("Multi Linear one")!, "linear_issue_key")).toBe(l1);
+    expect(linkedKey(ids.get("Multi Linear two")!, "linear_issue_key"), "stored with the task's own spelling of the key").toBe(l2);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    expect(commentFor(rows, "linear", l1).testcase_ids).toEqual([ids.get("Multi Linear one")]);
+    expect(commentFor(rows, "linear", l2).testcase_ids).toEqual([ids.get("Multi Linear two")]);
+  });
+
+  test("ZYR-AC-35 Jira + Linear: Jira-cited cases go only to Jira, Linear-cited only to Linear, a case citing both goes to both", async () => {
+    seedConnection("jira");
+    seedConnection("linear");
+    await setAutoComment({ jiraAutoComment: true, linearAutoComment: true });
+    const [j1, l1] = [ticketKey("JM"), ticketKey("LM")];
+    const taskId = await generateForTickets({ jira: [j1], linear: [l1] }, [
+      { title: "Mixed Jira case", refs: [j1] },
+      { title: "Mixed Linear case", refs: [l1] },
+      { title: "Mixed shared case", refs: [j1, l1] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    expect([linkedKey(ids.get("Mixed Jira case")!), linkedKey(ids.get("Mixed Jira case")!, "linear_issue_key")]).toEqual([j1, ""]);
+    expect([linkedKey(ids.get("Mixed Linear case")!), linkedKey(ids.get("Mixed Linear case")!, "linear_issue_key")]).toEqual(["", l1]);
+    expect([linkedKey(ids.get("Mixed shared case")!), linkedKey(ids.get("Mixed shared case")!, "linear_issue_key")]).toEqual([j1, l1]);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    const jira = commentFor(rows, "jira", j1);
+    const linear = commentFor(rows, "linear", l1);
+    expect([...jira.testcase_ids].sort()).toEqual([ids.get("Mixed Jira case"), ids.get("Mixed shared case")].sort());
+    expect([...linear.testcase_ids].sort()).toEqual([ids.get("Mixed Linear case"), ids.get("Mixed shared case")].sort());
+    expect(jira.comment_text, "no Linear-only case on the Jira ticket").not.toContain("Mixed Linear case");
+    expect(linear.comment_text, "no Jira-only case on the Linear ticket").not.toContain("Mixed Jira case");
+  });
+
+  test("ZYR-AC-36 multi-ticket drafts that cite no ticket, two tickets of one provider, or a key not on the task are saved unlinked and say so", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: true });
+    const [j1, j2] = [ticketKey("JU"), ticketKey("JV")];
+    const taskId = await generateForTickets({ jira: [j1, j2] }, [
+      { title: "Unattributed none", refs: [] },
+      { title: "Unattributed both", refs: [j1, j2] },
+      { title: "Unattributed foreign", refs: ["NOT-ON-TASK-1"] },
+      { title: "Attributed one", refs: [j1] },
+    ]);
+    expect(activityTitles(taskId)).toContain("Some drafts not linked to a ticket");
+    const note = JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))
+      .find((entry: { title: string }) => entry.title === "Some drafts not linked to a ticket");
+    expect(note.detail).toContain("3 of 4 draft(s)");
+
+    const ids = await saveAll(taskId);
+    for (const title of ["Unattributed none", "Unattributed both", "Unattributed foreign"]) {
+      expect(linkedKey(ids.get(title)!), `${title} must not be guessed onto a ticket`).toBe("");
+    }
+    expect(linkedKey(ids.get("Attributed one")!)).toBe(j1);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows.map((r) => `${r.provider}:${r.issue_key}`), "only the ticket that actually has a case is commented on").toEqual([`jira:${j1}`]);
+    expect(rows[0].testcase_ids).toEqual([ids.get("Attributed one")]);
+  });
+
+  test("ZYR-AC-37 one ticket's provider failing doesn't stop the other: Linear skipped (not connected) while Jira still goes out, and retrying Jira leaves Linear alone", async () => {
+    seedConnection("jira");
+    // No Linear connection in this tenant: that ticket's comment is recorded as skipped.
+    await setAutoComment({ jiraAutoComment: true, linearAutoComment: true });
+    const [j1, l1] = [ticketKey("JP"), ticketKey("LP")];
+    const taskId = seedMultiTicketReviewTask(
+      [
+        { title: "Partial Jira case", jiraIssueKey: j1 },
+        { title: "Partial Linear case", linearIssueKey: l1 },
+      ],
+      { jira: [j1], linear: [l1] },
+    );
+
+    await saveAll(taskId);
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    const jira = commentFor(rows, "jira", j1);
+    expect(commentFor(rows, "linear", l1).status).toBe("skipped_not_connected");
+    // The fixture Jira connection can't actually post (block header), so it ends posted or failed —
+    // either way it was attempted despite the Linear ticket being skipped.
+    expect(["posted", "failed"]).toContain(jira.status);
+
+    if (jira.status === "failed") {
+      const jiraId = scalar(
+        `SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)} AND provider = 'jira';`,
+      );
+      const retry = await asOwner.post(retryUrl(taskId, jiraId), { failOnStatusCode: false });
+      expect(retry.status(), await retry.text()).toBe(201);
+      const after = ledger(taskId);
+      expect(after, "a retry re-sends one ticket's comment, never adds a row").toHaveLength(2);
+      expect(commentFor(after, "linear", l1).status, "retrying Jira must not touch the Linear ticket's record").toBe("skipped_not_connected");
+      expect(commentFor(after, "jira", j1).comment_text).not.toContain("Partial Linear case");
+    }
+  });
+
+  test("ZYR-AC-38 concurrent and repeated saves of a multi-ticket task: exactly one comment per ticket", async () => {
+    await setAutoComment({ jiraAutoComment: false, linearAutoComment: false });
+    const [j1, j2, l1] = [ticketKey("JR"), ticketKey("JS"), ticketKey("LR")];
+    const taskId = seedMultiTicketReviewTask(
+      [
+        { title: "Race J1", jiraIssueKey: j1 },
+        { title: "Race J2", jiraIssueKey: j2 },
+        { title: "Race L1", linearIssueKey: l1 },
+      ],
+      { jira: [j1, j2], linear: [l1] },
+    );
+
+    const [a, b] = await Promise.all([save(taskId), save(taskId)]);
+    expect([a.status(), b.status()].sort(), "one save wins, the other is refused as already saved").toEqual([201, 409]);
+    expect(ledger(taskId).map((r) => `${r.provider}:${r.issue_key}`).sort()).toEqual([`jira:${j1}`, `jira:${j2}`, `linear:${l1}`].sort());
+
+    expect((await save(taskId)).status()).toBe(409);
+    expect(ledger(taskId), "a refused re-save adds nothing").toHaveLength(3);
+  });
+
+  test("ZYR-AC-39 regenerating a two-ticket task updates each ticket's own linked case in place, never the other ticket's", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const [j1, j2] = [ticketKey("JX"), ticketKey("JY")];
+    const first = seedMultiTicketReviewTask(
+      [
+        { title: "Regen J1 original", jiraIssueKey: j1 },
+        { title: "Regen J2 original", jiraIssueKey: j2 },
+      ],
+      { jira: [j1, j2] },
+    );
+    const original = await saveAll(first);
+
+    // Reversed order on purpose: pairing across the whole save (the old behaviour) would rewrite J1's
+    // case with J2's draft.
+    const second = seedMultiTicketReviewTask(
+      [
+        { title: "Regen J2 refined", jiraIssueKey: j2 },
+        { title: "Regen J1 refined", jiraIssueKey: j1 },
+      ],
+      { jira: [j1, j2] },
+    );
+    const refined = await saveAll(second);
+    expect(refined.get("Regen J1 refined"), "J1's draft updates J1's existing case").toBe(original.get("Regen J1 original"));
+    expect(refined.get("Regen J2 refined"), "J2's draft updates J2's existing case").toBe(original.get("Regen J2 original"));
+    expect(linkedKey(original.get("Regen J1 original")!)).toBe(j1);
+    expect(linkedKey(original.get("Regen J2 original")!)).toBe(j2);
+
+    const rows = ledger(second);
+    expect(commentFor(rows, "jira", j1).testcase_ids).toEqual([original.get("Regen J1 original")]);
+    expect(commentFor(rows, "jira", j2).testcase_ids).toEqual([original.get("Regen J2 original")]);
+  });
+
   // ─── Which ticket the KB selection links to ───────────────────────────────
 
-  test("ZYR-AC-11 KB docs from TWO tickets link to neither, and say so — no comment for either ticket", async () => {
+  // Changed on purpose ("[Zyra] Test Cases Generated and Saved from Linked Tickets Are Not Posted Back
+  // to Their Respective Jira/Linear Tickets"): this used to assert that a selection spanning two
+  // tickets linked NEITHER, because a save could only ever link one ticket. Each draft is now
+  // attributed to the ticket it cites, so every ticket behind the selection is linked instead.
+  test("ZYR-AC-11 KB docs from TWO tickets link both, and each ticket's comment lists only the cases citing it", async () => {
     await allocateFakeAiKey();
     const connectionId = seedConnection("jira");
-    const docA = seedTicketWithMirror("jira", connectionId, "MFLP-20");
-    const docB = seedTicketWithMirror("jira", connectionId, "MFLP-21");
+    const [k1, k2] = [ticketKey("MFA"), ticketKey("MFB")];
+    const docA = seedTicketWithMirror("jira", connectionId, k1);
+    const docB = seedTicketWithMirror("jira", connectionId, k2);
     await setAutoComment({ jiraAutoComment: true });
 
-    queueGeneration(["Two-ticket case"]);
+    queueCitedGeneration([
+      { title: "KB two-ticket first", refs: [k1] },
+      { title: "KB two-ticket second", refs: [k2] },
+    ]);
     const created = await createTask({ knowledgeItemIds: [docA, docB] });
     const taskId = created.generationRequestId;
-    expect(created.task.jiraIssueKeys).toEqual([]);
-    const note = (JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)) as Array<{ title: string; detail: string }>)
-      .find((e) => e.title === "Not linked to a ticket");
-    expect(note?.detail).toContain("MFLP-20");
-    expect(note?.detail).toContain("MFLP-21");
+    expect([...created.task.jiraIssueKeys].sort()).toEqual([k1, k2].sort());
+    expect(activityTitles(taskId)).not.toContain("Not linked to a ticket");
+    const sources = created.task.sources as Array<{ type: string; title: string; detail: string }>;
+    expect(sources.filter((s) => s.type === "jira").map((s) => s.detail)).toEqual([
+      "Linked from the selected Knowledge Base documents.",
+      "Linked from the selected Knowledge Base documents.",
+    ]);
 
     expect(await waitForTaskSettled(taskId)).toBe("in_review");
-    const saved = await (await save(taskId)).json();
-    expect(linkedKey((saved.testcases as Array<{ id: string }>)[0].id)).toBe("");
-    expect(ledger(taskId)).toHaveLength(0);
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get("KB two-ticket first")!)).toBe(k1);
+    expect(linkedKey(ids.get("KB two-ticket second")!)).toBe(k2);
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    expect(commentFor(rows, "jira", k1).testcase_ids).toEqual([ids.get("KB two-ticket first")]);
+    expect(commentFor(rows, "jira", k2).testcase_ids).toEqual([ids.get("KB two-ticket second")]);
+  });
+
+  test("ZYR-AC-40 KB docs from THREE Linear tickets: every ticket is linked and gets a comment with only its own cases", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("linear");
+    const keys = [ticketKey("YA"), ticketKey("YB"), ticketKey("YC")];
+    const docs = keys.map((key) => seedTicketWithMirror("linear", connectionId, key));
+    await setAutoComment({ linearAutoComment: true });
+
+    queueCitedGeneration(keys.map((key, i) => ({ title: `Three Linear case ${i + 1}`, refs: [key] })));
+    const created = await createTask({ knowledgeItemIds: docs });
+    const taskId = created.generationRequestId;
+    expect([...created.task.linearIssueKeys].sort()).toEqual([...keys].sort());
+    expect(created.task.jiraIssueKeys).toEqual([]);
+
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    const ids = await saveAll(taskId);
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(3);
+    keys.forEach((key, i) => {
+      const id = ids.get(`Three Linear case ${i + 1}`)!;
+      expect(linkedKey(id, "linear_issue_key")).toBe(key);
+      expect(commentFor(rows, "linear", key).testcase_ids).toEqual([id]);
+    });
+  });
+
+  test("ZYR-AC-41 a draft citing a ticket's KB mirror as 'KB N' is attributed to that ticket; a 'KB N' of a plain note is not a ticket", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const [k1, k2] = [ticketKey("KBA"), ticketKey("KBB")];
+    const docA = seedTicketWithMirror("jira", connectionId, k1);
+    const docB = seedTicketWithMirror("jira", connectionId, k2);
+    const note = await createNote(`E2E plain note ${Date.now()}`, "Loan officers work in two shifts.");
+    await setAutoComment({ jiraAutoComment: true });
+
+    queueCitedGeneration([
+      { title: "Cites KB 1", refs: ["KB 1"] },
+      { title: "Cites KB 2", refs: ["KB 2"] },
+      { title: "Cites KB 3", refs: ["KB 3"] },
+    ]);
+    const taskId = (await createTask({ knowledgeItemIds: [docA, docB, note] })).generationRequestId;
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+
+    // Which document got which "KB N" label is the backend's choice, so read it off the prompt the
+    // fake provider actually received rather than assuming the selection order.
+    const prompt = ai.requests.map((r) => JSON.stringify(r.messages)).find((m) => m.includes("cite by its 'KB N' label")) ?? "";
+    // Titles here are "<key>: E2E loan approval" — letters, digits, '-' and ':' only, nothing to escape.
+    const labelOf = (title: string) => prompt.match(new RegExp(`KB (\\d+): ${title}`))?.[1];
+    const kbOfK1 = labelOf(`${k1}: E2E loan approval`);
+    const kbOfK2 = labelOf(`${k2}: E2E loan approval`);
+    expect(kbOfK1, "the first ticket's mirror reached the prompt as a KB item").toBeTruthy();
+    expect(kbOfK2, "the second ticket's mirror reached the prompt as a KB item").toBeTruthy();
+    const noteLabel = ["1", "2", "3"].find((n) => n !== kbOfK1 && n !== kbOfK2)!;
+
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get(`Cites KB ${kbOfK1}`)!)).toBe(k1);
+    expect(linkedKey(ids.get(`Cites KB ${kbOfK2}`)!)).toBe(k2);
+    expect(linkedKey(ids.get(`Cites KB ${noteLabel}`)!), "a plain note is not a ticket").toBe("");
+    expect(activityTitles(taskId)).toContain("Some drafts not linked to a ticket");
+    const rows = await waitForDelivery(taskId);
+    expect(rows.map((r) => r.issue_key).sort()).toEqual([k1, k2].sort());
   });
 
   test("ZYR-AC-12 two docs of the SAME ticket still link to it", async () => {
