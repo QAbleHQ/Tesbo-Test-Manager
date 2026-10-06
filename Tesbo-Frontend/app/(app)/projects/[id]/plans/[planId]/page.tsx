@@ -38,7 +38,7 @@ import {
   type PlanRunItem,
   type PlanProgress,
   type TestRunListItem,
-  type TestEnvironmentSetting,
+  getTestRunEnvironments,
 } from "@/lib/api";
 import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
 import { Button, StatusChip, Input, PageLoader, Select, Field, FieldLabel, Card, EmptyStateBlock } from "@/components/ui";
@@ -166,33 +166,7 @@ export default function PlanDetailPage() {
   const [editDesc, setEditDesc] = useState("");
   const [editRelease, setEditRelease] = useState("");
 
-  function parseProjectSettings(raw: unknown): { testRunEnvironments?: Array<{ name?: string; url?: string }> } {
-    if (typeof raw !== "string" || !raw.trim()) return {};
-    try {
-      const parsed = JSON.parse(raw) as { testRunEnvironments?: Array<{ name?: string; url?: string }> };
-      return parsed && typeof parsed === "object" ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-
-  function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .map((item) => {
-        const candidate = item as { name?: unknown; url?: unknown };
-        const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
-        const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
-        if (!name || !url) return null;
-        return { name, url };
-      })
-      .filter((item): item is TestEnvironmentSetting => item !== null);
-  }
-
-  const environmentOptions = useMemo(
-    () => normalizeTestRunEnvironments(parseProjectSettings(project.settings).testRunEnvironments),
-    [project]
-  );
+  const environmentOptions = useMemo(() => getTestRunEnvironments(project.settings), [project]);
   const ownerNames = useMemo(
     () => Object.fromEntries(projectMembers.map((m) => [m.userId, m.name || m.email || "Unknown user"])),
     [projectMembers]

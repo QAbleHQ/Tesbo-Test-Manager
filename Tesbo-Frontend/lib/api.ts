@@ -846,6 +846,37 @@ export interface TestEnvironmentSetting {
   url: string;
 }
 
+/**
+ * The environments configured under project settings -> Test Environments, ready for a dropdown.
+ *
+ * `project.settings` arrives as a parsed object (jsonb column) from GET /api/projects/:id, but a
+ * JSON string is still tolerated. A parser that accepted only strings left the runs and test-plan
+ * dropdowns permanently empty. Entries missing a name or URL, and repeated names, are dropped.
+ */
+export function getTestRunEnvironments(settings: unknown): TestEnvironmentSetting[] {
+  let parsed: unknown = settings;
+  if (typeof settings === "string") {
+    try {
+      parsed = JSON.parse(settings);
+    } catch {
+      return [];
+    }
+  }
+  const raw = (parsed as { testRunEnvironments?: unknown } | null)?.testRunEnvironments;
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: TestEnvironmentSetting[] = [];
+  for (const item of raw) {
+    const candidate = (item ?? {}) as { name?: unknown; url?: unknown };
+    const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+    const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
+    if (!name || !url || seen.has(name)) continue;
+    seen.add(name);
+    out.push({ name, url });
+  }
+  return out;
+}
+
 export interface AiGeneratedDraft {
   title: string;
   preconditions: string;
@@ -977,6 +1008,8 @@ export interface ZyraTask {
   context: string;
   jiraIssueKeys: string[];
   linearIssueKeys: string[];
+  /** Full Notion page ids (not the short display keys) queued as Zyra context. */
+  notionPageIds?: string[];
   drafts: AiGeneratedDraft[];
   sources: Array<{ type: string; title: string; detail: string }>;
   activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string; kind?: string }>;
@@ -1318,6 +1351,7 @@ export async function createZyraTask(
     acceptanceCriteria?: string;
     jiraIssueKeys?: string[];
     linearIssueKeys?: string[];
+    notionPageIds?: string[];
     knowledgeItemIds?: string[];
     count?: number;
   }
@@ -1335,7 +1369,7 @@ export async function getZyraTask(projectId: string, taskId: string): Promise<Zy
 export async function sendZyraFeedback(
   projectId: string,
   taskId: string,
-  data: string | { feedback: string; referenceNote?: string; jiraIssueKeys?: string[]; linearIssueKeys?: string[] }
+  data: string | { feedback: string; referenceNote?: string; jiraIssueKeys?: string[]; linearIssueKeys?: string[]; notionPageIds?: string[] }
 ): Promise<GenerateAiTestCasesResponse & { task: ZyraTask; tokenUsage: { input: number; output: number; total: number } }> {
   return api(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/feedback`, {
     method: "POST",
@@ -1371,7 +1405,7 @@ export async function closeZyraTask(projectId: string, taskId: string): Promise<
 /** One ticket comment a Zyra save produced (integration_ticket_comments). */
 export interface ZyraTicketComment {
   id: string;
-  provider: "jira" | "linear";
+  provider: "jira" | "linear" | "notion";
   issueKey: string;
   status: "pending" | "posted" | "failed" | "skipped_disabled" | "skipped_not_connected";
   reason: string | null;
@@ -1503,6 +1537,9 @@ export interface TestCaseListItem {
   jiraUrl?: string | null;
   linearIssueKey?: string | null;
   linearUrl?: string | null;
+  /** Full Notion page id (not the short `notion:xxxxxxxx` display key) — how a case links to a page. */
+  notionPageId?: string | null;
+  notionUrl?: string | null;
   severity?: string | null;
   component?: string | null;
   customFieldValues?: Record<string, unknown>;
@@ -1528,6 +1565,7 @@ export async function listTestCases(
     automationStatus?: string;
     jiraIssueKey?: string;
     linearIssueKey?: string;
+    notionPageId?: string;
     search?: string;
     /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
     customFieldFilters?: string;
@@ -1549,6 +1587,7 @@ export async function listTestCases(
   if (params?.automationStatus) sp.set("automationStatus", params.automationStatus);
   if (params?.jiraIssueKey) sp.set("jiraIssueKey", params.jiraIssueKey);
   if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
+  if (params?.notionPageId) sp.set("notionPageId", params.notionPageId);
   if (params?.search) sp.set("search", params.search);
   if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
   if (params?.customTagIds?.length) sp.set("customTagIds", params.customTagIds.join(","));
@@ -1824,6 +1863,11 @@ export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: str
 
 export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
   return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-linear-keys`);
+}
+
+/** Notion test cases link by full page id, so `keys` are page ids (a ticket row's `externalId`). */
+export async function listLinkedNotionPages(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-notion-pages`);
 }
 
 // Test case import/export
@@ -3153,12 +3197,12 @@ export async function getProjectDashboardSummary(projectId: string): Promise<Pro
   return api<ProjectDashboardSummary>(`/api/projects/${projectId}/dashboard`);
 }
 
-// ── App integrations (Jira, Linear) ──
+// ── App integrations (Jira, Linear, Notion) ──
 // Connecting/configuring an app is workspace-scoped (one connection per organization per
 // provider) — see settings/integrations. Mapping which remote project/team feeds a given Tesbo
 // project, syncing, and browsing tickets stays project-scoped, mirrored per provider below.
 
-export type IntegrationProvider = "jira" | "linear";
+export type IntegrationProvider = "jira" | "linear" | "notion";
 
 /**
  * Read-only view of how the deployment is configured for this provider. Credentials come from the
@@ -3400,8 +3444,10 @@ export async function getJiraTicket(projectId: string, issueKey: string): Promis
 }
 
 export interface IssueSearchResult {
-  provider: "JIRA" | "LINEAR";
+  provider: "JIRA" | "LINEAR" | "NOTION";
   key: string;
+  /** Notion only: the full page id a test case links by (`key` is the short display label). */
+  pageId?: string;
   summary: string;
   status: string;
   url: string;
@@ -3515,7 +3561,105 @@ export async function searchLinearIssuesLive(projectId: string, search: string):
   return api(`/api/projects/${projectId}/linear/search-issues?${sp.toString()}`);
 }
 
-// ── Requirements page: cross-source (Jira + Linear) aggregates ──
+// ── Notion (project-scoped mapping/sync/pages) ──
+// Notion's unit of work is a "database" (a table of pages). One database feeds a Tesbo project and
+// each of its pages is mirrored as a ticket. Test cases link by the full page id; the short
+// `notion:xxxxxxxx` key is a display label only.
+
+export interface NotionConnection {
+  connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
+  id?: string;
+  siteUrl?: string;
+  tokenExpiresAt?: string;
+  connectedBy?: string;
+  createdAt?: string;
+  connectedProjects?: NotionConnectedDatabase[];
+  // Every database this Tesbo project has ever been linked to (disabled, never deleted).
+  history?: NotionConnectedDatabase[];
+}
+
+export interface NotionConnectedDatabase {
+  id: string;
+  notionDatabaseId: string;
+  notionDatabaseName: string;
+  createdAt: string;
+}
+
+/** A database the Tesbo integration has been shared with. */
+export interface NotionDatabase {
+  id: string;
+  name: string;
+  url: string;
+  connected: boolean;
+}
+
+export interface NotionPage {
+  id: string;
+  notionPageId: string;
+  /** Short display label, `notion:xxxxxxxx`. */
+  notionPageKey: string;
+  summary: string;
+  /** Markdown. */
+  description: string;
+  issueType: string;
+  status: string;
+  priority: string;
+  assignee: string;
+  reporter: string;
+  labels: string;
+  notionUrl: string;
+  notionCreatedAt: string | null;
+  notionUpdatedAt: string | null;
+  syncedAt: string | null;
+}
+
+export async function getNotionStatus(projectId: string): Promise<NotionConnection> {
+  return api<NotionConnection>(`/api/projects/${projectId}/notion/status`);
+}
+
+/** Empty when nothing has been shared with the Tesbo integration in Notion yet. */
+export async function listNotionDatabases(projectId: string): Promise<NotionDatabase[]> {
+  return api<NotionDatabase[]>(`/api/projects/${projectId}/notion/databases`);
+}
+
+export async function connectNotionDatabase(
+  projectId: string,
+  database: { databaseId: string; databaseName: string }
+): Promise<void> {
+  await api(`/api/projects/${projectId}/notion/databases`, { method: "POST", body: database });
+}
+
+export async function syncNotionPages(projectId: string): Promise<StartSyncResult> {
+  return api<StartSyncResult>(`/api/projects/${projectId}/notion/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
+}
+
+export async function addNotionComment(projectId: string, pageId: string, comment: string): Promise<void> {
+  await api(`/api/projects/${projectId}/notion/comment`, { method: "POST", body: { pageId, comment } });
+}
+
+export async function listNotionPages(
+  projectId: string,
+  params?: TicketListParams
+): Promise<{ list: NotionPage[]; total: number }> {
+  const query = ticketListParamsToSearch(params).toString();
+  return api<{ list: NotionPage[]; total: number }>(
+    `/api/projects/${projectId}/notion/pages${query ? `?${query}` : ""}`
+  );
+}
+
+export async function searchNotionPagesLive(projectId: string, search: string): Promise<{ list: IssueSearchResult[] }> {
+  const sp = new URLSearchParams();
+  if (search) sp.set("search", search);
+  return api(`/api/projects/${projectId}/notion/search-pages?${sp.toString()}`);
+}
+
+// ── Requirements page: cross-source (Jira + Linear + Notion) aggregates ──
 
 export interface TicketSourceStats {
   total: number;
@@ -3529,6 +3673,7 @@ export interface RequirementsSummary {
   all: TicketSourceStats;
   jira: TicketSourceStats;
   linear: TicketSourceStats;
+  notion: TicketSourceStats;
 }
 
 export async function getRequirementsSummary(projectId: string): Promise<RequirementsSummary> {
@@ -3537,8 +3682,10 @@ export async function getRequirementsSummary(projectId: string): Promise<Require
 
 export interface AllSourcesTicket {
   id: string;
-  source: "jira" | "linear";
+  source: "jira" | "linear" | "notion";
   key: string;
+  /** What a test case links to: the issue key for Jira/Linear, the full page id for Notion (`key` is only its short label). */
+  externalId: string;
   summary: string;
   description: string;
   issueType: string;

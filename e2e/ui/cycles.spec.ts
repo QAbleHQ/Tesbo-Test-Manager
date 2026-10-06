@@ -917,3 +917,153 @@ test.describe("deleting a run from the UI (hard-delete remediation Phase 1)", ()
     }
   });
 });
+
+/*
+ * "Test Environment dropdown shows no options": project settings -> Test Environments saves into
+ * projects.settings.testRunEnvironments, and GET /api/projects/:id hands `settings` back in whichever
+ * jsonb shape it was stored in: a parsed OBJECT (written by a PATCH with an object, or by any jsonb_set
+ * such as the Zyra agent config) or a JSON STRING (what the settings screen itself PATCHes). The Test
+ * Runs and Test Plan create-run dropdowns only understood the string form, so every project whose
+ * settings were stored as an object showed a dropdown with just "Select environment" and could never
+ * create a run. Both shapes are seeded here, each in its own disposable project so the shared project's
+ * settings (read by other specs) are never touched.
+ */
+test.describe("Test Environment dropdown: runs list and test plan", () => {
+  const ENVS = [
+    { name: "Staging", url: "https://staging.example.com" },
+    { name: "Production", url: "https://prod.example.com" },
+  ];
+  let api: APIRequestContext;
+  const projectIds: string[] = [];
+
+  test.beforeAll(async () => {
+    api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+  });
+  test.afterAll(async () => {
+    for (const id of projectIds) await api.delete(`/api/projects/${id}`, { failOnStatusCode: false });
+    await api.dispose();
+  });
+
+  /** A fresh project whose settings are PATCHed as `settings` (object => stored as a jsonb object, string => jsonb string). */
+  async function seedProject(settings: unknown): Promise<string> {
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const created = await (await api.post("/api/projects", { data: { name: `E2E EnvDropdown ${stamp}` } })).json();
+    projectIds.push(created.id);
+    if (settings !== undefined) {
+      const res = await api.patch(`/api/projects/${created.id}`, { data: { settings } });
+      expect(res.ok()).toBeTruthy();
+    }
+    return created.id;
+  }
+
+  /** The create/edit run modals render without role="dialog", so find the select by its placeholder option. */
+  const envSelect = (page: Page) =>
+    page.locator("select").filter({ has: page.locator("option", { hasText: "Select environment" }) });
+  const optionNames = async (page: Page) => (await envSelect(page).locator("option").allTextContents()).map((t) => t.trim());
+
+  const SHAPES: Array<[string, () => unknown]> = [
+    ["an object", () => ({ testRunEnvironments: ENVS })],
+    ["a JSON string (as the settings screen saves it)", () => JSON.stringify({ testRunEnvironments: ENVS })],
+  ];
+  for (const [shape, settings] of SHAPES) {
+    test(`Create Test Run lists the configured environments and persists the choice (settings stored as ${shape})`, async ({ page }) => {
+      const projectId = await seedProject(settings());
+      await page.goto(`/projects/${projectId}/cycles?create=1`);
+      await expect(envSelect(page)).toBeVisible();
+      await expect.poll(() => optionNames(page)).toEqual(["Select environment", "Staging", "Production"]);
+
+      const runName = `E2E EnvRun ${Date.now()}`;
+      await page.locator('form input[type="text"]').first().fill(runName);
+      // Nothing chosen yet: the form must not be submittable.
+      await expect(page.getByRole("button", { name: "Create Test Run", exact: true })).toBeDisabled();
+      await envSelect(page).selectOption("Production");
+      await expect(page.getByText("URL: https://prod.example.com")).toBeVisible();
+      await page.getByRole("button", { name: "Create Test Run", exact: true }).click();
+      await expect(page.getByText(runName, { exact: true })).toBeVisible();
+
+      const runs: { name: string; environment: string }[] = await (await api.get(`/api/projects/${projectId}/cycles`)).json();
+      expect(runs.find((r) => r.name === runName)?.environment).toBe("Production");
+    });
+  }
+
+  test("with no environments configured the dropdown is empty, Create is disabled, and the hint links to the Test Environments tab", async ({ page }) => {
+    const projectId = await seedProject(undefined);
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await expect.poll(() => optionNames(page)).toEqual(["Select environment"]);
+    await page.locator('form input[type="text"]').first().fill("E2E EnvRun none");
+    await expect(page.getByRole("button", { name: "Create Test Run", exact: true })).toBeDisabled();
+    await expect(page.getByRole("link", { name: "Project settings" })).toHaveAttribute("href", /settings\?tab=testRuns/);
+  });
+
+  test("entries without a name or URL, and repeated names, are not offered", async ({ page }) => {
+    const projectId = await seedProject({
+      testRunEnvironments: [
+        { name: "Good", url: "https://good.example.com" },
+        { name: "NoUrl", url: "   " },
+        { name: "  ", url: "https://blank-name.example.com" },
+        { name: "Good", url: "https://dup.example.com" },
+        null,
+      ],
+    });
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await expect.poll(() => optionNames(page)).toEqual(["Select environment", "Good"]);
+  });
+
+  test("a project whose settings carry unrelated keys (icon, zyraAgent) still lists its environments", async ({ page }) => {
+    const projectId = await seedProject({ testRunEnvironments: ENVS, zyraAgent: { testcaseCount: 3 }, testcaseIdPrefix: "ENV" });
+    await api.patch(`/api/projects/${projectId}`, { data: { icon: { color: "#7C5FCC", glyph: "E" } } });
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await expect.poll(() => optionNames(page)).toEqual(["Select environment", "Staging", "Production"]);
+  });
+
+  test("Edit Test Run keeps a since-removed environment selectable as (legacy) next to the current ones", async ({ page }) => {
+    const projectId = await seedProject({ testRunEnvironments: ENVS });
+    const name = `E2E EnvLegacy ${Date.now()}`;
+    const run = await (
+      await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Retired" } })
+    ).json();
+    await page.goto(`/projects/${projectId}/cycles`);
+    await runCard(page, run.id).getByTitle("Edit run").click();
+    await expect.poll(() => optionNames(page)).toEqual(["Select environment", "Retired (legacy)", "Staging", "Production"]);
+    await expect(envSelect(page)).toHaveValue("Retired");
+    await envSelect(page).selectOption("Staging");
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(runCard(page, run.id)).toContainText("Staging");
+    const runs: { id: string; environment: string }[] = await (await api.get(`/api/projects/${projectId}/cycles`)).json();
+    expect(runs.find((r) => r.id === run.id)?.environment).toBe("Staging");
+  });
+
+  test("an environment added in project settings appears in the dropdown on the next visit", async ({ page }) => {
+    const projectId = await seedProject({ testRunEnvironments: [ENVS[0]] });
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await expect.poll(() => optionNames(page)).toEqual(["Select environment", "Staging"]);
+    await api.patch(`/api/projects/${projectId}`, { data: { settings: { testRunEnvironments: ENVS } } });
+    await page.reload();
+    await expect.poll(() => optionNames(page)).toEqual(["Select environment", "Staging", "Production"]);
+  });
+
+  test("Test Plan -> Create test run offers the same environments and persists the choice", async ({ page }) => {
+    const projectId = await seedProject({ testRunEnvironments: ENVS });
+    const plan = await (await api.post(`/api/projects/${projectId}/plans`, { data: { name: `E2E EnvPlan ${Date.now()}` } })).json();
+    await page.goto(`/projects/${projectId}/plans/${plan.id}`);
+    await page.getByRole("button", { name: "Create test run" }).click();
+    await expect.poll(() => optionNames(page)).toEqual(["Select environment", "Staging", "Production"]);
+    // The plan form pre-selects the first environment; the user can still switch.
+    await envSelect(page).selectOption("Production");
+    const runName = `E2E EnvPlanRun ${Date.now()}`;
+    await page.locator('form input[type="text"]').first().fill(runName);
+    await page.getByRole("button", { name: "Create Test Run", exact: true }).click();
+    await expect(page.getByText(runName, { exact: true })).toBeVisible();
+    const runs: { name: string; environment: string }[] = await (await api.get(`/api/projects/${projectId}/cycles`)).json();
+    expect(runs.find((r) => r.name === runName)?.environment).toBe("Production");
+  });
+
+  test("Test Plan -> Create test run with no environments configured shows the hint and cannot submit", async ({ page }) => {
+    const projectId = await seedProject(undefined);
+    const plan = await (await api.post(`/api/projects/${projectId}/plans`, { data: { name: `E2E EnvPlanNone ${Date.now()}` } })).json();
+    await page.goto(`/projects/${projectId}/plans/${plan.id}`);
+    await page.getByRole("button", { name: "Create test run" }).click();
+    await expect(page.getByText("No environments configured in project settings.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Create Test Run", exact: true })).toBeDisabled();
+  });
+});

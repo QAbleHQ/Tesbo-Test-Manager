@@ -103,9 +103,11 @@ export class IntegrationSyncService {
     try {
       // The mapped project's name, recorded here, not just by the processor, so a still-queued run
       // already shows "QA DEMO" rather than a Jira key or a Linear Project's opaque slugId.
-      const remoteNameSql = provider === "jira"
-        ? "SELECT jira_project_name FROM jira_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1"
-        : "SELECT linear_team_name FROM linear_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1";
+      const remoteNameSql = {
+        jira: "SELECT jira_project_name FROM jira_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1",
+        linear: "SELECT linear_team_name FROM linear_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1",
+        notion: "SELECT notion_database_name FROM notion_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1"
+      }[provider];
       const inserted = await this.db.query<{ id: string }>(
         `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, remote_project_name, triggered_by, trigger_source, nightly_cycle_date, status, stage)
          VALUES ($1, $2, $3, $4, $5, (${remoteNameSql}), $6, $7, $8, 'queued', 'queued')
@@ -471,14 +473,14 @@ export class IntegrationSyncService {
    * Every (organization, project, remote key) the nightly scheduler should sync tonight for one
    * provider: an enabled mapping backed by a live connection. A disconnected workspace's
    * integration_connections row is deleted outright (see legacy.service.ts's disconnect flow), so
-   * it drops out of this join with no extra "still connected" check needed. Linear is additionally
-   * filtered through plan entitlement — Jira is unaffected since the Launch plan includes it.
+   * it drops out of this join with no extra "still connected" check needed. Linear and Notion are
+   * additionally filtered through plan entitlement; Jira is unaffected since the Launch plan includes it.
    */
   async listNightlySyncTargets(
     provider: SyncProvider
   ): Promise<Array<{ organizationId: string; projectId: string; remoteKey: string }>> {
-    const mappingTable = provider === "jira" ? "jira_project_mappings" : "linear_project_mappings";
-    const remoteKeyCol = provider === "jira" ? "jira_project_key" : "linear_team_key";
+    const mappingTable = { jira: "jira_project_mappings", linear: "linear_project_mappings", notion: "notion_project_mappings" }[provider];
+    const remoteKeyCol = { jira: "jira_project_key", linear: "linear_team_key", notion: "notion_database_id" }[provider];
     const res = await this.db.query<{ organization_id: string; project_id: string; remote_key: string }>(
       `SELECT ic.organization_id, m.project_id, m.${remoteKeyCol} AS remote_key
        FROM ${mappingTable} m
@@ -492,11 +494,13 @@ export class IntegrationSyncService {
       projectId: String(row.project_id),
       remoteKey: String(row.remote_key)
     }));
-    if (provider !== "linear") return targets;
+    // Jira is on every plan and is not checked. Notion is also on every plan, but goes through the
+    // same entitlement check as Linear so an allow-list change in plan-limits applies here too.
+    if (provider === "jira") return targets;
 
     const allowed: typeof targets = [];
     for (const target of targets) {
-      if (await this.planLimits.isIntegrationAllowed(target.organizationId, "linear")) allowed.push(target);
+      if (await this.planLimits.isIntegrationAllowed(target.organizationId, provider)) allowed.push(target);
     }
     return allowed;
   }
