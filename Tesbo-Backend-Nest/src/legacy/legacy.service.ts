@@ -3547,11 +3547,19 @@ export class LegacyService implements OnModuleInit {
       !query.search &&
       !query.customFieldFilters &&
       LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
+      LegacyService.parseCommaSeparatedIdsParam(query.ids).length === 0 &&
       String(query.includeArchived ?? "").toLowerCase() !== "true"
     );
   }
 
   private static parseCustomTagIdsParam(raw: unknown): string[] {
+    return LegacyService.parseCommaSeparatedIdsParam(raw);
+  }
+
+  // Shared by customTagIds and ids (buildTestcaseFilterFragments): both accept either the param
+  // repeated or one comma-separated value, same as a plain HTML multi-select would produce either
+  // way depending on how the caller built the query string.
+  private static parseCommaSeparatedIdsParam(raw: unknown): string[] {
     const parts = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
     return [...new Set(parts.flatMap((p) => String(p).split(",")).map((s) => s.trim()).filter(Boolean))];
   }
@@ -3690,6 +3698,25 @@ export class LegacyService implements OnModuleInit {
       filters.push(
         `EXISTS (SELECT 1 FROM testcase_custom_tags tct WHERE tct.testcase_id = testcases.id AND tct.tag_id = ANY($${values.length}::uuid[]))`
       );
+    }
+
+    /*
+     * `ids` — an explicit list of test case ids. Used by the repository's "Export" action once the
+     * user has ticked specific rows: the on-screen checkboxes previously had no effect on Export at
+     * all, which always exported every row matching the suite/column filters regardless of
+     * selection. When present, `ids` is meant to scope the result to exactly those rows (the
+     * frontend drops every other filter field once something is checked — see getExportUrl), but
+     * it is additive here like every other fragment in this method, so a caller that combines it
+     * with another filter narrows rather than silently losing the id scoping.
+     *
+     * Validated the same way as customTagIds above: a malformed id silently ignored would widen an
+     * "export only these" request into "export everything" instead of erroring.
+     */
+    const ids = LegacyService.parseCommaSeparatedIdsParam(query.ids);
+    if (ids.length) {
+      if (!ids.every(isUuid)) throw new BadRequestException({ error: "ids must be valid ids" });
+      values.push(ids);
+      filters.push(`testcases.id = ANY($${values.length}::uuid[])`);
     }
 
     // Custom field filters join custom_field_values once per condition (each scoped 1:1 by

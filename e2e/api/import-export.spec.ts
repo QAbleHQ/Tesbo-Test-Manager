@@ -724,6 +724,111 @@ test.describe("import / export", () => {
     },
   );
 
+  test(
+    "an export scoped by ids returns exactly those test cases, not every case matching the other filters",
+    async () => {
+      const stamp = Date.now();
+      const project = await newProject(`E2E Export Ids Filter ${stamp}`);
+      const selectedA = await seedCase({ title: `E2E Export Ids Selected A ${stamp}` }, project);
+      const selectedB = await seedCase({ title: `E2E Export Ids Selected B ${stamp}` }, project);
+      const notSelected = await seedCase({ title: `E2E Export Ids Not Selected ${stamp}` }, project);
+
+      const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { ids: `${selectedA.id},${selectedB.id}` },
+      });
+      expect(res.status()).toBe(200);
+      const { records } = parseCsvRecords(await res.text());
+      expect(records.map((r) => r.title).sort()).toEqual([selectedA.title, selectedB.title].sort());
+      expect(records.map((r) => r.title)).not.toContain(notSelected.title);
+
+      // Reproduces the reported bug directly: exporting with every id checked (not a subset)
+      // must still come back as exactly those rows, never silently widening to the whole project.
+      const all = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        params: { ids: `${selectedA.id},${selectedB.id},${notSelected.id}` },
+      });
+      expect(
+        parseCsvRecords(await all.text()).records.map((r) => r.title).sort(),
+      ).toEqual([selectedA.title, selectedB.title, notSelected.title].sort());
+    },
+  );
+
+  test("ids can be repeated as separate query params, not only comma-joined", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Ids Repeated ${stamp}`);
+    const selected = await seedCase({ title: `E2E Export Ids Repeated Selected ${stamp}` }, project);
+    const other = await seedCase({ title: `E2E Export Ids Repeated Other ${stamp}` }, project);
+
+    const res = await asOwner.get(
+      `/api/projects/${project}/testcases/export/csv?ids=${selected.id}`,
+    );
+    const { records } = parseCsvRecords(await res.text());
+    expect(records.map((r) => r.title)).toEqual([selected.title]);
+    expect(records.map((r) => r.title)).not.toContain(other.title);
+  });
+
+  test("ids is additive with other filters rather than overriding them", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Ids Additive ${stamp}`);
+    const matchesBoth = await seedCase(
+      { title: `E2E Export Ids Additive Both ${stamp}`, status: "Approved" },
+      project,
+    );
+    const idButWrongStatus = await seedCase(
+      { title: `E2E Export Ids Additive Wrong Status ${stamp}`, status: "Draft" },
+      project,
+    );
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+      params: { ids: `${matchesBoth.id},${idButWrongStatus.id}`, status: "Approved" },
+    });
+    const { records } = parseCsvRecords(await res.text());
+    expect(records.map((r) => r.title)).toEqual([matchesBoth.title]);
+    expect(records.map((r) => r.title)).not.toContain(idButWrongStatus.title);
+  });
+
+  test("a malformed id in ids is refused with 400, not silently dropped into a wider export", async () => {
+    const res = await asOwner.get(`/api/projects/${projectId}/testcases/export/csv`, {
+      params: { ids: "not-a-uuid" },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+  });
+
+  test(
+    "an id belonging to another project is excluded, not a cross-tenant leak",
+    async () => {
+      const stamp = Date.now();
+      const projectA = await newProject(`E2E Export Ids Tenant A ${stamp}`);
+      const projectB = await newProject(`E2E Export Ids Tenant B ${stamp}`);
+      const ownCase = await seedCase({ title: `E2E Export Ids Tenant A Case ${stamp}` }, projectA);
+      const otherTenantCase = await seedCase({ title: `E2E Export Ids Tenant B Case ${stamp}` }, projectB);
+
+      const res = await asOwner.get(`/api/projects/${projectA}/testcases/export/csv`, {
+        params: { ids: `${ownCase.id},${otherTenantCase.id}` },
+      });
+      expect(res.status()).toBe(200);
+      const { records } = parseCsvRecords(await res.text());
+      expect(records.map((r) => r.title)).toEqual([ownCase.title]);
+      expect(records.map((r) => r.title)).not.toContain(otherTenantCase.title);
+    },
+  );
+
+  test("exporting xlsx with ids also scopes to exactly those rows", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Ids Xlsx ${stamp}`);
+    const selected = await seedCase({ title: `E2E Export Ids Xlsx Selected ${stamp}` }, project);
+    const other = await seedCase({ title: `E2E Export Ids Xlsx Other ${stamp}` }, project);
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/xlsx`, {
+      params: { ids: selected.id },
+    });
+    expect(res.status()).toBe(200);
+    const workbook = XLSX.read(await res.body(), { type: "buffer" });
+    const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets["Test Cases"]);
+    expect(rows.map((r) => r.title)).toEqual([selected.title]);
+    expect(rows.map((r) => r.title)).not.toContain(other.title);
+  });
+
   /* ───────────────────────── test case XLSX export ───────────────────────── */
 
   test("exports a workbook whose \"Test Cases\" sheet matches the CSV", { tag: '@tesbo.testId("TES-TC-204")' }, async () => {
