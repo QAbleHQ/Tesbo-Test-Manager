@@ -16,6 +16,7 @@ import { Button, Card, Modal, Input, Field, FieldLabel, StatusChip, CopyButton }
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { formatDate as formatDateShared } from "@/lib/date";
 
 type ConnectTab = "claudeCode" | "claudeDesktop" | "other";
 
@@ -28,7 +29,7 @@ function normalizeRole(role: string): "owner" | "manager" | "qa_engineer" {
 
 function formatDate(iso: string | null): string {
   if (!iso) return "Never";
-  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  return formatDateShared(iso);
 }
 
 function scopeLabel(scopes: string[]): string {

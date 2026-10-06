@@ -186,7 +186,7 @@ export default function BugActivity({
                     </span>{" "}
                     {describe(item)}
                   </p>
-                  <time dateTime={item.createdAt} title={new Date(item.createdAt).toLocaleString()} className="text-[11px] text-[var(--muted-soft)]">
+                  <time dateTime={item.createdAt} title={formatAbsolute(item.createdAt)} className="text-[11px] text-[var(--muted-soft)]">
                     {formatAbsolute(item.createdAt)}
                   </time>
                 </div>

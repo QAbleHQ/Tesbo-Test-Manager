@@ -14,9 +14,9 @@ import { formatEventDate, formatEventTime } from "./ChangeHistory";
 // A field's label is usually a plain heading word ("Title", "Description", "Comments") — but for a
 // Zyra AI Memory log entry, groupSections (text-diff.util.ts) uses the section's own `## <ISO
 // timestamp>` heading as the label verbatim, so it reaches here as a raw
-// "2026-09-11T15:31:09.877Z" string. Reformat only that shape, into the same DD/MM/YYYY, hh:mm:ss
-// AM/PM the Update History list next to this modal already uses — every other label (not matching
-// the pattern) is left exactly as the backend sent it.
+// "2026-09-11T15:31:09.877Z" string. Reformat only that shape, into the same sitewide standard
+// format the Update History list next to this modal already uses — every other label (not
+// matching the pattern) is left exactly as the backend sent it.
 const ISO_TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
 function formatFieldLabel(label: string): string {
@@ -32,7 +32,7 @@ export function ChangeDiffModal({
 }: {
   open: boolean;
   onClose: () => void;
-  /** e.g. "Updated by Namrata Gosai on 02/09/2026" — shown once, above every field. */
+  /** e.g. "Updated by Namrata Gosai on 02 Sep 2026" — shown once, above every field. */
   title: string;
   fields: KnowledgeChangedField[];
 }) {

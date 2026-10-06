@@ -79,14 +79,19 @@ interface ZyraSaveEntryContext {
   taskId: string;
   chatSessionId: string | null;
   batchSuiteId: string | null;
+  // The task's ticket when it has exactly one (every draft falls back to it); null for a task with
+  // several, whose drafts each carry their own key. See zyraDraftTicketLink.
   jiraIssueKey: string | null;
-  jiraUrl: string | null;
   linearIssueKey: string | null;
-  linearUrl: string | null;
-  // Notion links by page id (testcases.notion_page_id), not by the short display key.
+  // The task's Notion page (testcases.notion_page_id) when it has exactly one ticket and that ticket
+  // is a Notion page, else null: same rule as jiraIssueKey/linearIssueKey.
   notionPageId: string | null;
-  notionUrl: string | null;
-  existingLinked: { rows: Body[] };
+  // Keyed `jira:<key>` / `linear:<key>` / `notion:<pageId>`, for every ticket the task names.
+  ticketUrls: Map<string, string | null>;
+  existingLinkedByTicket: Map<string, Body[]>;
+  // Mutable per-save state for zyraDraftTicketLink's per-ticket positional pairing.
+  linkedPositions: Map<string, number>;
+  claimedLinkedIds: Set<string>;
   // Every suite id a create-type entry in this save could target (batchSuiteId, and each draft's
   // own per-entry suiteId), re-validated live under this same transaction — see zyraSaveAttempt's
   // Q11 handling. A suite resolved once, at generation/staging time, can sit unsaved for hours (a
@@ -1342,42 +1347,48 @@ export class LegacyService implements OnModuleInit {
       const settings = this.parseProjectSettings((await this.getProject(projectId)).settings);
       const connected = new Map<TicketProvider, boolean>();
       for (const group of groups) {
-        const enabled = settings[`${group.provider}AutoComment`] === true;
-        if (enabled && !connected.has(group.provider)) {
-          connected.set(group.provider, await this.ticketProviderConnected(projectId, group.provider));
-        }
-        const status = !enabled ? "skipped_disabled" : connected.get(group.provider) ? "pending" : "skipped_not_connected";
-        // A Notion "issue key" is the page id, which means nothing to a reader: the comment and the
-        // task activity name the page by its title instead.
-        const ticketLabel = group.provider === "notion" ? await this.notionPageLabel(projectId, group.issueKey) : group.issueKey;
-        const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries, ticketLabel);
-        const claim = await this.db.query<{ id: string }>(
-          `INSERT INTO integration_ticket_comments
-             (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, posted_by)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
-           ON CONFLICT (generation_request_id, save_event_id, provider, issue_key) DO NOTHING
-           RETURNING id`,
-          [
-            projectId,
-            taskId,
-            saveEventId,
-            group.provider,
-            group.issueKey,
-            JSON.stringify(group.entries.map((entry) => String(entry.row.id))),
-            status,
-            content.markdown,
-            uid
-          ]
-        );
-        const claimId = claim.rows[0]?.id;
-        if (!claimId) continue;
-        const label = TICKET_PROVIDER_LABELS[group.provider];
-        if (status === "pending") {
-          void this.deliverZyraTicketComment(projectId, taskId, claimId, group.provider, group.issueKey, group.entries.length, content).catch(() => undefined);
-        } else if (status === "skipped_disabled") {
-          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${ticketLabel} was not commented on.`);
-        } else {
-          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${ticketLabel} was not commented on.`);
+        // Each ticket on its own: a failure claiming or recording one ticket's comment must not
+        // stop the save's other tickets from being commented on.
+        try {
+          const enabled = settings[`${group.provider}AutoComment`] === true;
+          if (enabled && !connected.has(group.provider)) {
+            connected.set(group.provider, await this.ticketProviderConnected(projectId, group.provider));
+          }
+          const status = !enabled ? "skipped_disabled" : connected.get(group.provider) ? "pending" : "skipped_not_connected";
+          // A Notion "issue key" is the page id, which means nothing to a reader: the comment and the
+          // task activity name the page by its title instead.
+          const ticketLabel = group.provider === "notion" ? await this.notionPageLabel(projectId, group.issueKey) : group.issueKey;
+          const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries, ticketLabel);
+          const claim = await this.db.query<{ id: string }>(
+            `INSERT INTO integration_ticket_comments
+               (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, posted_by)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+             ON CONFLICT (generation_request_id, save_event_id, provider, issue_key) DO NOTHING
+             RETURNING id`,
+            [
+              projectId,
+              taskId,
+              saveEventId,
+              group.provider,
+              group.issueKey,
+              JSON.stringify(group.entries.map((entry) => String(entry.row.id))),
+              status,
+              content.markdown,
+              uid
+            ]
+          );
+          const claimId = claim.rows[0]?.id;
+          if (!claimId) continue;
+          const label = TICKET_PROVIDER_LABELS[group.provider];
+          if (status === "pending") {
+            void this.deliverZyraTicketComment(projectId, taskId, claimId, group.provider, group.issueKey, group.entries.length, content).catch(() => undefined);
+          } else if (status === "skipped_disabled") {
+            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${ticketLabel} was not commented on.`);
+          } else {
+            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${ticketLabel} was not commented on.`);
+          }
+        } catch (err) {
+          this.logger.warn(`Failed to queue the ${group.provider} comment for ${group.issueKey} (task ${taskId}): ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     } catch (err) {
@@ -1409,6 +1420,96 @@ export class LegacyService implements OnModuleInit {
       }
     });
     return Array.from(groups.values());
+  }
+
+  // A task that names more than one ticket (the Feedback tab's pickers, or several keys passed to
+  // createZyraTask) is generated in ONE provider call, so which ticket each draft belongs to can only
+  // come from the draft itself: the ticket labels it cites in sourceRefs (the prompt labels every
+  // Jira/Linear ticket by its key). A draft is stamped with a provider's key only when it cites
+  // exactly one of THIS task's tickets on that provider — never a key the model made up, never a
+  // guess between two. A single-ticket task is left untouched: zyraSaveAttempt links every draft to
+  // that one ticket, exactly as it always has. Mutates `drafts`; returns how many of them could not
+  // be attributed to any ticket.
+  //
+  // `knowledgeLabels` (zyraKnowledgeTicketLabels) adds the "KB N" label of each ticket's Knowledge
+  // Base mirror: a ticket picked through the KB reaches the prompt under both, and citing either
+  // means that ticket — but only a ticket this task actually names, never one a stray document
+  // happens to mirror.
+  private zyraAttributeDraftsToTickets(
+    drafts: Body[],
+    jiraIssueKeys: string[],
+    linearIssueKeys: string[],
+    notionPageIds: string[],
+    knowledgeLabels: Map<string, { provider: TicketProvider; issueKey: string }> = new Map()
+  ): number {
+    if (jiraIssueKeys.length + linearIssueKeys.length + notionPageIds.length <= 1) return 0;
+    const byLabel = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    for (const issueKey of jiraIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "jira", issueKey });
+    for (const issueKey of linearIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "linear", issueKey });
+    // The prompt labels a Notion page by its short display key (notionPageKey), not its page id.
+    for (const issueKey of notionPageIds) byLabel.set(notionPageKey(issueKey).toLowerCase(), { provider: "notion", issueKey });
+    for (const [label, ticket] of knowledgeLabels) {
+      const own = (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).find((key) => key.trim().toLowerCase() === ticket.issueKey.trim().toLowerCase());
+      if (own) byLabel.set(label, { provider: ticket.provider, issueKey: own });
+    }
+    let unattributed = 0;
+    for (const draft of drafts) {
+      const cited: Record<TicketProvider, Set<string>> = { jira: new Set(), linear: new Set(), notion: new Set() };
+      for (const ref of Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []) {
+        // A raw label on the task-board path; a resolved {type, id, title} wherever refs were sanitized.
+        const label = typeof ref === "string" ? ref : ref && typeof ref === "object" ? String((ref as Body).id ?? "") : "";
+        const match = byLabel.get(label.trim().toLowerCase());
+        if (match) cited[match.provider].add(match.issueKey);
+      }
+      draft.jiraIssueKey = cited.jira.size === 1 ? Array.from(cited.jira)[0] : null;
+      draft.linearIssueKey = cited.linear.size === 1 ? Array.from(cited.linear)[0] : null;
+      draft.notionPageId = cited.notion.size === 1 ? Array.from(cited.notion)[0] : null;
+      if (!draft.jiraIssueKey && !draft.linearIssueKey && !draft.notionPageId) unattributed += 1;
+    }
+    return unattributed;
+  }
+
+  private zyraUnattributedDraftsActivity(unattributed: number, total: number, createdAt: string): Body[] {
+    if (!unattributed) return [];
+    return [{
+      actor: "system",
+      stage: "in_review",
+      title: "Some drafts not linked to a ticket",
+      detail: `${unattributed} of ${total} draft(s) don't cite exactly one of this task's tickets, so they will be saved without a ticket link and won't appear in any ticket comment.`,
+      createdAt
+    }];
+  }
+
+  // Which ticket one create-type draft is written against, and which already-linked test case (if
+  // any) it regenerates in place. `ctx.jiraIssueKey`/`linearIssueKey` are the task's ticket only when
+  // it has exactly one — every other draft carries its own key (zyraAttributeDraftsToTickets, or a
+  // chat draft's). Already-linked rows are paired per ticket, oldest first: the Nth draft for ticket
+  // K updates the Nth row already linked to K — the same positional pairing a single-ticket task has
+  // always used, kept within one ticket so a regeneration never rewrites another ticket's case. A
+  // row is claimed at most once per save, even if it is linked to two of this task's tickets.
+  private zyraDraftTicketLink(ctx: ZyraSaveEntryContext, draft: Body) {
+    const jiraIssueKey = String(draft.jiraIssueKey || ctx.jiraIssueKey || "").trim() || null;
+    const linearIssueKey = String(draft.linearIssueKey || ctx.linearIssueKey || "").trim() || null;
+    const notionPageId = String(draft.notionPageId || ctx.notionPageId || "").trim() || null;
+    const poolKey = jiraIssueKey ? `jira:${jiraIssueKey}` : linearIssueKey ? `linear:${linearIssueKey}` : notionPageId ? `notion:${notionPageId}` : null;
+    let existingLinkedRow: Body | undefined;
+    if (poolKey) {
+      const pool = ctx.existingLinkedByTicket.get(poolKey) || [];
+      let position = ctx.linkedPositions.get(poolKey) ?? 0;
+      while (position < pool.length && ctx.claimedLinkedIds.has(String(pool[position].id))) position += 1;
+      existingLinkedRow = pool[position];
+      ctx.linkedPositions.set(poolKey, position + 1);
+      if (existingLinkedRow?.id) ctx.claimedLinkedIds.add(String(existingLinkedRow.id));
+    }
+    return {
+      jiraIssueKey,
+      jiraUrl: jiraIssueKey ? ctx.ticketUrls.get(`jira:${jiraIssueKey}`) ?? null : null,
+      linearIssueKey,
+      linearUrl: linearIssueKey ? ctx.ticketUrls.get(`linear:${linearIssueKey}`) ?? null : null,
+      notionPageId,
+      notionUrl: notionPageId ? ctx.ticketUrls.get(`notion:${notionPageId}`) ?? null : null,
+      existingLinkedRow
+    };
   }
 
   // The link a ticket comment gives each test case — read by people other than this deployment's
@@ -1691,20 +1792,21 @@ export class LegacyService implements OnModuleInit {
     return err instanceof Error ? err.message : String(err);
   }
 
-  // Which ticket a Task-board task's Knowledge Base selection belongs to (see aiGenerate). Only
-  // mirror documents count — a user's own note that mentions a key is not the ticket — and they
-  // resolve to a key through the ticket table the mirror was written from, because a mirror stores
-  // the provider's issue id in source_external_id, not the key. Project-scoped on both sides, so a
-  // document id from another project resolves to nothing. `linked` is set only when the selection
-  // points at exactly one ticket; `tickets` lists every one it found.
-  private async zyraTicketFromKnowledgeSelection(
+  // Which ticket each Knowledge Base document is the mirror of. Only mirror documents count — a
+  // user's own note that mentions a key is not the ticket — and they resolve to a key through the
+  // ticket table the mirror was written from, because a mirror stores the provider's issue id in
+  // source_external_id, not the key. Project-scoped on both sides, so a document id from another
+  // project resolves to nothing. Keyed by document id; a document that isn't a ticket mirror is
+  // simply absent.
+  private async zyraMirrorTicketsByDocument(
     projectId: string,
-    knowledgeItemIds: string[]
-  ): Promise<{ linked: { provider: TicketProvider; issueKey: string } | null; tickets: Array<{ provider: TicketProvider; issueKey: string }> } | null> {
-    const ids = Array.from(new Set(knowledgeItemIds.filter((id) => isUuid(id))));
-    if (!ids.length) return null;
-    const res = await this.db.query<{ provider: TicketProvider; issue_key: string }>(
-      `SELECT DISTINCT d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) AS issue_key
+    documentIds: string[]
+  ): Promise<Map<string, { provider: TicketProvider; issueKey: string }>> {
+    const ids = Array.from(new Set(documentIds.filter((id) => isUuid(id))));
+    const byDocument = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    if (!ids.length) return byDocument;
+    const res = await this.db.query<{ id: string; provider: TicketProvider; issue_key: string }>(
+      `SELECT d.id, d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) AS issue_key
        FROM knowledge_documents d
        LEFT JOIN jira_tickets j
          ON d.source_provider = 'jira' AND j.project_id = d.project_id AND j.jira_issue_id = d.source_external_id
@@ -1714,12 +1816,41 @@ export class LegacyService implements OnModuleInit {
          ON d.source_provider = 'notion' AND n.project_id = d.project_id AND n.notion_page_id = d.source_external_id
        WHERE d.project_id = $1 AND d.id = ANY($2::uuid[]) AND d.is_deleted = false
          AND d.source_role = 'mirror' AND d.source_provider IN ('jira', 'linear', 'notion')
-         AND COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) IS NOT NULL
-       ORDER BY 1, 2`,
+         AND COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) IS NOT NULL`,
       [projectId, ids]
     );
-    const tickets = res.rows.map((row) => ({ provider: row.provider, issueKey: String(row.issue_key) }));
-    return { linked: tickets.length === 1 ? tickets[0] : null, tickets };
+    for (const row of res.rows) byDocument.set(String(row.id), { provider: row.provider, issueKey: String(row.issue_key) });
+    return byDocument;
+  }
+
+  // Every ticket a Task-board task's Knowledge Base selection mirrors (see aiGenerate), one entry
+  // per ticket however many of its documents were picked, ordered by provider then key.
+  private async zyraTicketsFromKnowledgeSelection(
+    projectId: string,
+    knowledgeItemIds: string[]
+  ): Promise<Array<{ provider: TicketProvider; issueKey: string }>> {
+    const unique = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    for (const ticket of (await this.zyraMirrorTicketsByDocument(projectId, knowledgeItemIds)).values()) {
+      unique.set(`${ticket.provider}:${ticket.issueKey}`, ticket);
+    }
+    return Array.from(unique.values()).sort((a, b) => a.provider.localeCompare(b.provider) || a.issueKey.localeCompare(b.issueKey));
+  }
+
+  // "KB N" prompt label (lower-cased, as zyraAttributeDraftsToTickets matches labels) -> the ticket
+  // that knowledge item is the mirror of. A ticket picked through the Knowledge Base reaches the
+  // prompt twice — as "KB N" and under its own key — and a draft may cite either.
+  private async zyraKnowledgeTicketLabels(
+    projectId: string,
+    knowledge: Array<{ citation?: ZyraKnowledgeCitation }>
+  ): Promise<Map<string, { provider: TicketProvider; issueKey: string }>> {
+    const documentIds = knowledge.map((item) => (item.citation?.sourceType === "document" ? item.citation.sourceId : "")).filter(Boolean);
+    const byDocument = await this.zyraMirrorTicketsByDocument(projectId, documentIds);
+    const labels = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    knowledge.forEach((item, index) => {
+      const ticket = item.citation?.sourceType === "document" ? byDocument.get(item.citation.sourceId) : undefined;
+      if (ticket) labels.set(`kb ${index + 1}`, ticket);
+    });
+    return labels;
   }
 
   async onModuleInit(): Promise<void> {
@@ -3588,11 +3719,19 @@ export class LegacyService implements OnModuleInit {
       !query.search &&
       !query.customFieldFilters &&
       LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
+      LegacyService.parseCommaSeparatedIdsParam(query.ids).length === 0 &&
       String(query.includeArchived ?? "").toLowerCase() !== "true"
     );
   }
 
   private static parseCustomTagIdsParam(raw: unknown): string[] {
+    return LegacyService.parseCommaSeparatedIdsParam(raw);
+  }
+
+  // Shared by customTagIds and ids (buildTestcaseFilterFragments): both accept either the param
+  // repeated or one comma-separated value, same as a plain HTML multi-select would produce either
+  // way depending on how the caller built the query string.
+  private static parseCommaSeparatedIdsParam(raw: unknown): string[] {
     const parts = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
     return [...new Set(parts.flatMap((p) => String(p).split(",")).map((s) => s.trim()).filter(Boolean))];
   }
@@ -3732,6 +3871,25 @@ export class LegacyService implements OnModuleInit {
       filters.push(
         `EXISTS (SELECT 1 FROM testcase_custom_tags tct WHERE tct.testcase_id = testcases.id AND tct.tag_id = ANY($${values.length}::uuid[]))`
       );
+    }
+
+    /*
+     * `ids` — an explicit list of test case ids. Used by the repository's "Export" action once the
+     * user has ticked specific rows: the on-screen checkboxes previously had no effect on Export at
+     * all, which always exported every row matching the suite/column filters regardless of
+     * selection. When present, `ids` is meant to scope the result to exactly those rows (the
+     * frontend drops every other filter field once something is checked — see getExportUrl), but
+     * it is additive here like every other fragment in this method, so a caller that combines it
+     * with another filter narrows rather than silently losing the id scoping.
+     *
+     * Validated the same way as customTagIds above: a malformed id silently ignored would widen an
+     * "export only these" request into "export everything" instead of erroring.
+     */
+    const ids = LegacyService.parseCommaSeparatedIdsParam(query.ids);
+    if (ids.length) {
+      if (!ids.every(isUuid)) throw new BadRequestException({ error: "ids must be valid ids" });
+      values.push(ids);
+      filters.push(`testcases.id = ANY($${values.length}::uuid[])`);
     }
 
     // Custom field filters join custom_field_values once per condition (each scoped 1:1 by
@@ -6683,6 +6841,22 @@ export class LegacyService implements OnModuleInit {
   async getBugForUser(userId: string | null | undefined, bugId: string) {
     await this.requireBugAccess(userId, bugId);
     return this.getBug(bugId);
+  }
+
+  /**
+   * Project-scoped bug lookup for a shareable Bug Details URL: accepts either the row's uuid or
+   * its external id (e.g. "PRO-BUG-12"), the same dual-key resolution getTestCaseForUser already
+   * uses for test cases. The project id in the URL is what makes the external id (unique only per
+   * project, not globally) resolvable without ambiguity, and makes a bug from another project
+   * "not found" here rather than readable by whoever guesses or is handed its code.
+   */
+  async getBugForUserByIdentifier(userId: string | null | undefined, projectId: string, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const res = isUuid(bugId)
+      ? await this.db.query<{ id: string }>("SELECT id FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [bugId, projectId])
+      : await this.db.query<{ id: string }>("SELECT id FROM bugs WHERE external_id = $1 AND project_id = $2 AND deleted_at IS NULL", [bugId, projectId]);
+    if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+    return this.getBug(res.rows[0].id);
   }
 
   // Flat discussion on a bug (V129) — the KB comment shape minus threading, anchors and resolution.
@@ -15894,30 +16068,21 @@ export class LegacyService implements OnModuleInit {
     // and stored in jira_issue_keys/linear_issue_keys like an explicit key, so everything downstream
     // (the save's ticket link and tags, regeneration, the ticket auto-comment) reads one source of
     // truth instead of re-deriving it from a selection that is not itself persisted.
-    const derivedTicket = jiraIssueKeys.length || linearIssueKeys.length || notionPageIds.length
-      ? null
-      : await this.zyraTicketFromKnowledgeSelection(projectId, knowledgeItemIds);
-    if (derivedTicket?.linked) {
-      const linkedKeys = { jira: jiraIssueKeys, linear: linearIssueKeys, notion: notionPageIds }[derivedTicket.linked.provider];
-      linkedKeys.push(derivedTicket.linked.issueKey);
-    } else if (derivedTicket?.tickets.length) {
-      // More than one ticket behind the selection: the save links every test case to exactly one
-      // ticket, so none of them can be attributed to the right one — link none rather than guess.
-      activityLog.push({
-        actor: "system",
-        stage: "todo",
-        title: "Not linked to a ticket",
-        detail: `The selected Knowledge Base documents belong to ${derivedTicket.tickets.length} tickets (${derivedTicket.tickets.map((t) => t.issueKey).join(", ")}). Test cases from this task won't be linked to a ticket and no ticket comment will be posted. Create one task per ticket to link them.`,
-        createdAt: now
-      });
-    }
-    const derivedKey = derivedTicket?.linked?.issueKey;
+    // Several tickets behind the selection are all linked: each draft is attributed to the one it
+    // cites at generation time (zyraAttributeDraftsToTickets — "KB N" citations of a ticket's mirror
+    // included), so every ticket's comment lists only its own test cases.
+    const derivedTickets = jiraIssueKeys.length || linearIssueKeys.length || notionPageIds.length
+      ? []
+      : await this.zyraTicketsFromKnowledgeSelection(projectId, knowledgeItemIds);
+    for (const ticket of derivedTickets) (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).push(ticket.issueKey);
+    const derivedKeys = new Set(derivedTickets.map((ticket) => `${ticket.provider}:${ticket.issueKey}`));
+    const derivedDetail = derivedTickets.length === 1 ? "Linked from the selected Knowledge Base document." : "Linked from the selected Knowledge Base documents.";
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
       ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
-      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Jira ticket queued for Zyra." })),
-      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Linear ticket queued for Zyra." })),
-      ...notionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: id === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Notion page queued for Zyra." }))
+      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: derivedKeys.has(`jira:${key}`) ? derivedDetail : "Selected Jira ticket queued for Zyra." })),
+      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: derivedKeys.has(`linear:${key}`) ? derivedDetail : "Selected Linear ticket queued for Zyra." })),
+      ...notionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: derivedKeys.has(`notion:${id}`) ? derivedDetail : "Selected Notion page queued for Zyra." }))
     ];
     const res = await this.db.query(
       `INSERT INTO ai_generation_requests
@@ -16059,6 +16224,9 @@ export class LegacyService implements OnModuleInit {
         input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, notion, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: LegacyService.zyraStoredLanguage(task.language) }
       });
       const drafts = aiResult.drafts;
+      // Stamped into generated_payload together with the drafts themselves, so the save reads the
+      // ticket each draft was generated for rather than re-deriving it later.
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
       const inputText = [
         story,
         context,
@@ -16085,7 +16253,8 @@ export class LegacyService implements OnModuleInit {
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel(options.knowledgeItemIds, knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
         { actor: "agent", stage: "in_progress", title: "Generation plan", detail: this.zyraThinking({ story, context, acceptanceCriteria, feedback, knowledgeCount: knowledge.length, jiraCount: jira.length, linearCount: linear.length }), createdAt: finishedAt },
-        { actor: "agent", stage: "in_review", title: "Generated testcase drafts", detail: `Generated ${drafts.length} testcase draft(s) with ${provider}${aiResult.requestId ? ` request ${aiResult.requestId}` : ""}. Cached input tokens: ${aiResult.usage.cached}.`, createdAt: finishedAt }
+        { actor: "agent", stage: "in_review", title: "Generated testcase drafts", detail: `Generated ${drafts.length} testcase draft(s) with ${provider}${aiResult.requestId ? ` request ${aiResult.requestId}` : ""}. Cached input tokens: ${aiResult.usage.cached}.`, createdAt: finishedAt },
+        ...this.zyraUnattributedDraftsActivity(unattributedDrafts, drafts.length, finishedAt)
       ];
       const successRes = await this.db.query(
         `UPDATE ai_generation_requests
@@ -16387,11 +16556,15 @@ export class LegacyService implements OnModuleInit {
       // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
       // branch) — the provider call happened and was billed either way.
       await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, aiResult.usage);
+      // Against the FULL key list (original + any the reviewer added), which is what the UPDATE below
+      // stores alongside these drafts — see processZyraTask's identical call.
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
         { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel([], knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
-        { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now }
+        { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now },
+        ...this.zyraUnattributedDraftsActivity(unattributedDrafts, aiResult.drafts.length, now)
       ];
       const previousSources = normalizeJsonArray(previousSourceSummary);
       const nextSources = [
@@ -16651,34 +16824,53 @@ export class LegacyService implements OnModuleInit {
 
       const jiraKeys = normalizeJsonArray(existing.jira_issue_keys).map(String).filter(Boolean);
       const linearKeys = normalizeJsonArray(existing.linear_issue_keys).map(String).filter(Boolean);
-      const jiraIssueKey = jiraKeys[0] || null;
-      const linearIssueKey = linearKeys[0] || null;
-      const jiraTicket = jiraIssueKey
-        ? await client.query("SELECT jira_url FROM jira_tickets WHERE project_id = $1 AND jira_issue_key = $2 LIMIT 1", [projectId, jiraIssueKey]).catch(() => ({ rows: [] as Body[] }))
-        : { rows: [] as Body[] };
-      const jiraUrl = jiraTicket.rows[0]?.jira_url || null;
-      const linearTicket = linearIssueKey
-        ? await client.query("SELECT linear_url FROM linear_tickets WHERE project_id = $1 AND linear_issue_key = $2 LIMIT 1", [projectId, linearIssueKey]).catch(() => ({ rows: [] as Body[] }))
-        : { rows: [] as Body[] };
-      const linearUrl = linearTicket.rows[0]?.linear_url || null;
-      const notionPageId = normalizeJsonArray(existing.notion_page_ids).map(String).filter(Boolean)[0] || null;
-      const notionPage = notionPageId
-        ? await client.query("SELECT notion_url FROM notion_pages WHERE project_id = $1 AND notion_page_id = $2 LIMIT 1", [projectId, notionPageId]).catch(() => ({ rows: [] as Body[] }))
-        : { rows: [] as Body[] };
-      const notionUrl = notionPage.rows[0]?.notion_url || null;
-      // A task carries either Jira or Linear keys, never both (the Requirements page creates one
-      // task per ticket) — this just resolves whichever one applies for the "already linked, update
-      // in place" lookup below. Chat-staged rows never set these, so this is always empty for them
-      // — every chat create draft goes through the plain "create new testcase" branch.
-      // severity/component now selected alongside id (previously id-only) so the create/update
-      // payload below can decide "only fill if blank" for those two fields — see its own comment.
-      const existingLinked = jiraIssueKey
-        ? await client.query("SELECT id, severity, component FROM testcases WHERE project_id = $1 AND jira_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, jiraIssueKey])
-        : linearIssueKey
-        ? await client.query("SELECT id, severity, component FROM testcases WHERE project_id = $1 AND linear_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, linearIssueKey])
-        : notionPageId
-        ? await client.query("SELECT id, severity, component FROM testcases WHERE project_id = $1 AND notion_page_id = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, notionPageId])
-        : { rows: [] as Body[] };
+      // A task can name several tickets, across both providers (the Feedback tab's pickers, or
+      // several keys passed to createZyraTask). Only a single-ticket task links every draft to its
+      // ticket; with more, each draft carries the one it was attributed to at generation time
+      // (zyraAttributeDraftsToTickets) — never "the first key" for all of them, which posted every
+      // test case to one ticket and, with Jira + Linear, to both. Chat-staged rows never set these,
+      // so all of this is empty for them — every chat create draft goes through the plain "create
+      // new testcase" branch.
+      const notionPageIds = normalizeJsonArray(existing.notion_page_ids).map(String).filter(Boolean);
+      const singleTicket = jiraKeys.length + linearKeys.length + notionPageIds.length === 1;
+      const jiraIssueKey = singleTicket ? jiraKeys[0] ?? null : null;
+      const linearIssueKey = singleTicket ? linearKeys[0] ?? null : null;
+      const notionPageId = singleTicket ? notionPageIds[0] ?? null : null;
+      const ticketUrls = new Map<string, string | null>();
+      if (jiraKeys.length) {
+        const res = await client.query("SELECT jira_issue_key, jira_url FROM jira_tickets WHERE project_id = $1 AND jira_issue_key = ANY($2::text[])", [projectId, jiraKeys]).catch(() => ({ rows: [] as Body[] }));
+        for (const row of res.rows) if (!ticketUrls.get(`jira:${row.jira_issue_key}`)) ticketUrls.set(`jira:${row.jira_issue_key}`, row.jira_url || null);
+      }
+      if (linearKeys.length) {
+        const res = await client.query("SELECT linear_issue_key, linear_url FROM linear_tickets WHERE project_id = $1 AND linear_issue_key = ANY($2::text[])", [projectId, linearKeys]).catch(() => ({ rows: [] as Body[] }));
+        for (const row of res.rows) if (!ticketUrls.get(`linear:${row.linear_issue_key}`)) ticketUrls.set(`linear:${row.linear_issue_key}`, row.linear_url || null);
+      }
+      if (notionPageIds.length) {
+        const res = await client.query("SELECT notion_page_id, notion_url FROM notion_pages WHERE project_id = $1 AND notion_page_id = ANY($2::text[])", [projectId, notionPageIds]).catch(() => ({ rows: [] as Body[] }));
+        for (const row of res.rows) if (!ticketUrls.get(`notion:${row.notion_page_id}`)) ticketUrls.set(`notion:${row.notion_page_id}`, row.notion_url || null);
+      }
+      // The test cases already linked to each of the task's tickets, oldest first, for the
+      // "already linked, update in place" pairing (zyraDraftTicketLink). severity/component are
+      // selected alongside id so the create/update payload below can decide "only fill if blank"
+      // for those two fields — see its own comment.
+      const existingLinkedByTicket = new Map<string, Body[]>();
+      if (jiraKeys.length || linearKeys.length || notionPageIds.length) {
+        const linked = await client.query(
+          `SELECT id, severity, component, jira_issue_key, linear_issue_key, notion_page_id FROM testcases
+           WHERE project_id = $1 AND deleted_at IS NULL
+             AND (jira_issue_key = ANY($2::text[]) OR linear_issue_key = ANY($3::text[]) OR notion_page_id = ANY($4::text[]))
+           ORDER BY updated_at ASC`,
+          [projectId, jiraKeys, linearKeys, notionPageIds]
+        );
+        for (const row of linked.rows) {
+          const pools = [
+            ...(row.jira_issue_key && jiraKeys.includes(row.jira_issue_key) ? [`jira:${row.jira_issue_key}`] : []),
+            ...(row.linear_issue_key && linearKeys.includes(row.linear_issue_key) ? [`linear:${row.linear_issue_key}`] : []),
+            ...(row.notion_page_id && notionPageIds.includes(row.notion_page_id) ? [`notion:${row.notion_page_id}`] : [])
+          ];
+          for (const pool of pools) existingLinkedByTicket.set(pool, [...(existingLinkedByTicket.get(pool) || []), row]);
+        }
+      }
 
       // Pre-validate every update/archive target still exists before writing anything, so a target
       // deleted between staging and saving aborts the whole batch with a clear list, rather than an
@@ -16747,12 +16939,12 @@ export class LegacyService implements OnModuleInit {
         chatSessionId: existing.chat_session_id ?? null,
         batchSuiteId,
         jiraIssueKey,
-        jiraUrl,
         linearIssueKey,
-        linearUrl,
         notionPageId,
-        notionUrl,
-        existingLinked,
+        ticketUrls,
+        existingLinkedByTicket,
+        linkedPositions: new Map(),
+        claimedLinkedIds: new Set(),
         validSuiteIds
       };
       // Selected by ZYRA_SET_BASED_SAVE_ENABLED (default off — see the flag's own comment). Both
@@ -16857,13 +17049,9 @@ export class LegacyService implements OnModuleInit {
     // say: an update and an archive push the exact same row shape (a plain toCamel'd testcases
     // row), distinguishable only here, at the point `opType` is actually known.
     const touchedActions: Array<"add" | "update" | "archive"> = [];
-    // existingLinked pairs positionally with create-type entries only ("the Nth create draft in
-    // this save" ↔ "the Nth already-Jira/Linear-linked testcase, oldest first") — mirrors the
-    // original single-item-per-transaction zyraSave exactly, which iterated `selected` under the
-    // assumption every entry was a create (true for every Task-board batch, the only source that
-    // ever populates jiraIssueKey/linearIssueKey in the first place). A running counter here keeps
-    // that same pairing correct even though `selected` can now also hold update/archive entries.
-    let createPosition = 0;
+    // Already-linked testcases pair positionally with create-type entries only, per ticket ("the
+    // Nth create draft for ticket K" ↔ "the Nth testcase already linked to K, oldest first") — see
+    // zyraDraftTicketLink. Update/archive entries never consume a position.
     for (const entry of selected) {
       const opType = entry.opType || "create";
       if (opType === "update" || opType === "archive") {
@@ -16878,9 +17066,9 @@ export class LegacyService implements OnModuleInit {
         );
         continue;
       }
-      const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const existingLinkedRow = ctx.existingLinked.rows[linkedIndex];
+      const link = this.zyraDraftTicketLink(ctx, draft);
+      const existingLinkedRow = link.existingLinkedRow;
       // Q11: whichever suite this entry would have targeted, re-validated live (see zyraSaveAttempt)
       // rather than trusted from whenever it was resolved — a soft-deleted suite falls back to
       // unassigned instead of failing this entry or the batch.
@@ -16890,9 +17078,9 @@ export class LegacyService implements OnModuleInit {
       const tags = Array.from(new Set([
         ...baseTags,
         "zyra",
-        ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
-        ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
-        ...(ctx.notionPageId ? [notionPageKey(ctx.notionPageId)] : []),
+        ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
+        ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
+        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -16921,12 +17109,12 @@ export class LegacyService implements OnModuleInit {
         type: draft.type || "Functional",
         status: draft.status || "Draft",
         automationTags: tags,
-        jiraIssueKey: draft.jiraIssueKey || ctx.jiraIssueKey,
-        jiraUrl: ctx.jiraUrl,
-        linearIssueKey: ctx.linearIssueKey,
-        linearUrl: ctx.linearUrl,
-        notionPageId: ctx.notionPageId,
-        notionUrl: ctx.notionUrl,
+        jiraIssueKey: link.jiraIssueKey,
+        jiraUrl: link.jiraUrl,
+        linearIssueKey: link.linearIssueKey,
+        linearUrl: link.linearUrl,
+        notionPageId: link.notionPageId,
+        notionUrl: link.notionUrl,
         // Carried from the staged draft (already resolved+verified at generation time) onto the
         // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
         // no sourceRefs ever attached) simply carries none, same as it always has. Same "only fill
@@ -16941,7 +17129,7 @@ export class LegacyService implements OnModuleInit {
       };
       this.assertTestcaseFieldLengths(payload);
       if (existingLinkedRow?.id) {
-        const linkedId = ctx.existingLinked.rows[linkedIndex].id;
+        const linkedId = existingLinkedRow.id;
         const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
         // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
         // sync-integration wiring in zyraSave has something to target — this row IS what was just
@@ -16985,7 +17173,6 @@ export class LegacyService implements OnModuleInit {
     // identical field for why this can't be derived from `touched` alone after the fact.
     const touchedActionSlots: Array<"add" | "update" | "archive" | null> = new Array(selected.length).fill(null);
     const toInsert: Array<{ slot: number; payload: Body; draft: Body; entryReason: unknown }> = [];
-    let createPosition = 0;
 
     for (let slot = 0; slot < selected.length; slot += 1) {
       const entry = selected[slot];
@@ -17003,9 +17190,9 @@ export class LegacyService implements OnModuleInit {
         continue;
       }
 
-      const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const existingLinkedRow = ctx.existingLinked.rows[linkedIndex];
+      const link = this.zyraDraftTicketLink(ctx, draft);
+      const existingLinkedRow = link.existingLinkedRow;
       // Q11: same live re-validation as processZyraSaveEntriesSequential — see that function's
       // identical comment.
       const rawTargetSuiteId = draft.suiteId || ctx.batchSuiteId;
@@ -17014,9 +17201,9 @@ export class LegacyService implements OnModuleInit {
       const tags = Array.from(new Set([
         ...baseTags,
         "zyra",
-        ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
-        ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
-        ...(ctx.notionPageId ? [notionPageKey(ctx.notionPageId)] : []),
+        ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
+        ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
+        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -17041,12 +17228,12 @@ export class LegacyService implements OnModuleInit {
         type: draft.type || "Functional",
         status: draft.status || "Draft",
         automationTags: tags,
-        jiraIssueKey: draft.jiraIssueKey || ctx.jiraIssueKey,
-        jiraUrl: ctx.jiraUrl,
-        linearIssueKey: ctx.linearIssueKey,
-        linearUrl: ctx.linearUrl,
-        notionPageId: ctx.notionPageId,
-        notionUrl: ctx.notionUrl,
+        jiraIssueKey: link.jiraIssueKey,
+        jiraUrl: link.jiraUrl,
+        linearIssueKey: link.linearIssueKey,
+        linearUrl: link.linearUrl,
+        notionPageId: link.notionPageId,
+        notionUrl: link.notionUrl,
         // Same "only overwrite when this run resolved something" rule as processZyraSaveEntriesSequential's
         // identical field — see that function's comment for why null (not []) is what protects an
         // already-linked row's existing citations from being wiped by an ungrounded regeneration.
@@ -18429,7 +18616,7 @@ export class LegacyService implements OnModuleInit {
       knowledge,
       "Jira tickets (cite by its ticket key):",
       jira,
-      "Linear tickets:",
+      "Linear tickets (cite by its ticket key):",
       linear,
       ...(notion ? ["Notion pages (cite by its page key):", notion] : []),
       "Existing testcases to review for context and duplicate avoidance (cite by its external id):",

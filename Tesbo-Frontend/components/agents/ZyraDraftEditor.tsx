@@ -132,12 +132,12 @@ export function ZyraDraftEditor({
       {/* Bound to the draft's description — what zyraSave writes to the test case's Description
           column, and what the repository's edit form shows under that same label. */}
       <Field>
-        <FieldLabel>{t("drawer.description")}</FieldLabel>
+        <FieldLabel>{t("col.description")}</FieldLabel>
         <Textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={2} />
       </Field>
       <Field>
-        <FieldLabel>{t("drawer.testData")}</FieldLabel>
-        <Textarea value={testData} onChange={(event) => setTestData(event.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
+        <FieldLabel>{t("col.testData")}</FieldLabel>
+        <Textarea value={testData} onChange={(event) => setTestData(event.target.value)} rows={2} placeholder={t("editor.testDataPlaceholder")} />
       </Field>
       <div>
         <FieldLabel>{t("col.steps")}</FieldLabel>

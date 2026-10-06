@@ -60,6 +60,8 @@ const EN = {
   "col.preconditions": "Preconditions",
   "col.expectedResult": "Expected result",
   "col.expectedResultCap": "Expected Result",
+  "col.description": "Description",
+  "col.testData": "Test Data",
   "col.steps": "Steps",
   "col.tags": "Tags",
   "col.testcase": "Testcase",
@@ -272,6 +274,7 @@ const EN = {
   // ── Draft editor ────────────────────────────────────────────────────────────
   "editor.select": "Select",
   "editor.componentPlaceholder": "e.g. Checkout",
+  "editor.testDataPlaceholder": "Input data, sample values, or setup-specific data",
   "editor.stepAction": (p) => `Step ${p.n} action`,
   "editor.remove": "Remove",
   "editor.addStep": "+ Add step",
@@ -464,6 +467,8 @@ const RU: Record<ZyraTextKey, Entry> = {
   "col.preconditions": "Предусловия",
   "col.expectedResult": "Ожидаемый результат",
   "col.expectedResultCap": "Ожидаемый результат",
+  "col.description": "Описание",
+  "col.testData": "Тестовые данные",
   "col.steps": "Шаги",
   "col.tags": "Теги",
   "col.testcase": "Тест-кейс",
@@ -661,6 +666,7 @@ const RU: Record<ZyraTextKey, Entry> = {
 
   "editor.select": "Выберите",
   "editor.componentPlaceholder": "например, Оформление заказа",
+  "editor.testDataPlaceholder": "Входные данные, примеры значений или данные для настройки",
   "editor.stepAction": (p) => `Действие шага ${p.n}`,
   "editor.remove": "Удалить",
   "editor.addStep": "+ Добавить шаг",

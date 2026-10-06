@@ -395,6 +395,76 @@ test.describe("bug CRUD", () => {
 });
 
 /*
+ * GET /api/projects/:projectId/bugs/:bugId — the project-scoped lookup the Bug Details page's
+ * shareable URL uses, added so a bug can be addressed by its stable external id (e.g. "PRO-BUG-12")
+ * and not only its uuid. Mirrors getTestCaseForUser's dual-key resolution; the project id in the
+ * URL is what makes the external id (unique only per project) resolvable without ambiguity.
+ */
+test.describe("bug details by project-scoped id", () => {
+  test("resolves a bug by its external id, scoped to the project, same shape as the flat uuid route", async ({ request }) => {
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Scoped Lookup ${Date.now()}`, description: "Found by external id", severity: "Medium" },
+      })
+    ).json();
+    try {
+      const byExternalId = await request.get(`/api/projects/${ctx.projectId}/bugs/${created.externalId}`);
+      expect(byExternalId.ok()).toBeTruthy();
+      const bodyByExternalId = await byExternalId.json();
+      expect(bodyByExternalId.id).toBe(created.id);
+      expect(bodyByExternalId.description).toBe("Found by external id");
+
+      // Same route also still resolves by uuid — one endpoint, either key, matching getTestCase's
+      // precedent.
+      const byUuid = await request.get(`/api/projects/${ctx.projectId}/bugs/${created.id}`);
+      expect(byUuid.ok()).toBeTruthy();
+      expect((await byUuid.json()).externalId).toBe(created.externalId);
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a bug's external id does not resolve under a different project", async ({ request }) => {
+    const otherProject = await (
+      await request.post(`/api/projects`, {
+        data: { name: `E2E Bug Scope Other ${Date.now()}`, key: `BSO${Date.now()}`.slice(0, 16), description: "", projectType: "tesbox" },
+      })
+    ).json();
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Scope Mismatch ${Date.now()}`, severity: "Medium" },
+      })
+    ).json();
+    try {
+      const res = await request.get(`/api/projects/${otherProject.id}/bugs/${created.externalId}`, { failOnStatusCode: false });
+      expect(res.status()).toBe(404);
+
+      // Same for the uuid: a real bug, but not this project's.
+      const resByUuid = await request.get(`/api/projects/${otherProject.id}/bugs/${created.id}`, { failOnStatusCode: false });
+      expect(resByUuid.status()).toBe(404);
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${otherProject.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a deleted bug's external id is not found, and a malformed id 404s rather than 500ing", async ({ request }) => {
+    const created = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Scope Deleted ${Date.now()}`, severity: "Low" },
+      })
+    ).json();
+    await request.delete(`/api/bugs/${created.id}`);
+
+    const afterDelete = await request.get(`/api/projects/${ctx.projectId}/bugs/${created.externalId}`, { failOnStatusCode: false });
+    expect(afterDelete.status()).toBe(404);
+
+    const malformed = await request.get(`/api/projects/${ctx.projectId}/bugs/NOPE-BUG-999999`, { failOnStatusCode: false });
+    expect(malformed.status()).toBe(404);
+  });
+});
+
+/*
  * Edit Bug's Jira/Linear field — previously a plain URL box that always sent
  * integrationIssueKey: null on save, so an already-linked ticket could never actually be changed
  * from the edit screen. The picker itself (Tesbo-Frontend/components/IssuePickerModal.tsx, reused

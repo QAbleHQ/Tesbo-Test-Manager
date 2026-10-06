@@ -1,4 +1,5 @@
 import { avatarColor } from "@/lib/avatarColors";
+import { formatDate as formatDateShared } from "@/lib/date";
 
 export function getInitials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -31,11 +32,7 @@ export function formatDuration(startedAt: string | null, endedAt: string | null)
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
-export function formatDate(iso: string): string {
-  const ts = new Date(iso).getTime();
-  if (Number.isNaN(ts)) return "—";
-  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
-}
+export const formatDate = formatDateShared;
 
 export function RunAvatar({ name }: { name: string }) {
   return (

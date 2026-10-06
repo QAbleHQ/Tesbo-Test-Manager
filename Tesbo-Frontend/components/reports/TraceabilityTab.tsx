@@ -4,6 +4,7 @@ import { useCallback, useMemo, useState } from "react";
 import { IconSearch } from "@tabler/icons-react";
 import { StatusChip, PriorityBadge, type Priority } from "@/components/ui";
 import type { RequirementMatrixRow } from "@/lib/api";
+import { formatDate } from "@/lib/date";
 import { statusTone, LoadingBlock } from "./shared";
 
 const MATRIX_COLUMNS = [
@@ -165,7 +166,7 @@ export function TraceabilityTab({
                           <StatusChip tone={statusTone(row.executionStatus)}>{row.executionStatus || "—"}</StatusChip>
                         </td>
                         <td className={`whitespace-nowrap px-3 py-2 text-[11px] text-[var(--muted-soft)] ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
-                          {row.executedAt ? new Date(row.executedAt).toLocaleDateString() : "—"}
+                          {row.executedAt ? formatDate(row.executedAt) : "—"}
                         </td>
                         <td className={`px-3 py-2 text-[13px] ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
                           {row.bugTitle ? (

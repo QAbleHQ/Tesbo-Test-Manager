@@ -845,4 +845,56 @@ test.describe("test case repository (UI)", () => {
     expect(xlsxHref).toContain("sortBy=title");
     expect(xlsxHref).toContain("sortDir=asc");
   });
+
+  /*
+   * Reported bug: "when i am exporting selected test cases, all are getting exported" — ticking
+   * specific rows' checkboxes and hitting Export had no effect at all; the links were built purely
+   * from the suite/column filters (see TCR-18/19 above), never from the row selection. Fixed by
+   * threading selectedCaseIds into currentTestCaseExportFilters as `ids`, which getExportUrl treats
+   * as overriding every other filter field once anything is checked — ticking rows means "export
+   * exactly these", not "these intersected with whatever the filter panel still shows". Whether the
+   * downloaded rows actually match `ids` (and that it combines correctly with other params at the API
+   * level) is covered in e2e/api/import-export.spec.ts; this proves the UI link itself carries the
+   * selected ids and drops the ambient suite filter once a row is checked.
+   */
+  test(
+    "TCR-21 the Export menu links carry the checked rows' ids, overriding the active suite filter",
+    async ({ browser }) => {
+      const suiteName = stamp("ExportSelSuite");
+      const suiteId = await seedSuite(suiteName);
+      const selectedTitle = stamp("ExportSelSelected");
+      const selectedId = await seedCase(selectedTitle, { suiteId });
+      const otherTitle = stamp("ExportSelOther");
+      await seedCase(otherTitle, { suiteId });
+
+      const page = await openRepository(browser);
+
+      // Filter down to the suite first, so there is an ambient filter for the selection to override.
+      await page.getByRole("button", { name: new RegExp(suiteName) }).click();
+      await expect(row(page, selectedTitle)).toBeVisible();
+
+      await page.getByRole("row").filter({ hasText: selectedTitle }).getByRole("checkbox").first().check();
+      await expect(page.getByText("1 selected")).toBeVisible();
+
+      await page.getByRole("button", { name: "Export" }).click();
+      const csvHref = await page.getByRole("link", { name: /^Export as CSV/ }).getAttribute("href");
+      expect(csvHref, "the export link must carry the checked row's id").toContain(`ids=${selectedId}`);
+      expect(
+        csvHref,
+        "a row selection must override the ambient suite filter, not merely add to it",
+      ).not.toContain("suiteId=");
+
+      const xlsxHref = await page.getByRole("link", { name: /^Export as Excel/ }).getAttribute("href");
+      expect(xlsxHref).toContain(`ids=${selectedId}`);
+      expect(xlsxHref).not.toContain("suiteId=");
+
+      // Clearing the selection reverts Export to the ambient suite filter again.
+      await page.keyboard.press("Escape");
+      await page.getByRole("button", { name: "Clear selection" }).click();
+      await page.getByRole("button", { name: "Export" }).click();
+      const clearedHref = await page.getByRole("link", { name: "Export as CSV" }).getAttribute("href");
+      expect(clearedHref).toContain(`suiteId=${suiteId}`);
+      expect(clearedHref).not.toContain("ids=");
+    },
+  );
 });

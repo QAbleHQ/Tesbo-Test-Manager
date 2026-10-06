@@ -27,6 +27,7 @@ import { ListWorkspaceLayout, PageHeader, Breadcrumbs } from "@/components/workf
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+import { formatDate } from "@/lib/date";
 
 interface AgentsPageData {
   state: ZyraAgentState;
@@ -74,15 +75,13 @@ const ACTIVE_TASK_STATUSES = new Set(["todo", "in_progress", "in_review"]);
 
 // Absolute date only — this card must not read "Nd ago" again (it used to go stale
 // silently whenever activity came from Zyra chat instead of the task board; see
-// `agent.lastUsedAt` on the backend, which now accounts for both). This formatter is local
-// to the Agents tab card; the Conversations list on the Zyra chat screen has its own
-// `formatTime` and is intentionally left on its existing "24 Aug, 08:08 pm" format.
+// `agent.lastUsedAt` on the backend, which now accounts for both). Sitewide standard
+// format (lib/date.ts) — now shared with the Zyra chat Conversations list's own
+// `formatTime`, which previously kept its own "24 Aug, 08:08 pm" shape.
 function formatLastUsedDate(iso: string): string | null {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
-  const day = String(date.getDate()).padStart(2, "0");
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  return `${day}/${month}/${date.getFullYear()}`;
+  return formatDate(date);
 }
 
 /*
