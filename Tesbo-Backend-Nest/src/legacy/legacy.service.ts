@@ -6766,6 +6766,22 @@ export class LegacyService implements OnModuleInit {
     return this.getBug(bugId);
   }
 
+  /**
+   * Project-scoped bug lookup for a shareable Bug Details URL: accepts either the row's uuid or
+   * its external id (e.g. "PRO-BUG-12"), the same dual-key resolution getTestCaseForUser already
+   * uses for test cases. The project id in the URL is what makes the external id (unique only per
+   * project, not globally) resolvable without ambiguity, and makes a bug from another project
+   * "not found" here rather than readable by whoever guesses or is handed its code.
+   */
+  async getBugForUserByIdentifier(userId: string | null | undefined, projectId: string, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const res = isUuid(bugId)
+      ? await this.db.query<{ id: string }>("SELECT id FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [bugId, projectId])
+      : await this.db.query<{ id: string }>("SELECT id FROM bugs WHERE external_id = $1 AND project_id = $2 AND deleted_at IS NULL", [bugId, projectId]);
+    if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+    return this.getBug(res.rows[0].id);
+  }
+
   // Flat discussion on a bug (V129) — the KB comment shape minus threading, anchors and resolution.
   // Routed under /api/projects/:projectId so ProjectWriteLockGuard covers the write, which is why
   // the bug is resolved against the URL's project rather than through requireBugAccess alone.

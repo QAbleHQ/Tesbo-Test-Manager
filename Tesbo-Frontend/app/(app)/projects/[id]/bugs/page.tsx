@@ -3,7 +3,7 @@
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { IconPencil, IconTrash } from "@tabler/icons-react";
+import { IconPencil, IconShare2, IconTrash } from "@tabler/icons-react";
 import {
   listBugs,
   createBug,
@@ -20,6 +20,7 @@ import {
 import {
   Button,
   Card,
+  CopyButton,
   Input,
   Drawer,
   Field,
@@ -67,6 +68,13 @@ const STATUS_COLOR: Record<string, string> = {
   Closed: "var(--success)",
 };
 
+/** The Bug Details page's own shareable URL — keyed on the bug's unique id, not its uuid, so the
+ *  copied link stays readable and stable even after a reporting/import round trip. */
+function bugShareUrl(projectId: string, externalId: string): string {
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  return `${origin}/projects/${projectId}/bugs/${externalId}`;
+}
+
 /* ───── View toggle buttons ───── */
 function ViewToggle({
   mode,
@@ -110,11 +118,13 @@ function ViewToggle({
 /* ───── Kanban card ───── */
 function KanbanCard({
   bug,
+  projectId,
   onView,
   onEdit,
   onDelete,
 }: {
   bug: BugItem;
+  projectId: string;
   onView: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -134,7 +144,17 @@ function KanbanCard({
     >
       <div className="flex items-start justify-between gap-2 mb-2">
         <div className="min-w-0">
-          <p className="font-mono text-[11px] text-[var(--muted-soft)]">{bug.integrationIssueKey || bug.externalId}</p>
+          {/* The bug's own unique id, always — not the linked Jira/Linear ticket key (that still
+              shows in the details body's tracker link). Navigates straight to the shareable Bug
+              Details URL; stopPropagation keeps it from also firing the card's own onView
+              (open-in-drawer) click. */}
+          <Link
+            href={`/projects/${projectId}/bugs/${bug.externalId}`}
+            onClick={(e) => e.stopPropagation()}
+            className="block font-mono text-[11px] text-[var(--muted-soft)] hover:text-[var(--accent-light)] hover:underline"
+          >
+            {bug.externalId}
+          </Link>
           <h4 className="text-sm font-medium text-[var(--foreground)] leading-snug line-clamp-2 break-words">
             {bug.title}
           </h4>
@@ -228,12 +248,14 @@ function KanbanCard({
 function KanbanColumn({
   status,
   bugs,
+  projectId,
   onView,
   onEdit,
   onDelete,
 }: {
   status: string;
   bugs: BugItem[];
+  projectId: string;
   onView: (b: BugItem) => void;
   onEdit: (b: BugItem) => void;
   onDelete: (id: string) => void;
@@ -259,6 +281,7 @@ function KanbanColumn({
             <KanbanCard
               key={b.id}
               bug={b}
+              projectId={projectId}
               onView={() => onView(b)}
               onEdit={() => onEdit(b)}
               onDelete={() => onDelete(b.id)}
@@ -791,6 +814,7 @@ export default function BugsPage() {
                       key={col.status}
                       status={col.status}
                       bugs={col.bugs}
+                      projectId={projectId}
                       onView={setViewBug}
                       onEdit={openEdit}
                       onDelete={setDeletingId}
@@ -855,7 +879,17 @@ export default function BugsPage() {
                               */}
                             <td>
                               <div className="flex flex-col gap-0.5 max-w-sm">
-                                <span className="font-mono text-[11px] text-[var(--muted-soft)]">{b.integrationIssueKey || b.externalId}</span>
+                                {/* The bug's own unique id, always — not the linked Jira/Linear ticket key
+                                    (that still shows in the details body's tracker link). Navigates to the
+                                    shareable Bug Details URL; stopPropagation keeps it from also firing the
+                                    row's own open-in-drawer click. */}
+                                <Link
+                                  href={`/projects/${projectId}/bugs/${b.externalId}`}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="font-mono text-[11px] text-[var(--muted-soft)] hover:text-[var(--accent-light)] hover:underline w-fit"
+                                >
+                                  {b.externalId}
+                                </Link>
                                 <span
                                   title={b.title}
                                   className="line-clamp-2 text-sm font-medium text-[var(--accent-light)] hover:underline break-words"
@@ -1008,14 +1042,31 @@ export default function BugsPage() {
           viewBug && (
             <div className="min-w-0">
               <p className="mb-0.5 text-xs font-medium uppercase tracking-wide text-[var(--muted-soft)]">Bug Details</p>
-              {/* Bug Key + Title — severity/priority/status are labelled fields in the body.
-                  Falls back to the bug's own per-project id when it has no external tracker
-                  ticket — same "Bug Key" fallback the Test Run and Test Case Detail screens use. */}
-              <p className="font-mono text-xs text-[var(--muted-soft)] mb-0.5">{viewBug.integrationIssueKey || viewBug.externalId}</p>
+              {/* Bug Key + Title — severity/priority/status are labelled fields in the body. Always
+                  the bug's own unique id, not the linked Jira/Linear ticket key (that still shows
+                  in the details body's tracker link) — the shareable URL is keyed on this id. */}
+              <Link
+                href={`/projects/${projectId}/bugs/${viewBug.externalId}`}
+                className="block w-fit font-mono text-xs text-[var(--muted-soft)] mb-0.5 hover:text-[var(--accent-light)] hover:underline"
+              >
+                {viewBug.externalId}
+              </Link>
               <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
                 {viewBug.title}
               </h3>
             </div>
+          )
+        }
+        headerExtra={
+          viewBug && (
+            <CopyButton
+              value={bugShareUrl(projectId, viewBug.externalId)}
+              icon={IconShare2}
+              iconOnly
+              label="Share"
+              copiedLabel="Link copied"
+              size="md"
+            />
           )
         }
       >

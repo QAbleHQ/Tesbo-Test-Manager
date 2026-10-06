@@ -1266,8 +1266,12 @@ test.describe("bugs — header status counts", () => {
  * A bug never linked to Jira/Linear has no integrationIssueKey, and until now "Bug Key" had
  * nothing else to show for it anywhere in the app (Test Run, Test Case Detail, and this page all
  * left it blank). Every bug now gets its own per-project sequential id (`<KEY>-BUG-<n>`, the same
- * scheme test cases already have), and these three surfaces — board card, list row, details modal
- * — fall back to it.
+ * scheme test cases already have).
+ *
+ * This id is now shown unconditionally, not just as a fallback: the shareable Bug Details URL is
+ * keyed on it (see "bug id link (shareable URL)" below), so board card, list row, drawer header
+ * and full page header all show it even when the bug IS linked to a tracker — the linked ticket's
+ * own key still shows, just in the details body's Jira/Linear link, not as the primary label.
  */
 test.describe("bug external id (Bug Key fallback)", () => {
   let api: APIRequestContext;
@@ -1315,6 +1319,178 @@ test.describe("bug external id (Bug Key fallback)", () => {
     // (which stays hidden here since this bug has no externalUrl).
     await row.click();
     await expect(page.getByText(bug.externalId, { exact: true })).toBeVisible();
+  });
+
+  test("BUG-U-116 the board card, list row, and details modal show the bug's own unique id, not the linked ticket key", async ({ page }) => {
+    const title = `E2E Bug Key Over Ticket ${uniqueSuffix()}`;
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: { title, severity: "Medium", integrationProvider: "JIRA", integrationIssueKey: "YAS-5", externalUrl: "https://e2e.atlassian.net/browse/YAS-5" },
+      })
+    ).json();
+    expect(bug.externalId).toMatch(/^.+-BUG-\d+$/);
+
+    await page.goto(`/projects/${projectId}/bugs`);
+
+    // Board view — the card shows the bug's own id, never the linked ticket key.
+    await expect(page.getByText(bug.externalId, { exact: true }).first()).toBeVisible();
+    await expect(page.getByText("YAS-5", { exact: true })).toHaveCount(0);
+
+    // List view — same id in the title cell, still not the ticket key.
+    await page.getByRole("button", { name: "List", exact: true }).click();
+    const row = page.locator("tbody tr").filter({ hasText: title });
+    await expect(row.getByText(bug.externalId, { exact: true })).toBeVisible();
+    await expect(row.getByText("YAS-5", { exact: true })).toHaveCount(0);
+
+    // Details modal — the own id is the primary label; the ticket key still shows, but only
+    // inside the Jira link section further down, not as the id.
+    await row.click();
+    await expect(page.getByText(bug.externalId, { exact: true }).first()).toBeVisible();
+    await expect(page.getByRole("link", { name: "YAS-5", exact: true })).toBeVisible();
+  });
+});
+
+/*
+ * The Bug ID (board card / list row / drawer header) is now a link to the bug's own full page, and
+ * that page resolves the external id directly — not just the uuid. Ticket: "Generate Unique Bug ID
+ * and Make It a Shareable Link". The uuid-addressed page is covered by "bug full page" above; these
+ * cover the id becoming clickable, and the externalId becoming an equally valid, shareable way to
+ * reach that same page.
+ */
+test.describe("bug id link (shareable URL)", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-110 the board card's Bug ID links straight to the full page, not the side panel", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Bug ID Link Board ${uniqueSuffix()}`, severity: "Medium" } })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("link", { name: bug.externalId, exact: true }).click();
+
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.externalId}$`));
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+      // Not the board or a drawer over it: navigation replaced the whole screen.
+      await expect(page.getByRole("button", { name: "Board", exact: true })).toHaveCount(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-111 the list row's Bug ID links straight to the full page without opening the drawer", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Bug ID Link List ${uniqueSuffix()}`, severity: "Medium" } })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.getByRole("link", { name: bug.externalId, exact: true }).click();
+
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.externalId}$`));
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+      // The drawer never opened: the list itself is gone, replaced by the full page.
+      await expect(page.locator("tbody tr")).toHaveCount(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-112 the drawer header's Bug ID also links to the full page", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Bug ID Link Drawer ${uniqueSuffix()}`, severity: "Medium" } })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      // Clicks the row itself (not the id link in its first cell) to open the drawer, exactly as
+      // BUG-U-38 does — the row's bounding box center lands on a later column.
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      // The portalled drawer renders after the table in DOM order, so its link is the later of the
+      // two now-matching "name: externalId" links (the row's own link is still underneath it).
+      await page.getByRole("link", { name: bug.externalId, exact: true }).last().click();
+
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs/${bug.externalId}$`));
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-113 a shared URL built from the external id (not the uuid) loads the right bug", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: { title: `E2E Bug ID Direct ${uniqueSuffix()}`, description: "Reached by external id", severity: "Medium" },
+      })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.externalId}`);
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+      await expect(page.getByText("Reached by external id")).toBeVisible();
+      // The old uuid URL still resolves too — existing shared links keep working.
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-114 an unknown external id says the bug could not be found, same as an unknown uuid", async ({ page }) => {
+    await page.goto(`/projects/${projectId}/bugs/NOPE-BUG-999999`);
+    await expect(page.getByText("This bug could not be found. It may have been deleted.")).toBeVisible();
+  });
+
+  test("BUG-U-115 a deleted bug's external id says it could not be found, and the id is not reissued", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Bug ID Deleted ${uniqueSuffix()}`, severity: "Low" } })
+    ).json();
+    await api.delete(`/api/bugs/${bug.id}`);
+
+    await page.goto(`/projects/${projectId}/bugs/${bug.externalId}`);
+    await expect(page.getByText("This bug could not be found. It may have been deleted.")).toBeVisible();
+  });
+
+  test("BUG-U-117 Share copies the bug's own shareable URL, from the drawer and from the full page", async ({ page, context, baseURL }) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Bug Share ${uniqueSuffix()}`, severity: "Medium" } })
+    ).json();
+    const expectedUrl = `${baseURL}/projects/${projectId}/bugs/${bug.externalId}`;
+    try {
+      // Drawer header, the icon button next to the close (X) control.
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      await page.getByRole("button", { name: "Share", exact: true }).click();
+      await expect(page.getByRole("button", { name: "Link copied", exact: true })).toBeVisible();
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(expectedUrl);
+
+      // Full page header, next to Edit — not the uuid url, the same external-id one shared from the drawer.
+      await page.goto(`/projects/${projectId}/bugs/${bug.externalId}`);
+      await page.getByRole("button", { name: "Share", exact: true }).click();
+      await expect(page.getByRole("button", { name: "Link copied", exact: true })).toBeVisible();
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(expectedUrl);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
   });
 });
 
@@ -1379,7 +1555,8 @@ test.describe("bug — editing the linked Jira/Linear ticket", () => {
     await page.goto(`/projects/${projectId}/bugs`);
     await page.getByRole("button", { name: "List", exact: true }).click();
     const row = page.locator("tbody tr").filter({ hasText: title });
-    // The page header and breadcrumb show the bug's ticket key too, so the form's own display is checked.
+    // The row's own id label and the drawer header show the bug's own unique id, not the ticket
+    // key, so the form's own display is what is checked here.
     const form = await editFromList(page, row);
 
     // The currently linked ticket is shown without having to open the picker.

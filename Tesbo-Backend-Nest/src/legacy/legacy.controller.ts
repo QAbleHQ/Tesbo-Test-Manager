@@ -903,6 +903,15 @@ export class LegacyController {
     return this.legacy.getBugForUser(req.userId, bugId);
   }
 
+  // Project-scoped (unlike /api/bugs/:bugId above) so the Bug Details page's shareable URL can
+  // carry the bug's external id (e.g. "PRO-BUG-12"), not just its uuid — the external id is only
+  // unique per project, so resolving it needs the project id from the URL. Read-only; existing
+  // mutation routes above are unaffected.
+  @Get("/api/projects/:projectId/bugs/:bugId")
+  getProjectBug(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("bugId") bugId: string) {
+    return this.legacy.getBugForUserByIdentifier(req.userId, projectId, bugId);
+  }
+
   @Patch("/api/bugs/:bugId")
   updateBug(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string, @Body() body: Record<string, any>) {
     return this.legacy.updateBug(req.userId, bugId, body);

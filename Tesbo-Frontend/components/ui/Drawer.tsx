@@ -10,11 +10,13 @@ type DrawerProps = {
   open: boolean;
   onClose: () => void;
   title?: ReactNode;
+  /** Rendered in the header, between the title and the close button — e.g. a Share icon button. */
+  headerExtra?: ReactNode;
   children: ReactNode;
   className?: string;
 };
 
-export default function Drawer({ open, onClose, title, children, className }: DrawerProps) {
+export default function Drawer({ open, onClose, title, headerExtra, children, className }: DrawerProps) {
   useEffect(() => {
     if (!open) return;
     function onKeyDown(e: KeyboardEvent) {
@@ -43,6 +45,7 @@ export default function Drawer({ open, onClose, title, children, className }: Dr
         {title ? (
           <div className="flex shrink-0 items-start justify-between gap-3 border-b border-[var(--border)] px-5 py-4">
             <div className="min-w-0 flex-1">{title}</div>
+            {headerExtra && <div className="flex shrink-0 items-center">{headerExtra}</div>}
             <button
               type="button"
               onClick={onClose}

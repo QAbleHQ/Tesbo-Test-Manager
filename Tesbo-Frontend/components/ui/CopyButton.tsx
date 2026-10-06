@@ -1,8 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ComponentType } from "react";
 import { IconClipboardCheck, IconCopy } from "@tabler/icons-react";
 import { cx } from "@/components/ui/cx";
+
+type IconComponent = ComponentType<{ size?: number; stroke?: number }>;
 
 export type CopyButtonProps = {
   value: string;
@@ -11,6 +13,8 @@ export type CopyButtonProps = {
   iconOnly?: boolean;
   size?: "sm" | "md";
   className?: string;
+  /** Resting-state icon, e.g. a share glyph instead of the default copy icon. */
+  icon?: IconComponent;
 };
 
 export default function CopyButton({
@@ -20,6 +24,7 @@ export default function CopyButton({
   iconOnly = false,
   size = "sm",
   className,
+  icon: Icon = IconCopy,
 }: CopyButtonProps) {
   const [copied, setCopied] = useState(false);
 
@@ -54,7 +59,7 @@ export default function CopyButton({
         className,
       )}
     >
-      {copied ? <IconClipboardCheck size={iconSize} stroke={1.9} /> : <IconCopy size={iconSize} stroke={1.9} />}
+      {copied ? <IconClipboardCheck size={iconSize} stroke={1.9} /> : <Icon size={iconSize} stroke={1.9} />}
       {!iconOnly && (copied ? copiedLabel : label)}
     </button>
   );

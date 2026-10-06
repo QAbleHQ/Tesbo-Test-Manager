@@ -2775,6 +2775,14 @@ export async function getBug(bugId: string): Promise<BugItem> {
 }
 
 /**
+ * Project-scoped bug lookup: accepts either the bug's uuid or its external id (e.g. "PRO-BUG-12"),
+ * so the Bug Details page's URL can be addressed and shared by the stable, human-readable id.
+ */
+export async function getProjectBug(projectId: string, bugId: string): Promise<BugItem> {
+  return api(`/api/projects/${projectId}/bugs/${bugId}`);
+}
+
+/**
  * One comment on a bug, or a reply to one (V131). The list is flat and oldest first; replies carry
  * their thread's top comment as `parentCommentId` and nest only one level deep. No resolution.
  */

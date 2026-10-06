@@ -3,15 +3,16 @@
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
+import { IconShare2 } from "@tabler/icons-react";
 import {
   deleteBug,
-  getBug,
   getJiraStatus,
   getLinearStatus,
+  getProjectBug,
   listTestRuns,
   type BugItem,
 } from "@/lib/api";
-import { Button, Modal, PageLoader } from "@/components/ui";
+import { Button, CopyButton, Modal, PageLoader } from "@/components/ui";
 import { Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -49,13 +50,15 @@ export default function BugDetailPage() {
   const [hasTestRuns, setHasTestRuns] = useState(false);
 
   const load = useCallback(() => {
-    getBug(bugId)
+    // bugId is either the bug's uuid (old shared links) or its external id (e.g. "PRO-BUG-12") —
+    // the project-scoped route resolves either, since the external id is unique only per project.
+    getProjectBug(projectId, bugId)
       .then((b) => {
         setBug(b);
         setNotFound(false);
       })
       .catch(() => setNotFound(true));
-  }, [bugId]);
+  }, [projectId, bugId]);
 
   useEffect(() => {
     if (!currentUser) {
@@ -89,7 +92,7 @@ export default function BugDetailPage() {
           { label: "Projects", href: "/projects" },
           { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
           { label: "Bugs", href: `/projects/${projectId}/bugs` },
-          { label: bug ? bug.integrationIssueKey || bug.externalId : "Bug" },
+          { label: bug ? bug.externalId : "Bug" },
         ]}
       />
     </header>
@@ -124,8 +127,9 @@ export default function BugDetailPage() {
       <main className="w-full px-6 py-8">
         <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0">
-            {/* Same "Bug Key" fallback as the panel: tracker key, else the bug's own id. */}
-            <p className="mb-1 font-mono text-xs text-[var(--muted-soft)]">{bug.integrationIssueKey || bug.externalId}</p>
+            {/* Always the bug's own unique id, not the linked tracker key (that still shows in
+                the details body's Jira/Linear link). */}
+            <p className="mb-1 font-mono text-xs text-[var(--muted-soft)]">{bug.externalId}</p>
             <div className="flex flex-wrap items-center gap-3">
               <h1 className="break-words text-xl font-bold text-[var(--foreground)]">{bug.title}</h1>
               <BugStatusBadge status={bug.status} />
@@ -135,6 +139,13 @@ export default function BugDetailPage() {
               Test Run execute page. */}
           {!editing && (
             <div className="flex shrink-0 items-center gap-2">
+              <CopyButton
+                value={`${typeof window !== "undefined" ? window.location.origin : ""}/projects/${projectId}/bugs/${bug.externalId}`}
+                icon={IconShare2}
+                label="Share"
+                copiedLabel="Link copied"
+                size="md"
+              />
               <Button variant="primary" onClick={() => setEditing(true)}>
                 Edit
               </Button>
