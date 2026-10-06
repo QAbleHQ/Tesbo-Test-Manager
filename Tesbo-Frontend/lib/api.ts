@@ -1041,6 +1041,11 @@ export interface ZyraChatTestcaseRow {
   preconditions?: string;
   expectedSummary?: string;
   stepsJson?: unknown;
+  /**
+   * Absent (not "") on a row snapshotted onto a chat message before chatDraftRow carried it — the
+   * editor uses that difference to avoid overwriting a draft's real test data with a blank.
+   */
+  testData?: string;
   /** See AiGeneratedDraft.severity/component — same fields, same server-side chatDraftRow/chatTestcaseRow normalization. */
   severity?: string | null;
   component?: string | null;

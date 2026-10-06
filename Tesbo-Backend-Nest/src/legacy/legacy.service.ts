@@ -20358,6 +20358,10 @@ export class LegacyService implements OnModuleInit {
       preconditions: value.preconditions || "",
       expectedSummary: value.expectedSummary || value.description || "",
       stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
+      // Basecamp: "[Zyra] Edit Test Case View Is Missing Fields Available After Saving" — generation,
+      // staging and save all carry testData; this row (what the review editor is seeded from) was
+      // the one place it was dropped, so the editor had nothing to show.
+      testData: value.testData || "",
       // Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generation
       // and save already carry both fields correctly; this row is what the chat/task-board UI
       // actually renders, and it was rebuilding every field except these two. `?? null` (not `||`)
@@ -20390,6 +20394,7 @@ export class LegacyService implements OnModuleInit {
       preconditions: row.preconditions,
       description: row.description,
       stepsJson: row.steps,
+      testData: row.testData,
       severity: row.severity,
       component: row.component,
       sourceRefs: row.sourceRefs

@@ -171,6 +171,7 @@ export function ZyraChatReviewPanel({
         preconditions: values.preconditions,
         description: values.description,
         stepsJson: values.stepsJson,
+        ...(values.testData !== undefined ? { testData: values.testData } : {}),
         severity: values.severity,
         component: values.component,
       });
@@ -184,6 +185,7 @@ export function ZyraChatReviewPanel({
                 preconditions: values.preconditions,
                 expectedSummary: values.description,
                 stepsJson: values.stepsJson,
+                ...(values.testData !== undefined ? { testData: values.testData } : {}),
                 severity: values.severity || null,
                 component: values.component || null,
               }
