@@ -89,6 +89,7 @@ type Internals = {
   detectZyraChatIntent: (message: string) => string;
   zyraPendingConfirmation: (row: Record<string, unknown>) => { kind: "proposal" | "offer"; actionType?: string; content: string } | null;
   zyraIsConfirmation: (message: string) => boolean;
+  zyraIsArchiveConfirmation: (message: string) => boolean;
   zyraDegradedDecision: (
     message: string,
     existingTestcases: Array<Record<string, unknown>>,
@@ -277,6 +278,33 @@ describe("Zyra chat AI routing", () => {
       ""
     ])("does not treat %j as a confirmation", (message) => {
       expect(internals(svc).zyraIsConfirmation(message)).toBe(false);
+    });
+  });
+
+  // The gate for applying a confirmed archive immediately (applyZyraChatOperations'
+  // archiveConfirmed). Wider than zyraIsConfirmation — "yes all" confirms — but any hedge or
+  // redirection leaves the archive staged for review instead.
+  describe("zyraIsArchiveConfirmation", () => {
+    it.each(["yes", "yes all", "Yes, archive all of them", "yes archive TES-TC-4 and TES-TC-7", "go ahead", "ok do it", "confirm", "proceed"])(
+      "lets %j apply a confirmed archive",
+      (message) => {
+        expect(internals(svc).zyraIsArchiveConfirmation(message)).toBe(true);
+      }
+    );
+
+    it.each([
+      "no",
+      "yes but not the archive one",
+      "yes, delete the login suite instead",
+      "yes except TES-TC-3",
+      "yes keep the smoke ones",
+      "wait",
+      "don't archive anything",
+      "delete all the test cases",
+      "archive TES-TC-4",
+      ""
+    ])("never lets %j apply an archive immediately", (message) => {
+      expect(internals(svc).zyraIsArchiveConfirmation(message)).toBe(false);
     });
   });
 
