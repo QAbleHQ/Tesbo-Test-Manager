@@ -567,7 +567,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "link_requirement_to_testcase",
       description:
-        "Link a test case to an external requirement — a Jira or Linear ticket — in the token's project, by setting its jiraIssueKey/jiraUrl or linearIssueKey/linearUrl fields, the same association get_requirement_matrix and the app's Requirements view already read from. There is no separate \"requirements\" table in this product — the ticket key on the test case IS the link, exactly as the app's own test case editor treats it, so this does not require the ticket to already be synced from a connected Jira/Linear integration. Required: testcaseId, and exactly one of jiraIssueKey or linearIssueKey (not both). Optional: jiraUrl/linearUrl to record the ticket's URL alongside it. Calling this again with the same key is safe: it re-sets the same value rather than creating a duplicate link, and more than one test case may legitimately link to the same requirement.",
+        "Link a test case to an external requirement (a Jira ticket, a Linear ticket or a Notion page) in the token's project, by setting its jiraIssueKey/jiraUrl, linearIssueKey/linearUrl or notionPageId/notionUrl fields, the same association get_requirement_matrix and the app's Requirements view already read from. There is no separate \"requirements\" table in this product: the ticket key on the test case IS the link, exactly as the app's own test case editor treats it, so this does not require the ticket to already be synced from a connected Jira/Linear integration. Required: testcaseId, and exactly one of jiraIssueKey, linearIssueKey or notionPageId (never more than one). A Notion page is identified by its full page id (the externalId its page list returns), not the short display key. Optional: jiraUrl/linearUrl/notionUrl to record the URL alongside it. Calling this again with the same key is safe: it re-sets the same value rather than creating a duplicate link, and more than one test case may legitimately link to the same requirement.",
       requiredScope: "write",
       inputSchema: {
         type: "object",
@@ -576,7 +576,9 @@ export function buildMcpTools(): McpTool[] {
           jiraIssueKey: { type: "string" },
           jiraUrl: { type: "string" },
           linearIssueKey: { type: "string" },
-          linearUrl: { type: "string" }
+          linearUrl: { type: "string" },
+          notionPageId: { type: "string" },
+          notionUrl: { type: "string" }
         },
         required: ["testcaseId"],
         additionalProperties: false
@@ -585,16 +587,20 @@ export function buildMcpTools(): McpTool[] {
         const testcaseId = requireString(args, "testcaseId");
         const jiraIssueKey = typeof args.jiraIssueKey === "string" ? args.jiraIssueKey.trim() : "";
         const linearIssueKey = typeof args.linearIssueKey === "string" ? args.linearIssueKey.trim() : "";
-        if (!jiraIssueKey && !linearIssueKey) {
-          throw new McpError(RpcCode.ToolExecutionError, `"jiraIssueKey" or "linearIssueKey" is required`);
+        const notionPageId = typeof args.notionPageId === "string" ? args.notionPageId.trim() : "";
+        const given = [jiraIssueKey, linearIssueKey, notionPageId].filter(Boolean).length;
+        if (given === 0) {
+          throw new McpError(RpcCode.ToolExecutionError, `"jiraIssueKey", "linearIssueKey" or "notionPageId" is required`);
         }
-        if (jiraIssueKey && linearIssueKey) {
-          throw new McpError(RpcCode.ToolExecutionError, 'Provide only one of "jiraIssueKey" or "linearIssueKey" per call');
+        if (given > 1) {
+          throw new McpError(RpcCode.ToolExecutionError, 'Provide only one of "jiraIssueKey", "linearIssueKey" or "notionPageId" per call');
         }
         await requireProjectOwnedRow(ctx, "testcases", testcaseId, "Test case");
         const body: Record<string, unknown> = jiraIssueKey
           ? { jiraIssueKey, jiraUrl: typeof args.jiraUrl === "string" ? args.jiraUrl : undefined }
-          : { linearIssueKey, linearUrl: typeof args.linearUrl === "string" ? args.linearUrl : undefined };
+          : notionPageId
+            ? { notionPageId, notionUrl: typeof args.notionUrl === "string" ? args.notionUrl : undefined }
+            : { linearIssueKey, linearUrl: typeof args.linearUrl === "string" ? args.linearUrl : undefined };
         await preserveOmittedSuiteAndOwner(ctx, testcaseId, body);
         await ctx.legacy.updateTestCase(testcaseId, ctx.actorId, body);
         return ctx.legacy.getTestCase(testcaseId);
@@ -603,7 +609,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "unlink_requirement_from_testcase",
       description:
-        "Remove a test case's link to an external requirement in the token's project, by clearing its jiraIssueKey/jiraUrl (provider \"jira\") or linearIssueKey/linearUrl (provider \"linear\") fields — nothing else on the test case changes, and the Jira/Linear ticket itself is untouched. Required: testcaseId, provider (\"jira\" or \"linear\"). Safe to call on a test case with no such link: it is a no-op, not an error.",
+        "Remove a test case's link to an external requirement in the token's project, by clearing its jiraIssueKey/jiraUrl (provider \"jira\"), linearIssueKey/linearUrl (provider \"linear\") or notionPageId/notionUrl (provider \"notion\") fields. Nothing else on the test case changes, and the Jira/Linear/Notion item itself is untouched. Required: testcaseId, provider (\"jira\", \"linear\" or \"notion\"). Safe to call on a test case with no such link: it is a no-op, not an error.",
       requiredScope: "write",
       inputSchema: {
         type: "object",
@@ -617,12 +623,16 @@ export function buildMcpTools(): McpTool[] {
       handler: async (args, ctx) => {
         const testcaseId = requireString(args, "testcaseId");
         const provider = requireString(args, "provider");
-        if (provider !== "jira" && provider !== "linear") {
-          throw new McpError(RpcCode.ToolExecutionError, '"provider" must be "jira" or "linear"');
+        if (provider !== "jira" && provider !== "linear" && provider !== "notion") {
+          throw new McpError(RpcCode.ToolExecutionError, '"provider" must be "jira" or "linear" (or "notion")');
         }
         await requireProjectOwnedRow(ctx, "testcases", testcaseId, "Test case");
         const body: Record<string, unknown> =
-          provider === "jira" ? { jiraIssueKey: null, jiraUrl: null } : { linearIssueKey: null, linearUrl: null };
+          provider === "jira"
+            ? { jiraIssueKey: null, jiraUrl: null }
+            : provider === "notion"
+              ? { notionPageId: null, notionUrl: null }
+              : { linearIssueKey: null, linearUrl: null };
         await preserveOmittedSuiteAndOwner(ctx, testcaseId, body);
         await ctx.legacy.updateTestCase(testcaseId, ctx.actorId, body);
         return ctx.legacy.getTestCase(testcaseId);

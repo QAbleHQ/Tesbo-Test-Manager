@@ -6,7 +6,7 @@ import { useEffect, useRef, useState, Suspense, type ReactNode } from "react";
 import { integrationCallback, getIntegrationAuthUrl, type IntegrationProvider } from "@/lib/api";
 import { INTEGRATION_OAUTH_CHANNEL, type IntegrationOAuthMessage } from "@/lib/useIntegrationOAuthConnect";
 
-const PROVIDER_LABELS: Record<IntegrationProvider, string> = { jira: "Jira", linear: "Linear" };
+const PROVIDER_LABELS: Record<IntegrationProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
 
 // Same brand marks used in components/settings/IntegrationsTab.tsx, kept local here since this
 // page is meant to be a disposable, self-contained OAuth landing tab.
@@ -19,6 +19,12 @@ const PROVIDER_ICONS: Record<IntegrationProvider, ReactNode> = {
   linear: (
     <svg viewBox="0 0 24 24" className="h-6 w-6 text-white" fill="currentColor">
       <path d="M2.28 15.36 8.64 21.7c-3.14-.55-5.79-3.2-6.36-6.34Zm-.27-2.06L14.7 22c.34.02.68.02 1.02 0L1.99 8.98c-.02.34-.02.68.02 1.02Zm.5-3.14L15.84 21.5a10.9 10.9 0 0 0 1.87-1.1L3.6 6.29a10.9 10.9 0 0 0-1.09 1.87Zm1.9-2.98L18.82 18.5a11 11 0 0 0 1.28-1.55L5.06 5.9a11 11 0 0 0-1.55 1.28Zm2.71-2.2L21.02 15.87A11 11 0 0 0 22 1.98L8.12 1a11 11 0 0 0-1.9 1.98Z" />
+    </svg>
+  ),
+  notion: (
+    <svg viewBox="0 0 24 24" className="h-6 w-6 text-white" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round">
+      <rect x="4" y="3.5" width="16" height="17" rx="2.5" />
+      <path d="M9 16.5v-9l6 9v-9" />
     </svg>
   ),
 };
@@ -42,13 +48,15 @@ function CallbackHandler() {
   // read here — to pick the endpoint — and the whole value goes back for the backend to verify.
   const state = searchParams.get("state") || "";
   const head = state.split(".")[0];
-  const provider = head === "jira" || head === "linear" ? head : null;
+  const provider = head === "jira" || head === "linear" || head === "notion" ? head : null;
   const providerLabel = provider ? PROVIDER_LABELS[provider] : "the app";
 
   // Failures visible straight from the query string need no round trip, so they stay derived rather
   // than being pushed into state from inside the effect.
+  // Notion sends the user back with `?error=access_denied` (and no code) when they cancel or deny
+  // the consent screen, the same shape as the other providers, so one branch covers all three.
   const upfrontError = oauthError
-    ? "Authorization was denied or failed."
+    ? `${providerLabel === "the app" ? "Authorization" : `${providerLabel} authorization`} was denied or failed.`
     : !code || !provider
       ? "Missing authorization code or integration context."
       : null;

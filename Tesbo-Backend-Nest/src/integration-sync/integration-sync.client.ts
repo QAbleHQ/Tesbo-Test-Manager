@@ -9,9 +9,21 @@ import {
   JIRA_TOKEN_REFRESH_RETRY_DELAY_MS,
   LINEAR_PAGE_SIZE,
   MAX_TICKETS_PER_RUN,
+  NOTION_MAX_BLOCKS_PER_PAGE,
+  NOTION_MAX_BLOCK_DEPTH,
+  NOTION_PAGE_SIZE,
   PROVIDER_FOLDER_NAMES
 } from "./integration-sync.constants";
 import { RemoteComment, RemoteTicket, SyncProvider } from "./integration-sync.types";
+import { NotionApiError, describeNotionError, notionPageKey, notionRequest } from "./notion-api";
+import {
+  notionPageTitle,
+  notionPropertiesMarkdown,
+  notionRichTextToMarkdown,
+  notionTicketFields,
+  renderNotionBlocks,
+  renderNotionProperties
+} from "./notion-render";
 
 type Row = Record<string, any>;
 /** Loose structural type for either DatabaseService itself or a transaction's PoolClient — both
@@ -60,6 +72,31 @@ export class LinearEntityNotFoundError extends Error {
 }
 
 /**
+ * Thrown when Notion says the mapped database (or a page of it) does not exist for this connection:
+ * `object_not_found` / 404. For Notion that almost always means the content was never shared with, or
+ * was unshared from, the Tesbo integration, or it was deleted. Reconnecting does not help, so the
+ * message says what does, instead of the raw API body leaking into the run's `error` field.
+ */
+export class NotionNotSharedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotionNotSharedError";
+  }
+}
+
+/**
+ * Thrown for a Notion 403: `restricted_resource`, or the integration lacking a capability (read
+ * content, read comments, insert comments). Distinct from a dead token (IntegrationConnectionInvalidError)
+ * because reconnecting the same integration cannot fix it.
+ */
+export class NotionPermissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotionPermissionError";
+  }
+}
+
+/**
  * Provider API access for the sync processors.
  *
  * Deliberately re-implements connection loading + Jira token refresh rather than importing
@@ -80,6 +117,10 @@ export class IntegrationSyncClient {
     ]);
     const connection = res.rows[0] as Row | undefined;
     if (!connection) return null;
+    // Notion access tokens never expire and there is no refresh grant (the row stores an empty
+    // refresh_token and a far-future token_expires_at). Returned before any expiry arithmetic so a
+    // Notion connection can never be sent down the Jira/Linear refresh path.
+    if (provider === "notion") return connection;
     // Fast, lock-free path: the overwhelming majority of calls land here, so this stays exactly as
     // cheap (and contention-free) as it always was. Only a token that's actually due for refresh
     // pays for the transaction below.
@@ -494,7 +535,199 @@ export class IntegrationSyncClient {
       .filter((comment) => comment.body);
   }
 
+  // ── Notion ──
+
+  /** Names already resolved from /users/{id}, so one comment thread costs one lookup per author. */
+  private readonly notionUserNames = new Map<string, string>();
+
+  /**
+   * One Notion call with the connection's token. A NotionApiError is translated here into the sync
+   * pipeline's own error types, so the processor's run-level handling (clean message, no raw body)
+   * works the same as for Jira and Linear.
+   */
+  private async notion<T>(
+    connection: Row,
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+    what: "database" | "page" | "content" = "content"
+  ): Promise<T> {
+    try {
+      return await notionRequest<T>(decryptSecret(String(connection.access_token || "")), method, path, body);
+    } catch (err) {
+      if (!(err instanceof NotionApiError)) throw err;
+      const message = describeNotionError(err, what);
+      if (err.status === 401) throw new IntegrationConnectionInvalidError(message);
+      if (err.status === 404 || err.code === "object_not_found") throw new NotionNotSharedError(message);
+      if (err.status === 403) throw new NotionPermissionError(message);
+      throw new Error(message);
+    }
+  }
+
+  /**
+   * Pages through a Notion database, newest-edited first. `sinceIso` adds a last_edited_time filter,
+   * the nightly scheduler's incremental fetch; manual Sync never passes it. The returned tickets carry
+   * properties only: the body costs a request per block container, so it is read in the per-ticket job
+   * (fetchNotionBody) where it gets its own retry instead of stalling this paging loop.
+   */
+  async fetchNotionPages(
+    connection: Row,
+    databaseId: string,
+    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    sinceIso?: string | null
+  ): Promise<{ total: number; truncated: boolean }> {
+    let cursor: string | undefined;
+    let total = 0;
+    for (;;) {
+      const body: Row = { page_size: NOTION_PAGE_SIZE, sorts: [{ timestamp: "last_edited_time", direction: "descending" }] };
+      if (sinceIso) body.filter = { timestamp: "last_edited_time", last_edited_time: { on_or_after: sinceIso } };
+      if (cursor) body.start_cursor = cursor;
+      const data = await this.notion<Row>(connection, "POST", `/databases/${encodeURIComponent(databaseId)}/query`, body, "database");
+
+      const pages = asArray(data.results).filter((page) => page.object === undefined || page.object === "page");
+      const remaining = MAX_TICKETS_PER_RUN - total;
+      const truncated = pages.length > remaining;
+      const batch = (truncated ? pages.slice(0, remaining) : pages).map((page) => {
+        const properties = (page.properties || {}) as Row;
+        return {
+          issueId: String(page.id || ""),
+          issueKey: notionPageKey(String(page.id || "")),
+          summary: notionPageTitle(properties),
+          description: "",
+          ...notionTicketFields(properties),
+          createdAt: (page.created_time as string) || null,
+          updatedAt: (page.last_edited_time as string) || null,
+          url: String(page.url || ""),
+          properties: renderNotionProperties(properties),
+          archived: page.archived === true || page.in_trash === true
+        } satisfies RemoteTicket;
+      });
+
+      if (batch.length) await onPage(batch);
+      total += batch.length;
+      if (truncated) return { total, truncated: true };
+
+      if (!data.has_more || !data.next_cursor) return { total, truncated: false };
+      cursor = String(data.next_cursor);
+    }
+  }
+
+  /**
+   * The page body as markdown. Container blocks are read depth-first through /blocks/{id}/children
+   * (paginated), capped at NOTION_MAX_BLOCK_DEPTH levels and NOTION_MAX_BLOCKS_PER_PAGE blocks; past
+   * either cap the body is cut and says so. A block type the renderer does not know becomes a
+   * placeholder line. Only the top-level read can throw (an unshared or unreadable page); a nested
+   * container that cannot be read is replaced by a placeholder, so one bad child never drops the page.
+   */
+  async fetchNotionBody(connection: Row, pageId: string): Promise<string> {
+    const budget = { remaining: NOTION_MAX_BLOCKS_PER_PAGE, truncated: false };
+    const tree = await this.fetchNotionBlocks(connection, pageId, 1, budget, true);
+    const markdown = renderNotionBlocks(tree);
+    return budget.truncated
+      ? `${markdown}\n\n_The rest of this page was not synced: Tesbo reads at most ${NOTION_MAX_BLOCKS_PER_PAGE} blocks per page._`.trim()
+      : markdown;
+  }
+
+  private async fetchNotionBlocks(
+    connection: Row,
+    blockId: string,
+    depth: number,
+    budget: { remaining: number; truncated: boolean },
+    topLevel = false
+  ): Promise<Row[]> {
+    const out: Row[] = [];
+    let cursor: string | undefined;
+    do {
+      if (budget.remaining <= 0) {
+        budget.truncated = true;
+        break;
+      }
+      let data: Row;
+      try {
+        data = await this.notion<Row>(
+          connection,
+          "GET",
+          `/blocks/${encodeURIComponent(blockId)}/children?page_size=${NOTION_PAGE_SIZE}${cursor ? `&start_cursor=${encodeURIComponent(cursor)}` : ""}`,
+          undefined,
+          "page"
+        );
+      } catch (err) {
+        // A dead token or a missing page fails the whole body; a nested container that merely cannot
+        // be read is dropped with a placeholder so the rest of the page still syncs.
+        if (topLevel || err instanceof IntegrationConnectionInvalidError) throw err;
+        out.push({ type: "unsupported", __unreadable: true });
+        break;
+      }
+      for (const block of asArray(data.results)) {
+        if (budget.remaining <= 0) {
+          budget.truncated = true;
+          break;
+        }
+        budget.remaining--;
+        out.push(block);
+        if (!block.has_children || block.type === "child_page" || block.type === "child_database") continue;
+        if (depth >= NOTION_MAX_BLOCK_DEPTH) block.__capped = true;
+        else block.children = await this.fetchNotionBlocks(connection, String(block.id), depth + 1, budget);
+      }
+      cursor = data.has_more && data.next_cursor ? String(data.next_cursor) : undefined;
+    } while (cursor);
+    return out;
+  }
+
+  private async notionUserName(connection: Row, userId: string): Promise<string> {
+    const cached = this.notionUserNames.get(userId);
+    if (cached) return cached;
+    let name = "Notion user";
+    try {
+      const user = await this.notion<Row>(connection, "GET", `/users/${encodeURIComponent(userId)}`);
+      name = String(user?.name || name);
+    } catch {
+      // Needs the read-user-information capability; without it the comment still syncs, just unattributed.
+    }
+    if (this.notionUserNames.size > 500) this.notionUserNames.clear();
+    this.notionUserNames.set(userId, name);
+    return name;
+  }
+
+  /** The most recent COMMENTS_PER_TICKET page-level comments, oldest first (Notion's own order). */
+  async fetchNotionComments(connection: Row, pageId: string): Promise<RemoteComment[]> {
+    const all: Row[] = [];
+    let cursor: string | undefined;
+    do {
+      const data = await this.notion<Row>(
+        connection,
+        "GET",
+        `/comments?block_id=${encodeURIComponent(pageId)}&page_size=${NOTION_PAGE_SIZE}${cursor ? `&start_cursor=${encodeURIComponent(cursor)}` : ""}`,
+        undefined,
+        "page"
+      );
+      all.push(...asArray(data.results));
+      cursor = data.has_more && data.next_cursor ? String(data.next_cursor) : undefined;
+    } while (cursor && all.length < 1000);
+
+    const comments: RemoteComment[] = [];
+    for (const comment of all.slice(-COMMENTS_PER_TICKET)) {
+      const body = notionRichTextToMarkdown(comment.rich_text).trim();
+      if (!body) continue;
+      const authorId = String(comment.created_by?.id || "");
+      comments.push({
+        author: authorId ? await this.notionUserName(connection, authorId) : "Unknown",
+        createdAt: (comment.created_time as string) || null,
+        body
+      });
+    }
+    return comments;
+  }
+
+  /** The text a Notion ticket's mirrored document shows as its description: properties, then the body. */
+  static composeNotionDescription(properties: unknown, body: string): string {
+    const props = notionPropertiesMarkdown(properties && typeof properties === "object" ? (properties as Record<string, string>) : {});
+    return [props, String(body || "").trim()].filter(Boolean).join("\n\n");
+  }
+
   async fetchComments(connection: Row, provider: SyncProvider, issueId: string): Promise<RemoteComment[]> {
-    return provider === "jira" ? this.fetchJiraComments(connection, issueId) : this.fetchLinearComments(connection, issueId);
+    if (provider === "jira") return this.fetchJiraComments(connection, issueId);
+    if (provider === "notion") return this.fetchNotionComments(connection, issueId);
+    return this.fetchLinearComments(connection, issueId);
   }
 }

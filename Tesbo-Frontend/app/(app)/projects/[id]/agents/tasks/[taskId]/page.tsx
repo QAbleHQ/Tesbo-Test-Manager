@@ -9,9 +9,11 @@ import {
   deleteZyraTaskDraft,
   getJiraStatus,
   getLinearStatus,
+  getNotionStatus,
   getZyraTask,
   listJiraTickets,
   listLinearTickets,
+  listNotionPages,
   listSuites,
   listZyraTaskTicketComments,
   retryZyraTicketComment,
@@ -19,9 +21,13 @@ import {
   sendZyraFeedback,
   type JiraTicket,
   type LinearTicket,
+  type NotionPage,
   type SuiteNode,
   type ZyraTask,
   type ZyraTicketComment,
+  integrationProviderLabel,
+  notionPageKey,
+  zyraTaskTicketKeys,
 } from "@/lib/api";
 import { IconSparkles, IconUser } from "@tabler/icons-react";
 import { Button, Card, CopyButton, Field, FieldError, FieldHint, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, type Severity } from "@/components/ui";
@@ -134,6 +140,7 @@ export default function ZyraTaskDetailPage() {
   const [suites, setSuites] = useState<SuiteNode[]>([]);
   const [jiraTickets, setJiraTickets] = useState<JiraTicket[]>([]);
   const [linearTickets, setLinearTickets] = useState<LinearTicket[]>([]);
+  const [notionPages, setNotionPages] = useState<NotionPage[]>([]);
   const [ticketComments, setTicketComments] = useState<ZyraTicketComment[]>([]);
   const [retryingCommentId, setRetryingCommentId] = useState<string | null>(null);
   const [selectedDrafts, setSelectedDrafts] = useState<number[]>([]);
@@ -141,6 +148,8 @@ export default function ZyraTaskDetailPage() {
   const [referenceNote, setReferenceNote] = useState("");
   const [selectedJiraKeys, setSelectedJiraKeys] = useState<string[]>([]);
   const [selectedLinearKeys, setSelectedLinearKeys] = useState<string[]>([]);
+  // Full Notion page ids (what the API links by), shown to the user as their short keys.
+  const [selectedNotionIds, setSelectedNotionIds] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<DetailTab>("testcases");
   const [savingOpen, setSavingOpen] = useState(false);
   const [saveMode, setSaveMode] = useState<SaveMode>("");
@@ -167,11 +176,12 @@ export default function ZyraTaskDetailPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [taskData, suiteList, jiraStatus, linearStatus, comments] = await Promise.all([
+      const [taskData, suiteList, jiraStatus, linearStatus, notionStatus, comments] = await Promise.all([
         getZyraTask(projectId, taskId),
         listSuites(projectId).catch(() => []),
         getJiraStatus(projectId).catch(() => ({ connected: false })),
         getLinearStatus(projectId).catch(() => ({ connected: false })),
+        getNotionStatus(projectId).catch(() => ({ connected: false })),
         listZyraTaskTicketComments(projectId, taskId).catch(() => [] as ZyraTicketComment[]),
       ]);
       setTask(taskData);
@@ -189,6 +199,12 @@ export default function ZyraTaskDetailPage() {
         setLinearTickets(tickets.list || []);
       } else {
         setLinearTickets([]);
+      }
+      if (notionStatus.connected) {
+        const pages = await listNotionPages(projectId, { limit: 50 }).catch(() => ({ list: [], total: 0 }));
+        setNotionPages(pages.list || []);
+      } else {
+        setNotionPages([]);
       }
       setError(null);
     } catch (err) {
@@ -250,7 +266,7 @@ export default function ZyraTaskDetailPage() {
     setError(null);
     try {
       const result = await retryZyraTicketComment(projectId, taskId, comment.id);
-      const label = result.provider === "jira" ? "Jira" : "Linear";
+      const label = integrationProviderLabel(result.provider);
       if (result.status === "posted") setMessage(t("task.commentPosted", { label, key: result.issueKey }));
       else setError(t("task.commentStillFailed", { label, key: result.issueKey, reason: result.reason || "" }));
       await loadData();
@@ -314,12 +330,14 @@ export default function ZyraTaskDetailPage() {
         referenceNote: referenceNote.trim() || undefined,
         jiraIssueKeys: selectedJiraKeys,
         linearIssueKeys: selectedLinearKeys,
+        notionPageIds: selectedNotionIds,
       });
       setTask(result.task);
       setFeedback("");
       setReferenceNote("");
       setSelectedJiraKeys([]);
       setSelectedLinearKeys([]);
+      setSelectedNotionIds([]);
       setMessage(t("task.feedbackSent"));
       await loadData();
     } catch (err) {
@@ -500,9 +518,9 @@ export default function ZyraTaskDetailPage() {
                 date: formatDateTime(task.updatedAt, t.locale),
               })}
             </p>
-            {(task.jiraIssueKeys.length > 0 || (task.linearIssueKeys ?? []).length > 0) && (
+            {zyraTaskTicketKeys(task).length > 0 && (
               <div className="mt-3 flex flex-wrap gap-2">
-                {[...task.jiraIssueKeys, ...(task.linearIssueKeys ?? [])].map((key) => (
+                {zyraTaskTicketKeys(task).map((key) => (
                   <span key={key} className="rounded-full bg-[var(--brand-soft)] px-2.5 py-1 text-xs font-medium text-[var(--accent-light)]">
                     {key}
                   </span>
@@ -547,7 +565,7 @@ export default function ZyraTaskDetailPage() {
                 <li key={comment.id} className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-[var(--border)] px-3 py-2">
                   <div className="min-w-0 space-y-1">
                     <div className="flex flex-wrap items-center gap-2 text-sm">
-                      <span className="font-medium text-[var(--foreground)]">{comment.provider === "jira" ? "Jira" : "Linear"} {comment.issueKey}</span>
+                      <span className="font-medium text-[var(--foreground)]">{integrationProviderLabel(comment.provider)} {comment.provider === "notion" ? notionPageKey(comment.issueKey) : comment.issueKey}</span>
                       <StatusChip tone={status.tone}>{t.opt(`task.commentStatus.${comment.status}`) ?? status.label}</StatusChip>
                       <span className="text-xs text-[var(--muted)]">
                         {t("task.commentCount", { n: comment.testcaseCount })} · {formatDateTime(comment.postedAt || comment.updatedAt, t.locale)}
@@ -778,6 +796,37 @@ export default function ZyraTaskDetailPage() {
                         className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]"
                       >
                         {key} x
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </Field>
+            )}
+            {notionPages.length > 0 && (
+              <Field>
+                <FieldLabel>{t("task.attachNotion")}</FieldLabel>
+                <Select
+                  value=""
+                  onChange={(event) => {
+                    const id = event.target.value;
+                    if (id && !selectedNotionIds.includes(id)) setSelectedNotionIds((prev) => [...prev, id]);
+                  }}
+                >
+                  <option value="">{t("task.selectTicket")}</option>
+                  {notionPages.map((page) => (
+                    <option key={page.id} value={page.notionPageId}>{page.notionPageKey} - {page.summary}</option>
+                  ))}
+                </Select>
+                {selectedNotionIds.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {selectedNotionIds.map((id) => (
+                      <button
+                        type="button"
+                        key={id}
+                        onClick={() => setSelectedNotionIds((prev) => prev.filter((item) => item !== id))}
+                        className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]"
+                      >
+                        {notionPageKey(id)} x
                       </button>
                     ))}
                   </div>

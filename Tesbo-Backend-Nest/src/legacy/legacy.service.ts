@@ -36,7 +36,15 @@ import { RagRetrievalService } from "../rag/rag-retrieval.service";
 import { TESTCASE_UPDATE_THRESHOLD } from "../rag/rag.constants";
 import type { RagRetrievalConfidence } from "../rag/rag.types";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
-import { JIRA_PAGE_SIZE, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
+import { INTEGRATION_SYNC_FETCH_TIMEOUT_MS, JIRA_PAGE_SIZE, NOTION_API_BASE, NOTION_API_VERSION, NOTION_PAGE_SIZE, NOTION_RICH_TEXT_LIMIT, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
+import { NotionApiError, describeNotionError, notionPageKey, notionRequest } from "../integration-sync/notion-api";
+import {
+  markdownToNotionRichText,
+  notionPageTitle,
+  notionPropertiesMarkdown,
+  notionTicketFields,
+  renderNotionProperties
+} from "../integration-sync/notion-render";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
@@ -52,7 +60,9 @@ import { ZYRA_TRACE_CURRENT_STEP, ZyraTurnTraceRecorder, type ZyraOnStage, type 
 type Body = Record<string, any>;
 
 /** Everything processZyraSaveEntriesSequential/Batched need that isn't `selected` or `client` itself. */
-type TicketProvider = "jira" | "linear";
+type TicketProvider = "jira" | "linear" | "notion";
+
+const TICKET_PROVIDER_LABELS: Record<TicketProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
 
 // See getIntegrationConnection: the access token the caller just had refused (401), to force one renewal.
 interface IntegrationConnectionLoadOptions {
@@ -73,7 +83,10 @@ interface ZyraSaveEntryContext {
   // several, whose drafts each carry their own key. See zyraDraftTicketLink.
   jiraIssueKey: string | null;
   linearIssueKey: string | null;
-  // Keyed `jira:<key>` / `linear:<key>`, for every ticket the task names.
+  // The task's Notion page (testcases.notion_page_id) when it has exactly one ticket and that ticket
+  // is a Notion page, else null: same rule as jiraIssueKey/linearIssueKey.
+  notionPageId: string | null;
+  // Keyed `jira:<key>` / `linear:<key>` / `notion:<pageId>`, for every ticket the task names.
   ticketUrls: Map<string, string | null>;
   existingLinkedByTicket: Map<string, Body[]>;
   // Mutable per-save state for zyraDraftTicketLink's per-ticket positional pairing.
@@ -269,6 +282,8 @@ type ZyraGenerationInput = {
   knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
   jira: Array<{ key: string; summary: string; description: string }>;
   linear: Array<{ key: string; summary: string; description: string }>;
+  // Optional like `bugs`: every caller that predates Notion keeps compiling and behaving unchanged.
+  notion?: Array<{ key: string; summary: string; description: string }>;
   existingTestcases: Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string; component: string }>;
   // Optional and defaulted to [] wherever built, so every existing caller of the functions this
   // type feeds (zyraGenerationContext, generateZyraChatTestcasesWithAi, ...) keeps compiling and
@@ -777,10 +792,10 @@ function escapeJql(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-type IntegrationProvider = "jira" | "linear";
+type IntegrationProvider = "jira" | "linear" | "notion";
 
 function assertIntegrationProvider(provider: string): IntegrationProvider {
-  if (provider !== "jira" && provider !== "linear") {
+  if (provider !== "jira" && provider !== "linear" && provider !== "notion") {
     throw new BadRequestException({ error: "Unsupported integration provider." });
   }
   return provider;
@@ -830,6 +845,13 @@ function extractHttpStatus(err: unknown): number | null {
 }
 
 const JIRA_OAUTH_SCOPE = "read:jira-work read:jira-user write:jira-work offline_access";
+// Notion access tokens never expire; this is what token_expires_at (NOT NULL) holds for them.
+const NOTION_TOKEN_EXPIRES_AT = "2999-12-31T00:00:00.000Z";
+const INTEGRATION_MAPPING_TABLES: Record<IntegrationProvider, string> = {
+  jira: "jira_project_mappings",
+  linear: "linear_project_mappings",
+  notion: "notion_project_mappings"
+};
 const LINEAR_OAUTH_SCOPE = "read,write,issues:create,comments:create";
 
 // ── OAuth `state` signing ──
@@ -1296,7 +1318,8 @@ export class LegacyService implements OnModuleInit {
     void this.ragIngestion.enqueueTestcaseEmbedding({ projectId, testcaseId, reason }).catch(() => undefined);
   }
 
-  // "Auto-comment on Jira/Linear ticket" (projects.settings.jiraAutoComment / linearAutoComment,
+  // "Auto-comment on Jira/Linear/Notion ticket" (projects.settings.jiraAutoComment / linearAutoComment /
+  // notionAutoComment,
   // IntegrationAiGenerationSettings.tsx). Called from zyraSave once a save has committed: posts ONE
   // comment per ticket, listing exactly the test cases that save wrote for it. The list is grouped
   // from the committed rows themselves (their own jira_issue_key/linear_issue_key), so a test case
@@ -1332,7 +1355,10 @@ export class LegacyService implements OnModuleInit {
             connected.set(group.provider, await this.ticketProviderConnected(projectId, group.provider));
           }
           const status = !enabled ? "skipped_disabled" : connected.get(group.provider) ? "pending" : "skipped_not_connected";
-          const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries);
+          // A Notion "issue key" is the page id, which means nothing to a reader: the comment and the
+          // task activity name the page by its title instead.
+          const ticketLabel = group.provider === "notion" ? await this.notionPageLabel(projectId, group.issueKey) : group.issueKey;
+          const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries, ticketLabel);
           const claim = await this.db.query<{ id: string }>(
             `INSERT INTO integration_ticket_comments
                (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, posted_by)
@@ -1353,13 +1379,13 @@ export class LegacyService implements OnModuleInit {
           );
           const claimId = claim.rows[0]?.id;
           if (!claimId) continue;
-          const label = group.provider === "jira" ? "Jira" : "Linear";
+          const label = TICKET_PROVIDER_LABELS[group.provider];
           if (status === "pending") {
             void this.deliverZyraTicketComment(projectId, taskId, claimId, group.provider, group.issueKey, group.entries.length, content).catch(() => undefined);
           } else if (status === "skipped_disabled") {
-            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${group.issueKey} was not commented on.`);
+            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${ticketLabel} was not commented on.`);
           } else {
-            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${group.issueKey} was not commented on.`);
+            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${ticketLabel} was not commented on.`);
           }
         } catch (err) {
           this.logger.warn(`Failed to queue the ${group.provider} comment for ${group.issueKey} (task ${taskId}): ${err instanceof Error ? err.message : String(err)}`);
@@ -1381,8 +1407,9 @@ export class LegacyService implements OnModuleInit {
     rows.forEach((row, index) => {
       const action = actions[index];
       if (!row?.id || !action) return;
-      for (const provider of ["jira", "linear"] as const) {
-        const issueKey = String((provider === "jira" ? row.jiraIssueKey : row.linearIssueKey) || "").trim();
+      for (const provider of ["jira", "linear", "notion"] as const) {
+        const linked = provider === "jira" ? row.jiraIssueKey : provider === "linear" ? row.linearIssueKey : row.notionPageId;
+        const issueKey = String(linked || "").trim();
         if (!issueKey) continue;
         const mapKey = `${provider}:${issueKey}`;
         const group = groups.get(mapKey) ?? { provider, issueKey, entries: [] };
@@ -1412,19 +1439,22 @@ export class LegacyService implements OnModuleInit {
     drafts: Body[],
     jiraIssueKeys: string[],
     linearIssueKeys: string[],
+    notionPageIds: string[],
     knowledgeLabels: Map<string, { provider: TicketProvider; issueKey: string }> = new Map()
   ): number {
-    if (jiraIssueKeys.length + linearIssueKeys.length <= 1) return 0;
+    if (jiraIssueKeys.length + linearIssueKeys.length + notionPageIds.length <= 1) return 0;
     const byLabel = new Map<string, { provider: TicketProvider; issueKey: string }>();
     for (const issueKey of jiraIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "jira", issueKey });
     for (const issueKey of linearIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "linear", issueKey });
+    // The prompt labels a Notion page by its short display key (notionPageKey), not its page id.
+    for (const issueKey of notionPageIds) byLabel.set(notionPageKey(issueKey).toLowerCase(), { provider: "notion", issueKey });
     for (const [label, ticket] of knowledgeLabels) {
-      const own = (ticket.provider === "jira" ? jiraIssueKeys : linearIssueKeys).find((key) => key.trim().toLowerCase() === ticket.issueKey.trim().toLowerCase());
+      const own = (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).find((key) => key.trim().toLowerCase() === ticket.issueKey.trim().toLowerCase());
       if (own) byLabel.set(label, { provider: ticket.provider, issueKey: own });
     }
     let unattributed = 0;
     for (const draft of drafts) {
-      const cited: Record<TicketProvider, Set<string>> = { jira: new Set(), linear: new Set() };
+      const cited: Record<TicketProvider, Set<string>> = { jira: new Set(), linear: new Set(), notion: new Set() };
       for (const ref of Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []) {
         // A raw label on the task-board path; a resolved {type, id, title} wherever refs were sanitized.
         const label = typeof ref === "string" ? ref : ref && typeof ref === "object" ? String((ref as Body).id ?? "") : "";
@@ -1433,7 +1463,8 @@ export class LegacyService implements OnModuleInit {
       }
       draft.jiraIssueKey = cited.jira.size === 1 ? Array.from(cited.jira)[0] : null;
       draft.linearIssueKey = cited.linear.size === 1 ? Array.from(cited.linear)[0] : null;
-      if (!draft.jiraIssueKey && !draft.linearIssueKey) unattributed += 1;
+      draft.notionPageId = cited.notion.size === 1 ? Array.from(cited.notion)[0] : null;
+      if (!draft.jiraIssueKey && !draft.linearIssueKey && !draft.notionPageId) unattributed += 1;
     }
     return unattributed;
   }
@@ -1459,7 +1490,8 @@ export class LegacyService implements OnModuleInit {
   private zyraDraftTicketLink(ctx: ZyraSaveEntryContext, draft: Body) {
     const jiraIssueKey = String(draft.jiraIssueKey || ctx.jiraIssueKey || "").trim() || null;
     const linearIssueKey = String(draft.linearIssueKey || ctx.linearIssueKey || "").trim() || null;
-    const poolKey = jiraIssueKey ? `jira:${jiraIssueKey}` : linearIssueKey ? `linear:${linearIssueKey}` : null;
+    const notionPageId = String(draft.notionPageId || ctx.notionPageId || "").trim() || null;
+    const poolKey = jiraIssueKey ? `jira:${jiraIssueKey}` : linearIssueKey ? `linear:${linearIssueKey}` : notionPageId ? `notion:${notionPageId}` : null;
     let existingLinkedRow: Body | undefined;
     if (poolKey) {
       const pool = ctx.existingLinkedByTicket.get(poolKey) || [];
@@ -1474,6 +1506,8 @@ export class LegacyService implements OnModuleInit {
       jiraUrl: jiraIssueKey ? ctx.ticketUrls.get(`jira:${jiraIssueKey}`) ?? null : null,
       linearIssueKey,
       linearUrl: linearIssueKey ? ctx.ticketUrls.get(`linear:${linearIssueKey}`) ?? null : null,
+      notionPageId,
+      notionUrl: notionPageId ? ctx.ticketUrls.get(`notion:${notionPageId}`) ?? null : null,
       existingLinkedRow
     };
   }
@@ -1495,7 +1529,8 @@ export class LegacyService implements OnModuleInit {
   private zyraTicketCommentContent(
     projectId: string,
     issueKey: string,
-    entries: Array<{ row: Body; action: "add" | "update" | "archive" }>
+    entries: Array<{ row: Body; action: "add" | "update" | "archive" }>,
+    ticketLabel: string = issueKey
   ): { markdown: string; adf: Body } {
     let budget = ZYRA_TICKET_COMMENT_MAX_ITEMS;
     const sections = (
@@ -1516,7 +1551,7 @@ export class LegacyService implements OnModuleInit {
     const total = entries.length;
     const hidden = total - sections.reduce((sum, section) => sum + section.items.length, 0);
     const heading = "Generated by Tesbo Test Manager";
-    const summary = `Zyra saved ${total} test case${total === 1 ? "" : "s"} for ${issueKey} in Tesbo.`;
+    const summary = `Zyra saved ${total} test case${total === 1 ? "" : "s"} for ${ticketLabel} in Tesbo.`;
     const overflow = hidden > 0 ? `…and ${hidden} more in Tesbo.` : "";
 
     const escapeLinkText = (text: string) => text.replace(/([\[\]\\])/g, "\\$1");
@@ -1574,16 +1609,18 @@ export class LegacyService implements OnModuleInit {
     count: number,
     content: { markdown: string; adf: Body }
   ): Promise<void> {
-    const label = provider === "jira" ? "Jira" : "Linear";
+    const label = TICKET_PROVIDER_LABELS[provider];
     try {
       const remoteId = provider === "jira"
         ? await this.jiraPostComment(projectId, issueKey, content.adf)
-        : await this.linearPostComment(projectId, issueKey, content.markdown);
+        : provider === "notion"
+          ? await this.notionPostComment(projectId, issueKey, content.markdown)
+          : await this.linearPostComment(projectId, issueKey, content.markdown);
       await this.db.query(
         "UPDATE integration_ticket_comments SET status = 'posted', remote_comment_id = $2, posted_at = now(), updated_at = now() WHERE id = $1",
         [claimId, remoteId]
       );
-      await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${issueKey}.`);
+      await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${provider === "notion" ? await this.notionPageLabel(projectId, issueKey) : issueKey}.`);
     } catch (err) {
       const reason = this.integrationErrorReason(err, label);
       this.logger.warn(`Failed to post Zyra ticket comment to ${label} ${issueKey}: ${reason}`);
@@ -1649,7 +1686,7 @@ export class LegacyService implements OnModuleInit {
       throw new ConflictException({ error: `This comment is "${existing.rows[0].status}" — only a failed comment can be retried.` });
     }
     const provider = row.provider as TicketProvider;
-    const label = provider === "jira" ? "Jira" : "Linear";
+    const label = TICKET_PROVIDER_LABELS[provider];
     const content = await this.rebuildZyraTicketCommentContent(projectId, row);
     if (!content) {
       const reason = "None of the test cases in this comment exist anymore, so there is nothing to post.";
@@ -1686,7 +1723,8 @@ export class LegacyService implements OnModuleInit {
           ("add" as const)
       }));
     if (!entries.length) return null;
-    return { ...this.zyraTicketCommentContent(projectId, String(row.issue_key), entries), count: entries.length };
+    const ticketLabel = row.provider === "notion" ? await this.notionPageLabel(projectId, String(row.issue_key)) : String(row.issue_key);
+    return { ...this.zyraTicketCommentContent(projectId, String(row.issue_key), entries, ticketLabel), count: entries.length };
   }
 
   // Which section (Added / Updated / Archived) each test case was listed under in a comment
@@ -1719,7 +1757,7 @@ export class LegacyService implements OnModuleInit {
   private async ticketProviderConnected(projectId: string, provider: TicketProvider): Promise<boolean> {
     if (provider === "jira") return Boolean(await this.getJiraConnection(projectId, false));
     const organizationId = await this.projectOrganizationId(projectId);
-    return Boolean(await this.getIntegrationConnection(organizationId, "linear", false));
+    return Boolean(await this.getIntegrationConnection(organizationId, provider, false));
   }
 
   private async appendZyraTaskActivity(projectId: string, taskId: string, title: string, detail: string): Promise<void> {
@@ -1734,8 +1772,15 @@ export class LegacyService implements OnModuleInit {
   // it as `error` on their response body rather than as the exception's own message. 401 and 403
   // share one generic message everywhere else (cleanAuthErrorOrNull); for a ticket comment they need
   // different fixes, so they get different reasons here.
-  private integrationErrorReason(err: unknown, provider: "Jira" | "Linear"): string {
+  private integrationErrorReason(err: unknown, provider: string): string {
     const providerStatus = (err as { providerStatus?: number })?.providerStatus;
+    // Notion's 403 is about the integration's capabilities or what is shared with it, and
+    // notionFetch already wrote the exact remedy (insert-comment capability, share the page) into
+    // the error, so that text is the reason rather than the Jira/Linear permission wording below.
+    if (provider === "Notion" && providerStatus === 403) {
+      const detail = (err as { getResponse?: () => unknown })?.getResponse?.();
+      if (detail && typeof detail === "object" && typeof (detail as Body).error === "string") return String((detail as Body).error);
+    }
     if (providerStatus === 401) {
       return `${provider} rejected the connection's credentials (401) — the authorization has expired or been revoked. Reconnect ${provider} in workspace settings, then retry.`;
     }
@@ -1761,15 +1806,17 @@ export class LegacyService implements OnModuleInit {
     const byDocument = new Map<string, { provider: TicketProvider; issueKey: string }>();
     if (!ids.length) return byDocument;
     const res = await this.db.query<{ id: string; provider: TicketProvider; issue_key: string }>(
-      `SELECT d.id, d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key) AS issue_key
+      `SELECT d.id, d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) AS issue_key
        FROM knowledge_documents d
        LEFT JOIN jira_tickets j
          ON d.source_provider = 'jira' AND j.project_id = d.project_id AND j.jira_issue_id = d.source_external_id
        LEFT JOIN linear_tickets l
          ON d.source_provider = 'linear' AND l.project_id = d.project_id AND l.linear_issue_id = d.source_external_id
+       LEFT JOIN notion_pages n
+         ON d.source_provider = 'notion' AND n.project_id = d.project_id AND n.notion_page_id = d.source_external_id
        WHERE d.project_id = $1 AND d.id = ANY($2::uuid[]) AND d.is_deleted = false
-         AND d.source_role = 'mirror' AND d.source_provider IN ('jira', 'linear')
-         AND COALESCE(j.jira_issue_key, l.linear_issue_key) IS NOT NULL`,
+         AND d.source_role = 'mirror' AND d.source_provider IN ('jira', 'linear', 'notion')
+         AND COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) IS NOT NULL`,
       [projectId, ids]
     );
     for (const row of res.rows) byDocument.set(String(row.id), { provider: row.provider, issueKey: String(row.issue_key) });
@@ -3668,6 +3715,7 @@ export class LegacyService implements OnModuleInit {
       !query.automationStatus &&
       !query.jiraIssueKey &&
       !query.linearIssueKey &&
+      !query.notionPageId &&
       !query.search &&
       !query.customFieldFilters &&
       LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
@@ -3783,7 +3831,8 @@ export class LegacyService implements OnModuleInit {
       ["type", "type"],
       ["automationStatus", "automation_status"],
       ["jiraIssueKey", "jira_issue_key"],
-      ["linearIssueKey", "linear_issue_key"]
+      ["linearIssueKey", "linear_issue_key"],
+      ["notionPageId", "notion_page_id"]
     ] as const) {
       if (param === "suiteId" && (wantsUnfiled || wantsSubtree)) continue;
       if (query[param]) {
@@ -3921,6 +3970,7 @@ export class LegacyService implements OnModuleInit {
               testcases.automation_status, testcases.automation_tags, testcases.status,
               testcases.suite_id, testcases.owner_id, testcases.updated_at, testcases.jira_issue_key,
               testcases.jira_url, testcases.linear_issue_key, testcases.linear_url,
+              testcases.notion_page_id, testcases.notion_url,
               testcases.severity, testcases.component, testcases.source_refs,
               COALESCE(
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
@@ -4275,8 +4325,9 @@ export class LegacyService implements OnModuleInit {
        (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
         priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
         automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-        linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28,$29::jsonb)
+        linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs,
+        notion_page_id, notion_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28,$29::jsonb,$30,$31)
        RETURNING *`,
       [
         projectId,
@@ -4316,7 +4367,9 @@ export class LegacyService implements OnModuleInit {
         body.attachments || null,
         uid,
         this.normalizeEstimatedDuration(body.estimatedDuration),
-        JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs))
+        JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs)),
+        body.notionPageId || null,
+        body.notionUrl || null
       ]
     );
     const row = res.rows[0];
@@ -4420,6 +4473,8 @@ export class LegacyService implements OnModuleInit {
         jira_url: row.jiraUrl || null,
         linear_issue_key: row.linearIssueKey || null,
         linear_url: row.linearUrl || null,
+        notion_page_id: row.notionPageId || null,
+        notion_url: row.notionUrl || null,
         attachments: row.attachments || null
       }));
 
@@ -4432,18 +4487,18 @@ export class LegacyService implements OnModuleInit {
            (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
             priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
             automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-            linear_issue_key, linear_url, attachments, created_by, updated_by)
+            linear_issue_key, linear_url, notion_page_id, notion_url, attachments, created_by, updated_by)
          SELECT $1::uuid, r.suite_id, r.external_id, r.title, r.description, r.preconditions, r.postconditions,
                 r.steps, r.test_data, r.priority, r.severity, r.type, r.automation_status, r.automation_repo,
                 r.automation_path, r.automation_test_name, r.automation_framework, r.automation_tags, r.owner_id,
                 r.component, r.status, r.jira_issue_key, r.jira_url, r.linear_issue_key, r.linear_url,
-                r.attachments, $2::uuid, $2::uuid
+                r.notion_page_id, r.notion_url, r.attachments, $2::uuid, $2::uuid
          FROM jsonb_to_recordset($3::jsonb) AS r(
            ord int, suite_id uuid, external_id text, title text, description text, preconditions text,
            postconditions text, steps jsonb, test_data text, priority text, severity text, type text,
            automation_status text, automation_repo text, automation_path text, automation_test_name text,
            automation_framework text, automation_tags text, owner_id uuid, component text, status text,
-           jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, attachments text
+           jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, notion_page_id text, notion_url text, attachments text
          )
          ORDER BY r.ord
          RETURNING *`,
@@ -5050,6 +5105,7 @@ export class LegacyService implements OnModuleInit {
      */
     const clearsJira = body.jiraIssueKey === null || body.jiraIssueKey === "";
     const clearsLinear = body.linearIssueKey === null || body.linearIssueKey === "";
+    const clearsNotion = body.notionPageId === null || body.notionPageId === "";
     const res = await client.query(
       `UPDATE testcases SET
        suite_id=$2, title=COALESCE($3,title), description=COALESCE($4,description),
@@ -5064,6 +5120,8 @@ export class LegacyService implements OnModuleInit {
        jira_url=CASE WHEN $29::boolean THEN NULL ELSE COALESCE($22,jira_url) END,
        linear_issue_key=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($23,linear_issue_key) END,
        linear_url=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($24,linear_url) END,
+       notion_page_id=CASE WHEN $33::boolean THEN NULL ELSE COALESCE($31,notion_page_id) END,
+       notion_url=CASE WHEN $33::boolean THEN NULL ELSE COALESCE($32,notion_url) END,
        attachments=COALESCE($25,attachments), updated_by=$26,
        estimated_duration=COALESCE($27,estimated_duration),
        source_refs=COALESCE($28::jsonb,source_refs), updated_at=now()
@@ -5103,7 +5161,10 @@ export class LegacyService implements OnModuleInit {
         // both validates shape and caps length before it overwrites the column.
         Array.isArray(body.sourceRefs) ? JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs)) : null,
         clearsJira,
-        clearsLinear
+        clearsLinear,
+        body.notionPageId ?? null,
+        body.notionUrl ?? null,
+        clearsNotion
       ]
     );
     const row = res.rows[0];
@@ -5155,8 +5216,8 @@ export class LegacyService implements OnModuleInit {
          (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
           priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
           automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-          linear_issue_key, linear_url, attachments, created_by, updated_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27)
+          linear_issue_key, linear_url, attachments, created_by, updated_by, notion_page_id, notion_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28,$29)
          RETURNING *`,
         [
           src.project_id,
@@ -5185,7 +5246,9 @@ export class LegacyService implements OnModuleInit {
           src.linear_issue_key,
           src.linear_url,
           src.attachments,
-          uid
+          uid,
+          src.notion_page_id,
+          src.notion_url
         ]
       );
       const row = res.rows[0];
@@ -5287,7 +5350,7 @@ export class LegacyService implements OnModuleInit {
    */
   private async zyraTaskStatusesByIssueKey(
     projectId: string,
-    column: "jira_issue_keys" | "linear_issue_keys"
+    column: "jira_issue_keys" | "linear_issue_keys" | "notion_page_ids"
   ): Promise<Record<string, { taskId: string; status: string }>> {
     const res = await this.db.query(
       `SELECT DISTINCT ON (key) key, id, task_status
@@ -5313,6 +5376,20 @@ export class LegacyService implements OnModuleInit {
     ]);
     const keys = res.rows.map((r) => r.jira_issue_key);
     return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.jira_issue_key, r.count])), tasks };
+  }
+
+  // Notion test cases link by page id, so `keys` are page ids (ticket lists expose them as externalId).
+  async linkedNotionPages(projectId: string, userId?: string | null) {
+    await this.requireProjectAccess(userId, projectId);
+    const [res, tasks] = await Promise.all([
+      this.db.query(
+        "SELECT notion_page_id, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND notion_page_id IS NOT NULL AND deleted_at IS NULL GROUP BY notion_page_id",
+        [projectId]
+      ),
+      this.zyraTaskStatusesByIssueKey(projectId, "notion_page_ids")
+    ]);
+    const keys = res.rows.map((r) => r.notion_page_id);
+    return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.notion_page_id, r.count])), tasks };
   }
 
   async linkedLinearKeys(projectId: string, userId?: string | null) {
@@ -9692,7 +9769,7 @@ export class LegacyService implements OnModuleInit {
     // since the API is reachable directly.
     if (doc.is_read_only) {
       throw new BadRequestException({
-        error: `"${doc.title}" is synced from ${doc.source_provider === "linear" ? "Linear" : "Jira"} and its body can't be edited — the next sync would overwrite your changes. Add a comment on the document instead.`
+        error: `"${doc.title}" is synced from ${PROVIDER_FOLDER_NAMES[String(doc.source_provider || "")] || "an integration"} and its body can't be edited because the next sync would overwrite your changes. Add a comment on the document instead.`
       });
     }
 
@@ -10726,7 +10803,7 @@ export class LegacyService implements OnModuleInit {
     return [];
   }
 
-  // ── App integrations (Jira, Linear) ──
+  // ── App integrations (Jira, Linear, Notion) ──
   // The OAuth connection (and its client id/secret) is workspace-scoped — one per organization
   // per provider — so a customer connects Jira/Linear once instead of re-authenticating every
   // project. Which remote project/team feeds which Tesbo project is a separate per-project mapping
@@ -10802,6 +10879,18 @@ export class LegacyService implements OnModuleInit {
       });
       return { url: `https://auth.atlassian.com/authorize?${params.toString()}` };
     }
+    if (p === "notion") {
+      // No scope parameter: a Notion integration's capabilities (read content, read/insert comments)
+      // are configured on the integration itself, and owner=user asks for a user-level authorization.
+      const params = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: "code",
+        owner: "user",
+        state
+      });
+      return { url: `https://api.notion.com/v1/oauth/authorize?${params.toString()}` };
+    }
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -10818,6 +10907,11 @@ export class LegacyService implements OnModuleInit {
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
     await this.planLimits.assertIntegrationAllowed(workspace.id, p);
+    // The provider redirects back with ?error=access_denied (and no code) when the user cancels the
+    // consent screen; say so instead of reporting a missing code.
+    if (body.error && !body.code) {
+      throw new BadRequestException({ error: `${PROVIDER_FOLDER_NAMES[p]} authorization was cancelled or denied (${String(body.error).slice(0, 80)}). Start the connection again.` });
+    }
     const code = String(body.code || "");
     if (!code) throw new BadRequestException({ error: "Authorization code is required." });
     verifyOAuthState(String(body.state || ""), p, workspace.id);
@@ -10867,6 +10961,56 @@ export class LegacyService implements OnModuleInit {
         [workspace.id, String(resource.id), String(resource.url), encryptSecret(accessToken), encryptSecret(refreshToken), expiresAt, userId || null]
       );
       return { connectionId: res.rows[0].id, cloudId: res.rows[0].external_id, siteUrl: res.rows[0].site_url };
+    }
+
+    if (p === "notion") {
+      // Notion authenticates the token exchange with HTTP Basic (client_id:client_secret) and a JSON
+      // body, and requires the Notion-Version header. The access token it returns never expires and
+      // has no refresh token, so the row stores an empty refresh_token and a far-future expiry.
+      let res: Response;
+      try {
+        res = await fetch(`${NOTION_API_BASE}/oauth/token`, {
+          method: "POST",
+          headers: {
+            Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+            "Content-Type": "application/json",
+            "Notion-Version": NOTION_API_VERSION
+          },
+          body: JSON.stringify({ grant_type: "authorization_code", code, redirect_uri: redirectUri }),
+          signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
+        });
+      } catch {
+        throw new BadRequestException({ error: "Could not reach Notion to finish connecting. Try again in a moment." });
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new BadRequestException({ error: "Notion did not accept the authorization code. Start the connection again.", detail: text.slice(0, 500) });
+      }
+      const token = (await res.json()) as Body;
+      const accessToken = String(token.access_token || "");
+      const workspaceId = String(token.workspace_id || "");
+      if (!accessToken || !workspaceId) throw new BadRequestException({ error: "Notion did not return an OAuth token." });
+      const connected = await this.db.query(
+        `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at, connected_by, auth_method, personal_token_identifier)
+         VALUES ($1, 'notion', $2, $3, $4, '', $5, $6, 'oauth', NULL)
+         ON CONFLICT (organization_id, provider) DO UPDATE SET
+           external_id = EXCLUDED.external_id,
+           site_url = EXCLUDED.site_url,
+           access_token = EXCLUDED.access_token,
+           refresh_token = '',
+           token_expires_at = EXCLUDED.token_expires_at,
+           connected_by = EXCLUDED.connected_by,
+           auth_method = 'oauth',
+           personal_token_identifier = NULL,
+           disconnected_at = NULL,
+           auth_error = NULL,
+           auth_error_at = NULL,
+           auth_error_refresh_fingerprint = NULL,
+           updated_at = now()
+         RETURNING id, site_url`,
+        [workspace.id, workspaceId, "https://www.notion.so", encryptSecret(accessToken), NOTION_TOKEN_EXPIRES_AT, userId || null]
+      );
+      return { connectionId: connected.rows[0].id, siteUrl: connected.rows[0].site_url, workspaceName: String(token.workspace_name || "") };
     }
 
     // Linear
@@ -10920,7 +11064,7 @@ export class LegacyService implements OnModuleInit {
     // `WHERE status IN ('queued','running')` UPDATE, so two concurrent disconnects racing here just
     // both find nothing left to fail the second time; nothing depends on this being serialized.
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
-    const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
+    const mappingsTable = INTEGRATION_MAPPING_TABLES[p];
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
     // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
     // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
@@ -10963,7 +11107,7 @@ export class LegacyService implements OnModuleInit {
     const workspace = await this.workspace(userId);
     const connection = await this.getIntegrationConnection(workspace.id, p, false);
     if (!connection) return { connected: false, connectedProjects: [] };
-    const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
+    const mappingsTable = INTEGRATION_MAPPING_TABLES[p];
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
     const projects = await this.db.query(
       `SELECT m.project_id, p.name AS project_name, p.key AS project_key
@@ -11129,20 +11273,22 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     const organizationId = await this.projectOrganizationId(projectId);
-    const label = provider === "jira" ? "Jira" : "Linear";
+    const label = TICKET_PROVIDER_LABELS[provider];
 
     const connection = await this.getIntegrationConnection(organizationId, provider, false);
     if (!connection) throw new NotFoundException({ error: `${label} is not connected.` });
 
-    const mapping = await this.db.query<{ remote_key: string }>(
-      provider === "jira"
-        ? "SELECT jira_project_key AS remote_key FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1"
-        : "SELECT linear_team_key AS remote_key FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1",
-      [projectId]
-    );
+    const remoteKeySql = {
+      jira: "SELECT jira_project_key AS remote_key FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1",
+      linear: "SELECT linear_team_key AS remote_key FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1",
+      // A Notion database has no short key; its id is the run's remote key.
+      notion: "SELECT notion_database_id AS remote_key FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1"
+    }[provider];
+    const mapping = await this.db.query<{ remote_key: string }>(remoteKeySql, [projectId]);
     const remoteKey = mapping.rows[0]?.remote_key ? String(mapping.rows[0].remote_key) : null;
     if (!remoteKey) {
-      throw new BadRequestException({ error: `Link a ${label} ${provider === "jira" ? "project" : "team"} to this project before syncing.` });
+      const remoteKind = { jira: "project", linear: "team", notion: "database" }[provider];
+      throw new BadRequestException({ error: `Link a ${label} ${remoteKind} to this project before syncing.` });
     }
 
     const { run, alreadyRunning } = await this.integrationSync.startRun(organizationId, projectId, provider, uid, remoteKey);
@@ -11356,6 +11502,10 @@ export class LegacyService implements OnModuleInit {
     );
     const connection = res.rows[0] as Body | undefined;
     if (!connection) return null;
+    // Notion tokens never expire and cannot be refreshed (the row holds an empty refresh_token and a
+    // far-future token_expires_at). Returned before any expiry check so a Notion connection can
+    // never enter the Jira/Linear renewal below.
+    if (provider === "notion") return connection;
     const forced = Boolean(options.rejectedAccessToken);
     // Fast, lock-free path: this is what the overwhelming majority of calls hit, so it stays exactly
     // as cheap as it always was. Only a token actually due for refresh pays for the transaction below.
@@ -11539,7 +11689,7 @@ export class LegacyService implements OnModuleInit {
 
   /** Shared fetch+status-check for a provider's OAuth token endpoint — generalizes jiraFetch's
    *  auth-error handling so Linear's token refresh gets the same clean-error treatment. */
-  private async providerTokenFetch<T = unknown>(url: string, init: RequestInit, providerLabel: "Jira" | "Linear"): Promise<T> {
+  private async providerTokenFetch<T = unknown>(url: string, init: RequestInit, providerLabel: "Jira" | "Linear" | "Notion"): Promise<T> {
     const res = await fetch(url, init);
     if (!res.ok) {
       const authError = this.cleanAuthErrorOrNull(providerLabel, res.status);
@@ -11571,7 +11721,7 @@ export class LegacyService implements OnModuleInit {
   // The status also rides along on the exception (non-enumerable, so never serialized into a
   // response) for callers that need to tell the two apart — see integrationErrorReason, where a 403
   // on a ticket comment means "no permission", which reconnecting would not fix.
-  private cleanAuthErrorOrNull(provider: "Jira" | "Linear", status: number): BadRequestException | null {
+  private cleanAuthErrorOrNull(provider: "Jira" | "Linear" | "Notion", status: number): BadRequestException | null {
     if (status !== 401 && status !== 403) return null;
     const error = new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
     Object.defineProperty(error, "providerStatus", { value: status, enumerable: false });
@@ -11826,7 +11976,7 @@ export class LegacyService implements OnModuleInit {
     const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
     const search = String(query.search || "").trim();
     const combined = `
-      SELECT id, 'jira' AS source, jira_issue_key AS key, summary, description, issue_type, status, priority,
+      SELECT id, 'jira' AS source, jira_issue_key AS key, jira_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, jira_created_at AS created_at, jira_updated_at AS updated_at,
              jira_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL) AS has_coverage
@@ -11834,13 +11984,22 @@ export class LegacyService implements OnModuleInit {
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
       UNION ALL
-      SELECT id, 'linear' AS source, linear_issue_key AS key, summary, description, issue_type, status, priority,
+      SELECT id, 'linear' AS source, linear_issue_key AS key, linear_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, linear_created_at AS created_at, linear_updated_at AS updated_at,
              linear_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL) AS has_coverage
       FROM linear_tickets
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
+      UNION ALL
+      -- external_id is the full Notion page id: a test case links to a Notion page by that, not by the short display key.
+      SELECT id, 'notion' AS source, notion_page_key AS key, notion_page_id AS external_id, summary, description, issue_type, status, priority,
+             assignee, reporter, labels, notion_created_at AS created_at, notion_updated_at AS updated_at,
+             notion_url AS url, synced_at,
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL) AS has_coverage
+      FROM notion_pages
+      WHERE project_id = $1 AND archived = false
+        AND mapped_remote_id = (SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
     `;
     const filters: string[] = [];
     const values: any[] = [projectId];
@@ -11878,15 +12037,15 @@ export class LegacyService implements OnModuleInit {
   async requirementsSummary(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const bySource = async (
-      table: "jira_tickets" | "linear_tickets",
-      keyColumn: "jira_issue_key" | "linear_issue_key",
-      mappingTable: "jira_project_mappings" | "linear_project_mappings",
-      remoteIdColumn: "jira_project_id" | "linear_team_id"
+      table: "jira_tickets" | "linear_tickets" | "notion_pages",
+      keyColumn: "jira_issue_key" | "linear_issue_key" | "notion_page_id",
+      mappingTable: "jira_project_mappings" | "linear_project_mappings" | "notion_project_mappings",
+      remoteIdColumn: "jira_project_id" | "linear_team_id" | "notion_database_id"
     ) => {
       // Same "scope to the currently mapped entity only" rule as jiraTickets/linearTickets/
       // allTickets, so the stat strip and filter dropdowns never count tickets from a
       // since-switched-away-from project/team alongside the current one.
-      const scope = `project_id = $1 AND mapped_remote_id = (SELECT ${remoteIdColumn} FROM ${mappingTable} WHERE project_id = $1 AND enabled = true LIMIT 1)`;
+      const scope = `project_id = $1 AND mapped_remote_id = (SELECT ${remoteIdColumn} FROM ${mappingTable} WHERE project_id = $1 AND enabled = true LIMIT 1)${table === "notion_pages" ? " AND archived = false" : ""}`;
       const stats = await this.db.query(
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE EXISTS (
@@ -11907,18 +12066,19 @@ export class LegacyService implements OnModuleInit {
         statuses: statuses.rows.map((r) => r.status as string)
       };
     };
-    const [jira, linear] = await Promise.all([
+    const [jira, linear, notion] = await Promise.all([
       bySource("jira_tickets", "jira_issue_key", "jira_project_mappings", "jira_project_id"),
-      bySource("linear_tickets", "linear_issue_key", "linear_project_mappings", "linear_team_id")
+      bySource("linear_tickets", "linear_issue_key", "linear_project_mappings", "linear_team_id"),
+      bySource("notion_pages", "notion_page_id", "notion_project_mappings", "notion_database_id")
     ]);
     const all = {
-      total: jira.total + linear.total,
-      covered: jira.covered + linear.covered,
-      uncovered: jira.uncovered + linear.uncovered,
-      types: Array.from(new Set([...jira.types, ...linear.types])).sort(),
-      statuses: Array.from(new Set([...jira.statuses, ...linear.statuses])).sort()
+      total: jira.total + linear.total + notion.total,
+      covered: jira.covered + linear.covered + notion.covered,
+      uncovered: jira.uncovered + linear.uncovered + notion.uncovered,
+      types: Array.from(new Set([...jira.types, ...linear.types, ...notion.types])).sort(),
+      statuses: Array.from(new Set([...jira.statuses, ...linear.statuses, ...notion.statuses])).sort()
     };
-    return { all, jira, linear };
+    return { all, jira, linear, notion };
   }
 
   async linearComment(projectId: string, userId: string | null | undefined, body: Body) {
@@ -12009,6 +12169,349 @@ export class LegacyService implements OnModuleInit {
       }
     }
     return { list: results.slice(0, 20) };
+  }
+
+  // ── Notion-specific mirrors of the Linear project-scoped methods above ──
+  // Notion's unit of work is a DATABASE (a table of pages): a Tesbo project maps to one database and
+  // its pages are mirrored as tickets (notion_pages). Test cases link to a page by its full id
+  // (testcases.notion_page_id); the short "notion:xxxxxxxx" key is a display label only.
+
+  // One Notion call with the connection's token. A NotionApiError becomes the BadRequestException
+  // shape every other provider call here throws, carrying the HTTP status as a non-enumerable
+  // `providerStatus` (see cleanAuthErrorOrNull) and a plain-language cause as `error`.
+  private async notionFetch<T = unknown>(
+    connection: Body,
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+    what: "database" | "page" | "content" = "content"
+  ): Promise<T> {
+    try {
+      return await notionRequest<T>(decryptSecret(String(connection.access_token || "")), method, path, body);
+    } catch (err) {
+      if (!(err instanceof NotionApiError)) throw err;
+      const error = new BadRequestException({ error: describeNotionError(err, what) });
+      Object.defineProperty(error, "providerStatus", { value: err.status, enumerable: false });
+      throw error;
+    }
+  }
+
+  // Notion ids arrive dashed or compact. Canonicalised to the dashed form (what the API returns and
+  // what the sync stores) and rejected otherwise, so nothing but a UUID ever reaches a request path.
+  private normalizeNotionId(raw: unknown): string | null {
+    const compact = String(raw ?? "").trim().replace(/-/g, "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(compact)) return null;
+    return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
+  }
+
+  // Same name collision as jiraStatus()/linearStatus(): connection status, not page status.
+  async notionStatus(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) return { connected: false, connectedProjects: [], history: [] };
+    const databases = await this.db.query(
+      `SELECT id, notion_database_id, notion_database_name, created_at
+       FROM notion_project_mappings
+       WHERE project_id = $1 AND enabled = true
+       ORDER BY notion_database_name`,
+      [projectId]
+    );
+    // Every database this Tesbo project has ever been linked to (never deleted, only disabled).
+    const history = await this.db.query(
+      `SELECT id, notion_database_id, notion_database_name, created_at
+       FROM notion_project_mappings
+       WHERE project_id = $1 AND enabled = false
+       ORDER BY created_at DESC`,
+      [projectId]
+    );
+    return {
+      connected: true,
+      ...this.integrationConnectionHealth(connection, "notion"),
+      id: connection.id,
+      siteUrl: connection.site_url,
+      tokenExpiresAt: connection.token_expires_at,
+      connectedBy: connection.connected_by,
+      createdAt: connection.created_at,
+      connectedProjects: databases.rows.map(toCamel),
+      history: history.rows.map(toCamel)
+    };
+  }
+
+  /**
+   * Every database the Tesbo integration has been shared with (Notion's search only returns content
+   * the integration can see), as a pickable list. A workspace with nothing shared yields [], not an
+   * error: the picker shows its own "share a database with the integration" hint.
+   */
+  async notionDatabases(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+
+    const found: Body[] = [];
+    let cursor: string | undefined;
+    // Bounded: 20 pages of 100 is far past any realistic number of databases shared with one integration.
+    for (let page = 0; page < 20; page++) {
+      const data: Body = await this.notionFetch<Body>(connection, "POST", "/search", {
+        filter: { property: "object", value: "database" },
+        page_size: NOTION_PAGE_SIZE,
+        ...(cursor ? { start_cursor: cursor } : {})
+      });
+      found.push(...normalizeJsonArray(data.results));
+      if (!data.has_more || !data.next_cursor) break;
+      cursor = String(data.next_cursor);
+    }
+
+    const connected = await this.db.query<{ notion_database_id: string }>(
+      "SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true",
+      [projectId]
+    );
+    const connectedIds = new Set(connected.rows.map((row) => String(row.notion_database_id)));
+    return found
+      .filter((database) => database.id && database.archived !== true && database.in_trash !== true)
+      .map((database) => {
+        const id = String(database.id);
+        return {
+          id,
+          name: normalizeJsonArray(database.title).map((part) => String(part.plain_text || "")).join("").trim() || "Untitled database",
+          url: String(database.url || ""),
+          connected: connectedIds.has(id)
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async connectNotionDatabase(projectId: string, userId: string | null | undefined, body: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+
+    // An explicit JSON null unlinks (disables the current mapping, like an empty Linear request); a
+    // missing or blank databaseId is a mistake and is rejected.
+    const unlink = body.databaseId === null;
+    let database: { id: string; name: string } | null = null;
+    if (!unlink) {
+      const id = this.normalizeNotionId(body.databaseId);
+      if (!id) throw new BadRequestException({ error: "A valid Notion databaseId is required." });
+      // Confirms the database exists and is shared with the integration right now (a 404 here is the
+      // "not shared" message, not a mapping that fails later at sync time), and supplies the name
+      // when the caller did not send one.
+      const remote = await this.notionFetch<Body>(connection, "GET", `/databases/${id}`, undefined, "database");
+      const remoteName = normalizeJsonArray(remote.title).map((part) => String(part.plain_text || "")).join("").trim();
+      database = { id, name: String(body.databaseName || "").trim() || remoteName || "Untitled database" };
+    }
+
+    // One database per Tesbo project, same invariant as Jira and Linear. Disabled, never deleted, so
+    // the outgoing mapping's pages and mirrored documents stay valid and re-linking restores them.
+    try {
+      await this.db.transaction(async (client) => {
+        await client.query("UPDATE notion_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
+        if (!database) return;
+        await client.query(
+          `INSERT INTO notion_project_mappings (integration_connection_id, project_id, notion_database_id, notion_database_name)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (integration_connection_id, notion_database_id, project_id) DO UPDATE SET
+             notion_database_name = EXCLUDED.notion_database_name,
+             enabled = true`,
+          [connection.id, projectId, database.id, database.name.slice(0, 512)]
+        );
+      });
+    } catch (error) {
+      // idx_notion_project_mappings_one_per_project rejects a second concurrent save for this project
+      // (a double-click or two tabs); answer with the same 409 Jira and Linear give.
+      if ((error as { code?: string })?.code === "23505") {
+        throw new ConflictException({ error: "This project's Notion link was just changed by another action. Reload and try again." });
+      }
+      throw error;
+    }
+    return { linked: database ? 1 : 0 };
+  }
+
+  async syncNotion(userId: string | null | undefined, projectId: string) {
+    return this.startIntegrationSync(userId, projectId, "notion");
+  }
+
+  async notionPages(projectId: string, userId: string | null | undefined, query: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const limit = pageNumber(query.limit, 25, 0, 100);
+    const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const search = String(query.search || "").trim();
+    // Archived/trashed pages are kept for history but never listed.
+    const filters = ["project_id = $1", "archived = false"];
+    const values: any[] = [projectId];
+    // Default scope is the currently mapped database only; remoteId opts into a past mapping.
+    const remoteId = String(query.remoteId || "").trim();
+    if (remoteId) {
+      values.push(remoteId);
+      filters.push(`mapped_remote_id = $${values.length}`);
+    } else {
+      filters.push(`mapped_remote_id = (SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)`);
+    }
+    if (search) {
+      values.push(`%${search}%`);
+      filters.push(`(notion_page_key ILIKE $${values.length} OR summary ILIKE $${values.length})`);
+    }
+    if (query.issueType) {
+      values.push(String(query.issueType));
+      filters.push(`issue_type = $${values.length}`);
+    }
+    if (query.status) {
+      values.push(String(query.status));
+      filters.push(`status = $${values.length}`);
+    }
+    if (query.coverage === "covered" || query.coverage === "uncovered") {
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL)`;
+      filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
+    }
+    const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM notion_pages WHERE ${filters.join(" AND ")}`, values);
+    values.push(limit, offset);
+    const res = await this.db.query(
+      `SELECT * FROM notion_pages
+       WHERE ${filters.join(" AND ")}
+       ORDER BY notion_updated_at DESC NULLS LAST, synced_at DESC
+       LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values
+    );
+    return { list: res.rows.map(toCamel), total: count.rows[0]?.count ?? 0 };
+  }
+
+  async notionComment(projectId: string, userId: string | null | undefined, body: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+    const pageId = this.normalizeNotionId(body.pageId || body.notionPageId || body.issueKey);
+    const comment = String(body.comment || body.body || "").trim();
+    if (!pageId || !comment) throw new BadRequestException({ error: "Notion page id and comment are required." });
+    await this.notionCreateComment(connection, pageId, comment);
+    return { ok: true };
+  }
+
+  // Internal counterpart of notionComment for callers that have already authorized (the Zyra ticket
+  // auto-comment). `body` is the markdown the comment builder produces. Returns Notion's comment id.
+  private async notionPostComment(projectId: string, pageId: string, body: string): Promise<string | null> {
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+    const id = this.normalizeNotionId(pageId);
+    if (!id) throw new BadRequestException({ error: "This test case's Notion page id is not valid." });
+    return this.notionCreateComment(connection, id, body);
+  }
+
+  private async notionCreateComment(connection: Body, pageId: string, markdown: string): Promise<string | null> {
+    const created = await this.notionFetch<Body>(
+      connection,
+      "POST",
+      "/comments",
+      { parent: { page_id: pageId }, rich_text: markdownToNotionRichText(markdown, NOTION_RICH_TEXT_LIMIT) },
+      "page"
+    );
+    return created?.id ? String(created.id) : null;
+  }
+
+  // Live search inside the mapped database (not the notion_pages sync cache), like linearSearchIssues.
+  async notionSearchPages(projectId: string, userId: string | null | undefined, query: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+    const mappings = await this.db.query(
+      "SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND integration_connection_id = $2 AND enabled = true",
+      [projectId, connection.id]
+    );
+    const databaseId = mappings.rows[0]?.notion_database_id ? String(mappings.rows[0].notion_database_id) : "";
+    if (!databaseId) return { list: [] };
+
+    const search = String(query.search || query.q || "").trim();
+    const request: Body = { page_size: 20, sorts: [{ timestamp: "last_edited_time", direction: "descending" }] };
+    if (search) {
+      // A title filter needs the title property's name, which is whatever the database calls it.
+      const schema = await this.notionFetch<Body>(connection, "GET", `/databases/${encodeURIComponent(databaseId)}`, undefined, "database");
+      const titleName = Object.entries((schema.properties || {}) as Body).find(([, prop]) => (prop as Body)?.type === "title")?.[0];
+      if (titleName) request.filter = { property: titleName, title: { contains: search } };
+    }
+    const data = await this.notionFetch<Body>(connection, "POST", `/databases/${encodeURIComponent(databaseId)}/query`, request, "database");
+    return {
+      list: normalizeJsonArray(data.results).map((page) => ({
+        provider: "NOTION",
+        key: notionPageKey(String(page.id || "")),
+        pageId: String(page.id || ""),
+        summary: notionPageTitle(page.properties),
+        status: notionTicketFields(page.properties).status,
+        url: String(page.url || "")
+      }))
+    };
+  }
+
+  // Cache-only, like linearSnapshot: reads notion_pages, never calls Notion. `keys` are page ids.
+  private async notionSnapshot(projectId: string, pageIds: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
+    const selected = Array.from(new Set(pageIds.map((id) => id.trim()).filter(Boolean)));
+    if (!selected.length) return [];
+    const res = await this.db.query(
+      `SELECT notion_page_id, notion_page_key, summary, description, status, properties_json FROM notion_pages
+       WHERE project_id = $1 AND notion_page_id = ANY($2::text[])`,
+      [projectId, selected]
+    ).catch(() => ({ rows: [] as any[] }));
+    const byId = new Map<string, { key: string; summary: string; description: string; status: string }>(
+      res.rows.map((row) => [
+        String(row.notion_page_id),
+        {
+          key: String(row.notion_page_key),
+          summary: String(row.summary || ""),
+          // Properties first (status, owner, dates), then the page body, the same order the mirrored document uses.
+          description: [notionPropertiesMarkdown(row.properties_json), String(row.description || "").trim()].filter(Boolean).join("\n\n"),
+          status: String(row.status || "")
+        }
+      ])
+    );
+    return selected.map((id) => byId.get(id) || {
+      key: notionPageKey(id),
+      summary: "Selected Notion page",
+      description: "Page details were not available from the local cache, but the selected page was included for Zyra context.",
+      status: ""
+    });
+  }
+
+  // A page's title for human-facing text (ticket comments, task activity); the id when it is not cached.
+  private async notionPageLabel(projectId: string, pageId: string): Promise<string> {
+    const res = await this.db
+      .query<{ summary: string }>("SELECT summary FROM notion_pages WHERE project_id = $1 AND notion_page_id = $2 LIMIT 1", [projectId, pageId])
+      .catch(() => ({ rows: [] as Array<{ summary: string }> }));
+    return String(res.rows[0]?.summary || "").trim() || pageId;
+  }
+
+  // Archive-sweep lookup for a test case linked to a Notion page. A page has no status category, so
+  // "done" means Notion itself reports the page archived or in the trash; anything else is not done.
+  // A 404 is "not found" (deleted, or no longer shared), never "done".
+  private async fetchLiveNotionPageCategory(projectId: string, pageId: string): Promise<TicketCategoryLookup> {
+    let organizationId: string;
+    try {
+      organizationId = await this.projectOrganizationId(projectId);
+    } catch {
+      return NOT_CONNECTED_RESULT;
+    }
+    let connection: Body | null;
+    try {
+      connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    } catch {
+      connection = null;
+    }
+    if (!connection) return NOT_CONNECTED_RESULT;
+    const id = this.normalizeNotionId(pageId);
+    if (!id) return NOT_FOUND_RESULT;
+
+    let page: Body;
+    try {
+      page = await this.notionFetch<Body>(connection, "GET", `/pages/${id}`, undefined, "page");
+    } catch (err) {
+      const status = (err as { providerStatus?: number })?.providerStatus;
+      if (status === 404) return NOT_FOUND_RESULT;
+      return { found: false, doneness: null, rawCategory: null, reason: "error", detail: (err instanceof Error ? err.message : String(err)).slice(0, 300) };
+    }
+    const archived = page?.archived === true || page?.in_trash === true;
+    return { found: true, doneness: archived ? "done" : "not_done", rawCategory: archived ? "archived" : "active", reason: "ok" };
   }
 
   /*
@@ -15552,6 +16055,8 @@ export class LegacyService implements OnModuleInit {
     if (!story) throw new BadRequestException({ error: "story is required" });
     const jiraIssueKeys = normalizeJsonArray(body.jiraIssueKeys).map(String);
     const linearIssueKeys = normalizeJsonArray(body.linearIssueKeys).map(String);
+    // Notion pages are referenced by page id, not by their short display key.
+    const notionPageIds = normalizeJsonArray(body.notionPageIds).map(String);
     const knowledgeItemIds = normalizeJsonArray(body.knowledgeItemIds).map(String).filter(Boolean);
     const feedback = String(body.feedback || "").trim();
     const now = new Date().toISOString();
@@ -15568,24 +16073,25 @@ export class LegacyService implements OnModuleInit {
     // Several tickets behind the selection are all linked: each draft is attributed to the one it
     // cites at generation time (zyraAttributeDraftsToTickets — "KB N" citations of a ticket's mirror
     // included), so every ticket's comment lists only its own test cases.
-    const derivedTickets = jiraIssueKeys.length || linearIssueKeys.length
+    const derivedTickets = jiraIssueKeys.length || linearIssueKeys.length || notionPageIds.length
       ? []
       : await this.zyraTicketsFromKnowledgeSelection(projectId, knowledgeItemIds);
-    for (const ticket of derivedTickets) (ticket.provider === "jira" ? jiraIssueKeys : linearIssueKeys).push(ticket.issueKey);
+    for (const ticket of derivedTickets) (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).push(ticket.issueKey);
     const derivedKeys = new Set(derivedTickets.map((ticket) => `${ticket.provider}:${ticket.issueKey}`));
     const derivedDetail = derivedTickets.length === 1 ? "Linked from the selected Knowledge Base document." : "Linked from the selected Knowledge Base documents.";
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
       ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
       ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: derivedKeys.has(`jira:${key}`) ? derivedDetail : "Selected Jira ticket queued for Zyra." })),
-      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: derivedKeys.has(`linear:${key}`) ? derivedDetail : "Selected Linear ticket queued for Zyra." }))
+      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: derivedKeys.has(`linear:${key}`) ? derivedDetail : "Selected Linear ticket queued for Zyra." })),
+      ...notionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: derivedKeys.has(`notion:${id}`) ? derivedDetail : "Selected Notion page queued for Zyra." }))
     ];
     const res = await this.db.query(
       `INSERT INTO ai_generation_requests
        (project_id, requested_by, provider, model, user_story, acceptance_criteria, custom_prompt, requested_count,
         generated_count, generated_payload, agent_name, task_status, feedback, context, jira_issue_keys, linear_issue_keys,
-        token_input, token_output, token_total, source_summary, activity_log, language)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,'[]'::jsonb,$9,'todo',$10,$11,$12::jsonb,$13::jsonb,0,0,0,$14::jsonb,$15::jsonb,$16)
+        token_input, token_output, token_total, source_summary, activity_log, language, notion_page_ids)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,'[]'::jsonb,$9,'todo',$10,$11,$12::jsonb,$13::jsonb,0,0,0,$14::jsonb,$15::jsonb,$16,$17::jsonb)
        RETURNING *`,
       [
         projectId,
@@ -15605,7 +16111,8 @@ export class LegacyService implements OnModuleInit {
         JSON.stringify(activityLog),
         // The language the task's own text is written in (detectScriptLanguage), stored because
         // processZyraTask runs after this request has returned. No signal is English.
-        detectScriptLanguage([story, acceptanceCriteria, context].join("\n")) ?? "en"
+        detectScriptLanguage([story, acceptanceCriteria, context].join("\n")) ?? "en",
+        JSON.stringify(notionPageIds)
       ]
     );
     void this.processZyraTask(projectId, res.rows[0].id, { userId: uid, knowledgeItemIds }).catch(() => undefined);
@@ -15697,6 +16204,7 @@ export class LegacyService implements OnModuleInit {
       const feedback = String(task.feedback || "");
       const jiraIssueKeys = normalizeJsonArray(task.jira_issue_keys).map(String);
       const linearIssueKeys = normalizeJsonArray(task.linear_issue_keys).map(String);
+      const notionPageIds = normalizeJsonArray(task.notion_page_ids).map(String);
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
       const testcaseRange = String((projectSettings as Body).testcaseRange || "30-50");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
@@ -15705,6 +16213,7 @@ export class LegacyService implements OnModuleInit {
       const { knowledge, knowledgeConfidence } = await this.zyraTaskKnowledge(projectId, options.knowledgeItemIds || [], [story, context, acceptanceCriteria]);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
+      const notion = await this.notionSnapshot(projectId, notionPageIds);
       const existingTestcases = await this.existingTestcaseSnapshot(projectId, story, context);
       const aiResult = await this.generateZyraWithProvider({
         provider,
@@ -15714,12 +16223,12 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.rows[0].auth_header_name,
         authScheme: allocation.rows[0].auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: LegacyService.zyraStoredLanguage(task.language) }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, notion, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: LegacyService.zyraStoredLanguage(task.language) }
       });
       const drafts = aiResult.drafts;
       // Stamped into generated_payload together with the drafts themselves, so the save reads the
       // ticket each draft was generated for rather than re-deriving it later.
-      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
       const inputText = [
         story,
         context,
@@ -15728,6 +16237,7 @@ export class LegacyService implements OnModuleInit {
         knowledge.map((item) => `${item.title}\n${item.content}`).join("\n"),
         jira.map((t) => `${t.key} ${t.summary}`).join("\n"),
         linear.map((t) => `${t.key} ${t.summary}`).join("\n"),
+        notion.map((t) => `${t.key} ${t.summary}`).join("\n"),
         existingTestcases.map((tc) => `${tc.externalId} ${tc.title} ${tc.description}`).join("\n")
       ].join("\n");
       const tokenInput = aiResult.usage.input || estimateTokens(inputText);
@@ -15738,6 +16248,7 @@ export class LegacyService implements OnModuleInit {
         ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: truncateAtWordBoundary(item.content, 1500) })),
         ...jira.map((item) => ({ type: "jira", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...linear.map((item) => ({ type: "linear", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
+        ...notion.map((item) => ({ type: "notion", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))
       ];
       const finishedAt = new Date().toISOString();
@@ -15881,6 +16392,7 @@ export class LegacyService implements OnModuleInit {
     const referenceNote = String(body.referenceNote || "").trim();
     const additionalJiraIssueKeys = normalizeJsonArray(body.jiraIssueKeys).map(String).filter(Boolean);
     const additionalLinearIssueKeys = normalizeJsonArray(body.linearIssueKeys).map(String).filter(Boolean);
+    const additionalNotionPageIds = normalizeJsonArray(body.notionPageIds).map(String).filter(Boolean);
     const feedback = [
       feedbackText,
       referenceNote ? `Referenced docs or tickets for knowledge base:\n${referenceNote}` : ""
@@ -15908,7 +16420,8 @@ export class LegacyService implements OnModuleInit {
         feedbackText,
         referenceNote ? `References: ${referenceNote}` : "",
         additionalJiraIssueKeys.length ? `Jira tickets: ${additionalJiraIssueKeys.join(", ")}` : "",
-        additionalLinearIssueKeys.length ? `Linear tickets: ${additionalLinearIssueKeys.join(", ")}` : ""
+        additionalLinearIssueKeys.length ? `Linear tickets: ${additionalLinearIssueKeys.join(", ")}` : "",
+        additionalNotionPageIds.length ? `Notion pages: ${additionalNotionPageIds.join(", ")}` : ""
       ].filter(Boolean).join("\n"),
       createdAt: new Date().toISOString()
     }];
@@ -15931,6 +16444,7 @@ export class LegacyService implements OnModuleInit {
     const acceptanceCriteria = existing.rows[0].acceptance_criteria || "";
     const jiraIssueKeys = Array.from(new Set([...normalizeJsonArray(existing.rows[0].jira_issue_keys).map(String), ...additionalJiraIssueKeys]));
     const linearIssueKeys = Array.from(new Set([...normalizeJsonArray(existing.rows[0].linear_issue_keys).map(String), ...additionalLinearIssueKeys]));
+    const notionPageIds = Array.from(new Set([...normalizeJsonArray(existing.rows[0].notion_page_ids).map(String), ...additionalNotionPageIds]));
     // Re-read the project's current range (rather than trusting the stored requested_count alone)
     // so a regenerate keeps the same "generate exhaustively" instruction the initial run used —
     // otherwise this falls back to the generic "generate exactly N" phrasing, which reads very
@@ -15956,8 +16470,10 @@ export class LegacyService implements OnModuleInit {
       referenceNote,
       jiraIssueKeys,
       linearIssueKeys,
+      notionPageIds,
       additionalJiraIssueKeys,
       additionalLinearIssueKeys,
+      additionalNotionPageIds,
       requestedCount,
       testcaseRange,
       provider,
@@ -15992,8 +16508,10 @@ export class LegacyService implements OnModuleInit {
       referenceNote: string;
       jiraIssueKeys: string[];
       linearIssueKeys: string[];
+      notionPageIds: string[];
       additionalJiraIssueKeys: string[];
       additionalLinearIssueKeys: string[];
+      additionalNotionPageIds: string[];
       requestedCount: number;
       testcaseRange: string;
       provider: string;
@@ -16005,7 +16523,7 @@ export class LegacyService implements OnModuleInit {
   ): Promise<void> {
     const {
       userId, story, context, acceptanceCriteria, feedback, feedbackText, referenceNote,
-      jiraIssueKeys, linearIssueKeys, additionalJiraIssueKeys, additionalLinearIssueKeys,
+      jiraIssueKeys, linearIssueKeys, notionPageIds, additionalJiraIssueKeys, additionalLinearIssueKeys, additionalNotionPageIds,
       requestedCount, testcaseRange, provider, model, allocation, previousSourceSummary
     } = options;
     try {
@@ -16020,10 +16538,11 @@ export class LegacyService implements OnModuleInit {
       // a single document cover both, so a reviewer pivoting to something the initial story never
       // mentioned (e.g. "also check the session timeout") would match nothing at all. feedback is
       // guaranteed non-empty here — zyraFeedback (the caller) already rejects an empty one.
-      const [{ knowledge, knowledgeConfidence }, jira, linear, existingTestcases] = await Promise.all([
+      const [{ knowledge, knowledgeConfidence }, jira, linear, notion, existingTestcases] = await Promise.all([
         this.zyraTaskKnowledge(projectId, [], [feedback]),
         this.jiraSnapshot(projectId, jiraIssueKeys),
         this.linearSnapshot(projectId, linearIssueKeys),
+        this.notionSnapshot(projectId, notionPageIds),
         this.existingTestcaseSnapshot(projectId, story, context)
       ]);
       const aiResult = await this.generateZyraWithProvider({
@@ -16034,14 +16553,14 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.auth_header_name,
         authScheme: allocation.auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: options.language }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, notion, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: options.language }
       });
       // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
       // branch) — the provider call happened and was billed either way.
       await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, aiResult.usage);
       // Against the FULL key list (original + any the reviewer added), which is what the UPDATE below
       // stores alongside these drafts — see processZyraTask's identical call.
-      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
@@ -16055,6 +16574,7 @@ export class LegacyService implements OnModuleInit {
         ...(referenceNote ? [{ type: "feedback_reference", title: "Reviewer reference", detail: referenceNote.slice(0, 320) }] : []),
         ...additionalJiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: "Referenced by reviewer feedback." })),
         ...additionalLinearIssueKeys.map((key) => ({ type: "linear", title: key, detail: "Referenced by reviewer feedback." })),
+        ...additionalNotionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: "Referenced by reviewer feedback." })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))
       ];
       const res = await this.db.query(
@@ -16062,7 +16582,7 @@ export class LegacyService implements OnModuleInit {
          SET generated_count = $3, generated_payload = $4::jsonb, feedback = $5,
              token_input = token_input + $6, token_output = token_output + $7, token_total = token_total + $8,
              activity_log = activity_log || $9::jsonb, source_summary = $10::jsonb, jira_issue_keys = $11::jsonb,
-             linear_issue_keys = $12::jsonb, task_status = 'in_review', updated_at = now()
+             linear_issue_keys = $12::jsonb, notion_page_ids = $13::jsonb, task_status = 'in_review', updated_at = now()
          WHERE id = $1 AND project_id = $2 AND task_status = 'todo'
          RETURNING *`,
         [
@@ -16077,7 +16597,8 @@ export class LegacyService implements OnModuleInit {
           JSON.stringify(activity),
           JSON.stringify(nextSources),
           JSON.stringify(jiraIssueKeys),
-          JSON.stringify(linearIssueKeys)
+          JSON.stringify(linearIssueKeys),
+          JSON.stringify(notionPageIds)
         ]
       );
       const responseRow = res.rows[0];
@@ -16110,7 +16631,8 @@ export class LegacyService implements OnModuleInit {
           `Regenerated ${aiResult.drafts.length} testcase draft(s) after applying reviewer feedback.`,
           referenceNote ? `Reviewer references: ${referenceNote}` : "",
           additionalJiraIssueKeys.length ? `Jira references: ${additionalJiraIssueKeys.join(", ")}` : "",
-          additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : ""
+          additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : "",
+          additionalNotionPageIds.length ? `Notion references: ${additionalNotionPageIds.join(", ")}` : ""
         ].filter(Boolean).join(" ")
       });
     } catch (error) {
@@ -16311,9 +16833,11 @@ export class LegacyService implements OnModuleInit {
       // test case to one ticket and, with Jira + Linear, to both. Chat-staged rows never set these,
       // so all of this is empty for them — every chat create draft goes through the plain "create
       // new testcase" branch.
-      const singleTicket = jiraKeys.length + linearKeys.length === 1;
+      const notionPageIds = normalizeJsonArray(existing.notion_page_ids).map(String).filter(Boolean);
+      const singleTicket = jiraKeys.length + linearKeys.length + notionPageIds.length === 1;
       const jiraIssueKey = singleTicket ? jiraKeys[0] ?? null : null;
       const linearIssueKey = singleTicket ? linearKeys[0] ?? null : null;
+      const notionPageId = singleTicket ? notionPageIds[0] ?? null : null;
       const ticketUrls = new Map<string, string | null>();
       if (jiraKeys.length) {
         const res = await client.query("SELECT jira_issue_key, jira_url FROM jira_tickets WHERE project_id = $1 AND jira_issue_key = ANY($2::text[])", [projectId, jiraKeys]).catch(() => ({ rows: [] as Body[] }));
@@ -16323,22 +16847,28 @@ export class LegacyService implements OnModuleInit {
         const res = await client.query("SELECT linear_issue_key, linear_url FROM linear_tickets WHERE project_id = $1 AND linear_issue_key = ANY($2::text[])", [projectId, linearKeys]).catch(() => ({ rows: [] as Body[] }));
         for (const row of res.rows) if (!ticketUrls.get(`linear:${row.linear_issue_key}`)) ticketUrls.set(`linear:${row.linear_issue_key}`, row.linear_url || null);
       }
+      if (notionPageIds.length) {
+        const res = await client.query("SELECT notion_page_id, notion_url FROM notion_pages WHERE project_id = $1 AND notion_page_id = ANY($2::text[])", [projectId, notionPageIds]).catch(() => ({ rows: [] as Body[] }));
+        for (const row of res.rows) if (!ticketUrls.get(`notion:${row.notion_page_id}`)) ticketUrls.set(`notion:${row.notion_page_id}`, row.notion_url || null);
+      }
       // The test cases already linked to each of the task's tickets, oldest first, for the
       // "already linked, update in place" pairing (zyraDraftTicketLink). severity/component are
       // selected alongside id so the create/update payload below can decide "only fill if blank"
       // for those two fields — see its own comment.
       const existingLinkedByTicket = new Map<string, Body[]>();
-      if (jiraKeys.length || linearKeys.length) {
+      if (jiraKeys.length || linearKeys.length || notionPageIds.length) {
         const linked = await client.query(
-          `SELECT id, severity, component, jira_issue_key, linear_issue_key FROM testcases
-           WHERE project_id = $1 AND deleted_at IS NULL AND (jira_issue_key = ANY($2::text[]) OR linear_issue_key = ANY($3::text[]))
+          `SELECT id, severity, component, jira_issue_key, linear_issue_key, notion_page_id FROM testcases
+           WHERE project_id = $1 AND deleted_at IS NULL
+             AND (jira_issue_key = ANY($2::text[]) OR linear_issue_key = ANY($3::text[]) OR notion_page_id = ANY($4::text[]))
            ORDER BY updated_at ASC`,
-          [projectId, jiraKeys, linearKeys]
+          [projectId, jiraKeys, linearKeys, notionPageIds]
         );
         for (const row of linked.rows) {
           const pools = [
             ...(row.jira_issue_key && jiraKeys.includes(row.jira_issue_key) ? [`jira:${row.jira_issue_key}`] : []),
-            ...(row.linear_issue_key && linearKeys.includes(row.linear_issue_key) ? [`linear:${row.linear_issue_key}`] : [])
+            ...(row.linear_issue_key && linearKeys.includes(row.linear_issue_key) ? [`linear:${row.linear_issue_key}`] : []),
+            ...(row.notion_page_id && notionPageIds.includes(row.notion_page_id) ? [`notion:${row.notion_page_id}`] : [])
           ];
           for (const pool of pools) existingLinkedByTicket.set(pool, [...(existingLinkedByTicket.get(pool) || []), row]);
         }
@@ -16412,6 +16942,7 @@ export class LegacyService implements OnModuleInit {
         batchSuiteId,
         jiraIssueKey,
         linearIssueKey,
+        notionPageId,
         ticketUrls,
         existingLinkedByTicket,
         linkedPositions: new Map(),
@@ -16551,6 +17082,7 @@ export class LegacyService implements OnModuleInit {
         "zyra",
         ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
         ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
+        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -16583,6 +17115,8 @@ export class LegacyService implements OnModuleInit {
         jiraUrl: link.jiraUrl,
         linearIssueKey: link.linearIssueKey,
         linearUrl: link.linearUrl,
+        notionPageId: link.notionPageId,
+        notionUrl: link.notionUrl,
         // Carried from the staged draft (already resolved+verified at generation time) onto the
         // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
         // no sourceRefs ever attached) simply carries none, same as it always has. Same "only fill
@@ -16602,7 +17136,7 @@ export class LegacyService implements OnModuleInit {
         // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
         // sync-integration wiring in zyraSave has something to target — this row IS what was just
         // written to `payload.jiraIssueKey`/`payload.linearIssueKey` above, not a guess.
-        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey });
+        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey, notionPageId: payload.notionPageId });
         touchedActions.push("update");
       } else {
         const row = toCamel(await this.insertTestCaseWithClient(client, ctx.projectId, ctx.uid, payload));
@@ -16671,6 +17205,7 @@ export class LegacyService implements OnModuleInit {
         "zyra",
         ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
         ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
+        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -16699,6 +17234,8 @@ export class LegacyService implements OnModuleInit {
         jiraUrl: link.jiraUrl,
         linearIssueKey: link.linearIssueKey,
         linearUrl: link.linearUrl,
+        notionPageId: link.notionPageId,
+        notionUrl: link.notionUrl,
         // Same "only overwrite when this run resolved something" rule as processZyraSaveEntriesSequential's
         // identical field — see that function's comment for why null (not []) is what protects an
         // already-linked row's existing citations from being wiped by an ungrounded regeneration.
@@ -16714,7 +17251,7 @@ export class LegacyService implements OnModuleInit {
         // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
         // sync-integration wiring in zyraSave has something to target — see the sequential path's
         // identical comment.
-        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey };
+        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey, notionPageId: payload.notionPageId };
         touchedActionSlots[slot] = "update";
       } else {
         // Deferred — actually written once, below, as a single batch insert by
@@ -16810,6 +17347,8 @@ export class LegacyService implements OnModuleInit {
       jira_url: payload.jiraUrl || null,
       linear_issue_key: payload.linearIssueKey || null,
       linear_url: payload.linearUrl || null,
+      notion_page_id: payload.notionPageId || null,
+      notion_url: payload.notionUrl || null,
       attachments: null,
       estimated_duration: null,
       source_refs: LegacyService.sanitizeSourceRefsInput(payload.sourceRefs)
@@ -16820,18 +17359,18 @@ export class LegacyService implements OnModuleInit {
          (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
           priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
           automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-          linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs)
+          linear_issue_key, linear_url, notion_page_id, notion_url, attachments, created_by, updated_by, estimated_duration, source_refs)
        SELECT $1::uuid, r.suite_id, r.external_id, r.title, r.description, r.preconditions, r.postconditions,
               r.steps, r.test_data, r.priority, r.severity, r.type, r.automation_status, r.automation_repo,
               r.automation_path, r.automation_test_name, r.automation_framework, r.automation_tags, r.owner_id,
               r.component, r.status, r.jira_issue_key, r.jira_url, r.linear_issue_key, r.linear_url,
-              r.attachments, $2::uuid, $2::uuid, r.estimated_duration, r.source_refs
+              r.notion_page_id, r.notion_url, r.attachments, $2::uuid, $2::uuid, r.estimated_duration, r.source_refs
        FROM jsonb_to_recordset($3::jsonb) AS r(
          suite_id uuid, external_id text, title text, description text, preconditions text,
          postconditions text, steps jsonb, test_data text, priority text, severity text, type text,
          automation_status text, automation_repo text, automation_path text, automation_test_name text,
          automation_framework text, automation_tags text, owner_id uuid, component text, status text,
-         jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, attachments text,
+         jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, notion_page_id text, notion_url text, attachments text,
          estimated_duration text, source_refs jsonb
        )
        RETURNING *`,
@@ -17709,7 +18248,9 @@ export class LegacyService implements OnModuleInit {
   async fetchLiveTicketCategory(projectId: string, provider: IntegrationProvider, issueKey: string): Promise<TicketCategoryLookup> {
     const key = issueKey.trim();
     if (!key) return NOT_FOUND_RESULT;
-    return provider === "jira" ? this.fetchLiveJiraTicketCategory(projectId, key) : this.fetchLiveLinearTicketCategory(projectId, key);
+    if (provider === "jira") return this.fetchLiveJiraTicketCategory(projectId, key);
+    if (provider === "notion") return this.fetchLiveNotionPageCategory(projectId, key);
+    return this.fetchLiveLinearTicketCategory(projectId, key);
   }
 
   private mapJiraStatusCategory(categoryKey: string): NormalizedTicketDoneness | null {
@@ -17914,13 +18455,14 @@ export class LegacyService implements OnModuleInit {
     // jiraIssueKeys attached at creation.
     const jiraIssueKeys = row.jiraIssueKey ? [String(row.jiraIssueKey)] : [];
     const linearIssueKeys = row.linearIssueKey ? [String(row.linearIssueKey)] : [];
+    const notionPageIds = row.notionPageId ? [String(row.notionPageId)] : [];
 
     try {
       await this.db.query(
         `INSERT INTO ai_generation_requests
            (project_id, requested_by, provider, model, user_story, requested_count, generated_count,
-            generated_payload, agent_name, task_status, activity_log, sweep_testcase_id, jira_issue_keys, linear_issue_keys)
-         VALUES ($1, NULL, $2, NULL, $3, 1, 1, $4::jsonb, $5, 'in_review', $6::jsonb, $7, $8::jsonb, $9::jsonb)`,
+            generated_payload, agent_name, task_status, activity_log, sweep_testcase_id, jira_issue_keys, linear_issue_keys, notion_page_ids)
+         VALUES ($1, NULL, $2, NULL, $3, 1, 1, $4::jsonb, $5, 'in_review', $6::jsonb, $7, $8::jsonb, $9::jsonb, $10::jsonb)`,
         [
           projectId,
           ZYRA_ARCHIVE_SWEEP_PROVIDER,
@@ -17930,7 +18472,8 @@ export class LegacyService implements OnModuleInit {
           JSON.stringify(activityLog),
           row.id,
           JSON.stringify(jiraIssueKeys),
-          JSON.stringify(linearIssueKeys)
+          JSON.stringify(linearIssueKeys),
+          JSON.stringify(notionPageIds)
         ]
       );
       return "staged";
@@ -18061,6 +18604,8 @@ export class LegacyService implements OnModuleInit {
     const linear = input.linear.length
       ? input.linear.map((item) => `${item.key}: ${item.summary}\n${item.description}`).join("\n\n")
       : "No Linear tickets were selected.";
+    // Only present when a Notion page was selected, so a prompt without one is byte-identical to before.
+    const notion = input.notion?.length ? input.notion.map((item) => `${item.key}: ${item.summary}\n${item.description}`).join("\n\n") : "";
     const existingTestcases = input.existingTestcases.length
       ? input.existingTestcases.map((item) => `${item.externalId}: ${item.title}\nPriority: ${item.priority}; Status: ${item.status}; Component: ${item.component || "unset"}\n${item.description}\nSteps: ${item.stepsSummary}`).join("\n\n")
       : "No existing testcases were available.";
@@ -18075,6 +18620,7 @@ export class LegacyService implements OnModuleInit {
       jira,
       "Linear tickets (cite by its ticket key):",
       linear,
+      ...(notion ? ["Notion pages (cite by its page key):", notion] : []),
       "Existing testcases to review for context and duplicate avoidance (cite by its external id):",
       existingTestcases,
       "Related bugs from this project's bug tracker (cite by its 'BUG N' label):",
@@ -20579,6 +21125,7 @@ export class LegacyService implements OnModuleInit {
     item.drafts = await Promise.all(rawDrafts.map((entry: Body) => this.normalizeAiTaskDraftEntry(entry)));
     item.jiraIssueKeys = normalizeJsonArray(row.jira_issue_keys);
     item.linearIssueKeys = normalizeJsonArray(row.linear_issue_keys);
+    item.notionPageIds = normalizeJsonArray(row.notion_page_ids);
     item.sources = normalizeJsonArray(row.source_summary);
     item.activities = normalizeJsonArray(row.activity_log);
     // A Russian task's timeline and sources are rendered in Russian; the stored English is untouched

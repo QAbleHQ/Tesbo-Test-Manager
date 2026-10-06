@@ -919,6 +919,113 @@ test.describe("filters", () => {
     }
   });
 
+  // A Notion link is a PAGE ID (testcases.notion_page_id, V133), not a display key: the sync stores
+  // the full dashed id and ticket lists expose it as externalId. These cover the link columns through
+  // the real create / update / list / duplicate API; no Notion connection or seeded page is needed
+  // because the link is a plain column, exactly like jiraIssueKey (the same reason the MCP link tool
+  // does not require the ticket to be synced).
+  test("links a test case to a Notion page by id, filters by it, and clears it with null or an empty string", async ({ request }) => {
+    const marker = Date.now();
+    const pageId = crypto.randomUUID();
+    const otherPageId = crypto.randomUUID();
+    const notionUrl = `https://www.notion.so/e2e-${pageId.replace(/-/g, "")}`;
+    const linked = await createCase(request, {
+      title: `E2E Notion Link ${marker}`,
+      notionPageId: pageId,
+      notionUrl,
+      jiraIssueKey: `JIRA${marker}`,
+      linearIssueKey: `LIN${marker}`,
+    });
+    const unlinked = await createCase(request, { title: `E2E Notion Unlinked ${marker}` });
+    const copies: string[] = [];
+
+    try {
+      expect(linked.notionPageId).toBe(pageId);
+      expect(linked.notionUrl).toBe(notionUrl);
+      const fetched = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${linked.id}`)).json();
+      expect(fetched.notionPageId).toBe(pageId);
+      expect(fetched.notionUrl).toBe(notionUrl);
+      // A case created with no link reads back as null, not as an empty string or undefined-as-"".
+      expect(unlinked.notionPageId ?? null).toBeNull();
+
+      // Filter: the full page id finds it; another id and the unlinked case do not appear.
+      const hit = await (
+        await request.get(`/api/projects/${ctx.projectId}/testcases`, { params: { notionPageId: pageId } })
+      ).json();
+      expect(hit.map((tc: { id: string }) => tc.id)).toEqual([linked.id]);
+      const miss = await (
+        await request.get(`/api/projects/${ctx.projectId}/testcases`, { params: { notionPageId: otherPageId } })
+      ).json();
+      expect(miss).toEqual([]);
+
+      // More than one test case may cover the same page, and a duplicate carries the link with it.
+      const dup = await request.post(`/api/projects/${ctx.projectId}/testcases/${linked.id}/duplicate`);
+      expect(dup.ok(), await dup.text()).toBeTruthy();
+      const copy = await dup.json();
+      copies.push(copy.id);
+      expect(copy.notionPageId).toBe(pageId);
+      expect(copy.notionUrl).toBe(notionUrl);
+      const both = await (
+        await request.get(`/api/projects/${ctx.projectId}/testcases`, { params: { notionPageId: pageId } })
+      ).json();
+      expect(both.map((tc: { id: string }) => tc.id).sort()).toEqual([linked.id, copy.id].sort());
+
+      // An update that does not mention the link leaves it alone.
+      const rename = await request.put(`/api/projects/${ctx.projectId}/testcases/${linked.id}`, {
+        data: { title: `E2E Notion Link ${marker} renamed` },
+      });
+      expect(rename.ok()).toBeTruthy();
+      let after = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${linked.id}`)).json();
+      expect(after.notionPageId).toBe(pageId);
+      expect(after.notionUrl).toBe(notionUrl);
+
+      // Re-pointing it to another page replaces the id (and the url that goes with it).
+      const repoint = await request.put(`/api/projects/${ctx.projectId}/testcases/${linked.id}`, {
+        data: { notionPageId: otherPageId, notionUrl: `${notionUrl}-2` },
+      });
+      expect(repoint.ok()).toBeTruthy();
+      after = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${linked.id}`)).json();
+      expect(after.notionPageId).toBe(otherPageId);
+      expect(after.notionUrl).toBe(`${notionUrl}-2`);
+
+      // An explicit null clears BOTH the id and the url, and only the Notion link: Jira and Linear stay.
+      const clearNull = await request.put(`/api/projects/${ctx.projectId}/testcases/${linked.id}`, {
+        data: { notionPageId: null },
+      });
+      expect(clearNull.ok()).toBeTruthy();
+      after = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${linked.id}`)).json();
+      expect(after.notionPageId ?? null).toBeNull();
+      expect(after.notionUrl ?? null).toBeNull();
+      expect(after.jiraIssueKey).toBe(`JIRA${marker}`);
+      expect(after.linearIssueKey).toBe(`LIN${marker}`);
+      const gone = await (
+        await request.get(`/api/projects/${ctx.projectId}/testcases`, { params: { notionPageId: otherPageId } })
+      ).json();
+      expect(gone).toEqual([]);
+
+      // An empty string clears too (same convention the Jira/Linear link fields use).
+      await request.put(`/api/projects/${ctx.projectId}/testcases/${linked.id}`, { data: { notionPageId: pageId, notionUrl } });
+      const clearEmpty = await request.put(`/api/projects/${ctx.projectId}/testcases/${linked.id}`, {
+        data: { notionPageId: "" },
+      });
+      expect(clearEmpty.ok()).toBeTruthy();
+      after = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${linked.id}`)).json();
+      expect(after.notionPageId ?? null).toBeNull();
+
+      // Clearing Jira leaves a Notion link in place: the three providers are independent columns.
+      await request.put(`/api/projects/${ctx.projectId}/testcases/${linked.id}`, { data: { notionPageId: pageId, notionUrl } });
+      await request.put(`/api/projects/${ctx.projectId}/testcases/${linked.id}`, { data: { jiraIssueKey: null } });
+      after = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${linked.id}`)).json();
+      expect(after.jiraIssueKey ?? null).toBeNull();
+      expect(after.notionPageId).toBe(pageId);
+      expect(after.linearIssueKey).toBe(`LIN${marker}`);
+    } finally {
+      for (const id of copies) await deleteCase(request, id);
+      await deleteCase(request, linked.id);
+      await deleteCase(request, unlinked.id);
+    }
+  });
+
   test("suiteId=none filters to test cases with no suite assigned", { tag: '@tesbo.testId("TES-TC-1208")' }, async ({ request }) => {
     const suite = await createSuite(request, `E2E NoSuite Filter Suite ${Date.now()}`);
     const marker = Date.now();

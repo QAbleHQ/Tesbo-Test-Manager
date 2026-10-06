@@ -16,6 +16,12 @@ import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workfl
 import { useIntegrationOAuthConnect } from "@/lib/useIntegrationOAuthConnect";
 import { useAppData } from "@/components/app/AppDataProvider";
 
+const REMOTE_UNIT_LABELS: Record<IntegrationProvider, string> = {
+  jira: "Jira project",
+  linear: "Linear team",
+  notion: "Notion database",
+};
+
 function isValidProjectId(value: string | null): value is string {
   return !!value && /^[a-zA-Z0-9-]+$/.test(value);
 }
@@ -196,7 +202,7 @@ function WorkspaceIntegrationConfigInner({
             </ul>
           )}
           <p className="text-sm text-[var(--muted)]">
-            To pick which {provider === "jira" ? "Jira project" : "Linear team"} feeds a Tesbo project, open that project&apos;s Settings → Integrations tab.
+            To pick which {REMOTE_UNIT_LABELS[provider]} feeds a Tesbo project, open that project&apos;s Settings → Integrations tab.
           </p>
           {canManage && (
             <Button
