@@ -15,6 +15,7 @@ import {
 import { Button, Input, Card, Field, FieldLabel, FieldError, Select } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { validateScheduleRunAt } from "@/lib/validation";
+import { formatDateTime } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
@@ -304,7 +305,7 @@ export default function ScheduleRunsPage() {
                       <td className="px-4 py-3">
                         {s.scheduleType === "one_time" ? "One-time" : `Every ${s.intervalMinutes}m`}
                       </td>
-                      <td className="px-4 py-3">{s.nextRunAt ? new Date(s.nextRunAt).toLocaleString() : "—"}</td>
+                      <td className="px-4 py-3">{s.nextRunAt ? formatDateTime(s.nextRunAt) : "—"}</td>
                       <td className="px-4 py-3">{s.lastStatus ?? "—"}</td>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">

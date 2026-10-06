@@ -124,7 +124,11 @@ export type RbacTenantKind =
   | "zyra-trace"
   // Zyra's exact-value KB grounding (api/zyra.spec.ts). Its own, genuinely-empty tenant: each test
   // asserts which document is "KB 1", which any other suite's leftover docs would change.
-  | "zyra-exact-values";
+  | "zyra-exact-values"
+  // The language Zyra writes generated test cases in (Accept-Language → zyra_chat_sessions.language /
+  // ai_generation_requests.language). Its own tenant because each test asserts on exactly which
+  // prompts the fake provider received, which any other suite's concurrent turn would interleave.
+  | "zyra-language";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";

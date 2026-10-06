@@ -1,0 +1,21 @@
+-- The language Zyra writes in for a chat session or a task-board task: 'en' or 'ru'
+-- (EXPORT_LOCALES in src/common/export-i18n.ts). It is judged from the Unicode script of what the
+-- user typed (detectScriptLanguage in src/common/script-language.ts), never from the browser.
+--
+-- It has to be stored rather than recomputed, for two reasons:
+--   * most generation outlives its request: a chat turn runs detached (startZyraChatMessage), an
+--     exhaustive plan's later batches run in continueZyraChatPlan, a server restart resumes a running
+--     plan with no request at all (resumeInterruptedZyraChatPlans), and a task is processed
+--     fire-and-forget (processZyraTask / processZyraFeedback);
+--   * a message with no language signal — "ok", "да", a bare ticket key — must keep the language
+--     the conversation already had, so there has to be one to keep.
+--
+-- A session's language is updated by every message that does carry a signal, so a user who switches
+-- to English mid-conversation gets English from the next turn on, and the reverse.
+--
+-- The stored vocabularies stay English whatever the language: type 'Functional', status 'Draft',
+-- automation_status 'Not Automated', priority P0-P3, severity Critical/High/Medium/Low.
+--
+-- Existing rows default to 'en', which is what every one of them was written in.
+ALTER TABLE zyra_chat_sessions ADD COLUMN IF NOT EXISTS language VARCHAR(8) NOT NULL DEFAULT 'en';
+ALTER TABLE ai_generation_requests ADD COLUMN IF NOT EXISTS language VARCHAR(8) NOT NULL DEFAULT 'en';

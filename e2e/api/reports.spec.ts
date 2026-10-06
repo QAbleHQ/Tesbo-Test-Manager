@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test, type APIRequestContext } from "@playwright/test";
+import * as XLSX from "xlsx";
 import { setGraceWindow, setProPlan } from "../utils/billing-db";
 import { literal, scalar } from "../utils/psql";
 import {
@@ -61,6 +62,8 @@ function reportPaths(projectId: string): string[] {
     // RPT-A-54, which is the promise that a downgraded workspace can still get its data out.
     `/api/projects/${projectId}/reports/export/csv?view=overview`,
     `/api/projects/${projectId}/reports/export/xlsx?view=execution`,
+    // Asking for a Russian file must not open any door the English one keeps shut.
+    `/api/projects/${projectId}/reports/export/csv?view=matrix&lang=ru`,
   ];
 }
 
@@ -1316,6 +1319,187 @@ test.describe("report export", () => {
     });
     expect(res.status()).toBe(200);
     expect(res.headers()["content-disposition"]).toContain('filename="report-overview.csv"');
+  });
+
+  /*
+   * Russian exports (Accept-Language: ru). Only fixed labels change: headers, sheet names, the
+   * long form's section/metric keys, the vocabularies the product computes or stores (execution,
+   * run, bug and test case status; health and flakiness labels). Names a user typed — suites, runs,
+   * bug titles — the AI summary text, numbers and dates are byte-identical to the English file, which
+   * is what the row-for-row comparisons below pin.
+   *
+   * The expected translations are written out here rather than imported from the backend's
+   * export-i18n.ts, so a change to that table has to be made deliberately in both places.
+   */
+  const RU = { "Accept-Language": "ru-RU,ru;q=0.9" };
+  const RU_SECTIONS: Record<string, string> = {
+    summary: "Сводка",
+    passRateTrend: "Динамика прохождения",
+    suiteHealth: "Состояние наборов",
+    bySuite: "По наборам",
+    byStatus: "По статусам",
+    byPriority: "По приоритетам",
+    addedByDate: "Добавлено по датам",
+    flakyTests: "Нестабильные тесты",
+    coverageGaps: "Пробелы в покрытии",
+    coverageBySuite: "Покрытие по наборам",
+    executionVelocity: "Скорость выполнения",
+    bugDiscoveryRate: "Обнаружение багов",
+  };
+  const RU_METRICS: Record<string, string> = {
+    trendDelta: "Изменение тренда",
+    flakyCount: "Нестабильных тестов",
+    coverageGapCount: "Пробелов в покрытии",
+    untestedP1Count: "Непротестированных P1",
+    aiSummary: "Сводка ИИ",
+    total: "Всего",
+    executed: "Выполнено",
+    passRate: "Процент прохождения",
+    createdAt: "Дата создания",
+    passedPct: "% пройдено",
+    failedPct: "% провалено",
+    blockedPct: "% заблокировано",
+    totalTestCases: "Всего тест-кейсов",
+    updatedToday: "Обновлено сегодня",
+    updatedThisWeek: "Обновлено за неделю",
+    updatedThisMonth: "Обновлено за месяц",
+    count: "Количество",
+    healthScore: "Оценка состояния",
+    healthLabel: "Состояние",
+    title: "Название",
+    suiteName: "Набор",
+    flipCount: "Смен статуса",
+    flakinessLabel: "Нестабильность",
+    covered: "Покрыто",
+    pct: "% покрытия",
+  };
+  const RU_TESTCASE_STATUS: Record<string, string> = {
+    Draft: "Черновик",
+    "In Review": "На проверке",
+    Approved: "Утверждён",
+    Deprecated: "Устаревший",
+    Archived: "В архиве",
+  };
+  const RU_EXECUTION_STATUS: Record<string, string> = {
+    Untested: "Не протестирован",
+    Passed: "Пройден",
+    Failed: "Провален",
+    Blocked: "Заблокирован",
+    Skipped: "Пропущен",
+    Retest: "Повторная проверка",
+  };
+  const RU_RUN_STATUS: Record<string, string> = { Planning: "Планирование", "In Progress": "В процессе", Completed: "Завершён" };
+  const RU_BUG_STATUS: Record<string, string> = { Open: "Открыт", "In Progress": "В работе", Reopened: "Переоткрыт", Closed: "Закрыт" };
+  const RU_HEALTH: Record<string, string> = { Healthy: "Хорошее", "Needs attention": "Требует внимания", "At risk": "Под угрозой" };
+  const RU_FLAKINESS: Record<string, string> = { High: "Высокая", Medium: "Средняя", Low: "Низкая" };
+  const RU_SHEETS: Record<string, string> = {
+    overview: "Обзор",
+    execution: "Отчёт о выполнении",
+    matrix: "Трассируемость",
+    repository: "Репозиторий",
+    insights: "Аналитика ИИ",
+    trends: "Тренды",
+  };
+  const translated = (table: Record<string, string>, value: string) => table[value] ?? value;
+
+  /** Both language versions of one view's CSV, BOM stripped, with whether the Russian one had it. */
+  async function bothLanguages(view: string) {
+    const english = await asOwner.get(exportUrl(view, "csv"));
+    const russian = await asOwner.get(exportUrl(view, "csv"), { headers: RU });
+    expect(english.status()).toBe(200);
+    expect(russian.status()).toBe(200);
+    const russianBytes = Buffer.from(await russian.body());
+    const englishBytes = Buffer.from(await english.body());
+    const hasBom = (bytes: Buffer) => bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+    return {
+      russianHasBom: hasBom(russianBytes),
+      englishHasBom: hasBom(englishBytes),
+      en: csvRows(englishBytes.toString("utf8")),
+      ru: csvRows(russianBytes.subarray(hasBom(russianBytes) ? 3 : 0).toString("utf8")),
+    };
+  }
+
+  for (const view of ["overview", "repository", "insights", "trends"] as const) {
+    test(`RPT-A-67 the ${view} view in Russian translates sections, metrics and labels, row for row with the English file`, async () => {
+      const { russianHasBom, englishHasBom, en, ru } = await bothLanguages(view);
+      expect(russianHasBom, "a Russian CSV starts with a UTF-8 BOM").toBe(true);
+      expect(englishHasBom, "the English CSV keeps its BOM-less shape").toBe(false);
+      expect(ru[0]).toEqual(["Раздел", "Метка", "Показатель", "Значение"]);
+      expect(ru.length, "translation adds and drops no rows").toBe(en.length);
+      expect(en.length, "the fixture must give this view rows to compare").toBeGreaterThan(1);
+
+      for (let i = 1; i < en.length; i++) {
+        const [section, label, metric, value] = en[i];
+        expect(RU_SECTIONS[section], `the test's table knows section "${section}"`).toBeTruthy();
+        expect(RU_METRICS[metric], `the test's table knows metric "${metric}"`).toBeTruthy();
+        const expectedLabel = section === "byStatus" ? translated(RU_TESTCASE_STATUS, label) : label;
+        const expectedValue =
+          metric === "healthLabel" ? RU_HEALTH[value] : metric === "flakinessLabel" ? RU_FLAKINESS[value] : value;
+        expect(expectedValue, `row ${i}: ${metric}=${value} has a known translation`).toBeDefined();
+        expect(ru[i], `row ${i} (${section}/${metric})`).toEqual([RU_SECTIONS[section], expectedLabel, RU_METRICS[metric], expectedValue]);
+      }
+    });
+  }
+
+  test("RPT-A-68 the execution view in Russian translates its headers and keeps every number", async () => {
+    const { russianHasBom, en, ru } = await bothLanguages("execution");
+    expect(russianHasBom).toBe(true);
+    expect(ru[0]).toEqual(["Группа", "Пройдено", "Провалено", "Заблокировано", "Пропущено", "Не протестировано", "Повторная проверка", "Всего"]);
+    // Group names are run/plan/suite names — user data — and the counts are numbers: all identical.
+    expect(ru.slice(1)).toEqual(en.slice(1));
+    expect(en.length).toBeGreaterThan(1);
+  });
+
+  test("RPT-A-69 the traceability view in Russian translates every status column and nothing else", async () => {
+    const { russianHasBom, en, ru } = await bothLanguages("matrix");
+    expect(russianHasBom).toBe(true);
+    expect(en[0]).toEqual([
+      "externalId", "testcaseTitle", "priority", "testcaseStatus", "suiteName", "runName",
+      "runStatus", "executionStatus", "executedAt", "bugTitle", "bugStatus", "bugUrl",
+    ]);
+    expect(ru[0]).toEqual([
+      "ID", "Тест-кейс", "Приоритет", "Статус тест-кейса", "Набор", "Тестовый прогон",
+      "Статус прогона", "Статус выполнения", "Дата выполнения", "Баг", "Статус бага", "Ссылка на баг",
+    ]);
+    expect(ru.length).toBe(en.length);
+    const statusColumns: Record<number, Record<string, string>> = {
+      3: RU_TESTCASE_STATUS,
+      6: RU_RUN_STATUS,
+      7: RU_EXECUTION_STATUS,
+      10: RU_BUG_STATUS,
+    };
+    let translatedCells = 0;
+    for (let i = 1; i < en.length; i++) {
+      const expected = en[i].map((cell, column) => (statusColumns[column] ? translated(statusColumns[column], cell) : cell));
+      translatedCells += expected.filter((cell, column) => cell !== en[i][column]).length;
+      expect(ru[i], `matrix row ${i}`).toEqual(expected);
+    }
+    expect(translatedCells, "the fixture's matrix must actually carry statuses to translate").toBeGreaterThan(0);
+  });
+
+  for (const view of EXPORT_VIEWS) {
+    test(`RPT-A-70 the ${view} workbook in Russian has a Russian sheet name`, async () => {
+      const res = await asOwner.get(exportUrl(view, "xlsx"), { headers: RU });
+      expect(res.status()).toBe(200);
+      // The download name stays ASCII: a non-ASCII filename needs RFC 5987 encoding that not every
+      // client honours, and the sheet inside is what a Russian reader actually sees.
+      expect(res.headers()["content-disposition"]).toContain(`filename="report-${view}.xlsx"`);
+      const workbook = XLSX.read(Buffer.from(await res.body()), { type: "buffer" });
+      expect(workbook.SheetNames).toEqual([RU_SHEETS[view]]);
+    });
+  }
+
+  test("RPT-A-71 an empty project's Russian exports still carry Russian header rows", async () => {
+    const emptyId = await seedProject(asOwner, `E2E Export RU Empty ${Date.now()}`);
+    try {
+      const res = await asOwner.get(`/api/projects/${emptyId}/reports/export/csv?view=matrix`, { headers: RU });
+      expect(res.status()).toBe(200);
+      const rows = csvRows(Buffer.from(await res.body()).subarray(3).toString("utf8"));
+      expect(rows[0][0]).toBe("ID");
+      expect(rows[0]).toContain("Статус выполнения");
+    } finally {
+      purgeProject(emptyId);
+    }
   });
 
   test("RPT-A-64 an empty project exports headers and no rows", { tag: '@tesbo.testId("TES-TC-1207")' }, async () => {

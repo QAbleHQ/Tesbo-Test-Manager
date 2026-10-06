@@ -1536,6 +1536,51 @@ describe("McpService", () => {
       });
     });
 
+    it("links a test case to a Notion page by page id and unlinks it", async () => {
+      const { db } = makeDb({ mcpActorId: "mcp-actor-1", testcaseProject: "proj-1" });
+      const legacy = makeLegacy();
+      const svc = new McpService(legacy, db);
+      const link: any = await svc.handleRequest(
+        rpc("tools/call", {
+          name: "link_requirement_to_testcase",
+          arguments: { testcaseId: "tc-1", notionPageId: "1429989f-e8ac-4eff-bc8f-57f56486db54", notionUrl: "https://www.notion.so/x" }
+        }),
+        principal(),
+        "proj-1"
+      );
+      expect(link.result.isError).toBe(false);
+      expect((legacy as any).updateTestCase).toHaveBeenCalledWith("tc-1", "mcp-actor-1", {
+        notionPageId: "1429989f-e8ac-4eff-bc8f-57f56486db54",
+        notionUrl: "https://www.notion.so/x",
+        suiteId: "suite-current",
+        ownerId: "user-current"
+      });
+
+      const unlink: any = await svc.handleRequest(
+        rpc("tools/call", { name: "unlink_requirement_from_testcase", arguments: { testcaseId: "tc-1", provider: "notion" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(unlink.result.isError).toBe(false);
+      expect((legacy as any).updateTestCase).toHaveBeenLastCalledWith("tc-1", "mcp-actor-1", {
+        notionPageId: null,
+        notionUrl: null,
+        suiteId: "suite-current",
+        ownerId: "user-current"
+      });
+    });
+
+    it("rejects a link that names a Notion page together with another provider's key", async () => {
+      const { db } = makeDb();
+      const svc = new McpService(makeLegacy(), db);
+      const res: any = await svc.handleRequest(
+        rpc("tools/call", { name: "link_requirement_to_testcase", arguments: { testcaseId: "tc-1", jiraIssueKey: "PROJ-1", notionPageId: "p" } }),
+        principal(),
+        "proj-1"
+      );
+      expect(res.error.message).toMatch(/only one of/i);
+    });
+
     it("rejects link_requirement_to_testcase with neither or both of jiraIssueKey/linearIssueKey", async () => {
       const { db } = makeDb();
       const svc = new McpService(makeLegacy(), db);

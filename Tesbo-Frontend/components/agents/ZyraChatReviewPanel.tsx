@@ -4,10 +4,12 @@ import { useEffect, useState } from "react";
 import { deleteZyraTaskDraft, editZyraTaskDraft, saveZyraTask, closeZyraTask, getZyraTask, type ZyraChatTestcaseRow } from "@/lib/api";
 import { refreshPageCachesAfterZyraSave } from "@/lib/zyraCacheSync";
 import { useAppData } from "@/components/app/AppDataProvider";
-import { Button, CopyButton, StatusChip, SeverityBadge, type Severity } from "@/components/ui";
+import { Button, CopyButton, StatusChip, type Severity } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
+import { useZyraText } from "@/lib/zyra-i18n";
 import { ZyraDraftEditor, type ZyraDraftEditValues } from "./ZyraDraftEditor";
 import { ZyraCitationsList } from "./ZyraCitations";
+import { ZyraSeverityBadge } from "./ZyraContextDrawer";
 
 function firstStepPreview(value: unknown): string {
   if (!value) return "—";
@@ -40,6 +42,8 @@ function knownSeverity(value?: string | null): Severity | null {
 // normalized update/archive draft row the same way this panel already does, instead of each
 // defining its own copy — see formatAiTask's server-side normalization, which is what makes a
 // non-create draft carry this same `action` value outside the chat flow now too.
+// English reference only — every Zyra surface renders the localized `draftAction.<action>` key from
+// lib/zyra-i18n.ts (same English text) instead; kept exported for any other importer.
 export const ACTION_LABEL: Record<string, string> = {
   "proposed-create": "New",
   "proposed-update": "Update",
@@ -47,17 +51,8 @@ export const ACTION_LABEL: Record<string, string> = {
 };
 
 // Display names for the fixed technique vocabulary (ZYRA_TECHNIQUES in legacy.service.ts,
-// ZYRA_TICKET_WORKFLOW.md §6/§8). Deliberately excludes "general" — see TechniqueBadges below.
-const TECHNIQUE_LABEL: Record<string, string> = {
-  equivalence_partitioning: "Equivalence Partitioning",
-  boundary_value_analysis: "Boundary Value Analysis",
-  decision_table: "Decision Table",
-  state_testing: "State Testing",
-  use_case_testing: "Use Case Testing",
-  pairwise_testing: "Pairwise Testing",
-  error_guessing: "Error Guessing",
-  security_perspective: "Security Perspective",
-};
+// ZYRA_TICKET_WORKFLOW.md §6/§8) live in lib/zyra-i18n.ts as "tech.<technique>". Deliberately
+// excludes "general" — see TechniqueBadges below.
 
 // Same rectangular-pill weight as JIRA_BADGE_CLASS (TaskQuickViewPanel) — a prose label instead of
 // a monospace ticket key, so no font-mono here.
@@ -77,12 +72,13 @@ const TECHNIQUE_BADGE_CLASS =
  * plain `tags` line elsewhere already render nothing rather than a hollow "no data" note.
  */
 export function TechniqueBadges({ techniques }: { techniques?: string[] }) {
+  const t = useZyraText();
   const real = (techniques || []).filter((t) => t !== "general");
   if (!real.length) return null;
   return (
     <div className="flex flex-wrap gap-1">
-      {real.map((t) => (
-        <span key={t} className={TECHNIQUE_BADGE_CLASS}>{TECHNIQUE_LABEL[t] || t}</span>
+      {real.map((technique) => (
+        <span key={technique} className={TECHNIQUE_BADGE_CLASS}>{t.opt(`tech.${technique}`) || technique}</span>
       ))}
     </div>
   );
@@ -114,6 +110,7 @@ export function ZyraChatReviewPanel({
   const [working, setWorking] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const t = useZyraText();
 
   useEffect(() => {
     let cancelled = false;
@@ -133,13 +130,13 @@ export function ZyraChatReviewPanel({
   }, [projectId, reviewRequestId]);
 
   if (status === "checking") {
-    return <p className="mt-3 text-xs text-[var(--muted)]">Checking review status…</p>;
+    return <p className="mt-3 text-xs text-[var(--muted)]">{t("review.checking")}</p>;
   }
 
   if (status === "resolved" && !message) {
     return (
       <p className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
-        This batch was already saved or closed — nothing left here to review.
+        {t("review.resolved")}
       </p>
     );
   }
@@ -158,7 +155,7 @@ export function ZyraChatReviewPanel({
       setSelected((prev) => prev.filter((item) => item !== index).map((item) => (item > index ? item - 1 : item)));
       if (editingIndex === index) setEditingIndex(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to discard the draft.");
+      setError(err instanceof Error ? err.message : t("review.err.discard"));
     } finally {
       setWorking(false);
     }
@@ -174,6 +171,7 @@ export function ZyraChatReviewPanel({
         preconditions: values.preconditions,
         description: values.description,
         stepsJson: values.stepsJson,
+        ...(values.testData !== undefined ? { testData: values.testData } : {}),
         severity: values.severity,
         component: values.component,
       });
@@ -187,6 +185,7 @@ export function ZyraChatReviewPanel({
                 preconditions: values.preconditions,
                 expectedSummary: values.description,
                 stepsJson: values.stepsJson,
+                ...(values.testData !== undefined ? { testData: values.testData } : {}),
                 severity: values.severity || null,
                 component: values.component || null,
               }
@@ -195,7 +194,7 @@ export function ZyraChatReviewPanel({
       );
       setEditingIndex(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save the edit.");
+      setError(err instanceof Error ? err.message : t("review.err.saveEdit"));
     } finally {
       setWorking(false);
     }
@@ -217,9 +216,9 @@ export function ZyraChatReviewPanel({
       setRows((prev) => prev.filter((_, i) => !savedSet.has(i)).map((row, newIndex) => ({ ...row, draftIndex: newIndex })));
       setSelected([]);
       if (!result.remaining) setStatus("resolved");
-      setMessage(`${result.savedCount} test case${result.savedCount === 1 ? "" : "s"} saved to the repository.`);
+      setMessage(t("review.savedMsg", { n: result.savedCount }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save the selected test cases.");
+      setError(err instanceof Error ? err.message : t("review.err.save"));
     } finally {
       setWorking(false);
     }
@@ -233,21 +232,21 @@ export function ZyraChatReviewPanel({
       setRows([]);
       setSelected([]);
       setStatus("resolved");
-      setMessage("Batch closed — nothing was saved to the repository.");
+      setMessage(t("review.closedMsg"));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to close the batch.");
+      setError(err instanceof Error ? err.message : t("review.err.close"));
     } finally {
       setWorking(false);
     }
   }
 
   const tsv = toTsv(
-    ["Action", "Title", "Priority", "Severity", "Component", "Preconditions", "First step", "Expected result"],
+    [t("col.action"), t("col.title"), t("col.priority"), t("col.severity"), t("col.component"), t("col.preconditions"), t("col.firstStep"), t("col.expectedResult")],
     rows.map((row) => [
-      ACTION_LABEL[row.action || ""] || row.action || "",
+      t.opt(`draftAction.${row.action || ""}`) || row.action || "",
       row.title,
       row.priority || "P2",
-      row.severity || "",
+      row.severity ? t.value("severity", row.severity) : "",
       row.component || "",
       row.preconditions || "",
       firstStepPreview(row.stepsJson),
@@ -263,23 +262,23 @@ export function ZyraChatReviewPanel({
         <>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs font-semibold text-[var(--foreground)]">
-              {selected.length} of {rows.length} selected — pending review
+              {t("review.selected", { selected: selected.length, total: rows.length })}
             </span>
             <div className="flex flex-wrap gap-1.5">
               <Button variant="secondary" size="sm" onClick={() => setSelected(allSelected ? [] : rows.map((_, i) => i))} disabled={working}>
-                {allSelected ? "Unselect all" : "Select all"}
+                {allSelected ? t("review.unselectAll") : t("review.selectAll")}
               </Button>
-              <span title="Copy these proposed test cases as tab-separated values, ready to paste into Excel.">
-                <CopyButton value={tsv} label="Copy" copiedLabel="Copied" size="sm" />
+              <span title={t("review.copyTitle")}>
+                <CopyButton value={tsv} label={t("copy")} copiedLabel={t("copied")} size="sm" />
               </span>
-              <Button variant="secondary" size="sm" onClick={() => void handleDiscardAll()} disabled={working}>Discard all</Button>
+              <Button variant="secondary" size="sm" onClick={() => void handleDiscardAll()} disabled={working}>{t("review.discardAll")}</Button>
               <Button size="sm" onClick={() => void handleSaveSelected()} disabled={working || selected.length === 0}>
-                {working ? "Saving…" : `Save ${selected.length || ""} to repository`}
+                {working ? t("saving") : t("review.saveToRepo", { n: selected.length || "" })}
               </Button>
             </div>
           </div>
 
-          <ul className="space-y-2 list-none p-0 m-0" aria-label="Proposed test cases">
+          <ul className="space-y-2 list-none p-0 m-0" aria-label={t("review.listLabel")}>
             {rows.map((row, index) => (
               <li key={`${reviewRequestId}-${index}`} className="rounded-md border border-[var(--border)] bg-[var(--background)] p-2.5">
                 <div className="flex items-start gap-2.5">
@@ -289,18 +288,18 @@ export function ZyraChatReviewPanel({
                     checked={selected.includes(index)}
                     onChange={() => toggle(index)}
                     disabled={working}
-                    aria-label={`Select proposed test case ${index + 1}`}
+                    aria-label={t("review.selectRow", { n: index + 1 })}
                   />
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-1.5">
                       <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
-                        {ACTION_LABEL[row.action || ""] || "Proposed"}
+                        {t.opt(`draftAction.${row.action || ""}`) || t("review.proposed")}
                       </StatusChip>
                       <StatusChip tone={priorityTone(row.priority)} className="!rounded-[5px] !px-1.5 !py-0 !font-mono !text-[10px] !font-semibold">
                         {row.priority || "P2"}
                       </StatusChip>
                       {knownSeverity(row.severity) && (
-                        <SeverityBadge severity={knownSeverity(row.severity)!} className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium" />
+                        <ZyraSeverityBadge severity={knownSeverity(row.severity)!} className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium" />
                       )}
                       {row.component && <span className="text-[11px] text-[var(--muted)]">{row.component}</span>}
                       {row.externalId && <span className="font-mono text-[11px] text-[var(--muted)]">{row.externalId}</span>}
@@ -318,9 +317,9 @@ export function ZyraChatReviewPanel({
                   </div>
                   <div className="flex shrink-0 gap-1.5">
                     <Button variant="secondary" size="sm" onClick={() => setEditingIndex(editingIndex === index ? null : index)} disabled={working}>
-                      {editingIndex === index ? "Close" : "Edit"}
+                      {editingIndex === index ? t("close") : t("edit")}
                     </Button>
-                    <Button variant="secondary" size="sm" onClick={() => void handleDiscard(index)} disabled={working}>Discard</Button>
+                    <Button variant="secondary" size="sm" onClick={() => void handleDiscard(index)} disabled={working}>{t("review.discard")}</Button>
                   </div>
                 </div>
                 {editingIndex === index && (

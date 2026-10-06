@@ -9,6 +9,7 @@ import {
   type ExecutionItem,
 } from "@/lib/api";
 import { BrandLogo } from "@/components/BrandLogo";
+import { formatDate } from "@/lib/date";
 
 /* ───── Donut chart (pure SVG) ───── */
 function DonutChart({
@@ -246,9 +247,9 @@ export default function PublicSharedRunPage() {
           <div className="flex items-center gap-4 mt-2 text-xs text-[var(--muted-soft)]">
             {run.environment && <span>Env: {run.environment}</span>}
             {run.buildVersion && <span>Build: {run.buildVersion}</span>}
-            <span>Created {new Date(run.createdAt).toLocaleDateString()}</span>
-            {run.startedAt && <span>Started {new Date(run.startedAt).toLocaleDateString()}</span>}
-            {run.endedAt && <span>Ended {new Date(run.endedAt).toLocaleDateString()}</span>}
+            <span>Created {formatDate(run.createdAt)}</span>
+            {run.startedAt && <span>Started {formatDate(run.startedAt)}</span>}
+            {run.endedAt && <span>Ended {formatDate(run.endedAt)}</span>}
           </div>
         </div>
 

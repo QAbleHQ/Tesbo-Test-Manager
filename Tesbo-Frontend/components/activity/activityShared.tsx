@@ -17,6 +17,7 @@ import type { ActivityLogItem, ActivitySummary } from "@/lib/api";
 import { Card, CardBody, StatusChip, type StatusChipProps } from "@/components/ui";
 import { cx } from "@/components/ui/cx";
 import { OwnerAvatar } from "@/components/testplans/PlanCard";
+import { formatDateTime, formatRelative as formatRelativeShared } from "@/lib/date";
 import { type ReactNode } from "react";
 
 // A workspace-scoped activity row also carries which project it belongs to (null for
@@ -240,21 +241,9 @@ export function describeActivity(item: ActivityLogItem): string | null {
   return null;
 }
 
-export function formatRelative(iso: string): string {
-  const diffMs = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diffMs / 60000);
-  if (mins < 1) return "Just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-}
+export const formatRelative = formatRelativeShared;
 
-export function formatAbsolute(iso: string): string {
-  return new Date(iso).toLocaleString("en-US", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-}
+export const formatAbsolute = formatDateTime;
 
 export function groupByDate<T extends ActivityLogItem>(items: T[]): { label: string; items: T[] }[] {
   const groups: Map<string, T[]> = new Map();

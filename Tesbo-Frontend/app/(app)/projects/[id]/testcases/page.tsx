@@ -53,6 +53,7 @@ import {
   type BugItem,
   type CustomTag,
   type ZyraSourceRef,
+  notionPageKey,
 } from "@/lib/api";
 import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
 
@@ -101,6 +102,7 @@ import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import { toTsv } from "@/lib/tsv";
 import { SUITE_NAME_MAX_LENGTH, validateSuiteName } from "@/lib/validation";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+import { formatDate } from "@/lib/date";
 
 // 500 is the server's per-request ceiling (listTestCases clamps `limit`), so it is the largest
 // page we can offer. Paired with "select all matching" below, a 500-case suite no longer has to
@@ -362,6 +364,8 @@ export default function TestCasesPage() {
   const formSuiteId = isUnfiledView ? null : activeSuiteId;
   const activeJiraIssueKey = searchParams.get("jiraIssueKey") || "";
   const activeLinearIssueKey = searchParams.get("linearIssueKey") || "";
+  // A Notion test case links by full page id; the chip below shows the short `notion:xxxxxxxx` label.
+  const activeNotionPageId = searchParams.get("notionPageId") || "";
 
   // Take over the shared TopBar with this page's breadcrumb + actions (portaled below),
   // and hide the default global "Search projects" search while this page is mounted.
@@ -684,7 +688,7 @@ export default function TestCasesPage() {
           tc.type,
           tc.automationStatus,
           tc.status,
-          tc.updatedAt ? new Date(tc.updatedAt).toLocaleDateString() : "",
+          tc.updatedAt ? formatDate(tc.updatedAt) : "",
         ])
       ),
     [copyableCases, suiteNameMap]
@@ -695,6 +699,10 @@ export default function TestCasesPage() {
       ? `Copies the ${copyableCases.length} selected test cases loaded on this page as tab-separated values, ready to paste into Excel. ${selectedCaseIds.length - copyableCases.length} more selected case(s) are on other pages and won't be included.`
       : `Copies the ${copyableCases.length} selected test cases as tab-separated values, ready to paste into Excel.`
     : `Copies the ${selectedSuiteCases.length} test cases on this page as tab-separated values, ready to paste into Excel.`;
+  // Export's own row count, shown on the menu items so checking rows visibly narrows what Export
+  // produces (unlike copyCasesLabel above, this is the true selection count, not capped to the
+  // current page — "Select all N matching" reaches ids beyond it, and export can follow them).
+  const exportCasesSuffix = selectedCaseIds.length > 0 ? ` ${selectedCaseIds.length} selected` : "";
   /*
    * The sum of the suite counts, which is NOT the size of the repository.
    *
@@ -835,6 +843,7 @@ export default function TestCasesPage() {
         automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
         jiraIssueKey: activeJiraIssueKey || undefined,
         linearIssueKey: activeLinearIssueKey || undefined,
+        notionPageId: activeNotionPageId || undefined,
         search: debouncedSuiteSearch || undefined,
         customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
         customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -860,6 +869,7 @@ export default function TestCasesPage() {
     suiteAutomationFilter,
     activeJiraIssueKey,
     activeLinearIssueKey,
+    activeNotionPageId,
     customFieldFilters,
     suiteTagFilter,
   ]);
@@ -870,6 +880,12 @@ export default function TestCasesPage() {
   // (suite/filters) and their order (sort) — instead of always exporting the whole project in an
   // unrelated order ("[Test Cases] Exported Test Cases Lose Their Original Sequence": export used to
   // always sort by most-recently-updated regardless of what the table displayed).
+  //
+  // `ids: selectedCaseIds` takes over the moment anything is checked: getExportUrl treats a
+  // non-empty `ids` as "export exactly these rows" and drops every filter field below, so ticking
+  // rows and hitting Export exports exactly what was ticked, not the filtered set it happened to
+  // be ticked from (previously the row checkboxes had no effect on Export at all — Export always
+  // exported every row matching the filter panel, selected or not).
   const currentTestCaseExportFilters = useMemo(
     () => ({
       suiteId: activeSuiteId ?? undefined,
@@ -880,9 +896,11 @@ export default function TestCasesPage() {
       automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
       jiraIssueKey: activeJiraIssueKey || undefined,
       linearIssueKey: activeLinearIssueKey || undefined,
+      notionPageId: activeNotionPageId || undefined,
       search: debouncedSuiteSearch || undefined,
       customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
       customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
+      ids: selectedCaseIds.length ? selectedCaseIds : undefined,
       sortBy: suiteCasesSort?.column,
       sortDir: suiteCasesSort?.direction,
     }),
@@ -894,9 +912,11 @@ export default function TestCasesPage() {
       suiteAutomationFilter,
       activeJiraIssueKey,
       activeLinearIssueKey,
+      activeNotionPageId,
       debouncedSuiteSearch,
       customFieldFilters,
       suiteTagFilter,
+      selectedCaseIds,
       suiteCasesSort,
     ]
   );
@@ -1141,6 +1161,7 @@ export default function TestCasesPage() {
           automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
           jiraIssueKey: activeJiraIssueKey || undefined,
           linearIssueKey: activeLinearIssueKey || undefined,
+          notionPageId: activeNotionPageId || undefined,
           search: debouncedSuiteSearch || undefined,
           customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
           customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -1593,7 +1614,7 @@ export default function TestCasesPage() {
                       className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
                     >
                       <IconUpload size={14} stroke={1.75} className="text-[var(--muted-soft)]" />
-                      Export as CSV
+                      Export as CSV{exportCasesSuffix}
                     </a>
                     <a
                       href={getExportUrl(projectId, "xlsx", currentTestCaseExportFilters)}
@@ -1603,7 +1624,7 @@ export default function TestCasesPage() {
                       className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
                     >
                       <IconUpload size={14} stroke={1.75} className="text-[var(--muted-soft)]" />
-                      Export as Excel
+                      Export as Excel{exportCasesSuffix}
                     </a>
                     <div className="my-1 border-t border-[var(--border)]" />
                     <a
@@ -2071,6 +2092,16 @@ export default function TestCasesPage() {
                         className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
                       >
                         <span className="opacity-70">Linear:</span> {activeLinearIssueKey}
+                        <IconX size={11} stroke={2.5} />
+                      </button>
+                    )}
+                    {activeNotionPageId && (
+                      <button
+                        type="button"
+                        onClick={() => router.replace(`/projects/${projectId}/testcases`)}
+                        className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
+                      >
+                        <span className="opacity-70">Notion:</span> {notionPageKey(activeNotionPageId)}
                         <IconX size={11} stroke={2.5} />
                       </button>
                     )}

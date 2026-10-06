@@ -2759,6 +2759,143 @@ test.describe("MCP link_requirement_to_testcase and unlink_requirement_from_test
     }
   });
 
+  // Notion links by PAGE ID (notionPageId/notionUrl), not by the short display key. Like the Jira and
+  // Linear fields it is a plain testcases column, so no Notion connection or seeded page is needed.
+  test("links, re-links and unlinks a Notion page by id without touching the Jira link or anything else", async ({ request }) => {
+    const stamp = Date.now();
+    const pageId = crypto.randomUUID();
+    const notionUrl = `https://www.notion.so/e2e-${pageId.replace(/-/g, "")}`;
+    const testcase = await createCase(request, {
+      title: `E2E MCP Link Notion ${stamp}`,
+      priority: "High",
+      jiraIssueKey: `E2E-${stamp}`,
+    });
+    let tokenId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP link_requirement notion token ${stamp}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+
+      const linked = await callMcpTool(mcpApi, token, "link_requirement_to_testcase", {
+        testcaseId: testcase.id,
+        notionPageId: pageId,
+        notionUrl,
+      });
+      expect(linked.notionPageId).toBe(pageId);
+      expect(linked.notionUrl).toBe(notionUrl);
+      expect(linked.priority).toBe("High");
+      expect(linked.jiraIssueKey).toBe(`E2E-${stamp}`);
+
+      // Linking the same page again re-sets the same value; the url is optional on the second call.
+      const again = await callMcpTool(mcpApi, token, "link_requirement_to_testcase", {
+        testcaseId: testcase.id,
+        notionPageId: pageId,
+      });
+      expect(again.notionPageId).toBe(pageId);
+
+      const fetched = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`)).json();
+      expect(fetched.notionPageId).toBe(pageId);
+      // The link is visible to the Requirements view's own read of it.
+      const linkedPages = await (await request.get(`/api/projects/${ctx.projectId}/testcases/linked-notion-pages`)).json();
+      expect(linkedPages.counts[pageId]).toBe(1);
+
+      const unlinked = await callMcpTool(mcpApi, token, "unlink_requirement_from_testcase", {
+        testcaseId: testcase.id,
+        provider: "notion",
+      });
+      expect(unlinked.notionPageId ?? null).toBeNull();
+      expect(unlinked.notionUrl ?? null).toBeNull();
+      // Only the Notion link went: the Jira link and the rest of the test case are untouched.
+      expect(unlinked.jiraIssueKey).toBe(`E2E-${stamp}`);
+      expect(unlinked.priority).toBe("High");
+
+      const fetchedUnlinked = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`)).json();
+      expect(fetchedUnlinked.notionPageId ?? null).toBeNull();
+
+      // Unlinking again is a graceful no-op, not an error.
+      const unlinkedAgain = await callMcpTool(mcpApi, token, "unlink_requirement_from_testcase", {
+        testcaseId: testcase.id,
+        provider: "notion",
+      });
+      expect(unlinkedAgain.notionPageId ?? null).toBeNull();
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      await deleteCase(request, testcase.id);
+      await mcpApi.dispose();
+    }
+  });
+
+  test("link_requirement_to_testcase accepts exactly one of jira, linear or notion, and names all three when none is given", async ({
+    request,
+  }) => {
+    const testcase = await createCase(request, { title: `E2E MCP Link Notion Validation ${Date.now()}` });
+    let tokenId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+
+    try {
+      const tokenRes = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+        data: { name: `E2E MCP link_requirement notion validation token ${Date.now()}`, scopes: ["write"] },
+      });
+      expect(tokenRes.ok()).toBeTruthy();
+      const tokenBody = await tokenRes.json();
+      tokenId = tokenBody.id;
+      const token = tokenBody.token as string;
+      const pageId = crypto.randomUUID();
+
+      const neither = await callMcpToolExpectError(mcpApi, token, "link_requirement_to_testcase", { testcaseId: testcase.id });
+      expect(neither.message).toMatch(/notionPageId/);
+      // A whitespace-only page id is "not given", not a link to a blank page.
+      const blank = await callMcpToolExpectError(mcpApi, token, "link_requirement_to_testcase", {
+        testcaseId: testcase.id,
+        notionPageId: "   ",
+      });
+      expect(blank.message).toMatch(/notionPageId/);
+
+      for (const other of [{ jiraIssueKey: "PROJ-1" }, { linearIssueKey: "ENG-1" }]) {
+        const both = await callMcpToolExpectError(mcpApi, token, "link_requirement_to_testcase", {
+          testcaseId: testcase.id,
+          notionPageId: pageId,
+          ...other,
+        });
+        expect(both.message).toMatch(/only one of/i);
+      }
+
+      // None of the refused calls linked anything.
+      const fetched = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`)).json();
+      expect(fetched.notionPageId ?? null).toBeNull();
+      expect(fetched.jiraIssueKey ?? null).toBeNull();
+      expect(fetched.linearIssueKey ?? null).toBeNull();
+
+      // The unlink provider list now includes notion and still refuses anything else.
+      const bad = await callMcpToolExpectError(mcpApi, token, "unlink_requirement_from_testcase", {
+        testcaseId: testcase.id,
+        provider: "github",
+      });
+      expect(bad.message).toMatch(/"provider" must be "jira" or "linear"/i);
+      expect(bad.message).toMatch(/notion/i);
+    } finally {
+      if (tokenId) {
+        await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      }
+      await deleteCase(request, testcase.id);
+      await mcpApi.dispose();
+    }
+  });
+
   test("rejects link_requirement_to_testcase with neither or both provider keys, and an invalid unlink provider", async ({
     request,
   }) => {

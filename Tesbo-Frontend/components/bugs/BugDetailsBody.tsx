@@ -1,6 +1,7 @@
 "use client";
 
 import type { BugItem } from "@/lib/api";
+import { formatDateTime } from "@/lib/date";
 import BugAttachments from "@/components/bugs/BugAttachments";
 import { BugAssignee, BugPriorityBadge, BugSeverityBadge, BugStatusBadge } from "@/components/bugs/BugBadges";
 
@@ -153,14 +154,14 @@ export default function BugDetailsBody({
             Reported On
           </p>
           <span className="text-sm text-[var(--foreground)]">
-            {new Date(bug.createdAt).toLocaleString()}
+            {formatDateTime(bug.createdAt)}
           </span>
         </div>
       </div>
 
       {bug.updatedAt !== bug.createdAt && (
         <p className="text-xs text-[var(--muted-soft)]">
-          Last updated: {new Date(bug.updatedAt).toLocaleString()}
+          Last updated: {formatDateTime(bug.updatedAt)}
         </p>
       )}
     </>

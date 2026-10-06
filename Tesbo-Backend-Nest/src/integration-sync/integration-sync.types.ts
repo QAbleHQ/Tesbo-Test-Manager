@@ -1,4 +1,4 @@
-export type SyncProvider = "jira" | "linear";
+export type SyncProvider = "jira" | "linear" | "notion";
 
 export type SyncRunStatus = "queued" | "running" | "succeeded" | "partial" | "failed";
 
@@ -32,7 +32,7 @@ export interface SyncTicketJobPayload {
   organizationId: string;
   projectId: string;
   provider: SyncProvider;
-  /** Our own jira_tickets/linear_tickets row id. */
+  /** Our own jira_tickets/linear_tickets/notion_pages row id. */
   ticketId: string;
   /** Provider-side issue id, used as knowledge_documents.source_external_id. */
   issueId: string;
@@ -63,4 +63,8 @@ export interface RemoteTicket {
   createdAt: string | null;
   updatedAt: string | null;
   url: string;
+  /** Notion only: every database property rendered to text, keyed by property name. */
+  properties?: Record<string, string>;
+  /** Notion only: the page is archived or in the trash. */
+  archived?: boolean;
 }

@@ -56,6 +56,7 @@ import {
   type BugItem,
 } from "@/lib/api";
 import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
+import { formatDate } from "@/lib/date";
 import { Button, StatusChip, Input, PageLoader, Select, Textarea, Drawer, PriorityBadge, ConfirmModal, type Priority } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
@@ -244,12 +245,6 @@ function formatDuration(startedAt: string | null, endedAt: string | null): strin
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
-}
-
-function formatDate(iso: string): string {
-  const ts = new Date(iso).getTime();
-  if (Number.isNaN(ts)) return "—";
-  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
 /* The neutral ("Untested") palette — also the fallback in execSelectStyle for any status the

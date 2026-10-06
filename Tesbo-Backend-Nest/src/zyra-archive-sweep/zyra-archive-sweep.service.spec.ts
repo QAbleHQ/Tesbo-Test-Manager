@@ -25,8 +25,18 @@ function lookupMap(entries: Array<[string, LookupLike]>): Map<string, LookupLike
   return new Map(entries);
 }
 
-function candidate(id: string, projectId: string, overrides: Partial<{ jiraIssueKey: string | null; linearIssueKey: string | null }> = {}): Body {
-  return { id, projectId, jiraIssueKey: overrides.jiraIssueKey ?? null, linearIssueKey: overrides.linearIssueKey ?? null };
+function candidate(
+  id: string,
+  projectId: string,
+  overrides: Partial<{ jiraIssueKey: string | null; linearIssueKey: string | null; notionPageId: string | null }> = {}
+): Body {
+  return {
+    id,
+    projectId,
+    jiraIssueKey: overrides.jiraIssueKey ?? null,
+    linearIssueKey: overrides.linearIssueKey ?? null,
+    notionPageId: overrides.notionPageId ?? null
+  };
 }
 
 function makeService(candidates: Body[], alreadyStagedIds: string[] = []) {
@@ -105,6 +115,43 @@ describe("ZyraArchiveSweepService.run", () => {
 
     expect(fetchLiveTicketCategory).toHaveBeenCalledWith("proj-a", "linear", "ENG-1");
     expect(fetchLiveJiraTicketCategoriesBulk).not.toHaveBeenCalled();
+  });
+
+  it("a Notion candidate is checked per page through fetchLiveTicketCategory and staged only when archived", async () => {
+    const candidates = [
+      candidate("tc-1", "proj-a", { notionPageId: "page-1" }),
+      candidate("tc-2", "proj-a", { notionPageId: "page-2" })
+    ];
+    const { svc, fetchLiveTicketCategory, fetchLiveJiraTicketCategoriesBulk, stageArchiveSweepProposal } = makeService(candidates);
+    fetchLiveTicketCategory.mockImplementation(async (_project: string, _provider: string, key: string) =>
+      key === "page-1" ? { found: true, doneness: "done", rawCategory: "archived", reason: "ok" } : { found: true, doneness: "not_done", rawCategory: "active", reason: "ok" }
+    );
+
+    const summary = await svc.run();
+
+    expect(fetchLiveTicketCategory).toHaveBeenCalledWith("proj-a", "notion", "page-1");
+    expect(fetchLiveTicketCategory).toHaveBeenCalledWith("proj-a", "notion", "page-2");
+    expect(fetchLiveJiraTicketCategoriesBulk).not.toHaveBeenCalled();
+    expect(stageArchiveSweepProposal).toHaveBeenCalledTimes(1);
+    expect(stageArchiveSweepProposal).toHaveBeenCalledWith("proj-a", "tc-1", expect.stringMatching(/Notion page page-1 is archived or in the trash/));
+    expect(summary).toMatchObject({ staged: 1, skippedNotDone: 1, checked: 2 });
+  });
+
+  it("a Notion page that cannot be found is a failure for that candidate, never an archive proposal", async () => {
+    const { svc, fetchLiveTicketCategory, stageArchiveSweepProposal } = makeService([candidate("tc-1", "proj-a", { notionPageId: "page-1" })]);
+    fetchLiveTicketCategory.mockResolvedValue(NOT_FOUND);
+    const summary = await svc.run();
+    expect(stageArchiveSweepProposal).not.toHaveBeenCalled();
+    expect(summary.failed).toBe(1);
+    expect(summary.failures[0]).toMatchObject({ provider: "notion", issueKey: "page-1", reason: "not_found" });
+  });
+
+  it("the candidate query also selects test cases linked only to a Notion page", async () => {
+    const { svc, dbQuery } = makeService([]);
+    await svc.run();
+    const sql = String(dbQuery.mock.calls.find(([s]) => String(s).includes("FROM testcases_active"))![0]);
+    expect(sql).toContain('notion_page_id AS "notionPageId"');
+    expect(sql).toContain("notion_page_id IS NOT NULL");
   });
 
   it("Linear lookups never exceed the configured concurrency bound", async () => {

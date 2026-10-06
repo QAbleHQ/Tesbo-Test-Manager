@@ -1993,6 +1993,93 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(res.status(), `editing a resolved batch — ${await res.text()}`).toBe(409);
   });
 
+  /*
+   * "[Zyra] Edit Test Case View Is Missing Fields Available After Saving" — testData was generated,
+   * staged and saved correctly, but chatDraftRow (the row every review surface and the draft
+   * editor are seeded from) never carried it, so the editor had nothing to show.
+   */
+  test("ZYR-A-142 a chat-staged create draft's test data is served on the review row and round-trips through an edit", async () => {
+    const { taskId } = seedChatReviewTask({
+      entries: [
+        {
+          opType: "create",
+          draft: {
+            suiteId: null,
+            title: `E2E chat test data ${Date.now()}`,
+            description: "The order is placed",
+            preconditions: "",
+            stepsJson: "[]",
+            testData: "card: 4242 4242 4242 4242",
+            priority: "P2",
+          },
+          reason: "",
+        },
+      ],
+    });
+
+    const before = await asOwner.get(url(`/agents/zyra/tasks/${taskId}`), { failOnStatusCode: false });
+    expect(before.status()).toBe(200);
+    const beforeRow = (await before.json()).drafts[0];
+    expect(beforeRow.testData, "the review row must carry the staged draft's test data").toBe("card: 4242 4242 4242 4242");
+    expect(beforeRow.expectedSummary, "the description must still be served on the review row").toBe("The order is placed");
+
+    const res = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), {
+      data: { testData: "card: 4000 0000 0000 0002" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `editing test data — ${await res.text()}`).toBe(200);
+    expect((await res.json()).drafts[0].testData).toBe("card: 4000 0000 0000 0002");
+
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+    expect(stored[0].draft.testData).toBe("card: 4000 0000 0000 0002");
+    expect(stored[0].draft.description, "an edit of one field must not touch the others").toBe("The order is placed");
+  });
+
+  test("ZYR-A-143 a create draft with no test data serves an empty string, and clearing test data persists as empty", async () => {
+    const { taskId } = seedChatReviewTask();
+    const before = await asOwner.get(url(`/agents/zyra/tasks/${taskId}`), { failOnStatusCode: false });
+    expect(before.status()).toBe(200);
+    expect((await before.json()).drafts[0].testData, "absent test data must be '' on the row, never undefined").toBe("");
+
+    await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), { data: { testData: "temporary" }, failOnStatusCode: false });
+    const cleared = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), { data: { testData: "" }, failOnStatusCode: false });
+    expect(cleared.status(), `clearing test data — ${await cleared.text()}`).toBe(200);
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+    expect(stored[0].draft.testData, "clearing must persist as empty, not be ignored").toBe("");
+  });
+
+  test("ZYR-A-144 an update proposal's review row previews the real test case's test data (and a staged change to it)", async () => {
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: `E2E chat update test data ${Date.now()}`, priority: "P2", testData: "user: alice" },
+      failOnStatusCode: false,
+    });
+    expect(created.status()).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const untouched = seedChatReviewTask({
+        entries: [{ opType: "update", testcaseId, externalId: "E2E-1", fields: { priority: "P1" }, reason: "" }],
+      });
+      const unchangedRes = await asOwner.get(url(`/agents/zyra/tasks/${untouched.taskId}`), { failOnStatusCode: false });
+      expect(unchangedRes.status()).toBe(200);
+      expect(
+        (await unchangedRes.json()).drafts[0].testData,
+        "a proposal that doesn't touch test data must preview the case's current value (chatTestcaseRow)",
+      ).toBe("user: alice");
+
+      const changing = seedChatReviewTask({
+        entries: [{ opType: "update", testcaseId, externalId: "E2E-1", fields: { testData: "user: bob" }, reason: "" }],
+      });
+      const changingRes = await asOwner.get(url(`/agents/zyra/tasks/${changing.taskId}`), { failOnStatusCode: false });
+      expect((await changingRes.json()).drafts[0].testData, "the preview shows the value after saving").toBe("user: bob");
+      expect(
+        scalar(`SELECT test_data FROM testcases WHERE id = ${literal(testcaseId)};`),
+        "previewing must not touch the real test case before Save",
+      ).toBe("user: alice");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
   test("ZYR-A-51 saving a chat-staged create draft writes a real test case into its own suite, tagged and audited as zyra_chat", async () => {
     const suite = await asOwner.post(url("/suites"), { data: { name: `E2E zyra chat suite ${Date.now()}` }, failOnStatusCode: false });
     expect(suite.status()).toBe(201);
@@ -4346,28 +4433,384 @@ test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
     expect(ledger(first)[0].save_event_id).not.toBe(row.save_event_id);
   });
 
+  // ─── Several tickets on one task ──────────────────────────────────────────
+  //
+  // "[Zyra] Test Cases Generated and Saved from Linked Tickets Are Not Posted Back to Their Respective
+  // Jira/Linear Tickets" — a task naming several tickets (the Feedback tab's pickers, or several keys
+  // sent to createZyraTask) used to link EVERY saved test case to the first key of each provider: one
+  // ticket's comment listed all of them, the others got nothing, and with Jira + Linear both tickets
+  // listed everything. Each draft is now attributed at generation time to the one ticket it cites
+  // (zyraAttributeDraftsToTickets), and the save writes that key per draft.
+
+  /** A ticket key unique to this run, so linked-row lookups never see another test's rows. */
+  function ticketKey(prefix: string): string {
+    return `${prefix}-${Date.now().toString().slice(-7)}${Math.floor(Math.random() * 90 + 10)}`;
+  }
+
+  /** Scripts one generation whose drafts cite the given labels (the model's raw sourceRefs). */
+  function queueCitedGeneration(drafts: Array<{ title: string; refs: string[] }>): void {
+    ai.queueReply({ drafts: drafts.map(({ title, refs }) => ({ ...draft(title), sourceRefs: refs })) });
+    ai.queueReply("- Generated multi-ticket test cases.");
+    queued += 2;
+  }
+
+  /** Generates through the real route for an explicit multi-ticket selection; returns the task id. */
+  async function generateForTickets(keys: { jira?: string[]; linear?: string[] }, drafts: Array<{ title: string; refs: string[] }>): Promise<string> {
+    await allocateFakeAiKey();
+    queueCitedGeneration(drafts);
+    const created = await createTask({ jiraIssueKeys: keys.jira ?? [], linearIssueKeys: keys.linear ?? [] });
+    const taskId = created.generationRequestId;
+    expect(await waitForTaskSettled(taskId), "generation must complete").toBe("in_review");
+    return taskId;
+  }
+
+  /** An in-review task whose drafts already carry their attributed keys — for the save-only cases. */
+  function seedMultiTicketReviewTask(
+    drafts: Array<{ title: string; jiraIssueKey?: string; linearIssueKey?: string }>,
+    keys: { jira?: string[]; linear?: string[] },
+  ): string {
+    const payload = drafts.map(({ title, jiraIssueKey, linearIssueKey }) => ({ ...draft(title), jiraIssueKey: jiraIssueKey ?? null, linearIssueKey: linearIssueKey ?? null }));
+    exec(
+      "INSERT INTO ai_generation_requests (project_id, requested_by, provider, model, user_story, requested_count, " +
+        "generated_count, saved_count, generated_payload, agent_name, task_status, jira_issue_keys, linear_issue_keys) VALUES (" +
+        `${literal(tenant!.mainProjectId)}, ${literal(tenant!.owner.userId)}, 'openai', 'gpt-4o-mini', 'E2E multi-ticket', ` +
+        `${payload.length}, ${payload.length}, 0, ${literal(JSON.stringify(payload))}::jsonb, 'Zyra the Test Generator', 'in_review', ` +
+        `${literal(JSON.stringify(keys.jira ?? []))}::jsonb, ${literal(JSON.stringify(keys.linear ?? []))}::jsonb);`,
+    );
+    return scalar(`SELECT id FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`);
+  }
+
+  async function saveAll(taskId: string): Promise<Map<string, string>> {
+    const res = await save(taskId);
+    expect(res.status(), `saving — ${await res.text()}`).toBe(201);
+    const saved = await res.json();
+    return new Map((saved.testcases as Array<{ id: string; title: string }>).map((t) => [t.title, t.id]));
+  }
+
+  function commentFor(rows: LedgerRow[], provider: "jira" | "linear", key: string): LedgerRow {
+    const row = rows.find((r) => r.provider === provider && r.issue_key === key);
+    expect(row, `a ${provider} comment for ${key}`).toBeTruthy();
+    return row!;
+  }
+
+  test("ZYR-AC-31 single Linear ticket by explicit key: every draft links to it even when none cites it, and one Linear comment lists them", async () => {
+    seedConnection("linear");
+    await setAutoComment({ linearAutoComment: true });
+    const key = ticketKey("LIN");
+    const taskId = await generateForTickets({ linear: [key] }, [
+      { title: "Single Linear uncited A", refs: [] },
+      { title: "Single Linear uncited B", refs: [] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    for (const id of ids.values()) {
+      expect(linkedKey(id, "linear_issue_key"), "a single-ticket task links every draft to its ticket").toBe(key);
+      expect(linkedKey(id, "jira_issue_key")).toBe("");
+    }
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ provider: "linear", issue_key: key });
+    expect([...rows[0].testcase_ids].sort()).toEqual([...ids.values()].sort());
+    expect(activityTitles(taskId)).not.toContain("Some drafts not linked to a ticket");
+  });
+
+  test("ZYR-AC-32 single Jira ticket by explicit key: unchanged — every draft links, one Jira comment", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: true });
+    const key = ticketKey("JRA");
+    const taskId = await generateForTickets({ jira: [key] }, [
+      { title: "Single Jira cited", refs: [key] },
+      { title: "Single Jira uncited", refs: [] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    for (const id of ids.values()) expect(linkedKey(id)).toBe(key);
+    const rows = await waitForDelivery(taskId);
+    expect(rows.map((r) => `${r.provider}:${r.issue_key}`)).toEqual([`jira:${key}`]);
+    expect(rows[0].testcase_ids).toHaveLength(2);
+  });
+
+  test("ZYR-AC-33 two Jira tickets: each test case links to the ticket it cites, and each ticket's comment lists only its own", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: true });
+    const [j1, j2] = [ticketKey("JA"), ticketKey("JB")];
+    const taskId = await generateForTickets({ jira: [j1, j2] }, [
+      { title: "Multi Jira one first", refs: [j1, "KB 1"] },
+      { title: "Multi Jira two only", refs: [j2] },
+      { title: "Multi Jira one second", refs: [j1] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get("Multi Jira one first")!)).toBe(j1);
+    expect(linkedKey(ids.get("Multi Jira one second")!)).toBe(j1);
+    expect(linkedKey(ids.get("Multi Jira two only")!), "the second ticket's case must not inherit the first key").toBe(j2);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    const first = commentFor(rows, "jira", j1);
+    const second = commentFor(rows, "jira", j2);
+    expect([...first.testcase_ids].sort()).toEqual([ids.get("Multi Jira one first"), ids.get("Multi Jira one second")].sort());
+    expect(second.testcase_ids).toEqual([ids.get("Multi Jira two only")]);
+    expect(first.comment_text).not.toContain("Multi Jira two only");
+    expect(second.comment_text).not.toContain("Multi Jira one");
+  });
+
+  test("ZYR-AC-34 two Linear tickets: same per-ticket split, on Linear", async () => {
+    seedConnection("linear");
+    await setAutoComment({ linearAutoComment: true });
+    const [l1, l2] = [ticketKey("LA"), ticketKey("LB")];
+    const taskId = await generateForTickets({ linear: [l1, l2] }, [
+      { title: "Multi Linear one", refs: [l1] },
+      // Labels are matched case-insensitively — the model sometimes changes a key's case.
+      { title: "Multi Linear two", refs: [l2.toLowerCase()] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get("Multi Linear one")!, "linear_issue_key")).toBe(l1);
+    expect(linkedKey(ids.get("Multi Linear two")!, "linear_issue_key"), "stored with the task's own spelling of the key").toBe(l2);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    expect(commentFor(rows, "linear", l1).testcase_ids).toEqual([ids.get("Multi Linear one")]);
+    expect(commentFor(rows, "linear", l2).testcase_ids).toEqual([ids.get("Multi Linear two")]);
+  });
+
+  test("ZYR-AC-35 Jira + Linear: Jira-cited cases go only to Jira, Linear-cited only to Linear, a case citing both goes to both", async () => {
+    seedConnection("jira");
+    seedConnection("linear");
+    await setAutoComment({ jiraAutoComment: true, linearAutoComment: true });
+    const [j1, l1] = [ticketKey("JM"), ticketKey("LM")];
+    const taskId = await generateForTickets({ jira: [j1], linear: [l1] }, [
+      { title: "Mixed Jira case", refs: [j1] },
+      { title: "Mixed Linear case", refs: [l1] },
+      { title: "Mixed shared case", refs: [j1, l1] },
+    ]);
+
+    const ids = await saveAll(taskId);
+    expect([linkedKey(ids.get("Mixed Jira case")!), linkedKey(ids.get("Mixed Jira case")!, "linear_issue_key")]).toEqual([j1, ""]);
+    expect([linkedKey(ids.get("Mixed Linear case")!), linkedKey(ids.get("Mixed Linear case")!, "linear_issue_key")]).toEqual(["", l1]);
+    expect([linkedKey(ids.get("Mixed shared case")!), linkedKey(ids.get("Mixed shared case")!, "linear_issue_key")]).toEqual([j1, l1]);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    const jira = commentFor(rows, "jira", j1);
+    const linear = commentFor(rows, "linear", l1);
+    expect([...jira.testcase_ids].sort()).toEqual([ids.get("Mixed Jira case"), ids.get("Mixed shared case")].sort());
+    expect([...linear.testcase_ids].sort()).toEqual([ids.get("Mixed Linear case"), ids.get("Mixed shared case")].sort());
+    expect(jira.comment_text, "no Linear-only case on the Jira ticket").not.toContain("Mixed Linear case");
+    expect(linear.comment_text, "no Jira-only case on the Linear ticket").not.toContain("Mixed Jira case");
+  });
+
+  test("ZYR-AC-36 multi-ticket drafts that cite no ticket, two tickets of one provider, or a key not on the task are saved unlinked and say so", async () => {
+    seedConnection("jira");
+    await setAutoComment({ jiraAutoComment: true });
+    const [j1, j2] = [ticketKey("JU"), ticketKey("JV")];
+    const taskId = await generateForTickets({ jira: [j1, j2] }, [
+      { title: "Unattributed none", refs: [] },
+      { title: "Unattributed both", refs: [j1, j2] },
+      { title: "Unattributed foreign", refs: ["NOT-ON-TASK-1"] },
+      { title: "Attributed one", refs: [j1] },
+    ]);
+    expect(activityTitles(taskId)).toContain("Some drafts not linked to a ticket");
+    const note = JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`))
+      .find((entry: { title: string }) => entry.title === "Some drafts not linked to a ticket");
+    expect(note.detail).toContain("3 of 4 draft(s)");
+
+    const ids = await saveAll(taskId);
+    for (const title of ["Unattributed none", "Unattributed both", "Unattributed foreign"]) {
+      expect(linkedKey(ids.get(title)!), `${title} must not be guessed onto a ticket`).toBe("");
+    }
+    expect(linkedKey(ids.get("Attributed one")!)).toBe(j1);
+
+    const rows = await waitForDelivery(taskId);
+    expect(rows.map((r) => `${r.provider}:${r.issue_key}`), "only the ticket that actually has a case is commented on").toEqual([`jira:${j1}`]);
+    expect(rows[0].testcase_ids).toEqual([ids.get("Attributed one")]);
+  });
+
+  test("ZYR-AC-37 one ticket's provider failing doesn't stop the other: Linear skipped (not connected) while Jira still goes out, and retrying Jira leaves Linear alone", async () => {
+    seedConnection("jira");
+    // No Linear connection in this tenant: that ticket's comment is recorded as skipped.
+    await setAutoComment({ jiraAutoComment: true, linearAutoComment: true });
+    const [j1, l1] = [ticketKey("JP"), ticketKey("LP")];
+    const taskId = seedMultiTicketReviewTask(
+      [
+        { title: "Partial Jira case", jiraIssueKey: j1 },
+        { title: "Partial Linear case", linearIssueKey: l1 },
+      ],
+      { jira: [j1], linear: [l1] },
+    );
+
+    await saveAll(taskId);
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    const jira = commentFor(rows, "jira", j1);
+    expect(commentFor(rows, "linear", l1).status).toBe("skipped_not_connected");
+    // The fixture Jira connection can't actually post (block header), so it ends posted or failed —
+    // either way it was attempted despite the Linear ticket being skipped.
+    expect(["posted", "failed"]).toContain(jira.status);
+
+    if (jira.status === "failed") {
+      const jiraId = scalar(
+        `SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)} AND provider = 'jira';`,
+      );
+      const retry = await asOwner.post(retryUrl(taskId, jiraId), { failOnStatusCode: false });
+      expect(retry.status(), await retry.text()).toBe(201);
+      const after = ledger(taskId);
+      expect(after, "a retry re-sends one ticket's comment, never adds a row").toHaveLength(2);
+      expect(commentFor(after, "linear", l1).status, "retrying Jira must not touch the Linear ticket's record").toBe("skipped_not_connected");
+      expect(commentFor(after, "jira", j1).comment_text).not.toContain("Partial Linear case");
+    }
+  });
+
+  test("ZYR-AC-38 concurrent and repeated saves of a multi-ticket task: exactly one comment per ticket", async () => {
+    await setAutoComment({ jiraAutoComment: false, linearAutoComment: false });
+    const [j1, j2, l1] = [ticketKey("JR"), ticketKey("JS"), ticketKey("LR")];
+    const taskId = seedMultiTicketReviewTask(
+      [
+        { title: "Race J1", jiraIssueKey: j1 },
+        { title: "Race J2", jiraIssueKey: j2 },
+        { title: "Race L1", linearIssueKey: l1 },
+      ],
+      { jira: [j1, j2], linear: [l1] },
+    );
+
+    const [a, b] = await Promise.all([save(taskId), save(taskId)]);
+    expect([a.status(), b.status()].sort(), "one save wins, the other is refused as already saved").toEqual([201, 409]);
+    expect(ledger(taskId).map((r) => `${r.provider}:${r.issue_key}`).sort()).toEqual([`jira:${j1}`, `jira:${j2}`, `linear:${l1}`].sort());
+
+    expect((await save(taskId)).status()).toBe(409);
+    expect(ledger(taskId), "a refused re-save adds nothing").toHaveLength(3);
+  });
+
+  test("ZYR-AC-39 regenerating a two-ticket task updates each ticket's own linked case in place, never the other ticket's", async () => {
+    await setAutoComment({ jiraAutoComment: false });
+    const [j1, j2] = [ticketKey("JX"), ticketKey("JY")];
+    const first = seedMultiTicketReviewTask(
+      [
+        { title: "Regen J1 original", jiraIssueKey: j1 },
+        { title: "Regen J2 original", jiraIssueKey: j2 },
+      ],
+      { jira: [j1, j2] },
+    );
+    const original = await saveAll(first);
+
+    // Reversed order on purpose: pairing across the whole save (the old behaviour) would rewrite J1's
+    // case with J2's draft.
+    const second = seedMultiTicketReviewTask(
+      [
+        { title: "Regen J2 refined", jiraIssueKey: j2 },
+        { title: "Regen J1 refined", jiraIssueKey: j1 },
+      ],
+      { jira: [j1, j2] },
+    );
+    const refined = await saveAll(second);
+    expect(refined.get("Regen J1 refined"), "J1's draft updates J1's existing case").toBe(original.get("Regen J1 original"));
+    expect(refined.get("Regen J2 refined"), "J2's draft updates J2's existing case").toBe(original.get("Regen J2 original"));
+    expect(linkedKey(original.get("Regen J1 original")!)).toBe(j1);
+    expect(linkedKey(original.get("Regen J2 original")!)).toBe(j2);
+
+    const rows = ledger(second);
+    expect(commentFor(rows, "jira", j1).testcase_ids).toEqual([original.get("Regen J1 original")]);
+    expect(commentFor(rows, "jira", j2).testcase_ids).toEqual([original.get("Regen J2 original")]);
+  });
+
   // ─── Which ticket the KB selection links to ───────────────────────────────
 
-  test("ZYR-AC-11 KB docs from TWO tickets link to neither, and say so — no comment for either ticket", async () => {
+  // Changed on purpose ("[Zyra] Test Cases Generated and Saved from Linked Tickets Are Not Posted Back
+  // to Their Respective Jira/Linear Tickets"): this used to assert that a selection spanning two
+  // tickets linked NEITHER, because a save could only ever link one ticket. Each draft is now
+  // attributed to the ticket it cites, so every ticket behind the selection is linked instead.
+  test("ZYR-AC-11 KB docs from TWO tickets link both, and each ticket's comment lists only the cases citing it", async () => {
     await allocateFakeAiKey();
     const connectionId = seedConnection("jira");
-    const docA = seedTicketWithMirror("jira", connectionId, "MFLP-20");
-    const docB = seedTicketWithMirror("jira", connectionId, "MFLP-21");
+    const [k1, k2] = [ticketKey("MFA"), ticketKey("MFB")];
+    const docA = seedTicketWithMirror("jira", connectionId, k1);
+    const docB = seedTicketWithMirror("jira", connectionId, k2);
     await setAutoComment({ jiraAutoComment: true });
 
-    queueGeneration(["Two-ticket case"]);
+    queueCitedGeneration([
+      { title: "KB two-ticket first", refs: [k1] },
+      { title: "KB two-ticket second", refs: [k2] },
+    ]);
     const created = await createTask({ knowledgeItemIds: [docA, docB] });
     const taskId = created.generationRequestId;
-    expect(created.task.jiraIssueKeys).toEqual([]);
-    const note = (JSON.parse(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)) as Array<{ title: string; detail: string }>)
-      .find((e) => e.title === "Not linked to a ticket");
-    expect(note?.detail).toContain("MFLP-20");
-    expect(note?.detail).toContain("MFLP-21");
+    expect([...created.task.jiraIssueKeys].sort()).toEqual([k1, k2].sort());
+    expect(activityTitles(taskId)).not.toContain("Not linked to a ticket");
+    const sources = created.task.sources as Array<{ type: string; title: string; detail: string }>;
+    expect(sources.filter((s) => s.type === "jira").map((s) => s.detail)).toEqual([
+      "Linked from the selected Knowledge Base documents.",
+      "Linked from the selected Knowledge Base documents.",
+    ]);
 
     expect(await waitForTaskSettled(taskId)).toBe("in_review");
-    const saved = await (await save(taskId)).json();
-    expect(linkedKey((saved.testcases as Array<{ id: string }>)[0].id)).toBe("");
-    expect(ledger(taskId)).toHaveLength(0);
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get("KB two-ticket first")!)).toBe(k1);
+    expect(linkedKey(ids.get("KB two-ticket second")!)).toBe(k2);
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(2);
+    expect(commentFor(rows, "jira", k1).testcase_ids).toEqual([ids.get("KB two-ticket first")]);
+    expect(commentFor(rows, "jira", k2).testcase_ids).toEqual([ids.get("KB two-ticket second")]);
+  });
+
+  test("ZYR-AC-40 KB docs from THREE Linear tickets: every ticket is linked and gets a comment with only its own cases", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("linear");
+    const keys = [ticketKey("YA"), ticketKey("YB"), ticketKey("YC")];
+    const docs = keys.map((key) => seedTicketWithMirror("linear", connectionId, key));
+    await setAutoComment({ linearAutoComment: true });
+
+    queueCitedGeneration(keys.map((key, i) => ({ title: `Three Linear case ${i + 1}`, refs: [key] })));
+    const created = await createTask({ knowledgeItemIds: docs });
+    const taskId = created.generationRequestId;
+    expect([...created.task.linearIssueKeys].sort()).toEqual([...keys].sort());
+    expect(created.task.jiraIssueKeys).toEqual([]);
+
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+    const ids = await saveAll(taskId);
+    const rows = await waitForDelivery(taskId);
+    expect(rows).toHaveLength(3);
+    keys.forEach((key, i) => {
+      const id = ids.get(`Three Linear case ${i + 1}`)!;
+      expect(linkedKey(id, "linear_issue_key")).toBe(key);
+      expect(commentFor(rows, "linear", key).testcase_ids).toEqual([id]);
+    });
+  });
+
+  test("ZYR-AC-41 a draft citing a ticket's KB mirror as 'KB N' is attributed to that ticket; a 'KB N' of a plain note is not a ticket", async () => {
+    await allocateFakeAiKey();
+    const connectionId = seedConnection("jira");
+    const [k1, k2] = [ticketKey("KBA"), ticketKey("KBB")];
+    const docA = seedTicketWithMirror("jira", connectionId, k1);
+    const docB = seedTicketWithMirror("jira", connectionId, k2);
+    const note = await createNote(`E2E plain note ${Date.now()}`, "Loan officers work in two shifts.");
+    await setAutoComment({ jiraAutoComment: true });
+
+    queueCitedGeneration([
+      { title: "Cites KB 1", refs: ["KB 1"] },
+      { title: "Cites KB 2", refs: ["KB 2"] },
+      { title: "Cites KB 3", refs: ["KB 3"] },
+    ]);
+    const taskId = (await createTask({ knowledgeItemIds: [docA, docB, note] })).generationRequestId;
+    expect(await waitForTaskSettled(taskId)).toBe("in_review");
+
+    // Which document got which "KB N" label is the backend's choice, so read it off the prompt the
+    // fake provider actually received rather than assuming the selection order.
+    const prompt = ai.requests.map((r) => JSON.stringify(r.messages)).find((m) => m.includes("cite by its 'KB N' label")) ?? "";
+    // Titles here are "<key>: E2E loan approval" — letters, digits, '-' and ':' only, nothing to escape.
+    const labelOf = (title: string) => prompt.match(new RegExp(`KB (\\d+): ${title}`))?.[1];
+    const kbOfK1 = labelOf(`${k1}: E2E loan approval`);
+    const kbOfK2 = labelOf(`${k2}: E2E loan approval`);
+    expect(kbOfK1, "the first ticket's mirror reached the prompt as a KB item").toBeTruthy();
+    expect(kbOfK2, "the second ticket's mirror reached the prompt as a KB item").toBeTruthy();
+    const noteLabel = ["1", "2", "3"].find((n) => n !== kbOfK1 && n !== kbOfK2)!;
+
+    const ids = await saveAll(taskId);
+    expect(linkedKey(ids.get(`Cites KB ${kbOfK1}`)!)).toBe(k1);
+    expect(linkedKey(ids.get(`Cites KB ${kbOfK2}`)!)).toBe(k2);
+    expect(linkedKey(ids.get(`Cites KB ${noteLabel}`)!), "a plain note is not a ticket").toBe("");
+    expect(activityTitles(taskId)).toContain("Some drafts not linked to a ticket");
+    const rows = await waitForDelivery(taskId);
+    expect(rows.map((r) => r.issue_key).sort()).toEqual([k1, k2].sort());
   });
 
   test("ZYR-AC-12 two docs of the SAME ticket still link to it", async () => {
@@ -6055,5 +6498,427 @@ test.describe("zyra chat — request trace and turn lifecycle (fake provider)", 
     expect(step(trace, "routing")).toMatchObject({ status: "timed_out", meta: { timeoutMs: 60_000 } });
     expect(trace.outcome).toBe("timed_out");
     expect(messages.find((m) => m.role === "assistant")?.status).toBe("timed_out");
+  });
+});
+
+test.describe("zyra — writes in the language the user writes in (fake provider)", () => {
+  /*
+   * Zyra's language is the Unicode script of what the user typed (common/script-language.ts), never
+   * the browser: Cyrillic in → Russian test cases, Russian replies and Russian fixed messages out.
+   * It is stored — zyra_chat_sessions.language / ai_generation_requests.language (V132) — because
+   * most of the work outlives its request, and because a message with no signal ("ok", "да", a
+   * ticket key) must keep the language the conversation already had.
+   *
+   * What a scripted provider can prove is the contract: which prompts carry the Russian
+   * instruction, what the backend itself writes into the chat, what is stored. Whether a real model
+   * then writes good Russian is outside what these tests can show.
+   *
+   * English is the default and must be untouched — every existing Zyra suite asserts the English
+   * wording verbatim, and runs in the same impacted selection as this block.
+   */
+  const RU_BROWSER = { "Accept-Language": "ru-RU,ru;q=0.9" };
+  const EN_BROWSER = { "Accept-Language": "en-US,en;q=0.9" };
+  const DRAFTS_IN_RUSSIAN = "Write every draft in Russian";
+  const REPLY_IN_RUSSIAN = "LANGUAGE: the user is writing in Russian";
+  const GENERATOR = "You are Zyra the Test Generator";
+
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let asGuest: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-language");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    asGuest = await loginAs(tenant.guest);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await asGuest?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    ai?.reset();
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT (V116) — before sessions.
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  // A custom-gateway provider: OpenAI-wire but not embeddings-capable, so no background embedding
+  // job ever eats a queued reply — see the "zyra chat — citations" block's identical helper.
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E language fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "e2e-fake-gateway", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  const sessionLanguage = (sessionId: string) =>
+    scalar(`SELECT language FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`);
+
+  const generationRequests = () => ai.requests.filter((r) => JSON.stringify(r.messages ?? []).includes(GENERATOR));
+  const routerRequests = () => ai.requests.filter((r) => JSON.stringify(r.messages ?? []).includes("You are Zyra, an expert test engineer and edge-case designer"));
+  const systemMessage = (request: { messages?: Array<{ role: string; content: unknown }> }) =>
+    JSON.stringify((request.messages ?? []).find((m) => m.role === "system")?.content ?? "");
+
+  const draft = (title: string) => ({
+    title,
+    preconditions: "Пользователь находится на странице входа.",
+    stepsJson: JSON.stringify([{ stepNumber: 1, action: "Ввести неверный пароль", expectedResult: "Отображается сообщение об ошибке" }]),
+    testData: "user@example.com",
+    expectedSummary: "Вход отклонён.",
+    priority: "P1",
+    severity: "High",
+    tags: ["zyra"],
+    sourceRefs: [],
+  });
+
+  function queueCreateTurn(title: string): void {
+    ai.queueReply({ reply: "", reasoningSummary: "Creating one case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({ drafts: [draft(title)] });
+    ai.queueReply("Noted."); // rememberZyraTurn's summarization call — see ZYR-A-63
+  }
+
+  const send = (sessionId: string, message: string, headers: Record<string, string> = {}) =>
+    asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message }, headers, failOnStatusCode: false });
+
+  async function lastAssistant(sessionId: string): Promise<Record<string, any>> {
+    const res = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    const messages = (await res.json()).messages as Array<Record<string, any>>;
+    return [...messages].reverse().find((m) => m.role === "assistant")!;
+  }
+
+  /** One full create turn; returns the generation and router prompts it sent. */
+  async function createTurn(sessionId: string, message: string, headers: Record<string, string> = {}) {
+    ai.reset();
+    queueCreateTurn("Черновик");
+    const res = await send(sessionId, message, headers);
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    const generation = generationRequests();
+    expect(generation, "exactly one draft-writing call").toHaveLength(1);
+    return { generation: JSON.stringify(generation[0].messages), router: JSON.stringify(routerRequests()[0]?.messages ?? []), request: generation[0] };
+  }
+
+  test("ZYR-L-01 a Russian message gets Russian drafts and a Russian reply; the cached system prompt does not change", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language basic");
+
+    const english = await createTurn(sessionId, "Create a test case for the login page.");
+    expect(english.generation).not.toContain(DRAFTS_IN_RUSSIAN);
+    expect(english.router).not.toContain(REPLY_IN_RUSSIAN);
+    expect(sessionLanguage(sessionId)).toBe("en");
+    expect(String((await lastAssistant(sessionId)).content)).toMatch(/^I drafted 1 test case\(s\) after reading/);
+
+    ai.reset();
+    queueCreateTurn("Вход с неверным паролем отклонён");
+    const res = await send(sessionId, "Создай тест-кейс для неверного пароля на странице входа.");
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    expect(sessionLanguage(sessionId)).toBe("ru");
+
+    const generation = generationRequests();
+    expect(generation).toHaveLength(1);
+    const prompt = JSON.stringify(generation[0].messages);
+    expect(prompt).toContain(DRAFTS_IN_RUSSIAN);
+    // Machine-read fields are pinned to English in the same instruction.
+    expect(prompt).toContain("severity (Critical/High/Medium/Low)");
+    expect(JSON.stringify(routerRequests()[0].messages), "the router is asked for a Russian reply").toContain(REPLY_IN_RUSSIAN);
+    // The instruction sits in the per-request prompt: the prompt-cached system message is byte-identical.
+    expect(systemMessage(generation[0])).toBe(systemMessage(english.request));
+
+    // The backend's own reply text is Russian; the draft suite keeps its real (English) name.
+    const reply = await lastAssistant(sessionId);
+    expect(String(reply.content)).toMatch(/^Я подготовил\(а\) 1 тест-кейс\(ов\), изучив:/);
+    expect(String(reply.content)).toContain("**Zyra generated test cases**");
+    expect(String(reply.content)).not.toContain("I drafted");
+    expect(String(reply.reasoningSummary ?? reply.reasoning_summary ?? "")).toContain("Генерация через");
+
+    // The Russian draft is what got staged, with the stored vocabulary still English.
+    const staged = JSON.parse(
+      scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`),
+    );
+    expect(staged[0].draft.title).toBe("Вход с неверным паролем отклонён");
+    expect(staged[0].draft.severity).toBe("High");
+  });
+
+  test("ZYR-L-02 the browser's language is ignored — the text decides, in both directions", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language browser ignored");
+
+    const englishFromRussianBrowser = await createTurn(sessionId, "Create a test case for the password reset email.", RU_BROWSER);
+    expect(englishFromRussianBrowser.generation).not.toContain(DRAFTS_IN_RUSSIAN);
+    expect(sessionLanguage(sessionId)).toBe("en");
+
+    const russianFromEnglishBrowser = await createTurn(sessionId, "Создай тест-кейс для письма сброса пароля.", EN_BROWSER);
+    expect(russianFromEnglishBrowser.generation).toContain(DRAFTS_IN_RUSSIAN);
+    expect(sessionLanguage(sessionId)).toBe("ru");
+  });
+
+  test("ZYR-L-03 a message with no language signal keeps the session's language, in both directions", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language no signal");
+
+    await createTurn(sessionId, "Создай тест-кейс для страницы входа.");
+    expect(sessionLanguage(sessionId)).toBe("ru");
+    for (const noSignal of ["ok", "yes", "5", "👍", "HBP-14"]) {
+      const turn = await createTurn(sessionId, noSignal);
+      expect(sessionLanguage(sessionId), `"${noSignal}" must not flip a Russian session`).toBe("ru");
+      expect(turn.generation, `"${noSignal}" still generates in Russian`).toContain(DRAFTS_IN_RUSSIAN);
+    }
+
+    // A real English message switches it back…
+    await createTurn(sessionId, "Now create a test case for the logout button.");
+    expect(sessionLanguage(sessionId)).toBe("en");
+    // …and a bare Russian "да" does not switch an English session to Russian.
+    const da = await createTurn(sessionId, "да");
+    expect(sessionLanguage(sessionId)).toBe("en");
+    expect(da.generation).not.toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-04 mixed text goes with the majority; URLs, ticket keys and code don't count; other Cyrillic languages fall back to English", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language mixed");
+    const cases: [string, "ru" | "en"][] = [
+      ["Создай тест-кейсы для login page на мобильном", "ru"],
+      ["Create test cases for the экран входа on mobile", "en"],
+      ["Проверь страницу https://example.com/login/very/long/path HBP-14 и `validateEmailFormat()`", "ru"],
+      ["Verify the city field accepts «Москва» and saves it", "en"],
+      // Ukrainian: Cyrillic, but not Russian — English, never Russian.
+      ["Створи тест-кейси для сторінки входу", "en"],
+      // Transliterated Russian is Latin script.
+      ["sozdai test dlya stranitsy vhoda", "en"],
+    ];
+    for (const [message, expected] of cases) {
+      const turn = await createTurn(sessionId, message);
+      expect(sessionLanguage(sessionId), message).toBe(expected);
+      if (expected === "ru") expect(turn.generation, message).toContain(DRAFTS_IN_RUSSIAN);
+      else expect(turn.generation, message).not.toContain(DRAFTS_IN_RUSSIAN);
+    }
+  });
+
+  test("ZYR-L-05 an exhaustive plan's background batches, and its plan messages, are Russian", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language plan");
+    const scenarioDraft = (title: string) => ({ ...draft(title), severity: undefined });
+
+    // Same seven-scenario, two-batch shape as ZCC-B-08 (api/zyra-chat-consistency.spec.ts).
+    ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
+    ai.queueReply({ scenarios: Array.from({ length: 7 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] });
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    ai.queueReply("Noted."); // the first batch's rememberZyraTurn — see ZCC-B-08
+    ai.queueReply({ drafts: Array.from({ length: 2 }, (_, i) => scenarioDraft(`Scenario ${i + 6}`)) });
+
+    const turn = await send(sessionId, "Сгенерируй все возможные тест-кейсы для входа в систему.");
+    expect(turn.status(), await turn.text()).toBeLessThan(300);
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must run its background batch to completion",
+        timeout: 30_000,
+      })
+      .toBeNull();
+
+    const generations = generationRequests();
+    expect(generations.length, "the inline batch and the background batch").toBe(2);
+    for (const [index, request] of generations.entries()) {
+      expect(JSON.stringify(request.messages), `batch ${index + 1}`).toContain(DRAFTS_IN_RUSSIAN);
+    }
+    const session = await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json();
+    const assistant = (session.messages as Array<Record<string, any>>).filter((m) => m.role === "assistant");
+    expect(assistant).toHaveLength(2);
+    expect(String(assistant[0].content)).toContain("Я выделил(а) 7 отдельных сценариев");
+    expect(String(assistant[1].content)).toContain("все 7 сценариев покрыты");
+    expect(JSON.stringify(session.messages)).not.toContain("all 7 scenarios are now covered");
+  });
+
+  test("ZYR-L-06 'продолжить' resumes a paused plan, and the resume message is Russian", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language resume");
+    exec(`UPDATE zyra_chat_sessions SET language = 'ru' WHERE id = ${literal(sessionId)};`);
+    const plan = JSON.stringify({ planId: `e2e-plan-${Date.now()}`, status: "paused", remainingScenarios: ["Лимит мест", "Освобождение мест"], batchSize: 5, doneCount: 3, totalCount: 5, originalMessage: "Сгенерируй все возможные кейсы" });
+    exec(`UPDATE zyra_chat_sessions SET active_plan = ${literal(plan)}::jsonb WHERE id = ${literal(sessionId)};`);
+    ai.queueReply({ drafts: [draft("Лимит мест"), draft("Освобождение мест")] });
+    ai.queueReply("Noted.");
+
+    const res = await send(sessionId, "продолжить");
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), { timeout: 30_000 })
+      .toBeNull();
+
+    const session = await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json();
+    const contents = (session.messages as Array<Record<string, any>>).filter((m) => m.role === "assistant").map((m) => String(m.content));
+    expect(contents.some((c) => c.startsWith("Продолжаю — покрыто сценариев:")), JSON.stringify(contents)).toBe(true);
+    expect(contents.some((c) => c.startsWith("Вот последние")), JSON.stringify(contents)).toBe(true);
+    expect(JSON.stringify(generationRequests()[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-07 a Russian reply that claims unsaved work as saved gets the Russian correction banner", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language claim guard");
+    // An answer turn — nothing staged, nothing written — whose Russian prose says otherwise.
+    ai.queueReply({ reply: "Готово! Тест-кейсы созданы и сохранены в набор Login.", reasoningSummary: "Ответ.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const res = await send(sessionId, "Сохрани эти тест-кейсы в набор Login, пожалуйста.");
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    const reply = String((await lastAssistant(sessionId)).content);
+    expect(reply.startsWith("⚠️ **Извините! Ничего не сохранено.**"), reply).toBe(true);
+    expect(reply).toContain("Тест-кейсы созданы и сохранены в набор Login.");
+
+    // A truthful Russian reply passes untouched.
+    ai.reset();
+    ai.queueReply({ reply: "Я подготовил(а) 3 тест-кейса — они ожидают вашей проверки.", reasoningSummary: "Ответ.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    await send(sessionId, "Что ты подготовил для страницы входа?");
+    expect(String((await lastAssistant(sessionId)).content)).toBe("Я подготовил(а) 3 тест-кейса — они ожидают вашей проверки.");
+  });
+
+  test("ZYR-L-08 a capability that is off is explained in Russian", async () => {
+    await allocateFakeAiKey();
+    const settings = await asOwner.patch(url("/settings"), { data: { capabilities: { generation: false } }, failOnStatusCode: false });
+    expect(settings.status(), await settings.text()).toBeLessThan(300);
+    try {
+      const sessionId = await newSession("E2E language capability");
+      ai.queueReply({ reply: "", reasoningSummary: "Создание.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+      const res = await send(sessionId, "Создай тест-кейс для страницы входа.");
+      expect(res.status(), await res.text()).toBeLessThan(300);
+      const reply = String((await lastAssistant(sessionId)).content);
+      expect(reply).toBe("Для Zyra в этом проекте сейчас отключено: Генерация тест-кейсов. Включите это в Zyra → Настройки → Возможности и попробуйте снова.");
+    } finally {
+      await asOwner.patch(url("/settings"), { data: { capabilities: { generation: true } }, failOnStatusCode: false });
+    }
+  });
+
+  async function waitForTask(taskId: string): Promise<void> {
+    await expect
+      .poll(() => scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`), { timeout: 30_000 })
+      .toBe("in_review");
+  }
+
+  test("ZYR-L-09 a task with a Russian story is generated in Russian and its timeline reads in Russian; feedback re-detects", async () => {
+    await allocateFakeAiKey();
+    ai.queueReply({ drafts: [draft("Проверка входа")] });
+    ai.queueReply("- Noted.");
+    const taskRes = await asOwner.post(url("/tasks"), {
+      data: { userStory: "Пользователь входит в систему по email и паролю." },
+      headers: EN_BROWSER,
+      failOnStatusCode: false,
+    });
+    expect(taskRes.status(), await taskRes.text()).toBe(201);
+    const taskId = (await taskRes.json()).generationRequestId;
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("ru");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+
+    const task = await (await asOwner.get(url(`/tasks/${taskId}`))).json();
+    const body = task.task ?? task;
+    expect(body.language).toBe("ru");
+    const titles = (body.activities as Array<{ title: string }>).map((a) => a.title);
+    expect(titles).toEqual(expect.arrayContaining(["Задача создана", "Задача взята в работу", "Сгенерированы черновики тест-кейсов"]));
+    expect(titles).not.toContain("Task created");
+    // The stored log is still English — translation happens on the way out.
+    expect(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toContain("Task created");
+    // The story itself is the user's text and is never rewritten.
+    expect((body.activities as Array<{ title: string; detail: string }>).find((a) => a.title === "Задача создана")!.detail).toBe("Пользователь входит в систему по email и паролю.");
+
+    // Feedback with no signal keeps Russian.
+    await expect.poll(() => ai.requests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    ai.reset();
+    ai.queueReply({ drafts: [draft("Проверка входа 2")] });
+    ai.queueReply("- Noted.");
+    const okRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), { data: { feedback: "ok" }, failOnStatusCode: false });
+    expect(okRes.status(), await okRes.text()).toBe(201);
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("ru");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+
+    // English feedback switches the task to English.
+    await expect.poll(() => ai.requests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    ai.reset();
+    ai.queueReply({ drafts: [draft("Sign-in check")] });
+    ai.queueReply("- Noted.");
+    const enRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Please also cover the locked account case." },
+      headers: RU_BROWSER,
+      failOnStatusCode: false,
+    });
+    expect(enRes.status(), await enRes.text()).toBe(201);
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("en");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).not.toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-10 Russian feedback on an English task switches it to Russian", async () => {
+    await allocateFakeAiKey();
+    ai.queueReply({ drafts: [draft("Login check")] });
+    ai.queueReply("- Noted.");
+    const taskRes = await asOwner.post(url("/tasks"), { data: { userStory: "Users sign in with email and password." }, failOnStatusCode: false });
+    const taskId = (await taskRes.json()).generationRequestId;
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("en");
+    await waitForTask(taskId);
+    const englishTask = await (await asOwner.get(url(`/tasks/${taskId}`))).json();
+    expect(((englishTask.task ?? englishTask).activities as Array<{ title: string }>).map((a) => a.title)).toContain("Task created");
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).not.toContain(DRAFTS_IN_RUSSIAN);
+
+    await expect.poll(() => ai.requests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    ai.reset();
+    ai.queueReply({ drafts: [draft("Заблокированная учётная запись")] });
+    ai.queueReply("- Noted.");
+    const fbRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Добавь сценарий с заблокированной учётной записью." },
+      failOnStatusCode: false,
+    });
+    expect(fbRes.status(), await fbRes.text()).toBe(201);
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("ru");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-11 a caller without access to the project cannot change a session's language", async () => {
+    const sessionId = await newSession("E2E language access");
+    expect(sessionLanguage(sessionId)).toBe("en");
+    // The guest is in the workspace but not a member of this project.
+    const res = await asGuest.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Создай тест-кейс для страницы входа." },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(404);
+    expect(sessionLanguage(sessionId), "a refused request writes nothing").toBe("en");
   });
 });

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request, test, type APIRequestContext, type APIResponse } from "@playwright/test";
 import { env } from "../utils/env";
+import { newNotionId, notionKeyOf, purgeNotionRows, seedNotionMapping, seedNotionPage } from "../utils/notion-seed";
 import { exec, literal, scalar } from "../utils/psql";
 import {
   anonymousContext,
@@ -17,7 +18,7 @@ import {
 const ctxB = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context-b.json"), "utf-8"));
 
 /*
- * Integrations — Jira and Linear: connection status, project/team mapping, the mirrored ticket
+ * Integrations (Jira, Linear and Notion; Notion is INT-A-57 and up): connection status, project/team/database mapping, the mirrored ticket
  * store, the cross-source Requirements aggregates, and sync history.
  *
  * Wave 8, on its own workspace ("integrations").
@@ -106,6 +107,7 @@ test.describe("integrations — Jira and Linear", () => {
     exec(`DELETE FROM linear_tickets WHERE project_id IN (${projects});`);
     exec(`DELETE FROM jira_project_mappings WHERE project_id IN (${projects});`);
     exec(`DELETE FROM linear_project_mappings WHERE project_id IN (${projects});`);
+    purgeNotionRows([t.mainProjectId, t.secondProjectId]);
     exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(t.organizationId)};`);
     // Was missing entirely until the nightly-sync dedup fix (V90) added tests that seed rows here —
     // without it, seeded runs from one test could leak into the next.
@@ -137,7 +139,7 @@ test.describe("integrations — Jira and Linear", () => {
    * would leave it — seeded directly because actually producing one means a real sync, which means
    * a real outbound call to Jira/Linear (see the file-level note above).
    */
-  function seedMirrorDocument(provider: "jira" | "linear", externalId: string, title: string, projectId?: string, folderId?: string): string {
+  function seedMirrorDocument(provider: "jira" | "linear" | "notion", externalId: string, title: string, projectId?: string, folderId?: string): string {
     exec(
       "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
         "document_type, status, source_provider, source_external_id, source_role, is_read_only) VALUES (" +
@@ -157,10 +159,10 @@ test.describe("integrations — Jira and Linear", () => {
    * disconnect-cleanup fix's lookup (by source_provider, never by name) is exercised against a real
    * row, the same "no real sync" reasoning as the mirror-document/ticket fixtures above.
    */
-  function seedProviderFolder(provider: "jira" | "linear", projectId?: string, name?: string): string {
+  function seedProviderFolder(provider: "jira" | "linear" | "notion", projectId?: string, name?: string): string {
     const pid = projectId ?? tenant!.mainProjectId;
     const rootId = scalar(`SELECT id FROM knowledge_folders WHERE project_id = ${literal(pid)} AND is_root = true LIMIT 1;`);
-    const folderName = name ?? (provider === "jira" ? "Jira" : "Linear");
+    const folderName = name ?? { jira: "Jira", linear: "Linear", notion: "Notion" }[provider];
     exec(
       "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, description, source_provider, created_by, updated_by) VALUES (" +
         `${literal(tenant!.organizationId)}, ${literal(pid)}, ${literal(rootId)}, ${literal(folderName)}, ` +
@@ -184,7 +186,7 @@ test.describe("integrations — Jira and Linear", () => {
    * that migration exists for was producing, so this fixture has to stay honest about it too.
    */
   function seedSyncRun(
-    provider: "jira" | "linear",
+    provider: "jira" | "linear" | "notion",
     fields: {
       status?: string;
       triggerSource?: "manual" | "nightly";
@@ -229,7 +231,7 @@ test.describe("integrations — Jira and Linear", () => {
    * reached Atlassian with this would fail loudly rather than quietly talking to a real site, which
    * is the behaviour we want from a fixture that must never make a live call.
    */
-  function seedConnection(provider: "jira" | "linear", siteUrl = "https://e2e.invalid"): string {
+  function seedConnection(provider: "jira" | "linear" | "notion", siteUrl = "https://e2e.invalid"): string {
     exec(
       "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, " +
         `refresh_token, token_expires_at, connected_by) VALUES (${literal(tenant!.organizationId)}, ` +
@@ -1591,5 +1593,882 @@ test.describe("integrations — Jira and Linear", () => {
       "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date) VALUES (" +
         `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, 'linear', 'failed', 'failed', 'manual', NULL);`,
     );
+  });
+  // ─── Notion (V133) ────────────────────────────────────────────────────────
+  //
+  // A Tesbo project maps to ONE Notion database and that database's pages are the tickets (the
+  // notion_pages table), the same role jira_tickets/linear_tickets play. Test cases link to a page
+  // by its full page id (testcases.notion_page_id), never by the short "notion:xxxxxxxx" display key.
+  //
+  // Same "no fake upstream" rule as the rest of this file (api.notion.com is compiled in), so what is
+  // driven here is everything that happens before an outbound call, against rows seeded by
+  // utils/notion-seed.ts. NOT reachable from this suite, and recorded here rather than silently
+  // skipped: the OAuth code exchange, the database picker (GET notion/databases once connected),
+  // connecting a database (POST notion/databases verifies it live against Notion, so only its 400/404
+  // paths and the null unlink are driven), a real sync, and posting a comment. Those are pinned at
+  // unit level in legacy/notion-integration.spec.ts and integration-sync/notion-client.spec.ts.
+  //
+  // No-session refusals are asserted with expectRefused (400/401/403/404), not a bare 401: the legacy
+  // service's requireUser raises BadRequest, so an anonymous caller gets 400 today. See the note at
+  // the top of api/authorization.spec.ts.
+
+  /** Every project-scoped Notion route, as thunks, so one list drives the authorization tests. */
+  function notionRoutes(api: APIRequestContext, projectId?: string): Array<[string, () => Promise<APIResponse>]> {
+    const opts = { failOnStatusCode: false } as const;
+    return [
+      ["GET notion/status", () => api.get(url("/notion/status", projectId), opts)],
+      ["GET notion/databases", () => api.get(url("/notion/databases", projectId), opts)],
+      // A null databaseId is the unlink request, so a refused caller must also leave the mapping alone.
+      ["POST notion/databases", () => api.post(url("/notion/databases", projectId), { data: { databaseId: null }, ...opts })],
+      ["POST notion/sync", () => api.post(url("/notion/sync", projectId), { data: {}, ...opts })],
+      ["GET notion/pages", () => api.get(url("/notion/pages", projectId), opts)],
+      [
+        "POST notion/comment",
+        () => api.post(url("/notion/comment", projectId), { data: { pageId: newNotionId(), comment: "hello" }, ...opts }),
+      ],
+      ["GET notion/search-pages", () => api.get(url("/notion/search-pages?q=e2e", projectId), opts)],
+      ["GET testcases/linked-notion-pages", () => api.get(url("/testcases/linked-notion-pages", projectId), opts)],
+      ["GET integrations/notion/sync-status", () => api.get(url("/integrations/notion/sync-status", projectId), opts)],
+    ];
+  }
+
+  function notionWorkspaceRoutes(api: APIRequestContext): Array<[string, () => Promise<APIResponse>]> {
+    const opts = { failOnStatusCode: false } as const;
+    const base = "/api/workspace/integrations/notion";
+    return [
+      ["GET auth-url", () => api.get(`${base}/auth-url`, opts)],
+      ["GET config", () => api.get(`${base}/config`, opts)],
+      ["GET status", () => api.get(`${base}/status`, opts)],
+      ["POST callback", () => api.post(`${base}/callback`, { data: { code: "e2e-not-a-real-code" }, ...opts })],
+      ["DELETE disconnect", () => api.delete(`${base}/disconnect`, opts)],
+    ];
+  }
+
+  /** Runs SQL that is expected to be rejected and returns Postgres's error text ("" if it was accepted). */
+  function sqlRejection(sql: string): string {
+    try {
+      exec(sql);
+      return "";
+    } catch (error) {
+      return `${(error as { stderr?: unknown })?.stderr ?? ""}${(error as Error)?.message ?? ""}`;
+    }
+  }
+
+  /** The `state` an owner's auth-url carries, or null when the deployment has no OAuth app for that provider. */
+  async function oauthState(api: APIRequestContext, provider: "notion" | "linear"): Promise<string | null> {
+    const res = await api.get(`/api/workspace/integrations/${provider}/auth-url`, { failOnStatusCode: false });
+    if (res.status() !== 200) return null;
+    return new URL((await res.json()).url).searchParams.get("state");
+  }
+
+  function countRows(table: string, where: string): string {
+    return scalar(`SELECT COUNT(*) FROM ${table} WHERE ${where};`);
+  }
+
+  async function notionPageList(api: APIRequestContext, query = ""): Promise<{ list: any[]; total: number }> {
+    const res = await api.get(url(`/notion/pages${query}`), { failOnStatusCode: false });
+    expect(res.status(), `notion/pages${query} answered ${res.status()}: ${await res.text()}`).toBe(200);
+    return res.json();
+  }
+
+  test("INT-A-57 no Notion route answers a caller with no session, and none of them changes anything", async () => {
+    const connectionId = seedConnection("notion");
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId);
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Anonymous must not read this page" });
+
+    for (const [what, attempt] of [...notionRoutes(anon), ...notionWorkspaceRoutes(anon)]) {
+      const res = await attempt();
+      await expectRefused(res, `${what} (anonymous)`);
+      expect(await res.text(), `${what} leaked the mirrored page to an anonymous caller`).not.toContain("Anonymous must not read this page");
+    }
+    for (const path of ["/tickets", "/tickets/summary"]) {
+      expect(await (await anon.get(url(path), { failOnStatusCode: false })).text()).not.toContain("Anonymous must not read this page");
+    }
+
+    // The unlink (databaseId null) and the disconnect were both refused, not half-applied.
+    expect(
+      countRows("notion_project_mappings", `project_id = ${literal(tenant!.mainProjectId)} AND notion_database_id = ${literal(dbId)} AND enabled = true`),
+    ).toBe("1");
+    expect(scalar(`SELECT disconnected_at IS NULL FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("t");
+  });
+
+  test("INT-A-58 a second tenant and a non-member are refused on every Notion route, and cannot reach the connection", async () => {
+    const connectionId = seedConnection("notion", "https://www.notion.so");
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId);
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Tenant A private requirement" });
+
+    for (const [who, api] of [
+      ["account B (another workspace)", asB],
+      ["a workspace member outside the project", asGuest],
+    ] as const) {
+      for (const [what, attempt] of notionRoutes(api)) {
+        const res = await attempt();
+        await expectRefused(res, `${what} (${who})`);
+        expect(await res.text(), `${what} leaked the page to ${who}`).not.toContain("Tenant A private requirement");
+      }
+    }
+    expect(
+      countRows("notion_project_mappings", `project_id = ${literal(tenant!.mainProjectId)} AND notion_database_id = ${literal(dbId)} AND enabled = true`),
+    ).toBe("1");
+
+    // Account B's workspace-level view is its own: tenant A's connection does not show through it, and
+    // B disconnecting "notion" acts on B's workspace only.
+    const bStatus = await asB.get("/api/workspace/integrations/notion/status", { failOnStatusCode: false });
+    expect(bStatus.status()).toBe(200);
+    expect((await bStatus.json()).connected).toBe(false);
+    const bDisconnect = await asB.delete("/api/workspace/integrations/notion/disconnect", { failOnStatusCode: false });
+    expect(bDisconnect.status()).toBeLessThan(500);
+    expect(scalar(`SELECT disconnected_at IS NULL FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("t");
+  });
+
+  test("INT-A-59 a malformed or unknown project id is a 404 on every Notion route, never a 500", async () => {
+    for (const projectId of ["not-a-uuid", crypto.randomUUID()]) {
+      for (const [what, attempt] of notionRoutes(asOwner, projectId)) {
+        const res = await attempt();
+        expect(res.status(), `${what} for project "${projectId}" answered ${res.status()}: ${await res.text()}`).toBe(404);
+      }
+    }
+  });
+
+  test("INT-A-60 with Notion not connected, status says so and every route that needs the provider answers 404 before calling out", async () => {
+    const status = await asOwner.get(url("/notion/status"), { failOnStatusCode: false });
+    expect(status.status()).toBe(200);
+    expect(await status.json()).toEqual({ connected: false, connectedProjects: [], history: [] });
+
+    // The connection check comes first, so even a well-formed databaseId or page id never reaches Notion.
+    const needsConnection: Array<[string, () => Promise<APIResponse>]> = [
+      ["GET notion/databases", () => asOwner.get(url("/notion/databases"), { failOnStatusCode: false })],
+      ["POST notion/databases (unlink)", () => asOwner.post(url("/notion/databases"), { data: { databaseId: null }, failOnStatusCode: false })],
+      [
+        "POST notion/databases (valid id)",
+        () => asOwner.post(url("/notion/databases"), { data: { databaseId: newNotionId(), databaseName: "x" }, failOnStatusCode: false }),
+      ],
+      ["POST notion/sync", () => asOwner.post(url("/notion/sync"), { data: {}, failOnStatusCode: false })],
+      [
+        "POST notion/comment",
+        () => asOwner.post(url("/notion/comment"), { data: { pageId: newNotionId(), comment: "hi" }, failOnStatusCode: false }),
+      ],
+      ["GET notion/search-pages", () => asOwner.get(url("/notion/search-pages?q=x"), { failOnStatusCode: false })],
+    ];
+    for (const [what, attempt] of needsConnection) {
+      const res = await attempt();
+      expect(res.status(), `${what} answered ${res.status()}: ${await res.text()}`).toBe(404);
+      expect(JSON.stringify(await res.json()).toLowerCase()).toContain("not connected");
+    }
+
+    // The mirrored-page reads need no provider at all: an empty store is an empty answer, not an error.
+    for (const who of [asOwner, asManager, asQa]) {
+      expect(await (await who.get(url("/notion/pages"))).json()).toEqual({ list: [], total: 0 });
+      const linked = await who.get(url("/testcases/linked-notion-pages"));
+      expect(linked.status()).toBe(200);
+      const linkedBody = await linked.json();
+      expect(Array.isArray(linkedBody.keys)).toBe(true);
+      expect(typeof linkedBody.counts).toBe("object");
+      expect((await who.get(url("/notion/status"))).status()).toBe(200);
+    }
+  });
+
+  test("INT-A-61 workspace status and config report not-connected and expose only the public OAuth fields", async () => {
+    const status = await asOwner.get("/api/workspace/integrations/notion/status", { failOnStatusCode: false });
+    expect(status.status(), await status.text()).toBe(200);
+    expect(await status.json()).toEqual({ connected: false, connectedProjects: [] });
+
+    const config = await asOwner.get("/api/workspace/integrations/notion/config", { failOnStatusCode: false });
+    expect(config.status(), await config.text()).toBe(200);
+    const body = await config.json();
+    // Exactly these keys: the client SECRET must never be one of them.
+    expect(Object.keys(body).sort()).toEqual(["clientId", "configured", "redirectUri"]);
+    expect(typeof body.configured).toBe("boolean");
+    expect(String(body.redirectUri)).toMatch(/\/integrations\/callback$/);
+    if (body.configured) expect(body.clientId).toBeTruthy();
+
+    // Any member can read config and status (the UI needs them to pick between Connect and "ask your owner").
+    for (const who of [asManager, asQa]) {
+      expect((await who.get("/api/workspace/integrations/notion/config")).status()).toBe(200);
+      expect((await who.get("/api/workspace/integrations/notion/status")).status()).toBe(200);
+    }
+  });
+
+  test("INT-A-62 auth-url points at Notion's authorize endpoint with owner=user and no scope, or names the missing env vars", async () => {
+    const config = await (await asOwner.get("/api/workspace/integrations/notion/config")).json();
+    const res = await asOwner.get("/api/workspace/integrations/notion/auth-url", { failOnStatusCode: false });
+
+    if (config.configured) {
+      expect(res.status(), await res.text()).toBe(200);
+      const authUrl = new URL((await res.json()).url);
+      expect(`${authUrl.origin}${authUrl.pathname}`).toBe("https://api.notion.com/v1/oauth/authorize");
+      expect(authUrl.searchParams.get("owner")).toBe("user");
+      expect(authUrl.searchParams.get("response_type")).toBe("code");
+      expect(authUrl.searchParams.get("client_id")).toBe(config.clientId);
+      expect(authUrl.searchParams.get("redirect_uri")).toBe(config.redirectUri);
+      // A Notion integration's capabilities live on the integration itself; a scope param is wrong here.
+      expect(authUrl.searchParams.has("scope")).toBe(false);
+      const state = String(authUrl.searchParams.get("state"));
+      expect(state.startsWith("notion."), `state was ${state}`).toBe(true);
+      expect(state.split(".")).toHaveLength(3);
+    } else {
+      // An unconfigured deployment says so; it never hands back a link with an empty client_id.
+      expect(res.status()).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("NOTION_CLIENT_ID");
+    }
+  });
+
+  test("INT-A-63 the callback refuses a missing code, a denied consent screen and any forged or foreign state, writing nothing", async () => {
+    const callback = (data: Record<string, unknown>) =>
+      asOwner.post("/api/workspace/integrations/notion/callback", { data, failOnStatusCode: false });
+
+    for (const data of [{}, { code: "" }, { state: "notion.a.b" }]) {
+      const res = await callback(data);
+      expect(res.status(), `${JSON.stringify(data)} answered ${res.status()}: ${await res.text()}`).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("Authorization code is required");
+    }
+
+    // Cancelling on Notion's consent screen redirects back with ?error= and no code: say so, do not
+    // report a "missing code", and cap how much of the provider-supplied value is echoed back.
+    const denied = await callback({ error: "access_denied" });
+    expect(denied.status()).toBe(400);
+    const deniedMessage = JSON.stringify(await denied.json());
+    expect(deniedMessage).toContain("Notion");
+    expect(deniedMessage).toMatch(/cancelled or denied/);
+    expect(deniedMessage).not.toContain("Authorization code is required");
+    const longError = await callback({ error: "z".repeat(300) });
+    expect(longError.status()).toBe(400);
+    expect(JSON.stringify(await longError.json())).not.toContain("z".repeat(81));
+
+    // State checks run before any token exchange, so a bad state never reaches Notion.
+    for (const state of ["", "garbage", "notion.only-two", "notion.a.b.c", "jira.payload.signature", "notion.not-base64.not-a-signature"]) {
+      const res = await callback({ code: "e2e-not-a-real-code", state });
+      expect(res.status(), `state "${state}" answered ${res.status()}: ${await res.text()}`).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("Invalid authorization state");
+    }
+    // A missing state is the same refusal.
+    expect((await callback({ code: "e2e-not-a-real-code" })).status()).toBe(400);
+
+    // The genuine-but-wrong cases need a real signed state, so they only run where the deployment has
+    // OAuth apps configured (wherever auth-url answers 200).
+    const own = await oauthState(asOwner, "notion");
+    if (own) {
+      const [provider, payload, signature] = own.split(".");
+      const flipped = payload.slice(0, -1) + (payload.endsWith("A") ? "B" : "A");
+      const tampered = await callback({ code: "e2e-not-a-real-code", state: `${provider}.${flipped}.${signature}` });
+      expect(tampered.status()).toBe(400);
+      expect(JSON.stringify(await tampered.json())).toContain("Invalid authorization state");
+
+      // A state minted for another workspace (account B's) is pinned to that workspace, not this one.
+      const foreign = await oauthState(asB, "notion");
+      if (foreign) {
+        const res = await callback({ code: "e2e-not-a-real-code", state: foreign });
+        expect(res.status()).toBe(400);
+        expect(JSON.stringify(await res.json())).toContain("different workspace");
+      }
+    }
+    // A Linear-signed state replayed against the Notion callback.
+    const linearState = await oauthState(asOwner, "linear");
+    if (linearState) {
+      const res = await callback({ code: "e2e-not-a-real-code", state: linearState });
+      expect(res.status()).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("Invalid authorization state");
+    }
+
+    expect(
+      countRows("integration_connections", `organization_id = ${literal(tenant!.organizationId)}`),
+      "a refused callback created a connection",
+    ).toBe("0");
+  });
+
+  test("INT-A-64 only the workspace owner can start, finish or undo a Notion connection", async () => {
+    const connectionId = seedConnection("notion");
+    for (const [who, api] of [
+      ["qa_engineer", asQa],
+      ["guest", asGuest],
+    ] as const) {
+      for (const [what, attempt] of notionWorkspaceRoutes(api).filter(([name]) => name !== "GET status" && name !== "GET config")) {
+        const res = await attempt();
+        expect(res.status(), `${what} as ${who} answered ${res.status()}: ${await res.text()}`).toBe(403);
+      }
+    }
+    // One engineer disconnecting it would break it for everyone; the row is exactly as it was.
+    expect(scalar(`SELECT disconnected_at IS NULL FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("t");
+    expect(scalar(`SELECT access_token FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("e2e-not-a-real-token");
+  });
+
+  test("INT-A-65 'notion' is a known provider on the shared routes and near-misses are still refused", async () => {
+    // sync-status for a project that has never synced Notion: a known provider with no run yet.
+    const status = await asOwner.get(url("/integrations/notion/sync-status"), { failOnStatusCode: false });
+    expect(status.status(), await status.text()).toBe(200);
+    expect((await status.json()).run).toBeNull();
+
+    // Provider matching is exact: case and padding variants are not "notion".
+    for (const provider of ["Notion", "NOTION", "notion2", "notio", "notion%20"]) {
+      for (const suffix of ["auth-url", "config", "status"]) {
+        const res = await asOwner.get(`/api/workspace/integrations/${provider}/${suffix}`, { failOnStatusCode: false });
+        expect(res.status(), `${provider}/${suffix} answered ${res.status()}: ${await res.text()}`).toBe(400);
+      }
+      const sync = await asOwner.get(url(`/integrations/${provider}/sync-status`), { failOnStatusCode: false });
+      expect(sync.status(), `sync-status for "${provider}" answered ${sync.status()}`).toBe(400);
+    }
+  });
+
+  test("INT-A-66 a connected workspace reports its site, the projects mapped to it, and never the token", async () => {
+    const connectionId = seedConnection("notion", "https://www.notion.so");
+
+    let body = await (await asOwner.get("/api/workspace/integrations/notion/status")).json();
+    expect(body.connected).toBe(true);
+    expect(body.id).toBe(connectionId);
+    expect(body.siteUrl).toBe("https://www.notion.so");
+    expect(body.connectedProjects).toEqual([]);
+    // A Notion token never expires or refreshes, so a healthy seeded connection is never "needs reconnect".
+    expect(body.needsReconnect).toBe(false);
+    expect(body.authError).toBeNull();
+    expect(JSON.stringify(body)).not.toContain("e2e-not-a-real-token");
+
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId, { databaseName: "E2E Requirements DB" });
+    body = await (await asOwner.get("/api/workspace/integrations/notion/status")).json();
+    expect(body.connectedProjects).toHaveLength(1);
+    expect(body.connectedProjects[0].projectId).toBe(tenant!.mainProjectId);
+    expect(body.connectedProjects[0].projectName).toBeTruthy();
+
+    // The same database can feed two Tesbo projects (uniqueness is per project, not per database).
+    seedNotionMapping(connectionId, tenant!.secondProjectId, { databaseId: dbId });
+    body = await (await asOwner.get("/api/workspace/integrations/notion/status")).json();
+    expect(body.connectedProjects.map((p: any) => p.projectId).sort()).toEqual([tenant!.mainProjectId, tenant!.secondProjectId].sort());
+
+    // Project-level status: the one enabled mapping, plus every past one as history.
+    seedNotionMapping(connectionId, tenant!.mainProjectId, { databaseName: "Previous DB", enabled: false });
+    const project = await (await asOwner.get(url("/notion/status"))).json();
+    expect(project.connected).toBe(true);
+    expect(project.siteUrl).toBe("https://www.notion.so");
+    expect(project.needsReconnect).toBe(false);
+    expect(project.connectedProjects).toHaveLength(1);
+    expect(project.connectedProjects[0].notionDatabaseId).toBe(dbId);
+    expect(project.connectedProjects[0].notionDatabaseName).toBe("E2E Requirements DB");
+    expect(project.history.map((h: any) => h.notionDatabaseName)).toEqual(["Previous DB"]);
+    expect(JSON.stringify(project)).not.toContain("e2e-not-a-real-token");
+
+    // Jira and Linear stay not-connected: one provider's connection never reads as another's.
+    for (const provider of ["jira", "linear"]) {
+      expect((await (await asOwner.get(`/api/workspace/integrations/${provider}/status`)).json()).connected).toBe(false);
+    }
+  });
+
+  test("INT-A-67 mirrored Notion pages list with their fields, newest edit first, and only for their own project", async () => {
+    const connectionId = seedConnection("notion");
+    const older = seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Checkout flow spec", status: "In progress", updatedMinutesAgo: 60 });
+    const newer = seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Login redesign spec", status: "Done", updatedMinutesAgo: 1 });
+    seedNotionPage(connectionId, tenant!.secondProjectId, { summary: "Belongs to the second project" });
+
+    const { list, total } = await notionPageList(asOwner);
+    expect(total).toBe(2);
+    expect(list.map((p) => p.summary)).toEqual(["Login redesign spec", "Checkout flow spec"]);
+
+    const first = list[0];
+    expect(first.notionPageId).toBe(newer.pageId);
+    expect(first.notionPageKey).toBe(notionKeyOf(newer.pageId));
+    expect(first.status).toBe("Done");
+    expect(first.archived).toBe(false);
+    // The URL is the only way back to the source page.
+    expect(String(first.notionUrl)).toContain("notion.so");
+    expect(list[1].notionPageId).toBe(older.pageId);
+    expect(JSON.stringify(list)).not.toContain("Belongs to the second project");
+
+    // Every project member reads the same list.
+    for (const who of [asManager, asQa]) expect((await notionPageList(who)).total).toBe(2);
+  });
+
+  test("INT-A-68 the page list searches by summary and by key, and filters by status, type and coverage", async () => {
+    const connectionId = seedConnection("notion");
+    const gateway = seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Payment gateway timeout", status: "In progress", issueType: "Bug" });
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Unrelated cosmetic tweak", status: "Done", issueType: "Task" });
+
+    const bySummary = await notionPageList(asOwner, "?search=gateway");
+    expect(bySummary.list.map((p) => p.notionPageId)).toEqual([gateway.pageId]);
+    // Search is case-insensitive and matches the display key too.
+    expect((await notionPageList(asOwner, "?search=PAYMENT")).total).toBe(1);
+    expect((await notionPageList(asOwner, `?search=${encodeURIComponent(gateway.key)}`)).list.map((p) => p.notionPageId)).toEqual([gateway.pageId]);
+    // A search nothing matches is empty rather than unfiltered; a whitespace-only search is no search.
+    expect(await notionPageList(asOwner, "?search=zzznomatch")).toEqual({ list: [], total: 0 });
+    expect((await notionPageList(asOwner, "?search=%20%20")).total).toBe(2);
+
+    expect((await notionPageList(asOwner, "?status=Done")).total).toBe(1);
+    expect((await notionPageList(asOwner, "?status=Nope")).total).toBe(0);
+    expect((await notionPageList(asOwner, "?issueType=Bug")).list.map((p) => p.notionPageId)).toEqual([gateway.pageId]);
+
+    // Coverage: a live test case linked by the full page id covers it; a deleted one does not.
+    const created = await asOwner.post(url("/testcases"), { data: { title: `E2E Notion coverage ${Date.now()}`, notionPageId: gateway.pageId } });
+    expect(created.ok(), `creating the linked test case answered ${created.status()}: ${await created.text()}`).toBe(true);
+    const testcaseId = (await created.json()).id;
+    try {
+      expect((await notionPageList(asOwner, "?coverage=covered")).list.map((p) => p.notionPageId)).toEqual([gateway.pageId]);
+      expect((await notionPageList(asOwner, "?coverage=uncovered")).total).toBe(1);
+      // An unknown coverage value is ignored rather than rejected.
+      expect((await notionPageList(asOwner, "?coverage=maybe")).total).toBe(2);
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+    expect((await notionPageList(asOwner, "?coverage=covered")).total).toBe(0);
+    expect((await notionPageList(asOwner, "?coverage=uncovered")).total).toBe(2);
+  });
+
+  test("INT-A-69 the page list paginates, reports the full total on every page, and clamps its bounds", async () => {
+    const connectionId = seedConnection("notion");
+    for (let i = 1; i <= 5; i++) seedNotionPage(connectionId, tenant!.mainProjectId, { summary: `Page ${i}`, updatedMinutesAgo: i });
+
+    const p1 = await notionPageList(asOwner, "?limit=2&offset=0");
+    const p2 = await notionPageList(asOwner, "?limit=2&offset=2");
+    const p3 = await notionPageList(asOwner, "?limit=2&offset=4");
+    expect([p1.list.length, p2.list.length, p3.list.length]).toEqual([2, 2, 1]);
+    for (const page of [p1, p2, p3]) expect(page.total).toBe(5);
+    // Stable ordering: three pages are five distinct rows, newest first.
+    expect([...p1.list, ...p2.list, ...p3.list].map((p) => p.summary)).toEqual(["Page 1", "Page 2", "Page 3", "Page 4", "Page 5"]);
+
+    // Past the end is empty, with the total intact.
+    expect(await notionPageList(asOwner, "?limit=2&offset=500")).toEqual({ list: [], total: 5 });
+    // limit=0 is the "count without rows" request; the ceiling is 100; exactly the page size is fine.
+    expect(await notionPageList(asOwner, "?limit=0")).toEqual({ list: [], total: 5 });
+    expect((await notionPageList(asOwner, "?limit=100")).list).toHaveLength(5);
+    expect((await notionPageList(asOwner, "?limit=100000")).list.length).toBeLessThanOrEqual(100);
+    expect((await notionPageList(asOwner, "?limit=1")).list).toHaveLength(1);
+
+    // Garbage never reaches the query as NaN (a 500 reachable by typing a word into a query string).
+    for (const qs of ["limit=abc&offset=abc", "limit=-5", "offset=-1", "limit=2.7"]) {
+      const res = await asOwner.get(url(`/notion/pages?${qs}`), { failOnStatusCode: false });
+      expect(res.status(), `${qs} answered ${res.status()}: ${await res.text()}`).toBe(200);
+      expect((await res.json()).total).toBe(5);
+    }
+    expect((await notionPageList(asOwner, "?limit=abc")).list.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("INT-A-70 an archived page is kept in the table but excluded from every list and count", async () => {
+    const connectionId = seedConnection("notion");
+    const live = seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Live page", status: "Done" });
+    const archived = seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Archived page", status: "Archived-only status", archived: true });
+
+    const { list, total } = await notionPageList(asOwner);
+    expect(total).toBe(1);
+    expect(list.map((p) => p.notionPageId)).toEqual([live.pageId]);
+    // Not findable by search either.
+    expect((await notionPageList(asOwner, "?search=Archived")).total).toBe(0);
+
+    const tickets = await (await asOwner.get(url("/tickets"))).json();
+    expect(tickets.list.filter((t: any) => t.source === "notion").map((t: any) => t.externalId)).toEqual([live.pageId]);
+    const summary = await (await asOwner.get(url("/tickets/summary"))).json();
+    expect(summary.notion.total).toBe(1);
+    expect(summary.notion.statuses).toEqual(["Done"]);
+
+    // Kept, not deleted: it is still a row, and coming back un-archived revives it.
+    expect(countRows("notion_pages", `notion_page_id = ${literal(archived.pageId)}`)).toBe("1");
+    exec(`UPDATE notion_pages SET archived = false WHERE notion_page_id = ${literal(archived.pageId)};`);
+    expect((await notionPageList(asOwner)).total).toBe(2);
+  });
+
+  test("INT-A-71 switching the mapped Notion database hides the old database's pages, but ?remoteId still reaches them", async () => {
+    const connectionId = seedConnection("notion");
+    const oldDb = seedNotionMapping(connectionId, tenant!.mainProjectId, { databaseName: "Old DB" });
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Old database page", mappedRemoteId: oldDb });
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Old archived page", mappedRemoteId: oldDb, archived: true });
+
+    expect((await notionPageList(asOwner)).list.map((p) => p.summary)).toEqual(["Old database page"]);
+
+    // What a remap leaves behind: the old mapping disabled (never deleted), a new one enabled.
+    exec(`UPDATE notion_project_mappings SET enabled = false WHERE project_id = ${literal(tenant!.mainProjectId)};`);
+    const newDb = seedNotionMapping(connectionId, tenant!.mainProjectId, { databaseName: "New DB" });
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "New database page", mappedRemoteId: newDb });
+
+    expect((await notionPageList(asOwner)).list.map((p) => p.summary)).toEqual(["New database page"]);
+    // The history list is what the UI offers ?remoteId from; archived pages stay hidden there too.
+    expect((await notionPageList(asOwner, `?remoteId=${oldDb}`)).list.map((p) => p.summary)).toEqual(["Old database page"]);
+    expect((await notionPageList(asOwner, `?remoteId=${newDb}`)).total).toBe(1);
+    expect((await notionPageList(asOwner, `?remoteId=${newNotionId()}`)).total).toBe(0);
+
+    const summary = await (await asOwner.get(url("/tickets/summary"))).json();
+    expect(summary.notion.total, "the stat strip counted a database the project is no longer mapped to").toBe(1);
+    const tickets = await (await asOwner.get(url("/tickets"))).json();
+    expect(JSON.stringify(tickets)).not.toContain("Old database page");
+
+    const status = await (await asOwner.get(url("/notion/status"))).json();
+    expect(status.connectedProjects.map((m: any) => m.notionDatabaseName)).toEqual(["New DB"]);
+    expect(status.history.map((m: any) => m.notionDatabaseName)).toEqual(["Old DB"]);
+  });
+
+  test("INT-A-72 pages with no enabled mapping, and a mapping with no pages, both list as empty", async () => {
+    const connectionId = seedConnection("notion");
+    // Pages whose mapping is gone are invisible by default (the default scope is the enabled mapping).
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Orphaned by unmapping", mappedRemoteId: newNotionId() });
+    expect(await notionPageList(asOwner)).toEqual({ list: [], total: 0 });
+
+    // A mapped database that has never synced.
+    seedNotionMapping(connectionId, tenant!.secondProjectId);
+    const empty = await asOwner.get(url("/notion/pages", tenant!.secondProjectId), { failOnStatusCode: false });
+    expect(empty.status()).toBe(200);
+    expect(await empty.json()).toEqual({ list: [], total: 0 });
+    const summary = await (await asOwner.get(url("/tickets/summary", tenant!.secondProjectId))).json();
+    expect(summary.notion).toEqual({ total: 0, covered: 0, uncovered: 0, types: [], statuses: [] });
+  });
+
+  test("INT-A-73 the combined ticket list and the summary carry Notion as a third source", async () => {
+    const emptySummary = await (await asOwner.get(url("/tickets/summary"))).json();
+    for (const source of ["all", "jira", "linear", "notion"]) {
+      expect(emptySummary[source], `summary has no "${source}" bucket: ${JSON.stringify(emptySummary)}`).toEqual({
+        total: 0,
+        covered: 0,
+        uncovered: 0,
+        types: [],
+        statuses: [],
+      });
+    }
+
+    const notion = seedConnection("notion");
+    const jira = seedConnection("jira");
+    const linear = seedConnection("linear");
+    const done = seedNotionPage(notion, tenant!.mainProjectId, { summary: "Notion requirement A", status: "Done", issueType: "Task" });
+    seedNotionPage(notion, tenant!.mainProjectId, { summary: "Notion requirement B", status: "Not started", issueType: "Task" });
+    seedNotionPage(notion, tenant!.mainProjectId, { summary: "Notion archived", status: "Hidden", archived: true });
+    seedJiraTicket(jira, { key: "E2E-70", summary: "Jira requirement" });
+    seedLinearTicket(linear, { key: "LIN-70", summary: "Linear requirement" });
+
+    const summary = await (await asOwner.get(url("/tickets/summary"))).json();
+    expect(summary.notion.total).toBe(2);
+    expect(summary.jira.total).toBe(1);
+    expect(summary.linear.total).toBe(1);
+    expect(summary.all.total).toBe(4);
+    expect(summary.all.covered + summary.all.uncovered).toBe(4);
+    expect(summary.notion.types).toEqual(["Task"]);
+    expect(summary.notion.statuses).toEqual(["Done", "Not started"]);
+    expect(summary.all.statuses).not.toContain("Hidden");
+    expect(summary.all.types).toEqual([...summary.all.types].sort());
+    expect(summary.all.types).toEqual(expect.arrayContaining(["Task", "Story", "Bug"]));
+
+    const tickets = await (await asOwner.get(url("/tickets"))).json();
+    expect(tickets.total).toBe(4);
+    const bySource = (source: string) => tickets.list.filter((t: any) => t.source === source);
+    expect(bySource("notion")).toHaveLength(2);
+    expect(bySource("jira")).toHaveLength(1);
+    expect(bySource("linear")).toHaveLength(1);
+    const row = bySource("notion").find((t: any) => t.summary === "Notion requirement A");
+    // externalId is the FULL page id (what a test case links by); key is only the display label.
+    expect(row.externalId).toBe(done.pageId);
+    expect(row.key).toBe(done.key);
+    expect(row.hasCoverage).toBe(false);
+    expect(String(row.url)).toContain("notion.so");
+
+    // The shared filters reach Notion rows too.
+    const searched = await (await asOwner.get(url("/tickets?search=Notion%20requirement%20B"))).json();
+    expect(searched.list.map((t: any) => t.source)).toEqual(["notion"]);
+    const byStatus = await (await asOwner.get(url("/tickets?status=Done"))).json();
+    expect(byStatus.list.map((t: any) => t.externalId)).toEqual([done.pageId]);
+  });
+
+  test("INT-A-74 linked-notion-pages reports linked page ids with their test case counts, and ignores deleted cases", async () => {
+    const pageId = newNotionId();
+    const created: string[] = [];
+    try {
+      const before = await (await asOwner.get(url("/testcases/linked-notion-pages"))).json();
+      expect(before.keys).not.toContain(pageId);
+
+      for (let i = 1; i <= 2; i++) {
+        const res = await asOwner.post(url("/testcases"), { data: { title: `E2E Notion link ${i} ${Date.now()}`, notionPageId: pageId } });
+        expect(res.ok(), `creating a linked test case answered ${res.status()}: ${await res.text()}`).toBe(true);
+        created.push((await res.json()).id);
+      }
+      const linked = await (await asOwner.get(url("/testcases/linked-notion-pages"))).json();
+      expect(linked.keys).toContain(pageId);
+      expect(linked.counts[pageId]).toBe(2);
+
+      await asOwner.delete(url(`/testcases/${created[0]}`), { failOnStatusCode: false });
+      expect((await (await asOwner.get(url("/testcases/linked-notion-pages"))).json()).counts[pageId]).toBe(1);
+    } finally {
+      for (const id of created) await asOwner.delete(url(`/testcases/${id}`), { failOnStatusCode: false });
+    }
+    expect((await (await asOwner.get(url("/testcases/linked-notion-pages"))).json()).keys).not.toContain(pageId);
+  });
+
+  test("INT-A-75 connecting a database refuses a missing, blank or malformed databaseId and leaves the mapping alone", async () => {
+    const connectionId = seedConnection("notion");
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId);
+    const mappings = () => countRows("notion_project_mappings", `project_id = ${literal(tenant!.mainProjectId)}`);
+    const before = mappings();
+
+    // Every one of these fails the id check BEFORE anything is sent to Notion. (A well-formed id would
+    // be verified live against Notion, which this suite cannot answer, so none is used here.)
+    const bad: Array<Record<string, unknown>> = [
+      {},
+      { databaseName: "name but no id" },
+      { databaseId: "" },
+      { databaseId: "   " },
+      { databaseId: "not-a-uuid" },
+      { databaseId: "1234" },
+      { databaseId: "z".repeat(32) },
+      { databaseId: `${newNotionId()}0` },
+      { databaseId: "'; DROP TABLE notion_pages; --" },
+      { databaseId: true },
+      { databaseId: {} },
+      { databaseId: 12345 },
+    ];
+    for (const data of bad) {
+      const res = await asOwner.post(url("/notion/databases"), { data, failOnStatusCode: false });
+      expect(res.status(), `${JSON.stringify(data)} answered ${res.status()}: ${await res.text()}`).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("valid Notion databaseId");
+    }
+
+    expect(mappings(), "a refused payload changed the stored mappings").toBe(before);
+    expect(
+      countRows("notion_project_mappings", `project_id = ${literal(tenant!.mainProjectId)} AND notion_database_id = ${literal(dbId)} AND enabled = true`),
+      "a refused payload disabled the current mapping on its way to a refusal",
+    ).toBe("1");
+  });
+
+  test("INT-A-76 an explicit null databaseId unlinks the project: mapping disabled not deleted, pages kept, repeatable", async () => {
+    const connectionId = seedConnection("notion");
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId, { databaseName: "To unlink" });
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Survives the unlink" });
+    expect((await notionPageList(asOwner)).total).toBe(1);
+
+    // A non-member cannot unlink someone else's project.
+    const refused = await asGuest.post(url("/notion/databases"), { data: { databaseId: null }, failOnStatusCode: false });
+    await expectRefused(refused, "unlink (non-member)");
+    expect(countRows("notion_project_mappings", `notion_database_id = ${literal(dbId)} AND enabled = true`)).toBe("1");
+
+    const res = await asOwner.post(url("/notion/databases"), { data: { databaseId: null }, failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    expect(await res.json()).toEqual({ linked: 0 });
+
+    expect(scalar(`SELECT enabled FROM notion_project_mappings WHERE notion_database_id = ${literal(dbId)};`)).toBe("f");
+    expect(countRows("notion_pages", `project_id = ${literal(tenant!.mainProjectId)}`), "unlinking deleted the mirrored pages").toBe("1");
+    // Hidden from the default view, reachable through ?remoteId, listed in the history.
+    expect((await notionPageList(asOwner)).total).toBe(0);
+    expect((await notionPageList(asOwner, `?remoteId=${dbId}`)).total).toBe(1);
+    const status = await (await asOwner.get(url("/notion/status"))).json();
+    expect(status.connected).toBe(true);
+    expect(status.connectedProjects).toEqual([]);
+    expect(status.history.map((m: any) => m.notionDatabaseId)).toEqual([dbId]);
+    // Nothing is mapped any more, so there is nothing to sync.
+    const sync = await asOwner.post(url("/notion/sync"), { data: {}, failOnStatusCode: false });
+    expect(sync.status()).toBe(400);
+    expect(JSON.stringify(await sync.json())).toContain("Link a Notion database");
+
+    // Unlinking an already-unlinked project is a harmless no-op, not an error.
+    const again = await asOwner.post(url("/notion/databases"), { data: { databaseId: null }, failOnStatusCode: false });
+    expect(again.status()).toBeLessThan(300);
+    expect(await again.json()).toEqual({ linked: 0 });
+  });
+
+  test("INT-A-77 the schema allows one enabled Notion database per project, and one row per page", async () => {
+    const connectionId = seedConnection("notion");
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId);
+
+    // A second ENABLED mapping for the same project is what two racing saves would produce; the
+    // connect endpoint turns this exact violation into a 409.
+    const second = sqlRejection(
+      "INSERT INTO notion_project_mappings (integration_connection_id, project_id, notion_database_id, notion_database_name) VALUES (" +
+        `${literal(connectionId)}, ${literal(tenant!.mainProjectId)}, ${literal(newNotionId())}, 'second enabled');`,
+    );
+    expect(second).toContain("idx_notion_project_mappings_one_per_project");
+    // Re-saving the very same database for the project hits the (connection, database, project) key.
+    expect(
+      sqlRejection(
+        "INSERT INTO notion_project_mappings (integration_connection_id, project_id, notion_database_id, notion_database_name) VALUES (" +
+          `${literal(connectionId)}, ${literal(tenant!.mainProjectId)}, ${literal(dbId)}, 'duplicate');`,
+      ),
+    ).toMatch(/duplicate key|unique/i);
+    // Disabled history rows are unrestricted, and the same database may feed another project.
+    seedNotionMapping(connectionId, tenant!.mainProjectId, { enabled: false });
+    seedNotionMapping(connectionId, tenant!.mainProjectId, { enabled: false });
+    seedNotionMapping(connectionId, tenant!.secondProjectId, { databaseId: dbId });
+    expect(countRows("notion_project_mappings", `notion_database_id = ${literal(dbId)} AND enabled = true`)).toBe("2");
+
+    // One row per (connection, page, project); the same page may be mirrored into two projects.
+    const page = seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Unique page" });
+    expect(
+      sqlRejection(
+        "INSERT INTO notion_pages (project_id, integration_connection_id, notion_page_id, notion_page_key, summary) VALUES (" +
+          `${literal(tenant!.mainProjectId)}, ${literal(connectionId)}, ${literal(page.pageId)}, ${literal(page.key)}, 'duplicate page');`,
+      ),
+    ).toMatch(/duplicate key|unique/i);
+    seedNotionPage(connectionId, tenant!.secondProjectId, { summary: "Same page, other project", pageId: page.pageId });
+    expect(countRows("notion_pages", `notion_page_id = ${literal(page.pageId)}`)).toBe("2");
+  });
+
+  test("INT-A-78 a workspace has one Notion connection row, and a reconnect revives it in place under the same id", async () => {
+    const connectionId = seedConnection("notion");
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId);
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Outlives a reconnect" });
+
+    // The upsert behind reconnecting is ON CONFLICT (organization_id, provider): a second row for the
+    // same workspace and provider cannot exist.
+    expect(
+      sqlRejection(
+        "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at) VALUES (" +
+          `${literal(tenant!.organizationId)}, 'notion', 'other-workspace', 'https://www.notion.so', 'x', '', now() + interval '1 hour');`,
+      ),
+    ).toMatch(/duplicate key|unique/i);
+
+    const disconnect = await asOwner.delete("/api/workspace/integrations/notion/disconnect", { failOnStatusCode: false });
+    expect(disconnect.ok(), await disconnect.text()).toBe(true);
+    expect((await (await asOwner.get("/api/workspace/integrations/notion/status")).json()).connected).toBe(false);
+
+    // What the callback's revive branch does (the real one needs a live Notion code exchange, so it is
+    // reproduced in SQL): same row, fresh token, disconnected_at cleared. Everything historical is
+    // still attached to that stable connection id.
+    exec(
+      "UPDATE integration_connections SET disconnected_at = NULL, access_token = 'e2e-not-a-real-token-2', refresh_token = '', " +
+        `token_expires_at = now() + interval '1 hour', updated_at = now() WHERE id = ${literal(connectionId)};`,
+    );
+    const status = await (await asOwner.get("/api/workspace/integrations/notion/status")).json();
+    expect(status.connected).toBe(true);
+    expect(status.id, "a reconnect must keep the same connection id").toBe(connectionId);
+    expect(countRows("notion_pages", `integration_connection_id = ${literal(connectionId)}`)).toBe("1");
+    // The disconnect disabled the mapping and reconnecting does not silently re-enable it: the project
+    // shows it as history until someone links a database again.
+    const project = await (await asOwner.get(url("/notion/status"))).json();
+    expect(project.connectedProjects).toEqual([]);
+    expect(project.history.map((m: any) => m.notionDatabaseId)).toEqual([dbId]);
+  });
+
+  test("INT-A-79 disconnecting Notion flips state only: tokens blanked, mappings disabled, pages and other providers untouched", async () => {
+    const connectionId = seedConnection("notion");
+    const jiraId = seedConnection("jira");
+    const dbId = seedNotionMapping(connectionId, tenant!.mainProjectId, { databaseName: "SURV" });
+    seedNotionMapping(connectionId, tenant!.secondProjectId, { databaseId: dbId });
+    const page = seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Must survive a disconnect" });
+
+    const res = await asOwner.delete("/api/workspace/integrations/notion/disconnect", { failOnStatusCode: false });
+    expect(res.ok(), `disconnect answered ${res.status()}: ${await res.text()}`).toBe(true);
+    expect(await res.json()).toEqual({ disconnected: true });
+
+    // Reads as not-connected everywhere...
+    expect((await (await asOwner.get("/api/workspace/integrations/notion/status")).json()).connected).toBe(false);
+    expect((await (await asOwner.get(url("/notion/status"))).json()).connected).toBe(false);
+    // (the routes that need the provider: databases, sync, search-pages)
+    for (const [what, attempt] of notionRoutes(asOwner).filter(([name]) => /databases|sync$|search-pages/.test(name))) {
+      const call = await attempt();
+      expect(call.status(), `${what} after disconnect answered ${call.status()}: ${await call.text()}`).toBe(404);
+    }
+
+    // ...but nothing was deleted, and the live credentials are gone.
+    expect(countRows("integration_connections", `id = ${literal(connectionId)}`)).toBe("1");
+    expect(scalar(`SELECT disconnected_at IS NOT NULL FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("t");
+    expect(scalar(`SELECT access_token FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("");
+    expect(scalar(`SELECT refresh_token FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("");
+    expect(countRows("notion_project_mappings", `integration_connection_id = ${literal(connectionId)} AND enabled = false`)).toBe("2");
+    expect(countRows("notion_project_mappings", `integration_connection_id = ${literal(connectionId)}`)).toBe("2");
+    expect(countRows("notion_pages", `notion_page_id = ${literal(page.pageId)}`)).toBe("1");
+    // The page list needs no provider: the disabled mapping hides it from the default view, ?remoteId still serves it.
+    expect((await notionPageList(asOwner)).total).toBe(0);
+    expect((await notionPageList(asOwner, `?remoteId=${dbId}`)).list.map((p) => p.notionPageId)).toEqual([page.pageId]);
+
+    // Jira's connection is a different row and is not touched.
+    expect(scalar(`SELECT disconnected_at IS NULL FROM integration_connections WHERE id = ${literal(jiraId)};`)).toBe("t");
+    expect((await (await asOwner.get("/api/workspace/integrations/jira/status")).json()).connected).toBe(true);
+  });
+
+  test("INT-A-80 disconnecting Notion twice is a no-op and leaves the Notion Knowledge Base folder and mirrored documents visible", async () => {
+    seedConnection("notion");
+    const folderId = seedProviderFolder("notion");
+    const docId = seedMirrorDocument("notion", `notion-kb-${Date.now()}`, "Notion page that must stay visible", tenant!.mainProjectId, folderId);
+
+    const first = await asOwner.delete("/api/workspace/integrations/notion/disconnect", { failOnStatusCode: false });
+    expect(first.ok(), await first.text()).toBe(true);
+    const second = await asOwner.delete("/api/workspace/integrations/notion/disconnect", { failOnStatusCode: false });
+    expect(second.ok(), `a repeat disconnect must be a harmless no-op: ${await second.text()}`).toBe(true);
+
+    expect(scalar(`SELECT is_deleted FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("f");
+    expect(scalar(`SELECT deletion_reason FROM knowledge_folders WHERE id = ${literal(folderId)};`)).toBe("");
+    expect(scalar(`SELECT is_deleted FROM knowledge_documents WHERE id = ${literal(docId)};`)).toBe("f");
+    const tree = await (await asOwner.get(url("/knowledge-base/folders/tree"))).json();
+    expect(tree.children.map((c: { id: string }) => c.id), "the Notion folder must still be in the tree").toContain(folderId);
+  });
+
+  test("INT-A-81 sync-status and sync-history accept Notion runs and surface their message and remote key", async () => {
+    const database = newNotionId();
+    seedSyncRun("notion", {
+      status: "failed",
+      error: "Notion needs to be reconnected to this workspace.",
+      remoteProjectKey: database,
+      remoteProjectName: "E2E Notion DB",
+    });
+
+    const status = await asOwner.get(url("/integrations/notion/sync-status"), { failOnStatusCode: false });
+    expect(status.status(), await status.text()).toBe(200);
+    const { run } = await status.json();
+    expect(run.provider).toBe("notion");
+    expect(run.status).toBe("failed");
+    expect(run.error).toBe("Notion needs to be reconnected to this workspace.");
+    // A Notion database has no short key, so the run's remote key is the database id.
+    expect(run.remoteProjectKey).toBe(database);
+    expect(run.remoteProjectName).toBe("E2E Notion DB");
+
+    const history = await (await asOwner.get(url("/integrations/sync-history"))).json();
+    expect(history.runs.map((r: any) => r.provider)).toContain("notion");
+
+    // One provider's runs never show as another's latest run, and they are project-scoped.
+    for (const provider of ["jira", "linear"]) {
+      expect((await (await asOwner.get(url(`/integrations/${provider}/sync-status`))).json()).run).toBeNull();
+    }
+    expect((await (await asOwner.get(url("/integrations/notion/sync-status", tenant!.secondProjectId))).json()).run).toBeNull();
+    // Nothing raw from the provider leaks through either route.
+    expect(JSON.stringify(history)).not.toContain("Unauthorized");
+  });
+
+  test("INT-A-82 a Notion comment needs a valid page id and a body, checked before anything is sent", async () => {
+    seedConnection("notion");
+
+    const cases: Array<Record<string, unknown>> = [
+      {},
+      { pageId: newNotionId() },
+      { pageId: newNotionId(), comment: "   " },
+      { comment: "orphaned" },
+      { pageId: "", comment: "" },
+      { pageId: "not-a-page-id", comment: "hello" },
+      { pageId: `${newNotionId()}f`, comment: "hello" },
+      { pageId: { nested: true }, comment: "hello" },
+    ];
+    for (const data of cases) {
+      const res = await asOwner.post(url("/notion/comment"), { data, failOnStatusCode: false });
+      // The alternative to this check is posting an empty comment to a customer's Notion page.
+      expect(res.status(), `${JSON.stringify(data)} answered ${res.status()}: ${await res.text()}`).toBe(400);
+      expect(JSON.stringify(await res.json()).toLowerCase()).toContain("required");
+    }
+  });
+
+  test("INT-A-83 a connected project with no database linked has nothing to search or sync, without calling Notion", async () => {
+    seedConnection("notion");
+
+    const search = await asOwner.get(url("/notion/search-pages?q=anything"), { failOnStatusCode: false });
+    expect(search.status(), await search.text()).toBe(200);
+    expect(await search.json()).toEqual({ list: [] });
+
+    const sync = await asOwner.post(url("/notion/sync"), { data: {}, failOnStatusCode: false });
+    expect(sync.status(), await sync.text()).toBe(400);
+    expect(JSON.stringify(await sync.json())).toContain("Link a Notion database to this project before syncing");
+    expect(
+      countRows("integration_sync_runs", `project_id = ${literal(tenant!.mainProjectId)} AND provider = 'notion'`),
+      "a refused sync queued a run",
+    ).toBe("0");
+  });
+
+  test("INT-A-84 deleting a Notion connection row outright cascades to its pages and mappings, which is why disconnect is a soft flip", async () => {
+    const connectionId = seedConnection("notion");
+    seedNotionMapping(connectionId, tenant!.mainProjectId);
+    seedNotionPage(connectionId, tenant!.mainProjectId, { summary: "Cascades away" });
+    expect(countRows("notion_pages", `integration_connection_id = ${literal(connectionId)}`)).toBe("1");
+
+    exec(`DELETE FROM integration_connections WHERE id = ${literal(connectionId)};`);
+    expect(countRows("notion_pages", `integration_connection_id = ${literal(connectionId)}`)).toBe("0");
+    expect(countRows("notion_project_mappings", `integration_connection_id = ${literal(connectionId)}`)).toBe("0");
+  });
+
+  test("INT-A-85 migration V133 is applied: the testcase link columns, the view, the Zyra column and the widened comment constraint", async () => {
+    const cols = (table: string) =>
+      scalar(
+        `SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns WHERE table_name = ${literal(table)} ` +
+          "AND column_name IN ('notion_page_id', 'notion_url', 'notion_page_ids');",
+      );
+    expect(cols("testcases")).toBe("notion_page_id,notion_url");
+    // testcases_active is SELECT * and froze its column list at creation; V133 recreates it.
+    expect(cols("testcases_active"), "testcases_active does not expose the Notion columns").toBe("notion_page_id,notion_url");
+    expect(cols("ai_generation_requests")).toBe("notion_page_ids");
+    expect(
+      scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'integration_ticket_comments_provider_check';"),
+    ).toContain("notion");
   });
 });
