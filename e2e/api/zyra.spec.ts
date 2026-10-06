@@ -1993,6 +1993,93 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(res.status(), `editing a resolved batch — ${await res.text()}`).toBe(409);
   });
 
+  /*
+   * "[Zyra] Edit Test Case View Is Missing Fields Available After Saving" — testData was generated,
+   * staged and saved correctly, but chatDraftRow (the row every review surface and the draft
+   * editor are seeded from) never carried it, so the editor had nothing to show.
+   */
+  test("ZYR-A-142 a chat-staged create draft's test data is served on the review row and round-trips through an edit", async () => {
+    const { taskId } = seedChatReviewTask({
+      entries: [
+        {
+          opType: "create",
+          draft: {
+            suiteId: null,
+            title: `E2E chat test data ${Date.now()}`,
+            description: "The order is placed",
+            preconditions: "",
+            stepsJson: "[]",
+            testData: "card: 4242 4242 4242 4242",
+            priority: "P2",
+          },
+          reason: "",
+        },
+      ],
+    });
+
+    const before = await asOwner.get(url(`/agents/zyra/tasks/${taskId}`), { failOnStatusCode: false });
+    expect(before.status()).toBe(200);
+    const beforeRow = (await before.json()).drafts[0];
+    expect(beforeRow.testData, "the review row must carry the staged draft's test data").toBe("card: 4242 4242 4242 4242");
+    expect(beforeRow.expectedSummary, "the description must still be served on the review row").toBe("The order is placed");
+
+    const res = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), {
+      data: { testData: "card: 4000 0000 0000 0002" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `editing test data — ${await res.text()}`).toBe(200);
+    expect((await res.json()).drafts[0].testData).toBe("card: 4000 0000 0000 0002");
+
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+    expect(stored[0].draft.testData).toBe("card: 4000 0000 0000 0002");
+    expect(stored[0].draft.description, "an edit of one field must not touch the others").toBe("The order is placed");
+  });
+
+  test("ZYR-A-143 a create draft with no test data serves an empty string, and clearing test data persists as empty", async () => {
+    const { taskId } = seedChatReviewTask();
+    const before = await asOwner.get(url(`/agents/zyra/tasks/${taskId}`), { failOnStatusCode: false });
+    expect(before.status()).toBe(200);
+    expect((await before.json()).drafts[0].testData, "absent test data must be '' on the row, never undefined").toBe("");
+
+    await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), { data: { testData: "temporary" }, failOnStatusCode: false });
+    const cleared = await asOwner.patch(url(`/agents/zyra/tasks/${taskId}/drafts/0`), { data: { testData: "" }, failOnStatusCode: false });
+    expect(cleared.status(), `clearing test data — ${await cleared.text()}`).toBe(200);
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`));
+    expect(stored[0].draft.testData, "clearing must persist as empty, not be ignored").toBe("");
+  });
+
+  test("ZYR-A-144 an update proposal's review row previews the real test case's test data (and a staged change to it)", async () => {
+    const created = await asOwner.post(url("/testcases"), {
+      data: { title: `E2E chat update test data ${Date.now()}`, priority: "P2", testData: "user: alice" },
+      failOnStatusCode: false,
+    });
+    expect(created.status()).toBe(201);
+    const testcaseId = (await created.json()).id;
+    try {
+      const untouched = seedChatReviewTask({
+        entries: [{ opType: "update", testcaseId, externalId: "E2E-1", fields: { priority: "P1" }, reason: "" }],
+      });
+      const unchangedRes = await asOwner.get(url(`/agents/zyra/tasks/${untouched.taskId}`), { failOnStatusCode: false });
+      expect(unchangedRes.status()).toBe(200);
+      expect(
+        (await unchangedRes.json()).drafts[0].testData,
+        "a proposal that doesn't touch test data must preview the case's current value (chatTestcaseRow)",
+      ).toBe("user: alice");
+
+      const changing = seedChatReviewTask({
+        entries: [{ opType: "update", testcaseId, externalId: "E2E-1", fields: { testData: "user: bob" }, reason: "" }],
+      });
+      const changingRes = await asOwner.get(url(`/agents/zyra/tasks/${changing.taskId}`), { failOnStatusCode: false });
+      expect((await changingRes.json()).drafts[0].testData, "the preview shows the value after saving").toBe("user: bob");
+      expect(
+        scalar(`SELECT test_data FROM testcases WHERE id = ${literal(testcaseId)};`),
+        "previewing must not touch the real test case before Save",
+      ).toBe("user: alice");
+    } finally {
+      await asOwner.delete(url(`/testcases/${testcaseId}`), { failOnStatusCode: false });
+    }
+  });
+
   test("ZYR-A-51 saving a chat-staged create draft writes a real test case into its own suite, tagged and audited as zyra_chat", async () => {
     const suite = await asOwner.post(url("/suites"), { data: { name: `E2E zyra chat suite ${Date.now()}` }, failOnStatusCode: false });
     expect(suite.status()).toBe(201);

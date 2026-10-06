@@ -245,7 +245,7 @@ test.describe("zyra / agents (UI)", () => {
 
   interface ChatEntry {
     opType: "create" | "update" | "archive";
-    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null; severity?: string; component?: string };
+    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; testData?: string; priority?: string; suiteId?: string | null; severity?: string; component?: string };
     testcaseId?: string;
     externalId?: string;
     fields?: Record<string, unknown>;
@@ -266,7 +266,15 @@ test.describe("zyra / agents (UI)", () => {
   // review_request_id — the shape every background plan batch was stored in before
   // postZyraPlanMessage persisted it, while each row still carried its own reviewRequestId.
   function seedChatReviewBatch(
-    options: { status?: string; entries?: ChatEntry[]; sessionId?: string; linkMessage?: boolean; content?: string } = {},
+    options: {
+      status?: string;
+      entries?: ChatEntry[];
+      sessionId?: string;
+      linkMessage?: boolean;
+      content?: string;
+      /** Snapshot rows without `testData`, the shape a message staged before chatDraftRow carried it has. */
+      legacySnapshot?: boolean;
+    } = {},
   ): {
     taskId: string;
     sessionId: string;
@@ -315,6 +323,7 @@ test.describe("zyra / agents (UI)", () => {
       preconditions: entry.draft?.preconditions ?? "",
       expectedSummary: entry.draft?.description ?? "",
       stepsJson: entry.draft?.stepsJson ?? "[]",
+      ...(options.legacySnapshot ? {} : { testData: entry.draft?.testData ?? String(entry.fields?.testData ?? "") }),
       // Mirrors chatDraftRow's own severity/component handling (legacy.service.ts) — this row is
       // seeded directly rather than produced by the live endpoint, so it must match that shape.
       severity: entry.draft?.severity ?? entry.fields?.severity ?? null,
@@ -2885,7 +2894,7 @@ test.describe("zyra / agents (UI)", () => {
     const row = page.getByRole("listitem").filter({ hasText: "Sign in with a wrong password" });
     await row.getByRole("button", { name: "Edit" }).click();
     // Field order in ZyraDraftEditor: Title (textbox 0), Priority (combobox 0), Severity
-    // (combobox 1), Component (textbox 1), Preconditions/Expected result/Steps after that.
+    // (combobox 1), Component (textbox 1), Preconditions/Description/Test Data/Steps after that.
     // The seeded draft has no severity, so the placeholder option must read "Select", not "No severity".
     await expect(row.getByRole("combobox").nth(1).locator("option:checked")).toHaveText("Select");
     await row.getByRole("combobox").nth(1).selectOption("Medium");
@@ -2904,6 +2913,117 @@ test.describe("zyra / agents (UI)", () => {
       .poll(() => readDraft("severity"), { message: "the severity edit must persist, not just render client-side" })
       .toBe("Medium");
     expect(readDraft("component")).toBe("Search");
+  });
+
+  /*
+   * "[Zyra] Edit Test Case View Is Missing Fields Available After Saving" — the draft editor showed
+   * the description under an "Expected result" label (below the fold) and had no Test Data field
+   * at all, while zyraSave wrote both onto the real test case.
+   *
+   * FieldLabel renders a <label> with no htmlFor, so getByLabel can't resolve these textareas —
+   * each is the label's next sibling inside its Field wrapper.
+   */
+  function editorTextarea(row: Locator, label: string): Locator {
+    return row.locator("label", { hasText: new RegExp(`^${label}$`) }).locator("xpath=following-sibling::textarea[1]");
+  }
+
+  function readDraftField(taskId: string, title: string, field: string): string {
+    return scalar(
+      `SELECT COALESCE(d->'draft'->>'${field}', '<absent>') FROM ai_generation_requests r, jsonb_array_elements(r.generated_payload) d ` +
+        `WHERE r.id = ${literal(taskId)} AND d->'draft'->>'title' = ${literal(title)};`,
+    );
+  }
+
+  test("ZYU-133 the draft editor shows a proposal's Description and Test Data, and a Test Data edit persists", async ({ browser }) => {
+    const title = stamp("Chat test data case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [
+        { opType: "create", draft: { suiteId: null, title, description: "The post appears in the feed", preconditions: "", stepsJson: "[]", testData: "post: Hello Buzz", priority: "P1" } },
+      ],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit" }).click();
+    await expect(editorTextarea(row, "Description")).toHaveValue("The post appears in the feed");
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("post: Hello Buzz");
+    // The description used to sit under this label; it must not survive as a second, misleading name.
+    await expect(row.locator("label", { hasText: /^Expected result$/ })).toHaveCount(0);
+
+    await editorTextarea(row, "Test Data").fill("post: Edited Buzz");
+    await row.getByRole("button", { name: "Save edit" }).click();
+    await expect(row.getByRole("button", { name: "Save edit" })).toHaveCount(0);
+
+    await expect
+      .poll(() => readDraftField(taskId, title, "testData"), { message: "the test data edit must persist, not just render client-side" })
+      .toBe("post: Edited Buzz");
+    expect(readDraftField(taskId, title, "description"), "editing test data must leave the description alone").toBe("The post appears in the feed");
+
+    // Reopening shows the edited value (the panel's local row was updated, not only the server).
+    await row.getByRole("button", { name: "Edit" }).click();
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("post: Edited Buzz");
+  });
+
+  test("ZYU-134 editing another field of a proposal staged before test data was on the row does not wipe its test data", async ({ browser }) => {
+    const title = stamp("Legacy snapshot case");
+    const { taskId } = seedChatReviewBatch({
+      legacySnapshot: true,
+      entries: [{ opType: "create", draft: { suiteId: null, title, description: "", preconditions: "", stepsJson: "[]", testData: "keep: me", priority: "P2" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit" }).click();
+    // The message snapshot predates the field, so the editor genuinely has no value to show here.
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("");
+    await editorTextarea(row, "Preconditions").fill("Signed in as an employee");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect
+      .poll(() => readDraftField(taskId, title, "preconditions"), { message: "the preconditions edit must persist" })
+      .toBe("Signed in as an employee");
+    expect(readDraftField(taskId, title, "testData"), "an untouched blank Test Data field must not overwrite the stored value").toBe("keep: me");
+  });
+
+  test("ZYU-135 saving a proposal with a description and test data persists both onto the real test case", async ({ browser }) => {
+    const title = stamp("Chat-saved test data case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [
+        { opType: "create", draft: { suiteId: null, title, description: "Order confirmation is shown", preconditions: "", stepsJson: "[]", testData: "qty: 3", priority: "P2" } },
+      ],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(title)).toBeVisible();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+
+    const savedField = (column: "description" | "test_data") =>
+      scalar(`SELECT ${column} FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`);
+    await expect.poll(() => savedField("test_data"), { message: "the proposal's test data must reach the saved row" }).toBe("qty: 3");
+    expect(savedField("description")).toBe("Order confirmation is shown");
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
+  test("ZYU-136 a failed draft edit keeps the editor open, shows the error, and stores nothing", async ({ browser }) => {
+    const title = stamp("Failed edit case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title, description: "", preconditions: "", stepsJson: "[]", testData: "before", priority: "P2" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+    await page.route("**/agents/zyra/tasks/*/drafts/*", (route) =>
+      route.request().method() === "PATCH" ? route.fulfill({ status: 500, json: { error: "Simulated edit failure" } }) : route.continue(),
+    );
+
+    const row = page.getByRole("listitem").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit" }).click();
+    await editorTextarea(row, "Test Data").fill("after");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect(page.getByText(/Simulated edit failure|Failed to save the edit/)).toBeVisible();
+    await expect(row.getByRole("button", { name: "Save edit" }), "the editor must stay open so the edit isn't lost").toBeVisible();
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("after");
+    expect(readDraftField(taskId, title, "testData")).toBe("before");
   });
 
   test("ZYU-67 saving selected proposals creates real test cases in their own suite", async ({ browser }) => {

@@ -13,14 +13,16 @@ const PRIORITIES = ["P0", "P1", "P2", "P3"];
 const SEVERITIES = ["Critical", "High", "Medium", "Low"];
 
 // Same shape editZyraTaskDraft accepts server-side (legacy.service.ts sanitizeZyraUpdateFields) —
-// title/priority/preconditions/description/stepsJson/severity/component cover a proposed draft
-// either way (a new test case, or a proposed change to an existing one).
+// title/priority/preconditions/description/stepsJson/testData/severity/component cover a proposed
+// draft either way (a new test case, or a proposed change to an existing one).
 export type ZyraDraftEditValues = {
   title: string;
   priority: string;
   preconditions: string;
   description: string;
   stepsJson: string;
+  /** Only present when the user changed it — see handleSave. */
+  testData?: string;
   severity: string;
   component: string;
 };
@@ -62,6 +64,8 @@ export function ZyraDraftEditor({
   const [preconditions, setPreconditions] = useState(row.preconditions || "");
   const [description, setDescription] = useState(row.expectedSummary || "");
   const [steps, setSteps] = useState<Step[]>(parseSteps(row.stepsJson));
+  const initialTestData = row.testData ?? "";
+  const [testData, setTestData] = useState(initialTestData);
   const [severity, setSeverity] = useState(row.severity || "");
   const [component, setComponent] = useState(row.component || "");
 
@@ -82,6 +86,10 @@ export function ZyraDraftEditor({
       preconditions,
       description,
       stepsJson: JSON.stringify(steps.map((step, index) => ({ stepNumber: index + 1, action: step.action, expectedResult: step.expectedResult }))),
+      // Sent only when edited: a row snapshotted onto a chat message before it carried testData
+      // opens this field blank even though the stored draft has a value, and the server merges
+      // whatever it's sent — an untouched blank would silently wipe that value on any other edit.
+      ...(testData !== initialTestData ? { testData } : {}),
       severity,
       component: component.trim(),
     });
@@ -118,9 +126,15 @@ export function ZyraDraftEditor({
         <FieldLabel>Preconditions</FieldLabel>
         <Textarea value={preconditions} onChange={(event) => setPreconditions(event.target.value)} rows={2} />
       </Field>
+      {/* Bound to the draft's description — what zyraSave writes to the test case's Description
+          column, and what the repository's edit form shows under that same label. */}
       <Field>
-        <FieldLabel>Expected result</FieldLabel>
+        <FieldLabel>Description</FieldLabel>
         <Textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={2} />
+      </Field>
+      <Field>
+        <FieldLabel>Test Data</FieldLabel>
+        <Textarea value={testData} onChange={(event) => setTestData(event.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
       </Field>
       <div>
         <FieldLabel>Steps</FieldLabel>
