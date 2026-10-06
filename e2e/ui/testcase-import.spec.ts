@@ -122,7 +122,7 @@ test.describe("test case import wizard", () => {
    * (organization_id, key) is unique forever — "E2E Import Wizard <stamp>" names would all collapse
    * to the same key and collide (see api/projects.spec.ts).
    */
-  async function withProject(browser: Browser, label: string): Promise<Fixture> {
+  async function withProject(browser: Browser, label: string, locale?: string): Promise<Fixture> {
     keyCounter += 1;
     const res = await api.post("/api/projects", {
       data: {
@@ -135,7 +135,9 @@ test.describe("test case import wizard", () => {
 
     // browser.newContext() doesn't inherit the ui project's `use` options, so baseURL is explicit —
     // without it every relative goto() resolves against nothing.
-    const context = await browser.newContext({ baseURL: env.webBaseUrl, storageState: IMPORT_UI_STATE });
+    // `locale` sets the browser's language, and with it the Accept-Language every request sends —
+    // which is what the exports read (see the Russian export tests at the end of this file).
+    const context = await browser.newContext({ baseURL: env.webBaseUrl, storageState: IMPORT_UI_STATE, ...(locale ? { locale } : {}) });
     return { page: await context.newPage(), projectId };
   }
 
@@ -891,6 +893,107 @@ test.describe("test case import wizard", () => {
       expect(body).toContain(title);
     } finally {
       await disposeProject(fixture);
+    }
+  });
+
+  /* ─────────────────────────── Russian exports and their re-import ─────────────────────────── */
+
+  test("a Russian browser clicking Export as CSV downloads a file with Russian headers and vocabulary", async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "RU Export Click", "ru-RU");
+      const { page, projectId } = fixture;
+      const title = `E2E RU Export Click ${Date.now()}`;
+      await api.post(`/api/projects/${projectId}/testcases`, { data: { title, status: "Approved", severity: "High" } });
+
+      await page.goto(`/projects/${projectId}/testcases`);
+      await page.getByRole("button", { name: "Export", exact: true }).click();
+      // The link is a plain href: the browser's own navigation carries Accept-Language: ru-RU, with
+      // no frontend change at all — this click is the user's real path to the file.
+      const [download] = await Promise.all([page.waitForEvent("download"), page.getByRole("link", { name: "Export as CSV" }).click()]);
+      const bytes = fs.readFileSync(await download.path());
+      expect([...bytes.subarray(0, 3)], "the Russian CSV starts with a UTF-8 BOM for Excel").toEqual([0xef, 0xbb, 0xbf]);
+      const text = bytes.subarray(3).toString("utf8");
+      const [header, row] = text.split("\n");
+      expect(header.split(",").slice(0, 3)).toEqual(["ID", "Название", "Описание"]);
+      expect(row).toContain(title);
+      expect(row).toContain("Утверждён");
+      expect(row).toContain("Высокая");
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("an English browser's export is unchanged", async ({ browser }) => {
+    let fixture: Fixture | undefined;
+    try {
+      fixture = await withProject(browser, "EN Export Click", "en-US");
+      const { page, projectId } = fixture;
+      await api.post(`/api/projects/${projectId}/testcases`, { data: { title: `E2E EN Export Click ${Date.now()}` } });
+      await page.goto(`/projects/${projectId}/testcases`);
+      await page.getByRole("button", { name: "Export", exact: true }).click();
+      const [download] = await Promise.all([page.waitForEvent("download"), page.getByRole("link", { name: "Export as CSV" }).click()]);
+      const bytes = fs.readFileSync(await download.path());
+      expect(bytes[0], "no BOM on an English file").not.toBe(0xef);
+      expect(bytes.toString("utf8").split("\n")[0].split(",")[0]).toBe("externalId");
+    } finally {
+      await disposeProject(fixture);
+    }
+  });
+
+  test("the wizard auto-maps a Russian export (and a Cyrillic custom field) and stores the English vocabulary", async ({ browser }) => {
+    let source: Fixture | undefined;
+    let target: Fixture | undefined;
+    try {
+      source = await withProject(browser, "RU Round Trip Source");
+      target = await withProject(browser, "RU Round Trip Target");
+      const stamp = Date.now();
+      const title = `E2E RU Wizard Round Trip ${stamp}`;
+      await api.post(`/api/projects/${source.projectId}/testcases`, {
+        data: { title, description: "Описание кейса", severity: "Critical", type: "Smoke", status: "In Review", priority: "P0" },
+      });
+      const exported = await api.get(`/api/projects/${source.projectId}/testcases/export/csv`, {
+        headers: { "Accept-Language": "ru-RU" },
+      });
+      // The real Russian file, BOM and all, exactly as a Russian user would download it.
+      let csv = Buffer.from(await exported.body());
+      expect([...csv.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+
+      // A Cyrillic-named custom field in the target, with a matching column appended to the file:
+      // the old ASCII-only header normalisation folded "Команда" to "" and never mapped it.
+      const field = await (
+        await api.post(`/api/projects/${target.projectId}/custom-fields/definitions`, { data: { name: "Команда", fieldType: "text" } })
+      ).json();
+      const lines = csv.toString("utf8").split("\n");
+      lines[0] = `${lines[0]},Команда`;
+      lines[1] = `${lines[1]},Платформа`;
+      csv = Buffer.from(lines.join("\n"), "utf8");
+
+      const { page, projectId } = target;
+      await openWizard(page, projectId);
+      await chooseFile(page, "testcases.csv", csv, "text/csv");
+      await expect(page.getByText("Map your file columns to test case fields.")).toBeVisible();
+      // Column 0 is "ID", which nothing maps; the Russian headers follow in export order.
+      await expect(mappingFor(page, "Title"), "Название maps to Title").toHaveValue("1");
+      await expect(mappingFor(page, "Description")).toHaveValue("2");
+      await expect(mappingFor(page, "Priority")).toHaveValue("8");
+      await expect(mappingFor(page, "Severity")).toHaveValue("9");
+      await expect(mappingFor(page, "Type")).toHaveValue("10");
+      await expect(mappingFor(page, "Status")).toHaveValue("11");
+
+      await runImport(page, 1);
+
+      const created = (await listCases(projectId)).find((c) => c.title === title);
+      expect(created, "the row was imported").toBeTruthy();
+      const full = (await getCase(projectId, created!.id)) as unknown as Record<string, unknown>;
+      expect(full).toMatchObject({ description: "Описание кейса", priority: "P0", severity: "Critical", type: "Smoke", status: "In Review" });
+
+      const english = await (await api.get(`/api/projects/${projectId}/testcases/export/csv`)).text();
+      expect(english, "the Cyrillic custom field column auto-mapped and its value landed").toContain("Платформа");
+      expect(english.split("\n")[0]).toContain(`cf_${field.key}`);
+    } finally {
+      await disposeProject(source);
+      await disposeProject(target);
     }
   });
 });

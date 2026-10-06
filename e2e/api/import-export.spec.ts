@@ -1610,4 +1610,473 @@ test.describe("import / export", () => {
       setProPlan(tenant!.organizationId);
     }
   });
+
+  /* ───────────────────────── localized (Russian) exports and their re-import ───────────────────────── */
+
+  /*
+   * A Russian browser (Accept-Language: ru…) gets every generated file with Russian FIXED labels —
+   * column headers, sheet name, and the product's own vocabularies (status, type, severity,
+   * automation type, execution status) — while everything a user typed passes through untouched.
+   * See Tesbo-Backend-Nest/src/common/export-i18n.ts.
+   *
+   * The other half is the round trip: the import still has to store the English vocabulary when it
+   * is handed a Russian file, because prepareImportRow stores these columns unvalidated and every
+   * count and filter in the product matches on 'Draft', 'Approved', …
+   *
+   * Every other test in this file sends no Accept-Language at all (Playwright's request contexts
+   * send none), which is why they keep seeing the English camelCase headers.
+   */
+
+  const RU_EXPORT_HEADERS = [
+    "ID",
+    "Название",
+    "Описание",
+    "Предусловия",
+    "Шаги",
+    "Действие",
+    "Ожидаемый результат",
+    "Тестовые данные",
+    "Приоритет",
+    "Серьёзность",
+    "Тип",
+    "Статус",
+    "Набор",
+    "Компонент",
+  ];
+
+  const RU_TEMPLATE_HEADERS = [
+    "Название",
+    "Описание",
+    "Предусловия",
+    "Постусловия",
+    "Шаги",
+    "Действие",
+    "Ожидаемый результат",
+    "Тестовые данные",
+    "Приоритет",
+    "Серьёзность",
+    "Тип",
+    "Статус",
+    "Набор",
+    "Компонент",
+    "Оценка времени",
+    "Тип автоматизации",
+    "Примечания",
+  ];
+
+  const RU_RUN_EXPORT_HEADERS = [
+    "ID",
+    "Название",
+    "Статус",
+    "Приоритет",
+    "Тип",
+    "Фактический результат",
+    "Дата выполнения",
+    "Ключ дефекта",
+    "Ссылка на дефект",
+  ];
+
+  const RU = { "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8" };
+  const UTF8_BOM = [0xef, 0xbb, 0xbf];
+
+  /** The body's text with a leading BOM removed, plus whether it had one. */
+  const csvBody = async (res: { body(): Promise<Buffer> }) => {
+    const bytes = await res.body();
+    const hasBom = bytes[0] === UTF8_BOM[0] && bytes[1] === UTF8_BOM[1] && bytes[2] === UTF8_BOM[2];
+    return { hasBom, text: bytes.subarray(hasBom ? 3 : 0).toString("utf8") };
+  };
+
+  test("a Russian browser gets the CSV export with Russian headers and vocabulary, user text untouched", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export RU ${stamp}`);
+    const suite = await (
+      await asOwner.post(`/api/projects/${project}/suites`, { data: { name: `E2E RU Suite ${stamp}` } })
+    ).json();
+    const seeded = await seedCase(
+      {
+        // English user text stays English: only fixed labels are translated, never content.
+        title: `E2E RU Export ${stamp}`,
+        description: "Typed by a user, in English",
+        priority: "P1",
+        severity: "High",
+        type: "Regression",
+        status: "Approved",
+        component: "Billing",
+        suiteId: suite.id,
+      },
+      project,
+    );
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, { headers: RU });
+    expect(res.status()).toBe(200);
+    expect(res.headers()["content-type"]).toContain("text/csv");
+    const { hasBom, text } = await csvBody(res);
+    // Without the BOM Excel on Windows decodes the file as ANSI and every Cyrillic letter is mojibake.
+    expect(hasBom, "a Russian CSV starts with a UTF-8 BOM").toBe(true);
+
+    const { headers, records } = parseCsvRecords(text);
+    expect(headers).toEqual(RU_EXPORT_HEADERS);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      ID: seeded.externalId,
+      Название: seeded.title,
+      Описание: "Typed by a user, in English",
+      // P0–P3 read the same in every language.
+      Приоритет: "P1",
+      Серьёзность: "Высокая",
+      Тип: "Регрессионный",
+      Статус: "Утверждён",
+      Набор: suite.name,
+      Компонент: "Billing",
+    });
+  });
+
+  test("the same export with an English browser, or no language at all, is byte-for-byte the English file", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export EN ${stamp}`);
+    await seedCase({ title: `E2E EN Export ${stamp}`, severity: "High", status: "Approved" }, project);
+
+    const english = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+      headers: { "Accept-Language": "en-US,en;q=0.9" },
+    });
+    const none = await asOwner.get(`/api/projects/${project}/testcases/export/csv`);
+    const englishBody = await csvBody(english);
+    const noneBody = await csvBody(none);
+
+    expect(englishBody.hasBom, "English CSVs keep their pre-existing BOM-less shape").toBe(false);
+    expect(noneBody.hasBom).toBe(false);
+    expect(englishBody.text).toBe(noneBody.text);
+    const { headers, records } = parseCsvRecords(englishBody.text);
+    expect(headers).toEqual(EXPORT_HEADERS);
+    expect(records[0]).toMatchObject({ severity: "High", status: "Approved" });
+  });
+
+  test("the export language follows Accept-Language preference order and an explicit lang= override", async () => {
+    const project = await newProject(`E2E Export Lang Negotiation ${Date.now()}`);
+    // [Accept-Language, ?lang, expected language] — the first header reads "ID" in Russian and
+    // "externalId" in English, which is all this needs to tell them apart.
+    const cases: [string | undefined, string | undefined, "ru" | "en"][] = [
+      ["ru", undefined, "ru"],
+      ["ru-RU", undefined, "ru"],
+      ["RU-ru", undefined, "ru"],
+      ["ru;q=0.9, en;q=0.8", undefined, "ru"],
+      ["en;q=1, ru;q=0.5", undefined, "en"],
+      // The first SUPPORTED language wins, not merely the first listed.
+      ["de-DE, ru;q=0.5", undefined, "ru"],
+      ["de-DE", undefined, "en"],
+      ["*", undefined, "en"],
+      ["ru;q=0", undefined, "en"],
+      // Garbage must never fail a download — it falls back to English.
+      [";;q=abc,,", undefined, "en"],
+      ["en-US", "ru", "ru"],
+      ["ru-RU", "en", "en"],
+      // An unsupported override is ignored rather than honoured or rejected.
+      ["ru-RU", "xx", "ru"],
+      [undefined, "ru", "ru"],
+    ];
+    for (const [acceptLanguage, lang, expected] of cases) {
+      const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, {
+        headers: acceptLanguage === undefined ? {} : { "Accept-Language": acceptLanguage },
+        params: lang === undefined ? {} : { lang },
+      });
+      expect(res.status(), `Accept-Language ${acceptLanguage} lang=${lang}`).toBe(200);
+      const { headers } = parseCsvRecords((await csvBody(res)).text);
+      expect(headers[0], `Accept-Language ${JSON.stringify(acceptLanguage)}, lang=${lang}`).toBe(
+        expected === "ru" ? "ID" : "externalId",
+      );
+    }
+  });
+
+  test("a value outside the known vocabulary, and custom field columns, export unchanged in Russian", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export RU Passthrough ${stamp}`);
+    // Named "label": a word the export does have a Russian header for. A custom field's column is
+    // user-named and must never be translated.
+    const field = await (
+      await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+        data: { name: `label ${stamp}`, fieldType: "text" },
+      })
+    ).json();
+    const seeded = await seedCase(
+      {
+        title: `E2E RU Passthrough ${stamp}`,
+        // testcases.type/status have no CHECK constraint; a team's own value must survive as typed.
+        type: "Exploratory",
+        status: "Team Specific",
+        customFieldValues: { [field.id]: "Owner text" },
+      },
+      project,
+    );
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, { headers: RU });
+    const { headers, records } = parseCsvRecords((await csvBody(res)).text);
+    expect(headers).toEqual([...RU_EXPORT_HEADERS, `cf_${field.key}`]);
+    expect(records[0]).toMatchObject({
+      Название: seeded.title,
+      Тип: "Exploratory",
+      Статус: "Team Specific",
+      [`cf_${field.key}`]: "Owner text",
+    });
+  });
+
+  test("a Russian XLSX export carries the Russian sheet name, headers and vocabulary", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export RU Workbook ${stamp}`);
+    const seeded = await seedCase(
+      { title: `E2E RU Workbook ${stamp}`, severity: "Critical", type: "Smoke", status: "Draft" },
+      project,
+    );
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/xlsx`, { headers: RU });
+    expect(res.status()).toBe(200);
+    expect(res.headers()["content-disposition"]).toBe('attachment; filename="testcases.xlsx"');
+    const workbook = XLSX.read(await res.body(), { type: "buffer" });
+    expect(workbook.SheetNames).toEqual(["Тест-кейсы"]);
+    const sheet = workbook.Sheets["Тест-кейсы"];
+    const headerRow = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1, blankrows: false })[0];
+    expect(headerRow).toEqual(RU_EXPORT_HEADERS);
+    const rows = XLSX.utils.sheet_to_json<Record<string, string>>(sheet);
+    expect(rows[0]).toMatchObject({
+      ID: seeded.externalId,
+      Название: seeded.title,
+      Серьёзность: "Критическая",
+      Тип: "Смоук",
+      Статус: "Черновик",
+    });
+  });
+
+  test("an empty project still exports Russian header rows in both formats", async () => {
+    const project = await newProject(`E2E Export RU Empty ${Date.now()}`);
+    const csv = await asOwner.get(`/api/projects/${project}/testcases/export/csv`, { headers: RU });
+    const { hasBom, text } = await csvBody(csv);
+    expect(hasBom).toBe(true);
+    expect(parseCsv(text)).toEqual([RU_EXPORT_HEADERS]);
+
+    const xlsx = await asOwner.get(`/api/projects/${project}/testcases/export/xlsx`, { headers: RU });
+    const workbook = XLSX.read(await xlsx.body(), { type: "buffer" });
+    const rows = XLSX.utils.sheet_to_json<string[]>(workbook.Sheets["Тест-кейсы"], { header: 1, blankrows: false });
+    expect(rows).toEqual([RU_EXPORT_HEADERS]);
+  });
+
+  test("a Russian export re-imports with the English vocabulary stored, not the Russian labels", async () => {
+    const stamp = Date.now();
+    const source = await newProject(`E2E RU Round Trip Source ${stamp}`);
+    const target = await newProject(`E2E RU Round Trip Target ${stamp}`);
+    const seeded = await seedCase(
+      {
+        title: `E2E RU Round Trip ${stamp}`,
+        priority: "P0",
+        severity: "Low",
+        type: "Security",
+        status: "In Review",
+        steps: [
+          { stepNumber: 1, action: "Open", expectedResult: "Opens" },
+          { stepNumber: 2, action: "Close", expectedResult: "Closes" },
+        ],
+      },
+      source,
+    );
+
+    const exported = await asOwner.get(`/api/projects/${source}/testcases/export/csv`, { headers: RU });
+    const { records } = parseCsvRecords((await csvBody(exported)).text);
+    expect(records[0].Статус, "the export really was Russian").toBe("На проверке");
+
+    // What the Map Columns screen sends once it has auto-mapped the Russian headers (covered in
+    // ui/testcase-import.spec.ts): field keys, with the cell values exactly as they are in the file.
+    const row = records[0];
+    const importRes = await asOwner.post(`/api/projects/${target}/testcases/import`, {
+      data: {
+        rows: [
+          {
+            rowNumber: 1,
+            title: row.Название,
+            priority: row.Приоритет,
+            severity: row.Серьёзность,
+            type: row.Тип,
+            status: row.Статус,
+            steps: row.Шаги,
+          },
+        ],
+      },
+    });
+    expect(importRes.status()).toBe(200);
+    const body = await importRes.json();
+    expect(body.errors).toEqual([]);
+    expect(body.imported).toBe(1);
+
+    const list = await (await asOwner.get(`/api/projects/${target}/testcases`, { params: { search: seeded.title } })).json();
+    const created = list.find((tc: { title: string }) => tc.title === seeded.title);
+    expect(created, "the re-imported row exists").toBeTruthy();
+    createdCaseIds.push(created.id);
+    const full = await (await asOwner.get(`/api/projects/${target}/testcases/${created.id}`)).json();
+    expect(full).toMatchObject({ priority: "P0", severity: "Low", type: "Security", status: "In Review" });
+
+    // And it is findable by the English status filter the repository screen uses — the failure
+    // mode this guards against is a row that exists but drops out of every status count.
+    const filtered = await (
+      await asOwner.get(`/api/projects/${target}/testcases`, { params: { status: "In Review" } })
+    ).json();
+    expect(filtered.map((tc: { id: string }) => tc.id)).toContain(created.id);
+  });
+
+  test("the import maps Russian labels case- and ё-insensitively, mixes with English rows, and keeps unknown values", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E RU Import Values ${stamp}`);
+    const rows = [
+      { rowNumber: 1, title: `E2E RU Values A ${stamp}`, status: "УТВЕРЖДЁН", severity: "критическая", type: "Функциональный", automationStatus: "Не автоматизирован" },
+      // "утвержден" without the ё: Russian typing uses е and ё interchangeably.
+      { rowNumber: 2, title: `E2E RU Values B ${stamp}`, status: "  утвержден ", type: "Санити", automationStatus: "Невозможно автоматизировать" },
+      { rowNumber: 3, title: `E2E RU Values C ${stamp}`, status: "Deprecated", severity: "Medium", type: "API", automationStatus: "Automated" },
+      // Not a known translation: stored as typed, exactly as the importer always has.
+      { rowNumber: 4, title: `E2E RU Values D ${stamp}`, status: "Своё значение" },
+    ];
+    const res = await asOwner.post(`/api/projects/${project}/testcases/import`, { data: { rows } });
+    expect(res.status()).toBe(200);
+    const body = await res.json();
+    expect(body.errors).toEqual([]);
+    expect(body.imported).toBe(4);
+
+    const list = await (await asOwner.get(`/api/projects/${project}/testcases`, { params: { limit: 50 } })).json();
+    const byTitle = new Map<string, any>();
+    for (const tc of list) {
+      createdCaseIds.push(tc.id);
+      byTitle.set(tc.title, await (await asOwner.get(`/api/projects/${project}/testcases/${tc.id}`)).json());
+    }
+    expect(byTitle.get(rows[0].title)).toMatchObject({ status: "Approved", severity: "Critical", type: "Functional", automationStatus: "Not Automated" });
+    expect(byTitle.get(rows[1].title)).toMatchObject({ status: "Approved", type: "Sanity", automationStatus: "Can't Automate" });
+    expect(byTitle.get(rows[2].title)).toMatchObject({ status: "Deprecated", severity: "Medium", type: "API", automationStatus: "Automated" });
+    expect(byTitle.get(rows[3].title)).toMatchObject({ status: "Своё значение" });
+  });
+
+  test("the Russian template has Russian headers, a Russian worked example, and imports as English vocabulary", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E RU Template ${stamp}`);
+    // A custom field that collides with a Russian base header must not produce two "Статус"
+    // columns; one named after a translated report word ("total") is left exactly as named.
+    const colliding = await (
+      await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+        data: { name: "Статус", fieldType: "text" },
+      })
+    ).json();
+    const plain = await (
+      await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+        data: { name: `total ${stamp}`, fieldType: "text" },
+      })
+    ).json();
+    expect(colliding.id && plain.id, "both custom fields were created").toBeTruthy();
+
+    const res = await asOwner.get(`/api/projects/${project}/testcases/import/template`, { headers: RU });
+    expect(res.status()).toBe(200);
+    const { hasBom, text } = await csvBody(res);
+    expect(hasBom).toBe(true);
+    const { headers, records } = parseCsvRecords(text);
+    expect(headers).toEqual([...RU_TEMPLATE_HEADERS, "Статус (Пользовательское поле)", `total ${stamp}`]);
+    expect(records[0]).toMatchObject({
+      Название: "Пример теста входа",
+      Приоритет: "P2",
+      Серьёзность: "Средняя",
+      Тип: "Функциональный",
+      Статус: "Черновик",
+      "Тип автоматизации": "Не автоматизирован",
+      "Оценка времени": "10m",
+    });
+    expect(records[0].Шаги, "the step DSL separators survive translation").toContain(" => ");
+    expect(records[0].Шаги).toContain(" | ");
+
+    const xlsx = await asOwner.get(`/api/projects/${project}/testcases/import/template`, {
+      headers: RU,
+      params: { format: "xlsx" },
+    });
+    const workbook = XLSX.read(await xlsx.body(), { type: "buffer" });
+    expect(workbook.SheetNames).toEqual(["Тест-кейсы"]);
+
+    const example = records[0];
+    const importRes = await asOwner.post(`/api/projects/${project}/testcases/import`, {
+      data: {
+        rows: [
+          {
+            rowNumber: 1,
+            title: `${example.Название} ${stamp}`,
+            priority: example.Приоритет,
+            severity: example.Серьёзность,
+            type: example.Тип,
+            status: example.Статус,
+            automationStatus: example["Тип автоматизации"],
+            estimatedDuration: example["Оценка времени"],
+            steps: example.Шаги,
+          },
+        ],
+      },
+    });
+    const importBody = await importRes.json();
+    expect(importBody.errors).toEqual([]);
+    const list = await (await asOwner.get(`/api/projects/${project}/testcases`)).json();
+    const created = list.find((tc: { title: string }) => tc.title === `${example.Название} ${stamp}`);
+    createdCaseIds.push(created.id);
+    const full = await (await asOwner.get(`/api/projects/${project}/testcases/${created.id}`)).json();
+    expect(full).toMatchObject({ severity: "Medium", type: "Functional", status: "Draft", automationStatus: "Not Automated" });
+  });
+
+  test("an English template request is unchanged by the localization work", async () => {
+    const res = await asOwner.get(`/api/projects/${projectId}/testcases/import/template`, {
+      headers: { "Accept-Language": "en-GB" },
+    });
+    const { hasBom, text } = await csvBody(res);
+    expect(hasBom).toBe(false);
+    const { headers, records } = parseCsvRecords(text);
+    expect(headers.slice(0, TEMPLATE_HEADERS.length)).toEqual(TEMPLATE_HEADERS);
+    expect(records[0]).toMatchObject({ title: "Example login test", status: "Draft", severity: "Medium" });
+  });
+
+  test("a Russian run export translates headers and execution statuses", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E RU Run Export ${stamp}`);
+    const passed = await seedCase({ title: `E2E RU Run Passed ${stamp}`, priority: "P1", type: "Smoke" }, project);
+    const blocked = await seedCase({ title: `E2E RU Run Blocked ${stamp}`, type: "Integration" }, project);
+    const untested = await seedCase({ title: `E2E RU Run Untested ${stamp}` }, project);
+    const cycleId = await seedRun(`E2E RU Run ${stamp}`, project);
+    await asOwner.post(`/api/cycles/${cycleId}/testcases`, {
+      data: { testcaseIds: [passed.id, blocked.id, untested.id] },
+    });
+    const executions = await executionsOf(cycleId);
+    await asOwner.patch(`/api/cycles/${cycleId}/executions/${executions.find((e) => e.testcaseId === passed.id)!.id}`, {
+      data: { status: "Passed", actualResult: "Как ожидалось" },
+    });
+    await asOwner.patch(`/api/cycles/${cycleId}/executions/${executions.find((e) => e.testcaseId === blocked.id)!.id}`, {
+      data: { status: "Blocked" },
+    });
+
+    const res = await asOwner.get(`/api/cycles/${cycleId}/export/csv`, { headers: RU });
+    expect(res.status()).toBe(200);
+    expect(res.headers()["content-disposition"]).toBe('attachment; filename="test-run.csv"');
+    const { hasBom, text } = await csvBody(res);
+    expect(hasBom).toBe(true);
+    const { headers, records } = parseCsvRecords(text);
+    expect(headers).toEqual(RU_RUN_EXPORT_HEADERS);
+    expect(records.map((r) => r.Название)).toEqual([passed.title, blocked.title, untested.title]);
+    expect(records[0]).toMatchObject({ Статус: "Пройден", Приоритет: "P1", Тип: "Смоук", "Фактический результат": "Как ожидалось" });
+    expect(records[1]).toMatchObject({ Статус: "Заблокирован", Тип: "Интеграционный" });
+    expect(records[2]).toMatchObject({ Статус: "Не протестирован" });
+
+    // English is untouched: same run, no language.
+    const english = parseCsvRecords((await csvBody(await asOwner.get(`/api/cycles/${cycleId}/export/csv`))).text);
+    expect(english.headers).toEqual(RUN_EXPORT_HEADERS);
+    expect(english.records[0].status).toBe("Passed");
+  });
+
+  test("asking for Russian grants nothing: the localized exports refuse callers without access", async () => {
+    const cycleId = await seedRun(`E2E RU Auth Run ${Date.now()}`);
+    const paths = [
+      `/api/projects/${projectId}/testcases/export/csv?lang=ru`,
+      `/api/projects/${projectId}/testcases/export/xlsx?lang=ru`,
+      `/api/projects/${projectId}/testcases/import/template?lang=ru`,
+      `/api/cycles/${cycleId}/export/csv?lang=ru`,
+    ];
+    for (const path of paths) {
+      const anonRes = await anon.get(path, { headers: RU, failOnStatusCode: false });
+      expect([400, 401], `anonymous ${path}`).toContain(anonRes.status());
+      const outsiderRes = await asOutsider.get(path, { headers: RU, failOnStatusCode: false });
+      expect(outsiderRes.status(), `outsider ${path}`).toBe(404);
+    }
+  });
 });

@@ -24,17 +24,22 @@ import {
   type ZyraTicketComment,
 } from "@/lib/api";
 import { IconSparkles, IconUser } from "@tabler/icons-react";
-import { Button, Card, CopyButton, Field, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, SeverityBadge, type Severity } from "@/components/ui";
+import { Button, Card, CopyButton, Field, FieldError, FieldHint, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, type Severity } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
+import { SUITE_NAME_MAX_LENGTH, validateSuiteName } from "@/lib/validation";
 import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
-import { ACTION_LABEL, TechniqueBadges } from "@/components/agents/ZyraChatReviewPanel";
+import { TechniqueBadges } from "@/components/agents/ZyraChatReviewPanel";
+import { ZyraSeverityBadge } from "@/components/agents/ZyraContextDrawer";
+import { ZyraLanguageContext, zyraLanguage, zyraText } from "@/lib/zyra-i18n";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 
-type SaveMode = "existing" | "new";
+// "" is the unchosen "Select suite" placeholder — never submittable. "none" saves unassigned.
+type SaveMode = "" | "none" | "existing" | "new";
 type DetailTab = "testcases" | "feedback" | "activities" | "sources";
 
+// `label` is the English text; the page renders the localized "task.commentStatus.<status>" key.
 const TICKET_COMMENT_STATUS: Record<ZyraTicketComment["status"], { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" }> = {
   pending: { label: "Posting…", tone: "info" },
   posted: { label: "Posted", tone: "success" },
@@ -58,9 +63,9 @@ function tone(status: string): "neutral" | "info" | "success" | "warning" | "err
   return "neutral";
 }
 
-function latestFailureDetail(activities: ZyraTask["activities"]): string | null {
+function latestFailureDetail(activities: ZyraTask["activities"], fallback: string): string | null {
   for (let i = activities.length - 1; i >= 0; i -= 1) {
-    if (activities[i].stage === "failed") return activities[i].detail || "Zyra failed to generate testcase drafts.";
+    if (activities[i].stage === "failed") return activities[i].detail || fallback;
   }
   return null;
 }
@@ -72,17 +77,10 @@ function isFeedbackActivity(activity: ZyraTask["activities"][number]): boolean {
   return activity.kind === "feedback" || activity.title === "Review feedback submitted";
 }
 
-const TASK_STATUS_LABELS: Record<string, string> = {
-  todo: "Pending",
-  in_progress: "In Progress",
-  in_review: "In Review",
-  failed: "Failed",
-  done: "Done",
-};
-
-function statusLabel(status: string): string {
+// Status labels are "taskStatus.<status>" in lib/zyra-i18n.ts; an unknown status reads as its own words.
+function statusLabel(status: string, t: ReturnType<typeof zyraText>): string {
   const normalized = normalizeStatus(status);
-  return TASK_STATUS_LABELS[normalized] ?? normalized.replaceAll("_", " ");
+  return t.opt(`taskStatus.${normalized}`) ?? normalized.replaceAll("_", " ");
 }
 
 const KNOWN_SEVERITIES: Severity[] = ["Critical", "High", "Medium", "Low"];
@@ -144,7 +142,7 @@ export default function ZyraTaskDetailPage() {
   const [selectedLinearKeys, setSelectedLinearKeys] = useState<string[]>([]);
   const [activeTab, setActiveTab] = useState<DetailTab>("testcases");
   const [savingOpen, setSavingOpen] = useState(false);
-  const [saveMode, setSaveMode] = useState<SaveMode>("existing");
+  const [saveMode, setSaveMode] = useState<SaveMode>("");
   const [targetSuiteId, setTargetSuiteId] = useState("");
   const [newSuiteName, setNewSuiteName] = useState("");
   const [savingDraftIndexes, setSavingDraftIndexes] = useState<number[] | null>(null);
@@ -156,6 +154,15 @@ export default function ZyraTaskDetailPage() {
   // modal's backdrop, so a failed save looked like the button had done nothing.
   const [saveError, setSaveError] = useState<string | null>(null);
   const pollInFlightRef = useRef(false);
+  // The task's own language (set server-side from the script of what the user typed); English
+  // until the task has loaded, or when it carries none.
+  const lang = zyraLanguage(task?.language);
+  const t = zyraText(lang);
+  // For loadData, which is memoized and so can't read `t` from a later render.
+  const langRef = useRef(lang);
+  useEffect(() => {
+    langRef.current = lang;
+  }, [lang]);
 
   const loadData = useCallback(async () => {
     try {
@@ -184,7 +191,7 @@ export default function ZyraTaskDetailPage() {
       }
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load task.");
+      setError(err instanceof Error ? err.message : zyraText(langRef.current)("task.err.load"));
     } finally {
       setLoading(false);
     }
@@ -243,11 +250,11 @@ export default function ZyraTaskDetailPage() {
     try {
       const result = await retryZyraTicketComment(projectId, taskId, comment.id);
       const label = result.provider === "jira" ? "Jira" : "Linear";
-      if (result.status === "posted") setMessage(`Comment posted on ${label} ${result.issueKey}.`);
-      else setError(`Comment still couldn't be posted on ${label} ${result.issueKey}${result.reason ? `: ${result.reason}` : "."}`);
+      if (result.status === "posted") setMessage(t("task.commentPosted", { label, key: result.issueKey }));
+      else setError(t("task.commentStillFailed", { label, key: result.issueKey, reason: result.reason || "" }));
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to retry the ticket comment.");
+      setError(err instanceof Error ? err.message : t("task.err.retryComment"));
       await loadData();
     } finally {
       setRetryingCommentId(null);
@@ -268,8 +275,22 @@ export default function ZyraTaskDetailPage() {
     setSelectedDrafts([]);
   }
 
+  // The one rule for whether the Save modal can submit — the button's disabled state and
+  // handleSave's guard both read it, so they can't drift apart.
+  const newSuiteNameError = saveMode === "new" ? validateSuiteName(newSuiteName) : "";
+  const saveTargetValid =
+    saveMode === "none" ||
+    (saveMode === "existing" && Boolean(targetSuiteId)) ||
+    (saveMode === "new" && !newSuiteNameError);
+  const canSave = !working && (savingDraftIndexes || selectedDrafts).length > 0 && saveTargetValid;
+
   function openSaveModal(indexes?: number[]) {
     setSavingDraftIndexes(indexes || selectedDrafts);
+    // Every save starts from "Select suite": a target left over from a cancelled attempt would
+    // otherwise be one click from filing these drafts somewhere nobody chose this time.
+    setSaveMode("");
+    setTargetSuiteId("");
+    setNewSuiteName("");
     setSaveError(null);
     setSavingOpen(true);
   }
@@ -298,10 +319,10 @@ export default function ZyraTaskDetailPage() {
       setReferenceNote("");
       setSelectedJiraKeys([]);
       setSelectedLinearKeys([]);
-      setMessage("Feedback sent. Zyra moved the task to Todo and is regenerating the testcase drafts now — this can take a minute.");
+      setMessage(t("task.feedbackSent"));
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to send feedback.");
+      setError(err instanceof Error ? err.message : t("task.err.feedback"));
     } finally {
       setWorking(false);
     }
@@ -316,9 +337,9 @@ export default function ZyraTaskDetailPage() {
       const updated = await deleteZyraTaskDraft(projectId, task.id, index);
       setTask(updated);
       setSelectedDrafts((prev) => prev.filter((item) => item !== index).map((item) => item > index ? item - 1 : item));
-      setMessage("Generated testcase draft deleted.");
+      setMessage(t("task.draftDeleted"));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete testcase draft.");
+      setError(err instanceof Error ? err.message : t("task.err.deleteDraft"));
     } finally {
       setWorking(false);
     }
@@ -337,24 +358,26 @@ export default function ZyraTaskDetailPage() {
       }
       setTask(updated);
       setSelectedDrafts([]);
-      setMessage(`${indexes.length} generated testcase draft${indexes.length === 1 ? "" : "s"} deleted.`);
+      setMessage(t("task.draftsDeleted", { n: indexes.length }));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete selected testcase drafts.");
+      setError(err instanceof Error ? err.message : t("task.err.deleteDrafts"));
     } finally {
       setWorking(false);
     }
   }
 
   async function handleSave() {
-    if (!task) return;
+    if (!task || !canSave) return;
     const indexes = savingDraftIndexes || selectedDrafts;
     setWorking(true);
     setMessage(null);
     setError(null);
     setSaveError(null);
     try {
+      // Only the chosen path contributes a suite, so a pick abandoned by switching to "No suite"
+      // can't ride along.
       let suiteId = saveMode === "existing" ? targetSuiteId : "";
-      if (saveMode === "new" && newSuiteName.trim()) {
+      if (saveMode === "new") {
         const suite = await createSuite(projectId, { name: newSuiteName.trim() });
         suiteId = suite.id;
       }
@@ -362,12 +385,12 @@ export default function ZyraTaskDetailPage() {
         selectedDraftIndexes: indexes,
         suiteId: suiteId || undefined,
       });
-      setMessage(`${result.savedCount} testcase${result.savedCount === 1 ? "" : "s"} saved.`);
+      setMessage(t("task.saved", { n: result.savedCount }));
       setSavingOpen(false);
       setSavingDraftIndexes(null);
       await loadData();
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Failed to save testcases.");
+      setSaveError(err instanceof Error ? err.message : t("task.err.save"));
     } finally {
       setWorking(false);
     }
@@ -382,10 +405,10 @@ export default function ZyraTaskDetailPage() {
       const updated = await closeZyraTask(projectId, task.id);
       setTask(updated);
       setSelectedDrafts([]);
-      setMessage("Task closed.");
+      setMessage(t("task.closed"));
       await loadData();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to close task.");
+      setError(err instanceof Error ? err.message : t("task.err.close"));
     } finally {
       setWorking(false);
     }
@@ -405,8 +428,8 @@ export default function ZyraTaskDetailPage() {
 
   if (loading || !task) {
     return (
-      <StandardPageLayout header={<PageHeader title="Zyra task" breadcrumb={taskBreadcrumb} />}>
-        <PageLoader label="Loading task…" />
+      <StandardPageLayout header={<PageHeader title={t("task.pageTitle")} breadcrumb={taskBreadcrumb} />}>
+        <PageLoader label={t("task.loading")} />
       </StandardPageLayout>
     );
   }
@@ -423,11 +446,11 @@ export default function ZyraTaskDetailPage() {
   const allDraftsSelected = task.drafts.length > 0 && selectedDrafts.length === task.drafts.length;
   const copyableDrafts = selectedDrafts.length > 0 ? selectedDrafts.map((i) => task.drafts[i]) : task.drafts;
   const draftsTsv = toTsv(
-    ["Title", "Priority", "Severity", "Component", "Preconditions", "Steps", "Expected Result", "Tags"],
+    [t("col.title"), t("col.priority"), t("col.severity"), t("col.component"), t("col.preconditions"), t("col.steps"), t("col.expectedResultCap"), t("col.tags")],
     copyableDrafts.map((draft) => [
       draft.title,
       draft.priority,
-      draft.severity ?? "",
+      draft.severity ? t.value("severity", draft.severity) : "",
       draft.component ?? "",
       draft.preconditions,
       stepsText(draft.stepsJson),
@@ -436,20 +459,22 @@ export default function ZyraTaskDetailPage() {
     ])
   );
   const tabItems: Array<{ key: DetailTab; label: string; count?: number }> = [
-    { key: "testcases", label: "Generated Testcases", count: task.drafts.length },
-    { key: "feedback", label: "Feedback", count: feedbackActivities.length },
-    { key: "activities", label: "Activities", count: task.activities.length },
-    { key: "sources", label: "Sources", count: task.sources.length },
+    { key: "testcases", label: t("task.tab.generated"), count: task.drafts.length },
+    { key: "feedback", label: t("task.tab.feedback"), count: feedbackActivities.length },
+    { key: "activities", label: t("task.tab.activities"), count: task.activities.length },
+    { key: "sources", label: t("task.tab.sources"), count: task.sources.length },
   ];
 
   return (
+    // Shared badges inside (techniques, severity) read the task's language from this context.
+    <ZyraLanguageContext.Provider value={lang}>
     <StandardPageLayout
       header={
         <PageHeader
-          title="Zyra task"
-          subtitle="Review the task, save or remove generated testcases, provide feedback, and track every Zyra status update."
+          title={t("task.pageTitle")}
+          subtitle={t("task.subtitle")}
           breadcrumb={taskBreadcrumb}
-          actions={<Link href={`/projects/${projectId}/agents/tasks`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">Back to board</Link>}
+          actions={<Link href={`/projects/${projectId}/agents/tasks`} className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">{t("task.backToBoard")}</Link>}
         />
       }
     >
@@ -459,15 +484,20 @@ export default function ZyraTaskDetailPage() {
       <Card className="p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
-            <StatusChip tone={tone(task.taskStatus)}>{statusLabel(task.taskStatus)}</StatusChip>
+            <StatusChip tone={tone(task.taskStatus)}>{statusLabel(task.taskStatus, t)}</StatusChip>
             <h2 className="mt-3 text-lg font-semibold text-[var(--foreground)]">{task.userStory}</h2>
             {normalizeStatus(task.taskStatus) === "failed" && (
               <p className="mt-2 rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">
-                {latestFailureDetail(task.activities)}
+                {latestFailureDetail(task.activities, t("task.failedDefault"))}
               </p>
             )}
             <p className="mt-2 text-sm text-[var(--muted)]">
-              {task.generatedCount} testcase{task.generatedCount === 1 ? "" : "s"} generated, {task.savedCount} saved, {task.tokenUsage.total} tokens, updated {new Date(task.updatedAt).toLocaleString()}
+              {t("task.summary", {
+                generated: task.generatedCount,
+                saved: task.savedCount,
+                tokens: task.tokenUsage.total,
+                date: new Date(task.updatedAt).toLocaleString(t.locale),
+              })}
             </p>
             {(task.jiraIssueKeys.length > 0 || (task.linearIssueKeys ?? []).length > 0) && (
               <div className="mt-3 flex flex-wrap gap-2">
@@ -484,20 +514,20 @@ export default function ZyraTaskDetailPage() {
                 320-character excerpt survived, as a Sources entry. Same field and same Markdown
                 renderer as the popup (escaped, http(s)-only links), so the two can't disagree. */}
             <div data-testid="task-description" className="mt-4 border-t border-[var(--border-subtle)] pt-3">
-              <p className="text-xs font-medium uppercase tracking-wide text-[var(--muted)]">Description</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-[var(--muted)]">{t("drawer.description")}</p>
               {task.context?.trim() ? (
                 <div
                   className="zyra-prose mt-1.5 break-words text-sm text-[var(--muted)]"
                   dangerouslySetInnerHTML={{ __html: renderMarkdown(task.context) }}
                 />
               ) : (
-                <p className="mt-1.5 text-sm text-[var(--muted-soft)]">No description available</p>
+                <p className="mt-1.5 text-sm text-[var(--muted-soft)]">{t("task.noDescription")}</p>
               )}
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
             {!done && (
-              <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={working}>Close task</Button>
+              <Button variant="secondary" onClick={() => void handleCloseTask()} disabled={working}>{t("task.closeTask")}</Button>
             )}
           </div>
         </div>
@@ -505,9 +535,9 @@ export default function ZyraTaskDetailPage() {
 
       {ticketComments.length > 0 && (
         <Card className="p-4">
-          <h3 className="text-sm font-semibold text-[var(--foreground)]">Ticket comments</h3>
+          <h3 className="text-sm font-semibold text-[var(--foreground)]">{t("task.ticketComments")}</h3>
           <p className="mt-1 text-xs text-[var(--muted)]">
-            What was posted to the linked ticket after each save. A failed comment can be sent again once the cause is fixed.
+            {t("task.ticketCommentsHint")}
           </p>
           <ul className="mt-3 space-y-2">
             {ticketComments.map((comment) => {
@@ -517,9 +547,9 @@ export default function ZyraTaskDetailPage() {
                   <div className="min-w-0 space-y-1">
                     <div className="flex flex-wrap items-center gap-2 text-sm">
                       <span className="font-medium text-[var(--foreground)]">{comment.provider === "jira" ? "Jira" : "Linear"} {comment.issueKey}</span>
-                      <StatusChip tone={status.tone}>{status.label}</StatusChip>
+                      <StatusChip tone={status.tone}>{t.opt(`task.commentStatus.${comment.status}`) ?? status.label}</StatusChip>
                       <span className="text-xs text-[var(--muted)]">
-                        {comment.testcaseCount} testcase{comment.testcaseCount === 1 ? "" : "s"} · {new Date(comment.postedAt || comment.updatedAt).toLocaleString()}
+                        {t("task.commentCount", { n: comment.testcaseCount })} · {new Date(comment.postedAt || comment.updatedAt).toLocaleString(t.locale)}
                       </span>
                     </div>
                     {comment.status === "failed" && comment.reason && (
@@ -528,7 +558,7 @@ export default function ZyraTaskDetailPage() {
                   </div>
                   {comment.status === "failed" && (
                     <Button variant="secondary" onClick={() => void handleRetryTicketComment(comment)} disabled={retryingCommentId !== null}>
-                      {retryingCommentId === comment.id ? "Retrying..." : "Retry comment"}
+                      {retryingCommentId === comment.id ? t("task.retrying") : t("task.retryComment")}
                     </Button>
                   )}
                 </li>
@@ -556,26 +586,26 @@ export default function ZyraTaskDetailPage() {
           <Card className="overflow-hidden">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface-secondary)] px-4 py-3">
               <div className="text-sm text-[var(--muted)]">
-                <span className="font-semibold text-[var(--foreground)]">{selectedDrafts.length}</span> of {task.drafts.length} testcase{task.drafts.length === 1 ? "" : "s"} selected
+                <span className="font-semibold text-[var(--foreground)]">{selectedDrafts.length}</span>{t("task.selectedOf", { n: task.drafts.length })}
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button variant="secondary" onClick={allDraftsSelected ? clearDraftSelection : selectAllDrafts} disabled={done || task.drafts.length === 0}>
-                  {allDraftsSelected ? "Unselect all" : "Select all"}
+                  {allDraftsSelected ? t("review.unselectAll") : t("review.selectAll")}
                 </Button>
                 {!allDraftsSelected && (
-                  <Button variant="secondary" onClick={clearDraftSelection} disabled={done || selectedDrafts.length === 0}>Clear selection</Button>
+                  <Button variant="secondary" onClick={clearDraftSelection} disabled={done || selectedDrafts.length === 0}>{t("task.clearSelection")}</Button>
                 )}
                 {task.drafts.length > 0 && (
-                  <span title={selectedDrafts.length > 0 ? "Copy the selected testcases as tab-separated values, ready to paste into Excel." : "Copy every generated testcase as tab-separated values, ready to paste into Excel."}>
+                  <span title={selectedDrafts.length > 0 ? t("task.copySelectedTitle") : t("task.copyAllTitle")}>
                     <CopyButton
                       value={draftsTsv}
-                      label={selectedDrafts.length > 0 ? `Copy ${selectedDrafts.length} selected` : "Copy all"}
-                      copiedLabel="Copied"
+                      label={selectedDrafts.length > 0 ? t("task.copySelected", { n: selectedDrafts.length }) : t("task.copyAll")}
+                      copiedLabel={t("copied")}
                     />
                   </span>
                 )}
-                <Button variant="secondary" onClick={() => openSaveModal()} disabled={done || selectedDrafts.length === 0}>Save selected</Button>
-                <Button variant="secondary" onClick={() => void handleDeleteSelectedDrafts()} disabled={done || working || selectedDrafts.length === 0}>Delete selected</Button>
+                <Button variant="secondary" onClick={() => openSaveModal()} disabled={done || selectedDrafts.length === 0}>{t("task.saveSelected")}</Button>
+                <Button variant="secondary" onClick={() => void handleDeleteSelectedDrafts()} disabled={done || working || selectedDrafts.length === 0}>{t("task.deleteSelected")}</Button>
               </div>
             </div>
             <div className="overflow-x-auto">
@@ -588,30 +618,30 @@ export default function ZyraTaskDetailPage() {
                         checked={allDraftsSelected}
                         onChange={allDraftsSelected ? clearDraftSelection : selectAllDrafts}
                         disabled={done || task.drafts.length === 0}
-                        aria-label="Select all generated testcases"
+                        aria-label={t("task.selectAllAria")}
                       />
                     </th>
-                    <th className="px-3 py-3">Testcase</th>
-                    <th className="px-3 py-3">Priority</th>
-                    <th className="px-3 py-3">Severity</th>
-                    <th className="px-3 py-3">Component</th>
-                    <th className="px-3 py-3">Preconditions</th>
-                    <th className="px-3 py-3">Steps</th>
-                    <th className="px-3 py-3">Expected Result</th>
-                    <th className="px-3 py-3 text-right">Actions</th>
+                    <th className="px-3 py-3">{t("col.testcase")}</th>
+                    <th className="px-3 py-3">{t("col.priority")}</th>
+                    <th className="px-3 py-3">{t("col.severity")}</th>
+                    <th className="px-3 py-3">{t("col.component")}</th>
+                    <th className="px-3 py-3">{t("col.preconditions")}</th>
+                    <th className="px-3 py-3">{t("col.steps")}</th>
+                    <th className="px-3 py-3">{t("col.expectedResultCap")}</th>
+                    <th className="px-3 py-3 text-right">{t("col.actions")}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {task.drafts.map((draft, index) => (
                     <tr key={`${task.id}-${index}`} className="border-t border-[var(--border)] align-top">
                       <td className="px-3 py-3">
-                        <input type="checkbox" checked={selectedDrafts.includes(index)} onChange={() => toggleDraft(index)} disabled={done} aria-label={`Select testcase ${index + 1}`} />
+                        <input type="checkbox" checked={selectedDrafts.includes(index)} onChange={() => toggleDraft(index)} disabled={done} aria-label={t("task.selectRow", { n: index + 1 })} />
                       </td>
                       <td className="max-w-[260px] px-3 py-3">
                         {draft.action && (
                           <div className="mb-1 flex flex-wrap items-center gap-1.5">
                             <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
-                              {ACTION_LABEL[draft.action] || draft.action}
+                              {t.opt(`draftAction.${draft.action}`) || draft.action}
                             </StatusChip>
                             {draft.externalId && <span className="font-mono text-[11px] text-[var(--muted-soft)]">{draft.externalId}</span>}
                           </div>
@@ -627,22 +657,22 @@ export default function ZyraTaskDetailPage() {
                       <td className="px-3 py-3">
                         <span className="rounded bg-[var(--surface-secondary)] px-2 py-1 text-xs font-medium text-[var(--muted)]">{draft.priority}</span>
                       </td>
-                      <td className="px-3 py-3">{knownSeverity(draft.severity) && <SeverityBadge severity={knownSeverity(draft.severity)!} />}</td>
+                      <td className="px-3 py-3">{knownSeverity(draft.severity) && <ZyraSeverityBadge severity={knownSeverity(draft.severity)!} />}</td>
                       <td className="px-3 py-3 text-[var(--muted)]">{draft.component || ""}</td>
                       <td className="max-w-[220px] px-3 py-3 text-[var(--muted)]">{draft.preconditions}</td>
-                      <td className="px-3 py-3 text-[var(--muted)]">{stepCount(draft.stepsJson)} step{stepCount(draft.stepsJson) === 1 ? "" : "s"}</td>
+                      <td className="px-3 py-3 text-[var(--muted)]">{t("task.stepCount", { n: stepCount(draft.stepsJson) })}</td>
                       <td className="max-w-[260px] px-3 py-3 text-[var(--muted)]">{draft.expectedSummary}</td>
                       <td className="px-3 py-3">
                         <div className="flex justify-end gap-2">
-                          <Button variant="secondary" onClick={() => openSaveModal([index])} disabled={done || working}>Save</Button>
-                          <Button variant="secondary" onClick={() => void handleDeleteDraft(index)} disabled={done || working}>Delete</Button>
+                          <Button variant="secondary" onClick={() => openSaveModal([index])} disabled={done || working}>{t("save")}</Button>
+                          <Button variant="secondary" onClick={() => void handleDeleteDraft(index)} disabled={done || working}>{t("task.delete")}</Button>
                         </div>
                       </td>
                     </tr>
                   ))}
                   {task.drafts.length === 0 && (
                     <tr>
-                      <td colSpan={9} className="px-3 py-10 text-center text-sm text-[var(--muted)]">No generated testcases remain for this task.</td>
+                      <td colSpan={9} className="px-3 py-10 text-center text-sm text-[var(--muted)]">{t("task.noDrafts")}</td>
                     </tr>
                   )}
                 </tbody>
@@ -665,35 +695,35 @@ export default function ZyraTaskDetailPage() {
                   <div className="flex items-center justify-between gap-2">
                     <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
                       {isAgent ? <IconSparkles size={12} stroke={1.75} /> : <IconUser size={12} stroke={1.75} />}
-                      {isAgent ? "Zyra" : "You"}
+                      {isAgent ? "Zyra" : t("you")}
                     </span>
                     <span className="text-[11px] text-[var(--muted-soft)]">
-                      {activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}
+                      {activity.createdAt ? new Date(activity.createdAt).toLocaleString(t.locale) : ""}
                     </span>
                   </div>
                   <p className="mt-1 whitespace-pre-wrap text-sm text-[var(--muted)]">{activity.detail || activity.title}</p>
                 </div>
               );
             })}
-            {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">No feedback yet.</p>}
+            {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noFeedback")}</p>}
           </Card>
 
           <Card className="p-4 space-y-4">
             <div>
-              <h2 className="text-base font-semibold text-[var(--foreground)]">Send feedback</h2>
-              <p className="mt-1 text-sm text-[var(--muted)]">Send updates from the same review table so Zyra can regenerate this task with the latest context.</p>
+              <h2 className="text-base font-semibold text-[var(--foreground)]">{t("task.sendFeedbackTitle")}</h2>
+              <p className="mt-1 text-sm text-[var(--muted)]">{t("task.sendFeedbackHint")}</p>
             </div>
             <Field>
-              <FieldLabel>Feedback for Zyra</FieldLabel>
-              <Textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} rows={5} placeholder="Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule." />
+              <FieldLabel>{t("task.feedbackLabel")}</FieldLabel>
+              <Textarea value={feedback} onChange={(event) => setFeedback(event.target.value)} rows={5} placeholder={t("task.feedbackPlaceholder")} />
             </Field>
             <Field>
-              <FieldLabel>Docs or ticket references for knowledge base</FieldLabel>
-              <Textarea value={referenceNote} onChange={(event) => setReferenceNote(event.target.value)} rows={3} placeholder="Mention docs, Jira or Linear tickets, release notes, or policy links Zyra should consider." />
+              <FieldLabel>{t("task.refsLabel")}</FieldLabel>
+              <Textarea value={referenceNote} onChange={(event) => setReferenceNote(event.target.value)} rows={3} placeholder={t("task.refsPlaceholder")} />
             </Field>
             {jiraTickets.length > 0 && (
               <Field>
-                <FieldLabel>Attach Jira tickets</FieldLabel>
+                <FieldLabel>{t("task.attachJira")}</FieldLabel>
                 <Select
                   value=""
                   onChange={(event) => {
@@ -701,7 +731,7 @@ export default function ZyraTaskDetailPage() {
                     if (key && !selectedJiraKeys.includes(key)) setSelectedJiraKeys((prev) => [...prev, key]);
                   }}
                 >
-                  <option value="">Select ticket...</option>
+                  <option value="">{t("task.selectTicket")}</option>
                   {jiraTickets.map((ticket) => (
                     <option key={ticket.id} value={ticket.jiraIssueKey}>{ticket.jiraIssueKey} - {ticket.summary}</option>
                   ))}
@@ -724,7 +754,7 @@ export default function ZyraTaskDetailPage() {
             )}
             {linearTickets.length > 0 && (
               <Field>
-                <FieldLabel>Attach Linear tickets</FieldLabel>
+                <FieldLabel>{t("task.attachLinear")}</FieldLabel>
                 <Select
                   value=""
                   onChange={(event) => {
@@ -732,7 +762,7 @@ export default function ZyraTaskDetailPage() {
                     if (key && !selectedLinearKeys.includes(key)) setSelectedLinearKeys((prev) => [...prev, key]);
                   }}
                 >
-                  <option value="">Select ticket...</option>
+                  <option value="">{t("task.selectTicket")}</option>
                   {linearTickets.map((ticket) => (
                     <option key={ticket.id} value={ticket.linearIssueKey}>{ticket.linearIssueKey} - {ticket.summary}</option>
                   ))}
@@ -756,11 +786,11 @@ export default function ZyraTaskDetailPage() {
             {!canGiveFeedback && (
               <p className="text-xs text-[var(--muted)]">
                 {taskStatusNow === "in_progress" || taskStatusNow === "todo"
-                  ? "Feedback opens up once Zyra finishes generating drafts for this task."
-                  : "Feedback isn't available once a task is closed."}
+                  ? t("task.feedbackLocked")
+                  : t("task.feedbackClosed")}
               </p>
             )}
-            <Button variant="secondary" onClick={handleFeedback} disabled={working || !canGiveFeedback || !feedback.trim()}>{working ? "Sending..." : "Send feedback"}</Button>
+            <Button variant="secondary" onClick={handleFeedback} disabled={working || !canGiveFeedback || !feedback.trim()}>{working ? t("task.sending") : t("task.sendFeedback")}</Button>
           </Card>
         </div>
       )}
@@ -771,20 +801,20 @@ export default function ZyraTaskDetailPage() {
             <div key={`${activity.title}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{activity.actor} - {(activity.stage || "").replaceAll("_", " ")}</span>
-                <span className="text-[11px] text-[var(--muted-soft)]">{activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}</span>
+                <span className="text-[11px] text-[var(--muted-soft)]">{activity.createdAt ? new Date(activity.createdAt).toLocaleString(t.locale) : ""}</span>
               </div>
               <h3 className="mt-1 text-sm font-semibold text-[var(--foreground)]">{activity.title}</h3>
               <p className="mt-1 whitespace-pre-wrap text-sm text-[var(--muted)]">{activity.detail}</p>
             </div>
           ))}
-          {task.activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
+          {task.activities.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noActivity")}</p>}
         </Card>
       )}
 
       {activeTab === "sources" && (
         <Card className="p-4 space-y-3">
           {task.sources.length === 0 ? (
-            <p className="text-sm text-[var(--muted)]">No source summary recorded.</p>
+            <p className="text-sm text-[var(--muted)]">{t("task.noSources")}</p>
           ) : (
             task.sources.map((source, index) => (
               <div key={`${source.type}-${index}`} className="rounded-lg border border-[var(--border)] p-3">
@@ -804,37 +834,45 @@ export default function ZyraTaskDetailPage() {
         </Card>
       )}
 
-      <Modal open={savingOpen} onClose={closeSaveModal} title="Save generated testcases">
+      <Modal open={savingOpen} onClose={closeSaveModal} title={t("task.saveModal.title")}>
         <div className="space-y-4">
-          <p className="text-sm text-[var(--muted)]">Save {(savingDraftIndexes || selectedDrafts).length} selected testcase draft(s) into a suite.</p>
+          <p className="text-sm text-[var(--muted)]">{t("task.saveModal.body", { n: (savingDraftIndexes || selectedDrafts).length })}</p>
           {saveError && <p role="alert" className="rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">{saveError}</p>}
           <Field>
-            <FieldLabel>Suite target</FieldLabel>
+            <FieldLabel>{t("task.suiteTarget")}</FieldLabel>
             <Select value={saveMode} onChange={(event) => setSaveMode(event.target.value as SaveMode)}>
-              <option value="existing">Existing suite</option>
-              <option value="new">Create suite</option>
+              {/* Disabled so it can't be re-picked once a real target is chosen. */}
+              <option value="" disabled>{t("task.selectSuite")}</option>
+              <option value="none">{t("task.noSuite")}</option>
+              <option value="existing">{t("task.existingSuite")}</option>
+              <option value="new">{t("task.createSuite")}</option>
             </Select>
           </Field>
-          {saveMode === "existing" ? (
+          {saveMode === "existing" && (
             <Field>
-              <FieldLabel>Existing suite</FieldLabel>
+              <FieldLabel>{t("task.selectExistingSuite")}</FieldLabel>
               <Select value={targetSuiteId} onChange={(event) => setTargetSuiteId(event.target.value)}>
-                <option value="">No suite</option>
+                <option value="" disabled>{t("task.selectASuite")}</option>
                 {suites.map((suite) => <option key={suite.id} value={suite.id}>{suite.name}</option>)}
               </Select>
+              {suites.length === 0 && <FieldHint>{t("task.noSuitesHint")}</FieldHint>}
             </Field>
-          ) : (
+          )}
+          {saveMode === "new" && (
             <Field>
-              <FieldLabel>New suite name</FieldLabel>
-              <Input value={newSuiteName} onChange={(event) => setNewSuiteName(event.target.value)} placeholder="AI generated regression" />
+              <FieldLabel>{t("task.newSuiteName")}</FieldLabel>
+              <Input value={newSuiteName} onChange={(event) => setNewSuiteName(event.target.value)} placeholder={t("task.newSuitePlaceholder")} maxLength={SUITE_NAME_MAX_LENGTH} />
+              {/* Shown once something is typed, so a freshly opened field isn't already in error. */}
+              {newSuiteName && newSuiteNameError && <FieldError>{newSuiteNameError}</FieldError>}
             </Field>
           )}
           <div className="flex justify-end gap-2">
-            <Button variant="secondary" onClick={closeSaveModal} disabled={working}>Cancel</Button>
-            <Button onClick={handleSave} disabled={working || (savingDraftIndexes || selectedDrafts).length === 0 || (saveMode === "new" && !newSuiteName.trim())}>{working ? "Saving..." : "Save"}</Button>
+            <Button variant="secondary" onClick={closeSaveModal} disabled={working}>{t("cancel")}</Button>
+            <Button onClick={handleSave} disabled={!canSave}>{working ? t("savingDots") : t("save")}</Button>
           </div>
         </div>
       </Modal>
     </StandardPageLayout>
+    </ZyraLanguageContext.Provider>
   );
 }

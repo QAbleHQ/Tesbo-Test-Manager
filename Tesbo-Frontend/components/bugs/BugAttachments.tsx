@@ -30,10 +30,15 @@ type BugAttachmentsProps = {
   projectId: string;
   attachments: BugAttachment[];
   /** Called once the server has deleted an attachment, so the caller can refresh its bug. */
-  onDeleted: (attachmentId: string) => void;
+  onDeleted?: (attachmentId: string) => void;
+  /**
+   * A comment's files reuse this view read-only: no "Attachments (n)" heading, and no Delete — those
+   * files are removed by editing the comment, under the comment's permissions.
+   */
+  readOnly?: boolean;
 };
 
-export default function BugAttachments({ projectId, attachments, onDeleted }: BugAttachmentsProps) {
+export default function BugAttachments({ projectId, attachments, onDeleted, readOnly = false }: BugAttachmentsProps) {
   const [viewing, setViewing] = useState<BugAttachment | null>(null);
   const [confirming, setConfirming] = useState<BugAttachment | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -51,7 +56,7 @@ export default function BugAttachments({ projectId, attachments, onDeleted }: Bu
       await deleteBugAttachment(target.id);
       setConfirming(null);
       if (viewing?.id === target.id) setViewing(null);
-      onDeleted(target.id);
+      onDeleted?.(target.id);
     } catch (err) {
       setConfirming(null);
       setError(err instanceof Error ? err.message : `Couldn't delete ${target.fileName}.`);
@@ -65,9 +70,11 @@ export default function BugAttachments({ projectId, attachments, onDeleted }: Bu
 
   return (
     <div>
-      <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-        Attachments <span className="text-[var(--muted-soft)]">({attachments.length})</span>
-      </p>
+      {!readOnly && (
+        <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+          Attachments <span className="text-[var(--muted-soft)]">({attachments.length})</span>
+        </p>
+      )}
 
       {error && (
         <p role="alert" data-testid="bug-attachment-error" className="mb-2 text-[13px] text-[var(--error-foreground)]">
@@ -104,9 +111,11 @@ export default function BugAttachments({ projectId, attachments, onDeleted }: Bu
                 <button type="button" onClick={() => setViewing(att)} aria-label={`View ${att.fileName}`} title="View" className={`${iconButton} hover:text-[var(--accent-light)]`}>
                   <IconEye size={15} />
                 </button>
-                <button type="button" onClick={() => setConfirming(att)} aria-label={`Delete ${att.fileName}`} title="Delete" className={`${iconButton} hover:text-[var(--error-foreground)]`}>
-                  <IconTrash size={15} />
-                </button>
+                {!readOnly && (
+                  <button type="button" onClick={() => setConfirming(att)} aria-label={`Delete ${att.fileName}`} title="Delete" className={`${iconButton} hover:text-[var(--error-foreground)]`}>
+                    <IconTrash size={15} />
+                  </button>
+                )}
               </div>
             </li>
           ))}
@@ -140,9 +149,11 @@ export default function BugAttachments({ projectId, attachments, onDeleted }: Bu
               >
                 <IconExternalLink size={15} />
               </a>
-              <button type="button" onClick={() => setConfirming(att)} aria-label={`Delete ${att.fileName}`} title="Delete" className={`${iconButton} hover:text-[var(--error-foreground)]`}>
-                <IconTrash size={15} />
-              </button>
+              {!readOnly && (
+                <button type="button" onClick={() => setConfirming(att)} aria-label={`Delete ${att.fileName}`} title="Delete" className={`${iconButton} hover:text-[var(--error-foreground)]`}>
+                  <IconTrash size={15} />
+                </button>
+              )}
             </li>
           ))}
         </ul>
@@ -161,9 +172,11 @@ export default function BugAttachments({ projectId, attachments, onDeleted }: Bu
                 >
                   <IconDownload size={14} /> Download
                 </a>
-                <Button variant="secondary" size="sm" onClick={() => setConfirming(viewing)}>
-                  <IconTrash size={14} /> Delete
-                </Button>
+                {!readOnly && (
+                  <Button variant="secondary" size="sm" onClick={() => setConfirming(viewing)}>
+                    <IconTrash size={14} /> Delete
+                  </Button>
+                )}
                 <button
                   type="button"
                   onClick={() => setViewing(null)}

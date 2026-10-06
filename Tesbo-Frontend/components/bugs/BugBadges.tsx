@@ -77,6 +77,8 @@ export function BugStatusBadge({ status }: { status: string }) {
 }
 
 /* ───── Severity badge ───── */
-export function BugSeverityBadge({ severity }: { severity: BugSeverity }) {
+export function BugSeverityBadge({ severity }: { severity: BugSeverity | null }) {
+  // Not selected renders the same as an untriaged priority (BugPriorityBadge above).
+  if (!severity) return <span className="text-xs text-[var(--muted-soft)]">—</span>;
   return <SeverityBadge severity={severity} />;
 }

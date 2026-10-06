@@ -260,18 +260,28 @@ test.describe("zyra / agents (UI)", () => {
    * would once applyZyraChatOperations stages it. Seeded directly for the same reason seedTask()
    * is: reaching this state through the live chat route needs a model this suite never calls.
    */
-  function seedChatReviewBatch(options: { status?: string; entries?: ChatEntry[] } = {}): {
+  //
+  // `sessionId` appends another batch to an existing session (an exhaustive plan posts one message
+  // per batch into the same conversation). `linkMessage: false` writes the message without
+  // review_request_id — the shape every background plan batch was stored in before
+  // postZyraPlanMessage persisted it, while each row still carried its own reviewRequestId.
+  function seedChatReviewBatch(
+    options: { status?: string; entries?: ChatEntry[]; sessionId?: string; linkMessage?: boolean; content?: string } = {},
+  ): {
     taskId: string;
     sessionId: string;
   } {
     const t = tenant!;
-    exec(
-      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
-        `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
-    );
-    const sessionId = scalar(
-      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
-    );
+    let sessionId = options.sessionId;
+    if (!sessionId) {
+      exec(
+        "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+          `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
+      );
+      sessionId = scalar(
+        `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+      );
+    }
     const entries: ChatEntry[] = options.entries ?? [
       {
         opType: "create",
@@ -318,7 +328,8 @@ test.describe("zyra / agents (UI)", () => {
     exec(
       "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
         `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
-        `'I have drafted these test cases for your review.', 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ${literal(taskId)});`,
+        `${literal(options.content ?? "I have drafted these test cases for your review.")}, 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ` +
+        `${options.linkMessage === false ? "NULL" : literal(taskId)});`,
     );
     exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
     return { taskId, sessionId };
@@ -1538,6 +1549,167 @@ test.describe("zyra / agents (UI)", () => {
   });
 
   /*
+   * "Save Test Cases popup — suite target" — the modal used to open on "Existing suite" with that
+   * dropdown's empty value labelled "No suite", so an untouched modal was already submittable and
+   * silently saved unassigned test cases. "No suite" was an option of the wrong dropdown, and Save
+   * had no rule for the existing-suite path at all. The target is now an explicit choice (No suite /
+   * Existing suite / Create new suite) behind a "Select suite" placeholder, and Save is enabled only
+   * when the chosen path is complete. ZYU-128..132 pin each path plus the payload it sends.
+   */
+  const SUITE_TARGET_OPTIONS = ["Select suite", "No suite", "Existing suite", "Create new suite"];
+
+  function isSaveRequest(taskId: string) {
+    // Pathname predicate rather than a glob: the API is on a different origin from the page.
+    return (req: { url(): string; method(): string }) =>
+      req.method() === "POST" && new URL(req.url()).pathname === `/api/projects/${tenant!.mainProjectId}/agents/zyra/tasks/${taskId}/save`;
+  }
+
+  async function seedSuite(name: string): Promise<string> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, { data: { name } });
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    return String((await res.json()).id);
+  }
+
+  async function openSaveFor(page: Page, title: string | RegExp): Promise<Locator> {
+    await page.getByRole("row", { name: title }).getByRole("button", { name: "Save" }).click();
+    return modal(page, "Save generated testcases");
+  }
+
+  test("ZYU-128 the Save modal opens on 'Select suite' with Save disabled and no suite fields", async ({ browser }) => {
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, /Sign in with a valid password/);
+
+    const target = dialog.getByRole("combobox");
+    // Exactly one select: the target. The existing-suite picker and name field are not rendered yet.
+    await expect(target).toHaveCount(1);
+    await expect(target).toHaveValue("");
+    await expect(target.locator("option:checked")).toHaveText("Select suite");
+    expect((await target.locator("option").allTextContents()).map((s) => s.trim())).toEqual(SUITE_TARGET_OPTIONS);
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
+  test("ZYU-129 'No suite' hides every suite field and saves the draft unassigned", async ({ browser }) => {
+    const title = stamp("No suite draft");
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+
+    await dialog.getByRole("combobox").selectOption("none");
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    const save = dialog.getByRole("button", { name: "Save" });
+    await expect(save).toBeEnabled();
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await save.click();
+    expect((await request).postDataJSON().suiteId).toBeUndefined();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText("1 testcase saved.")).toBeVisible();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(suite_id::text, 'NULL') FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe("NULL");
+  });
+
+  test("ZYU-130 'Existing suite' blocks Save until a suite is picked, then saves into that suite", async ({ browser }) => {
+    const title = stamp("Existing suite draft");
+    const suiteName = stamp("Target suite");
+    const suiteId = await seedSuite(suiteName);
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    const save = dialog.getByRole("button", { name: "Save" });
+
+    await dialog.getByRole("combobox").first().selectOption("existing");
+    const picker = dialog.getByRole("combobox").nth(1);
+    await expect(picker).toBeVisible();
+    await expect(picker).toHaveValue("");
+    // "No suite" is a target of its own now, not a value hiding inside this list.
+    const pickerOptions = (await picker.locator("option").allTextContents()).map((s) => s.trim());
+    expect(pickerOptions).not.toContain("No suite");
+    expect(pickerOptions).toContain(suiteName);
+    await expect(save).toBeDisabled();
+
+    await picker.selectOption({ label: suiteName });
+    await expect(save).toBeEnabled();
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await save.click();
+    expect((await request).postDataJSON().suiteId).toBe(suiteId);
+    await expect
+      .poll(() => scalar(`SELECT suite_id::text FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe(suiteId);
+  });
+
+  test("ZYU-131 'Create new suite' keeps Save disabled for a blank name and caps the name at 255", async ({ browser }) => {
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, /Sign in with a valid password/);
+    const save = dialog.getByRole("button", { name: "Save" });
+
+    await dialog.getByRole("combobox").selectOption("new");
+    const name = dialog.getByRole("textbox");
+    await expect(name).toBeVisible();
+    await expect(save).toBeDisabled();
+
+    await name.fill("   ");
+    await expect(save).toBeDisabled();
+    await expect(dialog.getByText("Suite name is required")).toBeVisible();
+
+    // suites.name is VARCHAR(255); the field stops there instead of letting the API reject it.
+    await name.fill("x".repeat(300));
+    await expect(name).toHaveValue("x".repeat(255));
+    await expect(save).toBeEnabled();
+
+    await name.fill(stamp("Suite"));
+    await expect(dialog.getByText("Suite name is required")).toHaveCount(0);
+    await expect(save).toBeEnabled();
+    // No click: ZYU-14 already proves the create-and-save path end to end.
+  });
+
+  test("ZYU-132 switching target drops the stale suite, and reopening the modal starts clean", async ({ browser }) => {
+    const title = stamp("Switch target draft");
+    const suiteName = stamp("Stale suite");
+    await seedSuite(suiteName);
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    let dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    const target = dialog.getByRole("combobox").first();
+
+    await target.selectOption("existing");
+    await dialog.getByRole("combobox").nth(1).selectOption({ label: suiteName });
+    await target.selectOption("new");
+    await dialog.getByRole("textbox").fill(stamp("Abandoned"));
+
+    // Cancel and reopen: nothing from the abandoned attempt survives.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+    await expect(dialog.getByRole("combobox")).toHaveValue("");
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    await dialog.getByRole("combobox").selectOption("existing");
+    await expect(dialog.getByRole("combobox").nth(1)).toHaveValue("");
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    // Pick a suite, then change your mind: the suite must not ride along with a "No suite" save.
+    await dialog.getByRole("combobox").nth(1).selectOption({ label: suiteName });
+    await dialog.getByRole("combobox").first().selectOption("none");
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await dialog.getByRole("button", { name: "Save" }).click();
+    expect((await request).postDataJSON().suiteId).toBeUndefined();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(suite_id::text, 'NULL') FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe("NULL");
+    // And no suite was created by the abandoned "Create new suite" attempt.
+    expect(Number(scalar(`SELECT COUNT(*) FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name LIKE 'E2E Abandoned %';`))).toBe(0);
+  });
+
+  /*
    * "[Zyra] Save Test Cases error message is hidden behind the modal" — a failed save used to write
    * to the page-level error banner, which sits under the modal's portaled backdrop. The text was in
    * the DOM, so a page-wide toBeVisible() would have passed; the assertion is therefore scoped to
@@ -1567,6 +1739,8 @@ test.describe("zyra / agents (UI)", () => {
 
     await page.getByRole("row", { name: new RegExp(title) }).getByRole("button", { name: "Save" }).click();
     const dialog = modal(page, "Save generated testcases");
+    // The modal opens on "Select suite" and can't submit until a target is chosen (ZYU-128).
+    await dialog.getByRole("combobox").selectOption("none");
     await dialog.getByRole("button", { name: "Save" }).click();
 
     // In flight: the button reports it, and Escape can't dismiss the modal out from under the result.
@@ -1588,6 +1762,8 @@ test.describe("zyra / agents (UI)", () => {
     await expect(dialog.getByRole("alert")).toHaveCount(0);
 
     // Retry goes through the unchanged success path: modal closes, page confirms, the row exists.
+    // Reopening resets the target too (ZYU-132), so it's chosen again.
+    await dialog.getByRole("combobox").selectOption("none");
     await dialog.getByRole("button", { name: "Save" }).click();
     await expect(dialog).toHaveCount(0);
     await expect(page.getByText("1 testcase saved.")).toBeVisible();
@@ -2798,6 +2974,101 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByRole("button", { name: /Save \d+ to repository/ })).toHaveCount(0);
   });
 
+  /*
+   * "All – Exhaustive" plans post one assistant message per batch into the same conversation. Every
+   * batch after the first was stored without review_request_id (postZyraPlanMessage never wrote it),
+   * and the panel only rendered off that column — so the header said "5 test cases drafted for
+   * review" with nothing under it. The rows themselves still carried their batch's reviewRequestId;
+   * these pin that every batch renders, earlier ones survive later ones, and each panel acts on its
+   * own batch. api/zyra-chat-consistency.spec.ts ZCC-B-17 pins the stored link for new batches.
+   */
+  function planBatch(label: string, count: number): ChatEntry[] {
+    return Array.from({ length: count }, (_, i) => ({
+      opType: "create" as const,
+      draft: { suiteId: null, title: `${label} case ${i + 1}`, description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+    }));
+  }
+
+  test("ZYU-125 every batch of an exhaustive plan renders its drafts, including batches stored without the message-level review link", async ({ browser }) => {
+    const b1 = stamp("Plan batch one");
+    const b2 = stamp("Plan batch two");
+    const b3 = stamp("Plan batch three");
+    const first = seedChatReviewBatch({ entries: planBatch(b1, 2), content: "I identified 6 distinct scenarios to cover. Here are the first 2." });
+    const second = seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b2, 2), linkMessage: false, content: "Here are 2 more test case(s) — 4/6 scenarios covered so far." });
+    const third = seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b3, 2), linkMessage: false, content: "Here are the final 2 test case(s) — all 6 scenarios are now covered." });
+    const page = await open(browser, "/agents/zyra");
+
+    for (const label of [b1, b2, b3]) {
+      await expect(page.getByText(`${label} case 1`), `${label} must be reviewable in the chat`).toBeVisible();
+      await expect(page.getByText(`${label} case 2`)).toBeVisible();
+    }
+    await expect(page.getByText(/2 of 2 selected — pending review/), "one review panel per batch").toHaveCount(3);
+
+    // The fallback panel must address ITS batch, not the first one: a discard in batch three
+    // changes batch three's stored drafts and leaves the other two untouched.
+    await page.getByRole("listitem").filter({ hasText: `${b3} case 1` }).getByRole("button", { name: "Discard" }).click();
+    await expect(page.getByText(`${b3} case 1`)).toHaveCount(0);
+    await expect.poll(() => draftTitles(third.taskId)).toEqual([`${b3} case 2`]);
+    expect(draftTitles(second.taskId)).toEqual([`${b2} case 1`, `${b2} case 2`]);
+    expect(draftTitles(first.taskId)).toEqual([`${b1} case 1`, `${b1} case 2`]);
+  });
+
+  test("ZYU-126 a batch landing while the plan runs is appended below the earlier one, which keeps its review state", async ({ browser }) => {
+    const b1 = stamp("Running plan batch one");
+    const b2 = stamp("Running plan batch two");
+    const first = seedChatReviewBatch({ entries: planBatch(b1, 2), content: "I identified 4 distinct scenarios to cover. Here are the first 2." });
+    // A plan row the page polls on — nothing executes it (the batch loop is only ever launched by a
+    // send, a resume, or a backend restart), so this test controls exactly when the next batch lands.
+    const plan = { planId: `e2e-plan-${Date.now()}`, status: "running", remainingScenarios: ["S3", "S4"], batchSize: 2, doneCount: 2, totalCount: 4, originalMessage: "Generate all possible cases" };
+    exec(`UPDATE zyra_chat_sessions SET active_plan = ${literal(JSON.stringify(plan))}::jsonb WHERE id = ${literal(first.sessionId)};`);
+    try {
+      const page = await open(browser, "/agents/zyra");
+      await expect(page.getByText(/Generating remaining scenarios — 2\/4 covered \(50%\)/)).toBeVisible();
+      await expect(page.getByText(`${b1} case 1`)).toBeVisible();
+      // In-progress review work on the earlier batch, which the next poll must not reset.
+      await page.getByRole("checkbox", { name: "Select proposed test case 1" }).first().uncheck();
+      await expect(page.getByText(/1 of 2 selected — pending review/)).toBeVisible();
+
+      // The background loop's next batch, stored the way postZyraPlanMessage now stores it.
+      seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b2, 2), content: "Here are the final 2 test case(s) — all 4 scenarios are now covered." });
+      exec(`UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = ${literal(first.sessionId)};`);
+
+      await expect(page.getByText(`${b2} case 1`), "the new batch must appear without a reload").toBeVisible({ timeout: 15_000 });
+      await expect(page.getByText(`${b2} case 2`)).toBeVisible();
+      await expect(page.getByText(`${b1} case 1`), "the earlier batch must not be replaced").toBeVisible();
+      await expect(page.getByText(/1 of 2 selected — pending review/), "the earlier batch's selection survives the refresh").toBeVisible();
+      await expect(page.getByText(/2 of 2 selected — pending review/)).toHaveCount(1);
+      await expect(page.getByText(/Generating remaining scenarios/)).toHaveCount(0);
+      // Each title rendered once — a refresh replaces the transcript, it never duplicates a batch.
+      await expect(page.getByText(`${b1} case 1`)).toHaveCount(1);
+      await expect(page.getByText(`${b2} case 1`)).toHaveCount(1);
+    } finally {
+      exec(`UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = ${literal(first.sessionId)};`);
+    }
+  });
+
+  test("ZYU-127 an unlinked message whose rows name two different batches gets no guessed review panel", async ({ browser }) => {
+    const label = stamp("Ambiguous batch");
+    const { sessionId, taskId } = seedChatReviewBatch({ entries: planBatch(label, 2) });
+    const otherTask = seedChatReviewBatch({ sessionId, entries: planBatch(stamp("Other batch"), 1) }).taskId;
+    // Rewrite the first message as unlinked, with its second row pointing at the other batch.
+    const rows = JSON.parse(
+      scalar(`SELECT testcases::text FROM zyra_chat_messages WHERE review_request_id = ${literal(taskId)};`) || "[]",
+    ) as Array<Record<string, unknown>>;
+    rows[1].reviewRequestId = otherTask;
+    exec(
+      `UPDATE zyra_chat_messages SET review_request_id = NULL, testcases = ${literal(JSON.stringify(rows))}::jsonb ` +
+        `WHERE review_request_id = ${literal(taskId)};`,
+    );
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(/Other batch case 1/)).toBeVisible();
+    await expect(page.getByText(/1 of 1 selected — pending review/)).toBeVisible();
+    // Only the other, properly linked batch gets a panel — no actions are offered against a guess.
+    await expect(page.getByText(/of 2 selected — pending review/)).toHaveCount(0);
+    await expect(page.getByText(`${label} case 1`)).toHaveCount(0);
+  });
+
   test("ZYU-69 saving only part of a batch leaves the rest visible and actionable, not resolved", async ({ browser }) => {
     const { taskId } = seedChatReviewBatch();
     const page = await open(browser, "/agents/zyra");
@@ -3468,8 +3739,9 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     expect(res.status(), `seeding the KB doc — ${await res.text()}`).toBe(201);
   }
 
-  async function openChat(browser: Browser): Promise<Page> {
-    const ctx = await browser.newContext({ storageState: ownerState });
+  // `locale` sets the browser language. Zyra must ignore it — its language comes from what is typed.
+  async function openChat(browser: Browser, locale?: string): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: ownerState, ...(locale ? { locale } : {}) });
     contexts.push(ctx);
     const page = await ctx.newPage();
     await page.goto(`/projects/${tenant!.mainProjectId}/agents/zyra`);
@@ -3687,5 +3959,82 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     await expect(running.locator('[data-zyra-step="routing"]')).toContainText("[RUN]");
     await expect(running.locator('[data-zyra-step="context:jira"]')).toContainText("none found");
     await expect(composer(page)).toBeDisabled();
+  });
+
+  /* ───────── Zyra's language follows what the user types (lib/zyra-i18n.ts, V132) ───────── */
+
+  const RU_PLACEHOLDER = "Попросите Zyra создать, обновить или проверить тест-кейсы...";
+
+  test("ZYU-L-01 after a Russian message the chat screen's own labels switch to Russian, and the reply is shown", async ({ browser }) => {
+    await allocateFakeAiKey();
+    // An English browser: the switch comes from the typed text, not from the browser.
+    const page = await openChat(browser, "en-US");
+    const reply = "Для входа нужны email и пароль; после трёх неудачных попыток вход блокируется.";
+    queueAnswer(reply);
+
+    await composer(page).fill("Как работает вход в систему?");
+    await composer(page).press("Enter");
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+
+    // The composer, its send button and its keyboard hints are now Russian.
+    await expect(page.getByPlaceholder(RU_PLACEHOLDER)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Отправить" })).toBeVisible();
+    await expect(page.getByText("— отправить")).toBeVisible();
+    await expect(composer(page), "the English placeholder is gone").toHaveCount(0);
+    // And persisted: the session the page shows is stored as Russian.
+    const sessionId = scalar(`SELECT session_id FROM zyra_chat_messages WHERE project_id = ${literal(tenant!.mainProjectId)} AND role = 'user' LIMIT 1;`);
+    expect(scalar(`SELECT language FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBe("ru");
+  });
+
+  test("ZYU-L-02 a Russian browser typing English keeps the whole screen in English", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser, "ru-RU");
+    const reply = "Sign-in needs an email and a password; three failed attempts lock the account.";
+    queueAnswer(reply);
+
+    await composer(page).fill("How does sign-in work?");
+    await composer(page).press("Enter");
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeVisible();
+    await expect(page.getByPlaceholder(RU_PLACEHOLDER)).toHaveCount(0);
+  });
+
+  test("ZYU-L-03 Russian test cases are shown under Russian column headers, and a later English message switches back", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser);
+    const title = `Вход с неверным паролем отклонён ${Date.now() % 100000}`;
+    ai.queueReply({ reply: "", reasoningSummary: "Создание.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title,
+        preconditions: "Пользователь на странице входа.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Ввести неверный пароль", expectedResult: "Показана ошибка" }]),
+        testData: "",
+        expectedSummary: "Вход отклонён.",
+        priority: "P1",
+        severity: "High",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+    ai.queueReply("Noted.");
+
+    await composer(page).fill("Создай тест-кейс для неверного пароля на странице входа.");
+    await composer(page).press("Enter");
+    await expect(page.getByText(title).first()).toBeVisible({ timeout: 30_000 });
+    // The backend's own reply text and the screen's labels around the drafts are Russian.
+    await expect(page.getByText(/Я подготовил\(а\) 1 тест-кейс\(ов\), изучив:/)).toBeVisible();
+    await expect(page.getByText("Первый шаг").first()).toBeVisible();
+    await expect(page.getByText("Выбрать все").first()).toBeVisible();
+    // The severity a draft carries is stored as High and displayed in Russian.
+    await expect(page.getByText("Высокая").first()).toBeVisible();
+
+    // Now an English message: the next reply and the labels go back to English.
+    const english = "Sure — these cover the wrong-password path.";
+    queueAnswer(english);
+    await page.getByPlaceholder(RU_PLACEHOLDER).fill("Summarize what you just drafted for the login page, please.");
+    await page.getByPlaceholder(RU_PLACEHOLDER).press("Enter");
+    await expect(page.getByText(english)).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeVisible();
   });
 });

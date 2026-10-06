@@ -239,6 +239,16 @@ export default function ProjectDashboardPage() {
     { label: "Medium", count: bySeverity.Medium, text: "var(--muted)", bg: "var(--surface-secondary)", bar: "var(--muted-soft)" },
     { label: "Low", count: bySeverity.Low, text: "var(--success-foreground)", bg: "var(--success-soft)", bar: "var(--success)" },
   ];
+  // Open bugs with no severity selected (V130). Shown in the bar and the breakdown so the rows
+  // still add up to the total, but never as the stat card's badge — that names the worst severity.
+  const noSeverity = summary.openBugs.noSeverity ?? 0;
+  const BREAKDOWN_ROWS =
+    noSeverity > 0
+      ? [
+          ...SEVERITY_ROWS,
+          { label: "Not selected", count: noSeverity, text: "var(--muted-soft)", bg: "var(--surface-secondary)", bar: "var(--ink-200)" },
+        ]
+      : SEVERITY_ROWS;
   // The "Open bugs" stat card's badge used to only ever show Critical's count — so a project with,
   // say, 5 High bugs and 0 Critical showed no count badge at all, even though a non-zero count
   // existed. Falls through in severity order to the first non-zero row instead.
@@ -380,7 +390,7 @@ export default function ProjectDashboardPage() {
           bar={
             openBugsTotal > 0 ? (
               <ThinBar>
-                {SEVERITY_ROWS.filter((r) => r.count > 0).map((r) => (
+                {BREAKDOWN_ROWS.filter((r) => r.count > 0).map((r) => (
                   <div
                     key={r.label}
                     className="h-full"
@@ -529,10 +539,10 @@ export default function ProjectDashboardPage() {
               <p className="text-[13px] text-[var(--muted-soft)]">No open bugs right now.</p>
             ) : (
               <div className="space-y-2.5">
-                {SEVERITY_ROWS.map((row) => (
+                {BREAKDOWN_ROWS.map((row) => (
                   <div key={row.label} className="flex items-center gap-3">
                     <span
-                      className="w-16 shrink-0 rounded-[4px] px-2 py-0.5 text-center text-[11px] font-medium"
+                      className="w-[84px] shrink-0 whitespace-nowrap rounded-[4px] px-2 py-0.5 text-center text-[11px] font-medium"
                       style={{ background: row.bg, color: row.text }}
                     >
                       {row.label}

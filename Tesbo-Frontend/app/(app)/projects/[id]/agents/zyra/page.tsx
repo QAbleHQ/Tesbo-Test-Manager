@@ -54,6 +54,7 @@ import { toTsv } from "@/lib/tsv";
 import { renderMarkdown } from "@/lib/markdown";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { ZyraLanguageContext, useZyraText, zyraLanguage, zyraText, type ZyraT } from "@/lib/zyra-i18n";
 
 // ─── Zyra icon badge — gradient sparkle mark used in the header and per-message ──
 function ZyraMark({ size = 24 }: { size?: number }) {
@@ -68,21 +69,14 @@ function ZyraMark({ size = 24 }: { size?: number }) {
 }
 
 // ─── Quick actions shown on empty chat ───────────────────────────────────────
-const QUICK_ACTIONS = [
-  { label: "Generate smoke tests", prompt: "Generate smoke test cases covering the most critical user flows in this project." },
-  { label: "Find coverage gaps", prompt: "Analyze existing test cases and identify the most important areas of missing coverage." },
-  { label: "Add negative scenarios", prompt: "Add negative test cases for the main features, focusing on invalid inputs and error states." },
-  { label: "Improve expected results", prompt: "Review existing test cases and rewrite any weak or vague expected results to be more specific." },
-  { label: "Regression test cases", prompt: "Generate a regression test suite that covers the core product functionality." },
-  { label: "Review this module", prompt: "Review all test cases in this project and identify duplicates, outdated cases, and weak coverage." },
-  { label: "Edge cases", prompt: "Create edge case test scenarios covering boundary values, empty states, and unexpected inputs." },
-  { label: "API test cases", prompt: "Generate API test cases for the main endpoints covering success, error, and boundary scenarios." },
-];
+// Label and prompt text are "quick.<id>.label" / "quick.<id>.prompt" in lib/zyra-i18n.ts — both
+// localized, so a Russian session's chip puts a Russian prompt in the composer.
+const QUICK_ACTIONS = ["smoke", "gaps", "negative", "expected", "regression", "review", "edge", "api"] as const;
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
-function formatTime(value?: string) {
+function formatTime(value?: string, locale?: string) {
   if (!value) return "";
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(locale, {
     month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"
   }).format(new Date(value));
 }
@@ -115,7 +109,7 @@ function actionColor(action?: string): string {
   return "text-[var(--muted)]";
 }
 
-function summarizeTestcaseActions(rows: ZyraChatTestcaseRow[]): string | null {
+function summarizeTestcaseActions(rows: ZyraChatTestcaseRow[], t: ZyraT): string | null {
   if (!rows.length) return null;
   const counts = rows.reduce<Record<string, number>>((acc, row) => {
     const key = row.action || "suggested";
@@ -123,45 +117,52 @@ function summarizeTestcaseActions(rows: ZyraChatTestcaseRow[]): string | null {
     return acc;
   }, {});
   const proposedCount = (counts["proposed-create"] || 0) + (counts["proposed-update"] || 0) + (counts["proposed-archive"] || 0);
-  if (proposedCount === rows.length) return `${rows.length} test case${rows.length === 1 ? "" : "s"} drafted for review`;
+  if (proposedCount === rows.length) return t("tc.summary.drafted", { n: rows.length });
   const verb = counts.created ? "generated" : counts.updated ? "updated" : counts.archived ? "archived" : "suggested";
-  return `${rows.length} test case${rows.length === 1 ? "" : "s"} ${verb}`;
+  return t(`tc.summary.${verb}` as const, { n: rows.length });
+}
+
+/** The Source column's action word — localized for a known action, the raw value otherwise. */
+function sourceLabel(t: ZyraT, action?: string): string {
+  const value = action || "suggested";
+  return t.opt(`source.${value}`) ?? value;
 }
 
 // ─── TestcaseTable ────────────────────────────────────────────────────────────
 function TestcaseTable({ rows, projectId }: { rows: ZyraChatTestcaseRow[]; projectId: string }) {
+  const t = useZyraText();
   if (!rows.length) return null;
   const tsv = toTsv(
-    ["ID", "Title", "Priority", "Status", "First step", "Source"],
+    [t("col.id"), t("col.title"), t("col.priority"), t("col.status"), t("col.firstStep"), t("col.source")],
     rows.map((row) => [
       row.externalId || row.id || "",
       row.title,
       row.priority || "P2",
-      row.status || "Draft",
+      t.value("testcaseStatus", row.status || "Draft"),
       firstStepPreview(row.stepsJson),
-      row.action || "suggested",
+      sourceLabel(t, row.action),
     ])
   );
   return (
     <div className="mt-3 overflow-hidden rounded-lg border border-[var(--border)]">
       <div className="flex items-center justify-between gap-2 border-b border-[var(--border)] bg-[var(--background)] px-3 py-1.5">
         <span className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">
-          {rows.length} test case{rows.length === 1 ? "" : "s"}
+          {t("tc.count", { n: rows.length })}
         </span>
-        <span title="Copy these test cases as tab-separated values, ready to paste into Excel.">
-          <CopyButton value={tsv} label="Copy" copiedLabel="Copied" size="sm" />
+        <span title={t("tc.copyTitle")}>
+          <CopyButton value={tsv} label={t("copy")} copiedLabel={t("copied")} size="sm" />
         </span>
       </div>
       <div className="overflow-x-auto">
         <table className="min-w-full divide-y divide-[var(--border)] text-sm">
           <thead className="bg-[var(--background)]">
             <tr className="text-left text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">
-              <th className="px-3 py-2">ID</th>
-              <th className="px-3 py-2">Title</th>
-              <th className="px-3 py-2">Priority</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">First step</th>
-              <th className="px-3 py-2">Source</th>
+              <th className="px-3 py-2">{t("col.id")}</th>
+              <th className="px-3 py-2">{t("col.title")}</th>
+              <th className="px-3 py-2">{t("col.priority")}</th>
+              <th className="px-3 py-2">{t("col.status")}</th>
+              <th className="px-3 py-2">{t("col.firstStep")}</th>
+              <th className="px-3 py-2">{t("col.source")}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-[var(--border)] bg-[var(--surface)]">
@@ -171,7 +172,7 @@ function TestcaseTable({ rows, projectId }: { rows: ZyraChatTestcaseRow[]; proje
                   <div className="flex flex-col gap-1">
                     <span className="font-mono text-[11px] text-[var(--muted)]">{row.externalId || "—"}</span>
                     <StatusChip tone="info" className="w-fit !rounded-full !px-1.5 !py-0 !text-[10px] !font-medium">
-                      {row.type || "Functional"}
+                      {t.value("type", row.type || "Functional")}
                     </StatusChip>
                   </div>
                 </td>
@@ -181,7 +182,7 @@ function TestcaseTable({ rows, projectId }: { rows: ZyraChatTestcaseRow[]; proje
                 </td>
                 <td className="px-3 py-3">
                   <StatusChip tone={statusTone(row.status)} className="!px-[9px] !py-[2px] !text-[11px] !font-medium">
-                    {row.status || "Draft"}
+                    {t.value("testcaseStatus", row.status || "Draft")}
                   </StatusChip>
                 </td>
                 <td className="max-w-[220px] px-3 py-3 text-[11px] leading-snug text-[var(--muted)]">
@@ -190,9 +191,9 @@ function TestcaseTable({ rows, projectId }: { rows: ZyraChatTestcaseRow[]; proje
                 <td className="max-w-[220px] px-3 py-3">
                   <div className="flex flex-col gap-1">
                     <span className={`text-[11px] font-semibold capitalize ${actionColor(row.action)}`}>
-                      {row.action || "suggested"}
+                      {sourceLabel(t, row.action)}
                     </span>
-                    <span className="text-[10px] text-[var(--muted)]">AI · Zyra chat</span>
+                    <span className="text-[10px] text-[var(--muted)]">{t("source.aiChat")}</span>
                     <ZyraCitationsList refs={row.sourceRefs} projectId={projectId} />
                   </div>
                 </td>
@@ -395,6 +396,7 @@ function MessageBubble({
   onContinue: (messageId: string, opts?: { narrow?: boolean }) => Promise<void>;
 }) {
   const isUser = message.role === "user";
+  const t = useZyraText();
   const [copied, setCopied] = useState(false);
   // Guards only the click-to-ack round trip (fast — the backend responds before the actual resume
   // finishes) against a double-click; the potentially-minutes-long wait itself is shown by
@@ -427,7 +429,7 @@ function MessageBubble({
           <div className="rounded-[10px] border border-[var(--brand-border)] bg-[var(--brand-soft)] px-3.5 py-2.5 text-sm leading-relaxed text-[var(--foreground)]">
             <div className="whitespace-pre-wrap">{text}</div>
           </div>
-          <time className="px-1 font-mono text-[10px] text-[var(--muted)]">{formatTime(message.createdAt)}</time>
+          <time className="px-1 font-mono text-[10px] text-[var(--muted)]">{formatTime(message.createdAt, t.locale)}</time>
         </div>
       </article>
     );
@@ -440,11 +442,16 @@ function MessageBubble({
     return <ZyraBacklog steps={backlogSteps?.length ? backlogSteps : zyraStepsFromTrace(message.trace)} />;
   }
 
-  const metaLabel = summarizeTestcaseActions(testcases);
+  const metaLabel = summarizeTestcaseActions(testcases, t);
   // Proposed rows aren't in the repository yet — they get the review panel (select/edit/discard/
   // save) instead of the plain read-only table, and don't count toward "View test cases" below.
   const proposedRows = testcases.filter((row) => typeof row.action === "string" && row.action.startsWith("proposed-"));
   const appliedRows = testcases.filter((row) => !(typeof row.action === "string" && row.action.startsWith("proposed-")));
+  // Batch messages of an exhaustive plan posted before the backend stored review_request_id on them
+  // still stamp it on every proposed row. Fall back to it only when the rows agree on a single id —
+  // a mixed set has no one batch the panel could act on, so it is not guessed at.
+  const rowReviewIds = Array.from(new Set(proposedRows.map((row) => row.reviewRequestId).filter((id): id is string => Boolean(id))));
+  const reviewRequestId = message.reviewRequestId || (rowReviewIds.length === 1 ? rowReviewIds[0] : null);
   // Defense-in-depth, independent of the backend guard: a reply that routed as a mutation but carries
   // no rows and no review panel to show is a sign something upstream failed silently — surface that
   // instead of leaving the bubble looking like an ordinary, uneventful answer. Never fires for a
@@ -461,7 +468,7 @@ function MessageBubble({
     !isUser &&
     ["create", "update", "archive", "mixed"].includes(message.actionType || "") &&
     testcases.length === 0 &&
-    !message.reviewRequestId;
+    !reviewRequestId;
 
   return (
     <article className="flex flex-col gap-2.5">
@@ -476,7 +483,7 @@ function MessageBubble({
       {reasoning && (
         <details className="w-full max-w-[720px]">
           <summary className="cursor-pointer text-xs font-medium text-[var(--muted)] hover:text-[var(--foreground)] select-none">
-            Zyra reasoning
+            {t("msg.reasoning")}
           </summary>
           <div className="mt-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs leading-5 text-[var(--muted)]">
             {reasoning}
@@ -490,12 +497,12 @@ function MessageBubble({
       />
 
       <TestcaseTable rows={appliedRows} projectId={projectId} />
-      {message.reviewRequestId && proposedRows.length > 0 && (
-        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={message.reviewRequestId} initialRows={proposedRows} />
+      {reviewRequestId && proposedRows.length > 0 && (
+        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={reviewRequestId} initialRows={proposedRows} />
       )}
       {missingStructuredData && (
         <p className="mt-1 flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-          ⚠️ Zyra didn&apos;t return structured data for this reply — nothing above should be treated as saved or staged. Try asking again.
+          {t("msg.noStructured")}
         </p>
       )}
 
@@ -506,7 +513,7 @@ function MessageBubble({
             className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--brand-border)] hover:text-[var(--foreground)]"
           >
             <IconClipboardCheck size={13} stroke={1.9} />
-            View test cases
+            {t("msg.viewTestCases")}
           </Link>
         )}
         <button
@@ -515,15 +522,15 @@ function MessageBubble({
           className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--brand-border)] hover:text-[var(--foreground)]"
         >
           <IconCopy size={13} stroke={1.9} />
-          {copied ? "Copied" : "Copy"}
+          {copied ? t("copied") : t("copy")}
         </button>
         {/* Only ever shown for a turn the provider never answered in time — never on a normal reply. */}
         {message.status === ZYRA_MESSAGE_TIMED_OUT && message.resumeAttempt < ZYRA_RESUME_ATTEMPT_CAP && (
           <Button type="button" size="sm" variant="ai" onClick={() => void handleContinueClick()} disabled={clicking}>
-            Continue
+            {t("msg.continue")}
           </Button>
         )}
-        <time className="ml-auto font-mono text-[10px] text-[var(--muted)]">{formatTime(message.createdAt)}</time>
+        <time className="ml-auto font-mono text-[10px] text-[var(--muted)]">{formatTime(message.createdAt, t.locale)}</time>
       </div>
 
       {/* This turn has failed to resume at its original size repeatedly — offering the identical
@@ -534,11 +541,11 @@ function MessageBubble({
       {message.status === ZYRA_MESSAGE_TIMED_OUT && message.resumeAttempt >= ZYRA_RESUME_ATTEMPT_CAP && (
         <div className="flex flex-col items-start gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-400">
           <span>
-            This has timed out {message.resumeAttempt + 1} times in a row. The batch may be too large for the provider to finish in time.
+            {t("msg.timedOutRepeatedly", { n: message.resumeAttempt + 1 })}
           </span>
           <div className="flex items-center gap-3">
             <Button type="button" size="sm" variant="ai" onClick={() => void handleContinueClick({ narrow: true })} disabled={clicking}>
-              Continue with a smaller batch (5 cases)
+              {t("msg.continueSmaller")}
             </Button>
             <button
               type="button"
@@ -546,7 +553,7 @@ function MessageBubble({
               disabled={clicking}
               className="text-[11px] font-medium text-amber-700 underline decoration-dotted hover:text-amber-800 disabled:opacity-50 dark:text-amber-400 dark:hover:text-amber-300"
             >
-              Try the original size again anyway
+              {t("msg.tryOriginal")}
             </button>
           </div>
         </div>
@@ -583,45 +590,20 @@ type ZyraBacklogStep = {
 /** A finished request's trace, ready to render. */
 type ZyraFinishedBacklog = { steps: ZyraBacklogStep[]; durationMs: number; outcome: ZyraTraceOutcome };
 
-const ZYRA_STAGE_LABELS: Record<string, string> = {
-  received: "Received your request",
-  resuming: "Resuming the timed-out request",
-  retrying: "Re-reading your confirmation",
-  "plan:superseded": "Stopped the running generation plan",
-  "plan:batch": "Next batch of the generation plan",
-  "plan:stop": "Stopped the generation plan",
-  "plan:resume": "Resumed the generation plan",
-  "context:knowledge": "Knowledge Base",
-  "context:jira": "Jira",
-  "context:testcases": "Existing Test Cases",
-  "context:bugs": "Bugs",
-  routing: "Deciding what to do",
-  "tool:jira_coverage": "Checking Jira test case coverage",
-  summarizing: "Summarizing the result",
-  generating: "Generating your test cases",
-  staging: "Staging results",
-  finalizing: "Finalizing",
-};
+// Stage labels are "stage.<stage>" and the router decision labels (how the decision reads in a step
+// summary) are "act.<action>" in lib/zyra-i18n.ts. A stage or action with no key is shown by its raw
+// name rather than guessed at.
 
-/** How the router's decision reads in a step summary — the raw action when it is one not listed. */
-const ZYRA_ACTION_LABELS: Record<string, string> = {
-  answer: "answer",
-  list: "list test cases",
-  create: "create test cases",
-  update: "update test cases",
-  archive: "archive test cases",
-  suite: "suite changes",
-  mixed: "several changes",
-  jira_pending_testcases: "Jira coverage",
-};
+/** Marks the one failure reason written client-side (zyraFinishedFromTrace), so it can be localized. */
+const ZYRA_CLIENT_INTERRUPTED = "zyraClientInterrupted";
 
 const ZYRA_TRACE_STATUSES: ZyraTraceStepStatus[] = ["ok", "empty", "skipped", "blocked", "failed", "timed_out"];
 
-function zyraFormatDuration(ms: number): string {
+function zyraFormatDuration(ms: number, t: ZyraT): string {
   const totalSec = Math.max(0, Math.round(ms / 1000));
   const m = Math.floor(totalSec / 60);
   const s = totalSec % 60;
-  return m > 0 ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
+  return m > 0 ? t("dur.minutes", { m, s: String(s).padStart(2, "0") }) : t("dur.seconds", { s });
 }
 
 // How close to the bottom (px) still counts as "at bottom" for auto-follow purposes — a little
@@ -676,7 +658,7 @@ function zyraFinishedFromTrace(trace: ZyraTurnTrace | null | undefined, interrup
       if (step.status === "active") {
         step.status = "done";
         step.outcome = "failed";
-        step.meta = { ...(step.meta || {}), reason: "interrupted — this request stopped before it finished" };
+        step.meta = { ...(step.meta || {}), reason: "interrupted — this request stopped before it finished", [ZYRA_CLIENT_INTERRUPTED]: true };
       }
     }
   }
@@ -686,58 +668,64 @@ function zyraFinishedFromTrace(trace: ZyraTurnTrace | null | undefined, interrup
 }
 
 /** A short "what happened" summary for a step's row, never inventing anything not in `meta`. */
-function zyraBacklogSummary(step: ZyraBacklogStep): string {
+function zyraBacklogSummary(step: ZyraBacklogStep, t: ZyraT): string {
   const meta = step.meta;
   if (!meta) return "";
+  const actionLabel = (action: string) => t.opt(`act.${action}`) || action;
   const outcome = zyraStepOutcome(step);
-  if (outcome === "timed_out") return typeof meta.timeoutMs === "number" ? `timed out after ${zyraFormatDuration(meta.timeoutMs)}` : "timed out";
+  if (outcome === "timed_out") return typeof meta.timeoutMs === "number" ? t("sum.timedOutAfter", { d: zyraFormatDuration(meta.timeoutMs, t) }) : t("sum.timedOut");
   if ((outcome === "blocked" || outcome === "failed") && meta.reason) {
-    const action = typeof meta.action === "string" ? `${ZYRA_ACTION_LABELS[meta.action] || meta.action} — ` : "";
-    return `${action}${String(meta.reason)}`;
+    const action = typeof meta.action === "string" ? `${actionLabel(meta.action)} — ` : "";
+    // The backend's own reasons are shown as-is; only the client-written "interrupted" one is localized.
+    const reason = meta[ZYRA_CLIENT_INTERRUPTED] === true ? t("trace.interrupted") : String(meta.reason);
+    return `${action}${reason}`;
   }
-  if (meta.skipped) return `skipped: ${String(meta.reason || "disabled")}`;
+  if (meta.skipped) return t("sum.skipped", { reason: meta.reason ? String(meta.reason) : t("sum.disabled") });
   if (Array.isArray(meta.items)) {
     const count = typeof meta.count === "number" ? meta.count : meta.items.length;
-    return count === 0 ? "none found" : `${count} found`;
+    return count === 0 ? t("sum.noneFound") : t("sum.found", { n: count });
   }
   if (meta.operationCounts && typeof meta.operationCounts === "object") {
-    const parts = Object.entries(meta.operationCounts as Record<string, number>).map(([type, count]) => `${count} ${type}`);
-    return parts.length ? parts.join(", ") : "nothing to stage";
+    const parts = Object.entries(meta.operationCounts as Record<string, number>).map(([type, count]) =>
+      t("sum.opCount", { n: count, op: t.opt(`op.${type}`) ?? type }),
+    );
+    return parts.length ? parts.join(", ") : t("sum.nothingToStage");
   }
   if (typeof meta.savedCount === "number" || typeof meta.proposedCount === "number") {
     const saved = Number(meta.savedCount || 0);
     const proposed = Number(meta.proposedCount || 0);
-    const parts = [saved ? `${saved} saved` : "", proposed ? `${proposed} proposed for review` : ""].filter(Boolean);
-    return parts.length ? parts.join(", ") : "nothing changed";
+    const parts = [saved ? t("sum.saved", { n: saved }) : "", proposed ? t("sum.proposed", { n: proposed }) : ""].filter(Boolean);
+    return parts.length ? parts.join(", ") : t("sum.nothingChanged");
   }
   if (step.stage === "routing") {
     const parts = [
-      typeof meta.action === "string" ? ZYRA_ACTION_LABELS[meta.action] || meta.action : "",
-      typeof meta.totalContextItems === "number" ? `${meta.totalContextItems} context items` : "",
-      typeof meta.attempts === "number" && meta.attempts > 1 ? `${meta.attempts} attempts` : "",
+      typeof meta.action === "string" ? actionLabel(meta.action) : "",
+      typeof meta.totalContextItems === "number" ? t("sum.contextItems", { n: meta.totalContextItems }) : "",
+      typeof meta.attempts === "number" && meta.attempts > 1 ? t("sum.attempts", { n: meta.attempts }) : "",
     ].filter(Boolean);
     return parts.join(" · ");
   }
   if (typeof meta.draftedCount === "number") {
-    const requested = typeof meta.requestedCount === "number" ? ` of ${meta.requestedCount} requested` : "";
-    return `${meta.draftedCount} drafted${requested}`;
+    return typeof meta.requestedCount === "number"
+      ? t("sum.draftedOf", { n: meta.draftedCount, r: meta.requestedCount })
+      : t("sum.drafted", { n: meta.draftedCount });
   }
   if (typeof meta.requestedCount === "number") {
-    return `${meta.requestedCount} requested${meta.suiteName ? ` into "${String(meta.suiteName)}"` : ""}${meta.retry ? " · smaller retry" : ""}`;
+    return `${t("sum.requested", { n: meta.requestedCount })}${meta.suiteName ? t("sum.intoSuite", { name: String(meta.suiteName) }) : ""}${meta.retry ? t("sum.smallerRetry") : ""}`;
   }
   if (typeof meta.fromScenario === "number" && typeof meta.toScenario === "number") {
-    return `scenarios ${meta.fromScenario}–${meta.toScenario}${typeof meta.totalCount === "number" ? ` of ${meta.totalCount}` : ""}`;
+    return `${t("sum.scenarios", { from: meta.fromScenario, to: meta.toScenario })}${typeof meta.totalCount === "number" ? t("sum.ofTotal", { n: meta.totalCount }) : ""}${typeof meta.retrying === "number" ? t("sum.retried", { n: meta.retrying }) : ""}`;
   }
-  if (typeof meta.doneCount === "number" && typeof meta.totalCount === "number") return `${meta.doneCount}/${meta.totalCount} scenarios covered`;
-  if (step.stage === "resuming" && typeof meta.attempt === "number") return `attempt ${meta.attempt}`;
-  if (typeof meta.fired === "boolean") return meta.fired ? "acted on it" : "still nothing to act on";
+  if (typeof meta.doneCount === "number" && typeof meta.totalCount === "number") return t("sum.scenariosCovered", { done: meta.doneCount, total: meta.totalCount });
+  if (step.stage === "resuming" && typeof meta.attempt === "number") return t("sum.attempt", { n: meta.attempt });
+  if (typeof meta.fired === "boolean") return meta.fired ? t("sum.actedOnIt") : t("sum.nothingToActOn");
   return "";
 }
 
 /** The finished disclosure's one-line outcome, read off whatever `finalizing` actually reported. */
-function zyraFinishedOutcome(steps: ZyraBacklogStep[]): string {
+function zyraFinishedOutcome(steps: ZyraBacklogStep[], t: ZyraT): string {
   const finalStep = [...steps].reverse().find((s) => s.stage === "finalizing");
-  return finalStep ? zyraBacklogSummary(finalStep) : "";
+  return finalStep ? zyraBacklogSummary(finalStep, t) : "";
 }
 
 const ZYRA_TAGS: Record<ZyraTraceStepStatus, { text: string; tag: string; marker: string }> = {
@@ -764,16 +752,17 @@ function zyraStepKey(step: ZyraBacklogStep): string {
 
 /** One row, expandable when its step carries named items. Item titles/summaries are user-authored (a doc title, a Jira summary) and rendered as plain text, never markdown/HTML. */
 function ZyraBacklogRow({ step, now }: { step: ZyraBacklogStep; now: number }) {
+  const t = useZyraText();
   const [expanded, setExpanded] = useState(false);
   const items = Array.isArray(step.meta?.items) ? (step.meta!.items as Array<Record<string, unknown>>) : null;
   const total = typeof step.meta?.count === "number" ? step.meta.count : items?.length ?? 0;
   const canExpand = Boolean(items && items.length > 0);
-  const summary = zyraBacklogSummary(step);
+  const summary = zyraBacklogSummary(step, t);
   const tag = ZYRA_TAGS[zyraStepOutcome(step)];
-  const label = `${ZYRA_STAGE_LABELS[step.stage] || step.stage}${step.attempt > 1 ? ` · attempt ${step.attempt}` : ""}`;
+  const label = `${t.opt(`stage.${step.stage}`) || step.stage}${step.attempt > 1 ? t("trace.rowAttempt", { n: step.attempt }) : ""}`;
   const elapsed = step.status === "active"
-    ? zyraFormatDuration(now - step.activatedAt)
-    : step.endedAt && step.endedAt - step.activatedAt >= 1000 ? zyraFormatDuration(step.endedAt - step.activatedAt) : null;
+    ? zyraFormatDuration(now - step.activatedAt, t)
+    : step.endedAt && step.endedAt - step.activatedAt >= 1000 ? zyraFormatDuration(step.endedAt - step.activatedAt, t) : null;
   return (
     <div className="flex flex-col" data-zyra-step={step.stage} data-zyra-step-status={zyraStepOutcome(step)}>
       <button
@@ -800,7 +789,7 @@ function ZyraBacklogRow({ step, now }: { step: ZyraBacklogStep; now: number }) {
               </li>
             );
           })}
-          {total > 10 && <li className="italic text-[var(--muted-2)]">+{total - 10} more</li>}
+          {total > 10 && <li className="italic text-[var(--muted-2)]">{t("trace.more", { n: total - 10 })}</li>}
         </ul>
       )}
     </div>
@@ -816,12 +805,13 @@ const ZYRA_OUTCOME_TAGS: Record<Exclude<ZyraTraceOutcome, "running">, { text: st
 
 /** The collapsed "what Zyra did" log under a finished request. */
 function ZyraTraceDisclosure({ finished }: { finished: ZyraFinishedBacklog }) {
+  const t = useZyraText();
   const tag = ZYRA_OUTCOME_TAGS[finished.outcome === "running" ? "completed" : finished.outcome];
-  const outcomeSummary = zyraFinishedOutcome(finished.steps);
+  const outcomeSummary = zyraFinishedOutcome(finished.steps, t);
   return (
     <details className="w-full max-w-[720px]" data-zyra-trace={finished.outcome}>
       <summary className={`cursor-pointer select-none border-l-2 pl-2 font-mono text-[11px] ${tag.className}`}>
-        {tag.text} {zyraFormatDuration(finished.durationMs)} · {finished.steps.length} {finished.steps.length === 1 ? "step" : "steps"}
+        {tag.text} {zyraFormatDuration(finished.durationMs, t)} · {t("trace.steps", { n: finished.steps.length })}
         {outcomeSummary ? ` · ${outcomeSummary}` : ""}
       </summary>
       <div className="mt-1.5 flex flex-col gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
@@ -832,6 +822,7 @@ function ZyraTraceDisclosure({ finished }: { finished: ZyraFinishedBacklog }) {
 }
 
 function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
+  const t = useZyraText();
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -850,7 +841,7 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
         <ZyraMark size={24} />
         <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5 font-mono text-[11px] tabular-nums text-[var(--muted)]">
           <span className="h-1.5 w-1.5 shrink-0 animate-pulse bg-[var(--brand-primary)]" />
-          zyra is working on this · {zyraFormatDuration(now - mountedAt)} elapsed
+          {t("trace.working", { d: zyraFormatDuration(now - mountedAt, t) })}
         </div>
       </div>
     );
@@ -858,7 +849,7 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
 
   // No "N of M" here: how many steps a request takes depends on what it turns out to need (an
   // answer never generates; a retry adds steps), so any fixed denominator would be made up.
-  const turnElapsed = zyraFormatDuration(now - steps[0].activatedAt);
+  const turnElapsed = zyraFormatDuration(now - steps[0].activatedAt, t);
   let contextHeaderShown = false;
 
   return (
@@ -866,7 +857,7 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
       <ZyraMark size={24} />
       <div className="min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5">
         <div className="mb-1.5 font-mono text-[11px] tabular-nums text-[var(--muted)]">
-          zyra · step {steps.length} · {turnElapsed}
+          {t("trace.header", { n: steps.length, d: turnElapsed })}
         </div>
         <div className="mb-2 h-px w-full overflow-hidden bg-[var(--border)]">
           <div className="h-full w-full animate-pulse bg-gradient-to-r from-[var(--brand-primary)] to-[#4F46E5]" />
@@ -884,7 +875,7 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
                 <div className="min-w-0 flex-1 pb-1.5">
                   {isFirstContext && (
                     <div className="mb-1 font-mono text-[10px] text-[var(--muted-2)]">
-                      # gathering context · {zyraFormatDuration(step.activatedAt - steps[0].activatedAt)}
+                      {t("trace.gathering", { d: zyraFormatDuration(step.activatedAt - steps[0].activatedAt, t) })}
                     </div>
                   )}
                   <ZyraBacklogRow step={step} now={now} />
@@ -899,14 +890,16 @@ function ZyraBacklog({ steps }: { steps: ZyraBacklogStep[] }) {
 }
 
 // ─── PlanProgressBubble ───────────────────────────────────────────────────────
-function PlanProgressBubble({ plan }: { plan: { doneCount: number; totalCount: number } }) {
-  const pct = plan.totalCount > 0 ? Math.round((plan.doneCount / plan.totalCount) * 100) : 0;
+function PlanProgressBubble({ plan }: { plan: { doneCount: number; totalCount: number; coveredCount?: number } }) {
+  const t = useZyraText();
+  const covered = plan.coveredCount ?? plan.doneCount;
+  const pct = plan.totalCount > 0 ? Math.round((covered / plan.totalCount) * 100) : 0;
   return (
     <div className="flex items-start gap-2">
       <ZyraMark size={24} />
       <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2.5 text-xs text-[var(--muted)]">
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--brand-primary)] animate-pulse" />
-        Generating remaining scenarios — {plan.doneCount}/{plan.totalCount} covered ({pct}%). Review what&apos;s in so far; more will appear here shortly.
+        {t("plan.generating", { covered, total: plan.totalCount, pct })}
       </div>
     </div>
   );
@@ -926,6 +919,7 @@ function RenameSessionModal({
   onClose: () => void;
   onSave: (title: string) => Promise<void>;
 }) {
+  const t = useZyraText();
   const [title, setTitle] = useState(initialTitle);
   const [titleError, setTitleError] = useState("");
   useEffect(() => {
@@ -938,21 +932,21 @@ function RenameSessionModal({
   async function handleSaveClick() {
     const trimmed = title.trim();
     if (!trimmed) {
-      setTitleError("Conversation name is required");
+      setTitleError(t("rename.required"));
       return;
     }
     try {
       await onSave(trimmed);
     } catch (err) {
-      setTitleError(err instanceof Error ? err.message : "Failed to rename conversation.");
+      setTitleError(err instanceof Error ? err.message : t("rename.failed"));
     }
   }
 
   return (
-    <Modal open={open} onClose={onClose} title="Rename conversation">
+    <Modal open={open} onClose={onClose} title={t("rename.title")}>
       <div className="space-y-4">
         <Field>
-          <FieldLabel>Conversation name</FieldLabel>
+          <FieldLabel>{t("rename.label")}</FieldLabel>
           <Input
             value={title}
             onChange={(e) => {
@@ -965,8 +959,8 @@ function RenameSessionModal({
           {titleError && <FieldError>{titleError}</FieldError>}
         </Field>
         <div className="flex justify-end gap-2 pt-2">
-          <Button type="button" variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button type="button" disabled={!title.trim() || saving} onClick={handleSaveClick}>{saving ? "Saving…" : "Save"}</Button>
+          <Button type="button" variant="secondary" onClick={onClose} disabled={saving}>{t("cancel")}</Button>
+          <Button type="button" disabled={!title.trim() || saving} onClick={handleSaveClick}>{saving ? t("saving") : t("save")}</Button>
         </div>
       </div>
     </Modal>
@@ -975,19 +969,20 @@ function RenameSessionModal({
 
 // ─── NoKeyBanner ─────────────────────────────────────────────────────────────
 function NoKeyBanner({ projectId }: { projectId: string }) {
+  const t = useZyraText();
   return (
     <div className="mx-auto max-w-lg rounded-2xl border border-amber-500/30 bg-amber-500/10 p-6 text-center">
       <div className="text-2xl mb-2">⚡</div>
-      <h3 className="text-sm font-semibold text-amber-700 dark:text-amber-400">AI provider not connected</h3>
+      <h3 className="text-sm font-semibold text-amber-700 dark:text-amber-400">{t("nokey.title")}</h3>
       <p className="mt-2 text-xs text-amber-700/80 dark:text-amber-400/80">
-        Zyra needs an Anthropic or OpenAI key allocated to this project before it can respond.
+        {t("nokey.body")}
       </p>
       <div className="mt-4 flex flex-col gap-2">
         <Link href="/settings?tab=ai" className="inline-flex items-center justify-center gap-1 rounded-lg bg-amber-600 px-4 py-2 text-xs font-semibold text-white hover:bg-amber-700">
-          Set up AI key
+          {t("nokey.setup")}
         </Link>
         <Link href={`/projects/${projectId}/agents/zyra/settings`} className="text-xs text-amber-700/70 hover:underline dark:text-amber-400/70">
-          Check Zyra settings
+          {t("nokey.settings")}
         </Link>
       </div>
     </div>
@@ -1063,6 +1058,17 @@ export default function ZyraChatPage() {
   const loadStartedRef = useRef(false);
   const creatingSessionRef = useRef(false);
   const messages = useMemo(() => activeSession?.messages || [], [activeSession]);
+  // UI language = the loaded session's language (set server-side from the script of what the user
+  // typed). English with no session, a brand-new one, or an unknown value. Provided as context to
+  // every child below, and read through langRef by async handlers that outlive the render they
+  // started in (a first Russian message flips a new session to "ru" mid-turn).
+  const lang = zyraLanguage(activeSession?.language);
+  const t = zyraText(lang);
+  const langRef = useRef(lang);
+  useEffect(() => {
+    langRef.current = lang;
+  }, [lang]);
+  const tNow = () => zyraText(langRef.current);
   // A user message the server still marks `processing` is a background turn in flight — including
   // one this tab didn't start (sent before a reload, or from another tab).
   const hasProcessingMessage = messages.some((m) => m.role === "user" && m.status === ZYRA_MESSAGE_PROCESSING);
@@ -1144,7 +1150,7 @@ export default function ZyraChatPage() {
         else await createSession();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete conversation.");
+      setError(err instanceof Error ? err.message : tNow()("err.deleteConversation"));
       setDeleteTarget(null);
     } finally {
       setDeleting(false);
@@ -1162,7 +1168,7 @@ export default function ZyraChatPage() {
       else await createSession();
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load Zyra chat.");
+      setError(err instanceof Error ? err.message : zyraText(langRef.current)("err.load"));
     } finally {
       setLoading(false);
     }
@@ -1333,7 +1339,7 @@ export default function ZyraChatPage() {
     } catch (err) {
       // Rejected before the turn began (validation, a turn already running, network) — nothing was
       // queued server-side, so drop the optimistic bubble and say why.
-      setError(err instanceof Error ? err.message : "Zyra could not answer.");
+      setError(err instanceof Error ? err.message : tNow()("err.answer"));
       setActiveSession((prev) => prev && prev.id === sessionId ? { ...prev, messages: (prev.messages || []).filter((m) => m.id !== optimistic.id) } : prev);
       setPendingSessionIds((prev) => {
         const next = new Set(prev);
@@ -1351,9 +1357,10 @@ export default function ZyraChatPage() {
       void refreshSessions();
       const userMessage = settled?.messages?.find((m) => m.id === started.userMessageId);
       if (!settled || !userMessage) {
-        setError("Zyra is taking longer than expected. The reply will appear here once it's ready — refresh to check.");
+        setError(tNow()("err.slow"));
       } else if (userMessage.status === ZYRA_MESSAGE_FAILED) {
-        setError("Zyra couldn't finish answering that message. Please try again.");
+        // The settled session's own language when it has one: it is the freshest answer to it.
+        setError(zyraText(settled.language ? zyraLanguage(settled.language) : langRef.current)("err.failed"));
       }
     } finally {
       // Same render batch as the settled session above, so the persisted trace replaces the live
@@ -1390,7 +1397,7 @@ export default function ZyraChatPage() {
       void refreshSessions();
       if (result.accepted) watchZyraTurnProgress(sessionId, turnId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not resume that turn. Try again.");
+      setError(err instanceof Error ? err.message : tNow()("err.resumeTurn"));
     }
   }
 
@@ -1492,7 +1499,7 @@ export default function ZyraChatPage() {
       const session = await stopZyraChatPlan(projectId, activeSession.id);
       setActiveSession(session);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to stop Zyra.");
+      setError(err instanceof Error ? err.message : tNow()("err.stop"));
     } finally {
       setStoppingPlan(false);
     }
@@ -1505,16 +1512,19 @@ export default function ZyraChatPage() {
       const session = await resumeZyraChatPlan(projectId, activeSession.id);
       setActiveSession(session);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to resume Zyra.");
+      setError(err instanceof Error ? err.message : tNow()("err.resumePlan"));
     } finally {
       setStoppingPlan(false);
     }
   }
 
   return (
-    // Full-bleed, full-height IDE-style workspace — same pattern as the Test Cases / Plan
-    // Details screens. `tc-fullbleed` makes the wrapping .tesbo-page drop its centered
-    // 1280px cap + padding, so this fills the whole content region below the 3.5rem TopBar.
+    // Every Zyra component below (review panel, citations, drawer, editor) reads the session's
+    // language from this context — including the portaled top-bar actions and the modals.
+    <ZyraLanguageContext.Provider value={lang}>
+    {/* Full-bleed, full-height IDE-style workspace — same pattern as the Test Cases / Plan
+        Details screens. `tc-fullbleed` makes the wrapping .tesbo-page drop its centered
+        1280px cap + padding, so this fills the whole content region below the 3.5rem TopBar. */}
     <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {/* This page takes over the shared TopBar: breadcrumb (start slot) + actions (end slot). */}
@@ -1534,16 +1544,16 @@ export default function ZyraChatPage() {
             <div className="flex flex-wrap items-center gap-2">
               {agent && (
                 <StatusChip tone={agent.agent.active ? "success" : "warning"} dot>
-                  {agent.agent.active ? "AI connected" : "No AI key"}
+                  {agent.agent.active ? t("top.aiConnected") : t("top.noAiKey")}
                 </StatusChip>
               )}
               <Link href={`/projects/${projectId}/agents/tasks`} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
                 <IconClipboardCheck size={15} stroke={1.9} />
-                Task board
+                {t("top.taskBoard")}
               </Link>
               <Link href={`/projects/${projectId}/agents/zyra/settings`} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
                 <IconSettings size={15} stroke={1.9} />
-                Settings
+                {t("top.settings")}
               </Link>
             </div>,
             topBarEndEl,
@@ -1555,7 +1565,7 @@ export default function ZyraChatPage() {
           <div>
             <h1 className="text-[20px] font-semibold leading-tight tracking-[-0.02em] text-[var(--foreground)]">Zyra</h1>
             <p className="mt-[1px] text-[13px] text-[var(--muted-soft)]">
-              AI test case assistant — generate, update, and manage test cases through conversation.
+              {t("page.subtitle")}
             </p>
           </div>
         </div>
@@ -1571,7 +1581,7 @@ export default function ZyraChatPage() {
         {loading ? (
           <PageLoader
             variant="inline"
-            label="Loading Zyra…"
+            label={t("page.loading")}
             className="min-h-0 flex-1 rounded-r-xl border border-l-0 border-[var(--border)] bg-[var(--surface)]"
           />
         ) : (
@@ -1582,21 +1592,21 @@ export default function ZyraChatPage() {
               {/* Sidebar header */}
               <div className="shrink-0 flex items-center justify-between gap-2 border-b border-[var(--border)] px-4 py-3">
                 <div>
-                  <p className="text-sm font-semibold text-[var(--foreground)]">Conversations</p>
+                  <p className="text-sm font-semibold text-[var(--foreground)]">{t("side.conversations")}</p>
                   <p className="text-[11px] text-[var(--muted)]">
-                    {visibleSessions.length} {visibleSessions.length === 1 ? "session" : "sessions"}
+                    {t("side.sessions", { n: visibleSessions.length })}
                   </p>
                 </div>
                 <Button size="sm" variant="secondary" disabled={creatingSession} onClick={() => void createSession()}>
                   <IconPlus size={13} stroke={2} />
-                  New
+                  {t("side.new")}
                 </Button>
               </div>
 
               {/* Session list — scrollable */}
               <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
                 {visibleSessions.length === 0 && (
-                  <p className="px-3 py-8 text-center text-xs text-[var(--muted)]">No conversations yet</p>
+                  <p className="px-3 py-8 text-center text-xs text-[var(--muted)]">{t("side.empty")}</p>
                 )}
                 {visibleSessions.map((session) => {
                   const isActive = activeSession?.id === session.id;
@@ -1623,13 +1633,13 @@ export default function ZyraChatPage() {
                           {session.title}
                         </span>
                         <span className="mt-0.5 block font-mono text-[11px] text-[var(--muted-soft)]">
-                          {formatTime(session.updatedAt)}
+                          {formatTime(session.updatedAt, t.locale)}
                         </span>
                       </div>
                       <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                         <button
                           type="button"
-                          title="Rename conversation"
+                          title={t("rename.title")}
                           onClick={(e) => {
                             e.stopPropagation();
                             setRenameTarget(session);
@@ -1640,7 +1650,7 @@ export default function ZyraChatPage() {
                         </button>
                         <button
                           type="button"
-                          title="Delete conversation"
+                          title={t("delete.title")}
                           onClick={(e) => {
                             e.stopPropagation();
                             setDeleteTarget(session);
@@ -1666,10 +1676,10 @@ export default function ZyraChatPage() {
                     <>
                       <span className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">{agent.aiKey.provider}</span>
                       <span className="text-[var(--border)]">·</span>
-                      <span className="font-mono text-[11px] text-[var(--muted)]">{agent.aiKey.defaultModel || "default model"}</span>
+                      <span className="font-mono text-[11px] text-[var(--muted)]">{agent.aiKey.defaultModel || t("chat.defaultModel")}</span>
                     </>
                   ) : (
-                    <span className="text-xs text-[var(--muted)]">No AI key connected</span>
+                    <span className="text-xs text-[var(--muted)]">{t("chat.noKey")}</span>
                   )}
                 </p>
               </div>
@@ -1686,22 +1696,22 @@ export default function ZyraChatPage() {
                         <>
                           <div className="text-center max-w-md">
                             <div className="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-xl font-bold text-white">Z</div>
-                            <h3 className="text-base font-semibold text-[var(--foreground)]">How can I help?</h3>
+                            <h3 className="text-base font-semibold text-[var(--foreground)]">{t("empty.title")}</h3>
                             <p className="mt-1 text-sm text-[var(--muted)]">
-                              Generate test cases, find coverage gaps, update existing tests, or review your test suite — all through conversation.
+                              {t("empty.body")}
                             </p>
                           </div>
                           <div className="w-full max-w-2xl">
-                            <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">Quick actions</p>
+                            <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">{t("empty.quickActions")}</p>
                             <div className="flex flex-wrap gap-2">
                               {QUICK_ACTIONS.map((action) => (
                                 <button
-                                  key={action.label}
+                                  key={action}
                                   type="button"
-                                  onClick={() => onQuickAction(action.prompt)}
+                                  onClick={() => onQuickAction(t(`quick.${action}.prompt` as const))}
                                   className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5 text-xs font-medium text-[var(--foreground)] transition-all hover:border-[var(--brand-primary)] hover:shadow-sm active:scale-95"
                                 >
-                                  {action.label}
+                                  {t(`quick.${action}.label` as const)}
                                 </button>
                               ))}
                             </div>
@@ -1743,7 +1753,7 @@ export default function ZyraChatPage() {
                     className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--foreground)] shadow-md transition-all hover:border-[var(--brand-primary)] hover:text-[var(--brand-primary)]"
                   >
                     {sending && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[var(--brand-primary)]" />}
-                    catch up
+                    {t("chat.catchUp")}
                     <IconArrowDown size={12} stroke={2} />
                   </button>
                 )}
@@ -1754,10 +1764,10 @@ export default function ZyraChatPage() {
                 {activeSession?.activePlan?.status === "paused" && (
                   <div className="mb-2.5 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
                     <span>
-                      Paused — {activeSession.activePlan.doneCount}/{activeSession.activePlan.totalCount} scenarios covered.
+                      {t("plan.paused", { covered: activeSession.activePlan.coveredCount ?? activeSession.activePlan.doneCount, total: activeSession.activePlan.totalCount })}
                     </span>
                     <Button type="button" size="sm" variant="secondary" onClick={handleResumePlan} disabled={stoppingPlan}>
-                      {stoppingPlan ? "Resuming…" : "Resume"}
+                      {stoppingPlan ? t("plan.resuming") : t("plan.resume")}
                     </Button>
                   </div>
                 )}
@@ -1770,26 +1780,26 @@ export default function ZyraChatPage() {
                     rows={3}
                     placeholder={
                       agent?.agent.active
-                        ? "Ask Zyra to generate, update, or review test cases..."
-                        : "Connect an AI key to start chatting with Zyra"
+                        ? t("composer.placeholder")
+                        : t("composer.placeholderNoKey")
                     }
                     disabled={sending || !agent?.agent.active}
                     className="resize-none"
                   />
                   <div className="mt-2.5 flex items-center justify-between gap-3">
                     <p className="text-[11px] text-[var(--muted)]">
-                      <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{" "}send
+                      <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{t("composer.sendHint")}
                       {" · "}
-                      <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>{" "}new line
+                      <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>{t("composer.newLineHint")}
                     </p>
                     <div className="flex items-center gap-2">
                       {isPlanRunning && (
                         <Button type="button" size="sm" variant="secondary" onClick={handleStopPlan} disabled={stoppingPlan}>
-                          {stoppingPlan ? "Stopping…" : "Stop"}
+                          {stoppingPlan ? t("plan.stopping") : t("plan.stop")}
                         </Button>
                       )}
                       <Button type="submit" size="sm" disabled={!input.trim() || sending || !agent?.agent.active}>
-                        {sending ? "Thinking..." : "Send"}
+                        {sending ? t("composer.thinking") : t("composer.send")}
                       </Button>
                     </div>
                   </div>
@@ -1810,9 +1820,9 @@ export default function ZyraChatPage() {
 
       <ConfirmModal
         open={!!deleteTarget}
-        title="Delete conversation"
-        message={`Delete "${deleteTarget?.title || "this conversation"}"? This permanently removes its message history and cannot be undone.`}
-        confirmLabel="Delete"
+        title={t("delete.title")}
+        message={t("delete.message", { title: deleteTarget?.title || t("delete.thisConversation") })}
+        confirmLabel={t("delete.confirm")}
         confirmVariant="destructive"
         loading={deleting}
         onConfirm={() => void handleConfirmDelete()}
@@ -1839,5 +1849,6 @@ export default function ZyraChatPage() {
         .zyra-prose li { margin: 0.2rem 0; }
       `}</style>
     </main>
+    </ZyraLanguageContext.Provider>
   );
 }

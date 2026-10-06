@@ -5,9 +5,10 @@ import { Button, Field, FieldLabel, Input } from "@/components/ui";
 import type { BugAttachment } from "@/lib/api";
 import { isImageAttachment } from "@/components/bugs/BugAttachments";
 import {
+  BUG_FILE_MAX_SIZE,
+  BUG_MAX_ATTACHMENTS,
   EVIDENCE_ACCEPT_ATTRIBUTE,
   EVIDENCE_ALLOWED_EXTENSIONS,
-  EVIDENCE_MAX_FILE_SIZE,
   formatFileSizeShort,
   validateEvidenceFile,
 } from "@/lib/validation";
@@ -27,7 +28,7 @@ const THUMB_CLASS = "h-9 w-9 shrink-0 rounded-[4px] border border-[var(--border-
  * than an object URL: nothing to revoke, so StrictMode's double-run effects cannot revoke a URL the
  * <img> is still showing, and a removed row leaves no blob behind.
  */
-function StagedThumbnail({ file }: { file: File }) {
+export function StagedThumbnail({ file }: { file: File }) {
   const [src, setSrc] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -86,10 +87,14 @@ export default function BugEvidenceField({
     if (!files || !files.length) return;
     const accepted: File[] = [];
     const rejected: string[] = [];
+    // A bug holds at most BUG_MAX_ATTACHMENTS files in all: the ones it has plus the ones picked.
+    const alreadyAttached = (existingAttachments?.length ?? 0) + stagedFiles.length;
     for (const file of Array.from(files)) {
-      const problem = validateEvidenceFile(file);
+      const problem = validateEvidenceFile(file, BUG_FILE_MAX_SIZE);
       if (problem) rejected.push(problem);
-      else accepted.push(file);
+      else if (alreadyAttached + accepted.length >= BUG_MAX_ATTACHMENTS) {
+        rejected.push(`${file.name}: a bug can have at most ${BUG_MAX_ATTACHMENTS} attachments.`);
+      } else accepted.push(file);
     }
     setRejections(rejected);
     if (accepted.length) onStagedFilesChange([...stagedFiles, ...accepted]);
@@ -196,7 +201,7 @@ export default function BugEvidenceField({
               + Add files
             </Button>
             <span className="text-[12px] text-[var(--muted)]">
-              Up to {formatFileSizeShort(EVIDENCE_MAX_FILE_SIZE)} per file · {EVIDENCE_ALLOWED_EXTENSIONS.length} supported types
+              Up to {BUG_MAX_ATTACHMENTS} files, {formatFileSizeShort(BUG_FILE_MAX_SIZE)} each · {EVIDENCE_ALLOWED_EXTENSIONS.length} supported types
             </span>
           </div>
         </div>

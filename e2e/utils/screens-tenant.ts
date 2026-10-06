@@ -446,7 +446,7 @@ export interface DashboardSummary {
   testCases: { total: number; addedThisWeek: number };
   passRate: { value: number | null; deltaThisWeek: number | null };
   executionProgress: { value: number };
-  openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number } };
+  openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number }; noSeverity: number };
   coverage: { pct: number | null; totalRequirements: number };
   plans: number;
   suites: number;

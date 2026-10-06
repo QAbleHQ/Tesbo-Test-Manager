@@ -432,7 +432,7 @@ test.describe("project dashboard summary", () => {
         testCases: { total: 0, addedThisWeek: 0 },
         passRate: { value: null, deltaThisWeek: null },
         executionProgress: { value: 0 },
-        openBugs: { total: 0, bySeverity: { Critical: 0, High: 0, Medium: 0, Low: 0 } },
+        openBugs: { total: 0, bySeverity: { Critical: 0, High: 0, Medium: 0, Low: 0 }, noSeverity: 0 },
         coverage: { pct: null, totalRequirements: 0 },
         plans: 0,
         suites: 0,
@@ -584,6 +584,28 @@ test.describe("project dashboard summary", () => {
       const summary = await getDashboard(api, project.id);
       expect(summary.openBugs.total).toBe(2);
       expect(summary.openBugs.bySeverity).toEqual({ Critical: 1, High: 1, Medium: 0, Low: 0 });
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * Severity is optional since V130. The total used to be the sum of the four buckets, so an open bug
+   * with no severity would have silently vanished from "Open bugs". It counts in the total and in its
+   * own noSeverity figure, and never in a severity bucket it doesn't have.
+   */
+  test("DSH-A-09b an open bug with no severity counts toward the total, in noSeverity, not in a bucket", async () => {
+    const project = await createProject(api);
+    try {
+      await createBug(api, project.id, { severity: "High" });
+      await createBug(api, project.id, {});
+      await createBug(api, project.id, {});
+      await createBug(api, project.id, { status: "Closed" });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.openBugs.total).toBe(3);
+      expect(summary.openBugs.noSeverity).toBe(2);
+      expect(summary.openBugs.bySeverity).toEqual({ Critical: 0, High: 1, Medium: 0, Low: 0 });
     } finally {
       await deleteProjects(api, [project.id]);
     }
