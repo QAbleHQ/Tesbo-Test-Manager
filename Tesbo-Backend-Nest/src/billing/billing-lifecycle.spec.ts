@@ -38,6 +38,7 @@ const PRICES = {
 
 function makeConfig(overrides: Partial<AppConfigService> = {}): AppConfigService {
   return {
+    isStripeBillingEnabled: true,
     stripePriceIdProMonthly: PRICES.usdMonthly,
     stripePriceIdProAnnual: PRICES.usdAnnual,
     stripePriceIdProMonthlyInr: PRICES.inrMonthly,
