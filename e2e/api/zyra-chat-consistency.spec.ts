@@ -694,6 +694,210 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
   });
 
   /*
+   * "[Zyra] Confirmed 'Delete All Test Cases' Does Not Execute the Delete/Archive Operation" — on the
+   * confirming "yes" the router emitted ONE archive op with allExisting:true (it only ever sees 25
+   * cases, so it cannot name them all), and normalizeZyraChatDecision dropped it for naming no single
+   * testcaseId/externalId: routing said 1 operation, staging said 0, and the reply claimed a staged
+   * archive that never existed. A set-wide archive is now resolved against the repository.
+   *
+   * And, by product decision, a CONFIRMED archive (the user's message really is a confirmation —
+   * zyraIsArchiveConfirmation) is applied in that same turn through zyraSave, not left waiting in the
+   * review panel. ZCC-B-20/21 originally asserted "staged until Save"; they were changed on purpose
+   * when that decision was made. An archive on a hedged or non-confirming message is still only staged.
+   */
+  async function createCase(title: string, projectId = tenant!.mainProjectId): Promise<{ id: string; externalId: string }> {
+    const res = await asOwner.post(`/api/projects/${projectId}/testcases`, { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `seeding "${title}" — ${await res.text()}`).toBe(201);
+    const body = await res.json();
+    return { id: body.id, externalId: body.externalId };
+  }
+
+  function statusOf(id: string): string {
+    return scalar(`SELECT status FROM testcases WHERE id = ${literal(id)};`);
+  }
+
+  function latestReview(sessionId: string): { id: string; payload: Array<{ opType: string; testcaseId: string }> } | null {
+    const id = scalar(`SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    if (!id) return null;
+    return { id, payload: JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE id = ${literal(id)};`)) };
+  }
+
+  async function lastAssistant(sessionId: string): Promise<Record<string, unknown>> {
+    const messages = (await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json()).messages as Array<Record<string, unknown>>;
+    return [...messages].reverse().find((m) => m.role === "assistant")!;
+  }
+
+  const ARCHIVE_ALL_OFFER =
+    "Before I proceed — this would archive all of this project's test cases. Are you sure? Reply 'yes' to confirm, or 'no' to cancel.";
+
+  test("ZCC-B-20 a confirmed 'delete all' archives every active case of this project in that turn, and says so", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC archive all");
+    const cases = [await createCase(`E2E ZCC all A ${Date.now()}`), await createCase(`E2E ZCC all B ${Date.now()}`), await createCase(`E2E ZCC all C ${Date.now()}`)];
+    const alreadyArchived = await createCase(`E2E ZCC all archived ${Date.now()}`);
+    exec(`UPDATE testcases SET status = 'Archived' WHERE id = ${literal(alreadyArchived.id)};`);
+    // Another project of the same workspace: "all" means this project's cases, never another's.
+    const otherProject = await createCase(`E2E ZCC other project ${Date.now()}`, tenant!.secondProjectId);
+    try {
+      ai.queueReply({ reply: ARCHIVE_ALL_OFFER, reasoningSummary: "Asked for confirmation first.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+      expect((await sendMessage(sessionId, "delete all the test cases")).status).toBeLessThan(300);
+      expect(latestReview(sessionId), "asking for confirmation stages nothing").toBeNull();
+
+      // The exact shape the reported session's router produced on "yes".
+      ai.queueReply({
+        reply: "Archiving all test cases as confirmed — staged for your review.",
+        reasoningSummary: "User confirmed; one archive operation with allExisting=true.",
+        action: "archive",
+        actionType: "archive",
+        operations: [{ type: "archive", allExisting: true, reason: "user confirmed archiving all test cases" }],
+        testcases: [],
+      });
+      const turn = await sendMessage(sessionId, "yes");
+      expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+
+      for (const c of cases) expect(statusOf(c.id), "a confirmed archive is applied in the same turn").toBe("Archived");
+      expect(statusOf(alreadyArchived.id)).toBe("Archived");
+      expect(statusOf(otherProject.id), "another project's case is never touched").not.toBe("Archived");
+
+      // Committed through zyraSave: the batch records exactly this project's active cases and is done.
+      const review = latestReview(sessionId);
+      expect(review!.payload.map((entry) => entry.testcaseId).sort(), "every active case of this project, and only those").toEqual(cases.map((c) => c.id).sort());
+      expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(review!.id)};`)).toBe("done");
+
+      const assistant = await lastAssistant(sessionId);
+      const content = String(assistant.content || "");
+      expect(content).not.toContain("did not produce any test case operations");
+      expect(content, "the reply states what actually happened").toContain(`Archived ${cases.length} test cases`);
+      expect(assistant.reviewRequestId, "nothing is left for the review panel").toBeFalsy();
+      const rows = assistant.testcases as Array<{ action?: string; id?: string }>;
+      expect(rows).toHaveLength(cases.length);
+      expect(rows.every((row) => row.action === "archived" && !!row.id)).toBe(true);
+      const activity = (assistant.activity as Array<{ title?: string }>) ?? [];
+      expect(activity.some((entry) => entry.title === "Archived testcases")).toBe(true);
+    } finally {
+      await asOwner.delete(`/api/projects/${tenant!.secondProjectId}/testcases/${otherProject.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("ZCC-B-21 a confirmed archive naming several cases archives only those, and names the ones that don't exist", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC archive named set");
+    const [a, b, untouched] = [await createCase(`E2E ZCC set A ${Date.now()}`), await createCase(`E2E ZCC set B ${Date.now()}`), await createCase(`E2E ZCC set C ${Date.now()}`)];
+
+    ai.queueReply({
+      reply: "Archiving the named test cases — staged for your review.",
+      reasoningSummary: "Archiving 3 named cases as confirmed.",
+      action: "archive",
+      actionType: "archive",
+      operations: [{ type: "archive", externalIds: [a.externalId, b.externalId, "TC-NOPE-404"], reason: "confirmed" }],
+      testcases: [],
+    });
+    expect((await sendMessage(sessionId, "yes, archive those three")).status).toBeLessThan(300);
+
+    expect(statusOf(a.id)).toBe("Archived");
+    expect(statusOf(b.id)).toBe("Archived");
+    expect(statusOf(untouched.id), "a case that wasn't named is untouched").not.toBe("Archived");
+    const activity = ((await lastAssistant(sessionId)).activity as Array<{ title?: string; detail?: string }>) ?? [];
+    expect(
+      activity.some((entry) => entry.title === "Could not archive testcases" && /1 of the named/.test(String(entry.detail || ""))),
+      `the missing id must be reported — got ${JSON.stringify(activity)}`,
+    ).toBe(true);
+  });
+
+  test("ZCC-B-24 a single named case confirmed with 'yes' is archived in that turn", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC archive one");
+    const [target, other] = [await createCase(`E2E ZCC one target ${Date.now()}`), await createCase(`E2E ZCC one other ${Date.now()}`)];
+
+    ai.queueReply({
+      reply: `I found ${target.externalId}. Should I archive it? Reply yes to confirm.`,
+      reasoningSummary: "Asked for confirmation first.",
+      action: "answer",
+      actionType: "answer",
+      operations: [],
+      testcases: [],
+    });
+    expect((await sendMessage(sessionId, `delete ${target.externalId}`)).status).toBeLessThan(300);
+    expect(statusOf(target.id), "asking is not archiving").not.toBe("Archived");
+
+    ai.queueReply({
+      reply: `Archiving ${target.externalId}.`,
+      reasoningSummary: "Confirmed.",
+      action: "archive",
+      actionType: "archive",
+      operations: [{ type: "archive", externalId: target.externalId, reason: "confirmed" }],
+      testcases: [],
+    });
+    expect((await sendMessage(sessionId, "yes")).status).toBeLessThan(300);
+
+    expect(statusOf(target.id)).toBe("Archived");
+    expect(statusOf(other.id)).not.toBe("Archived");
+    expect(String((await lastAssistant(sessionId)).content || "")).toContain("Archived 1 test case");
+  });
+
+  test("ZCC-B-25 an archive on a hedged reply ('yes but keep …') is only staged for review — nothing changes", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC archive hedged");
+    const [a, b] = [await createCase(`E2E ZCC hedged A ${Date.now()}`), await createCase(`E2E ZCC hedged B ${Date.now()}`)];
+
+    // Even if the model emits an archive on a hedged message, the server's own check refuses to
+    // apply it immediately: it falls back to the review panel, where nothing changes until Save.
+    ai.queueReply({
+      reply: "Archiving everything as requested.",
+      reasoningSummary: "Archiving all.",
+      action: "archive",
+      actionType: "archive",
+      operations: [{ type: "archive", allExisting: true, reason: "requested" }],
+      testcases: [],
+    });
+    expect((await sendMessage(sessionId, `yes but keep ${a.externalId}`)).status).toBeLessThan(300);
+
+    expect(statusOf(a.id)).not.toBe("Archived");
+    expect(statusOf(b.id)).not.toBe("Archived");
+    const assistant = await lastAssistant(sessionId);
+    expect(assistant.reviewRequestId, "the archive waits in the review panel").toBeTruthy();
+    expect(((assistant.testcases as Array<{ action?: string }>) ?? []).every((row) => row.action === "proposed-archive")).toBe(true);
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(String(assistant.reviewRequestId))};`)).toBe("in_review");
+  });
+
+  test("ZCC-B-22 'no' after the confirmation prompt stages nothing and changes nothing", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC archive declined");
+    const c = await createCase(`E2E ZCC declined ${Date.now()}`);
+
+    ai.queueReply({ reply: ARCHIVE_ALL_OFFER, reasoningSummary: "Asked for confirmation first.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    expect((await sendMessage(sessionId, "delete all the test cases")).status).toBeLessThan(300);
+    ai.queueReply({ reply: "Okay — nothing was archived.", reasoningSummary: "User declined.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    expect((await sendMessage(sessionId, "no")).status).toBeLessThan(300);
+
+    expect(latestReview(sessionId)).toBeNull();
+    expect(statusOf(c.id)).not.toBe("Archived");
+  });
+
+  test("ZCC-B-23 a confirmed 'delete all' with no active cases says nothing was staged instead of claiming it", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E ZCC archive empty");
+    const archived = await createCase(`E2E ZCC only archived ${Date.now()}`);
+    exec(`UPDATE testcases SET status = 'Archived' WHERE id = ${literal(archived.id)};`);
+
+    ai.queueReply({
+      reply: "Archiving all test cases as confirmed — staged for your review.",
+      reasoningSummary: "User confirmed.",
+      action: "archive",
+      actionType: "archive",
+      operations: [{ type: "archive", allExisting: true, reason: "confirmed" }],
+      testcases: [],
+    });
+    expect((await sendMessage(sessionId, "yes")).status).toBeLessThan(300);
+
+    expect(latestReview(sessionId), "nothing to archive, so no batch").toBeNull();
+    const assistant = await lastAssistant(sessionId);
+    const activity = (assistant.activity as Array<{ title?: string; detail?: string }>) ?? [];
+    expect(activity.some((entry) => entry.title === "Could not archive testcases" && /no active test cases/.test(String(entry.detail || "")))).toBe(true);
+    expect(String(assistant.content || ""), "the reply must not stand as a claim that something was staged").toContain("Nothing was saved");
+  });
+
+  /*
    * fromLastPlan — Basecamp-adjacent, found by architecture audit rather than a report. A `create` op
    * has been staged-not-written since the 2026-09-03 review-panel change, so `applied.testcases[].id`
    * is always null for one; the code that recorded `zyra_chat_sessions.last_completed_plan` still
