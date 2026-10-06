@@ -204,22 +204,27 @@ export default function OnboardingPage() {
                         <span className="min-w-0 flex-1 truncate text-sm text-[var(--foreground)]" title={email}>
                           {email}
                         </span>
-                        <Select
-                          aria-label={`Role for ${email}`}
-                          value={role}
-                          onChange={(e) => {
-                            const next = e.target.value as WorkspaceRole;
-                            setRoleByEmail((prev) => ({ ...prev, [email]: next }));
-                          }}
-                          disabled={loading}
-                          className="w-40 shrink-0"
-                        >
-                          {inviteRoleOptions.map((opt) => (
-                            <option key={opt.value} value={opt.value}>
-                              {opt.label}
-                            </option>
-                          ))}
-                        </Select>
+                        {/* Sized by this wrapper, not a className on Select: Select always carries
+                            w-full and cx() is a plain join, so a `w-40` there races w-full in the
+                            stylesheet — w-full won, the select took the whole row, and the email
+                            beside it collapsed to zero width. */}
+                        <div className="w-40 shrink-0">
+                          <Select
+                            aria-label={`Role for ${email}`}
+                            value={role}
+                            onChange={(e) => {
+                              const next = e.target.value as WorkspaceRole;
+                              setRoleByEmail((prev) => ({ ...prev, [email]: next }));
+                            }}
+                            disabled={loading}
+                          >
+                            {inviteRoleOptions.map((opt) => (
+                              <option key={opt.value} value={opt.value}>
+                                {opt.label}
+                              </option>
+                            ))}
+                          </Select>
+                        </div>
                       </li>
                     );
                   })}
