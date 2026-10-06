@@ -499,6 +499,55 @@ test.describe("bugs list — controls and filters", () => {
     await expect(save).toBeVisible();
     await expect(save).toBeEnabled();
   });
+
+  test("BUG-U-107 the List view's edit and delete sit under an Actions column heading", async ({ page }) => {
+    // The column used to be headed by an empty <th>, so the icons read as stray glyphs at the row's end.
+    const headers = page.getByRole("columnheader");
+    await expect(headers.last()).toHaveText("Actions");
+
+    // The heading belongs to the column that actually holds the controls, not one beside it.
+    const actionsIndex = (await headers.count()) - 1;
+    const row = page.locator("tbody tr").filter({ hasText: "E2E Low sev bug" }).first();
+    const cell = row.locator("td").nth(actionsIndex);
+    await expect(cell.getByRole("button", { name: "Edit bug" })).toBeVisible();
+    await expect(cell.getByRole("button", { name: "Delete bug" })).toBeVisible();
+  });
+
+  test("BUG-U-108 the row's delete icon asks first, Cancel keeps the bug, Delete removes it", async ({ page }) => {
+    const seeded = await createBug(api, projectId, { title: `E2E Delete from list ${uniqueSuffix()}`, severity: "Low" });
+    try {
+      await page.reload();
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      const row = page.locator("tbody tr").filter({ hasText: seeded.title });
+      await expect(row).toHaveCount(1);
+
+      // The confirm modal renders without role="dialog"; its own copy is the reliable anchor.
+      const confirmText = page.getByText("Are you sure you want to delete this bug?");
+
+      await row.getByRole("button", { name: "Delete bug" }).click();
+      await expect(confirmText).toBeVisible();
+      // The icon sits inside a clickable row; it must not also open the bug.
+      await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(confirmText).toHaveCount(0);
+      await expect(row).toHaveCount(1);
+      expect((await api.get(`/api/bugs/${seeded.id}`)).status(), "Cancel leaves the bug in place").toBe(200);
+
+      await row.getByRole("button", { name: "Delete bug" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(confirmText).toHaveCount(0);
+      await expect(row).toHaveCount(0);
+      expect((await api.get(`/api/bugs/${seeded.id}`)).status(), "Delete removed it server-side").toBe(404);
+    } finally {
+      await api.delete(`/api/bugs/${seeded.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-109 an empty bug list shows its empty state, not a table with an Actions heading", async ({ page }) => {
+    await page.getByPlaceholder("Search bugs...").fill(`no-such-bug-${uniqueSuffix()}`);
+    await expect(page.getByText("No bugs match your filter.")).toBeVisible();
+    await expect(page.getByRole("columnheader", { name: "Actions", exact: true })).toHaveCount(0);
+  });
 });
 
 /*
