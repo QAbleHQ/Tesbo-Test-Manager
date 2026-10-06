@@ -613,6 +613,79 @@ test.describe("bulk operations", () => {
     }
   });
 
+  test("bulk-update changes severity for every selected test case, alongside priority", async ({ request }) => {
+    const a = await createCase(request, { severity: "Low", priority: "P3" });
+    const b = await createCase(request, { severity: "Low", priority: "P3" });
+
+    try {
+      const res = await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-update`, {
+        data: { testcaseIds: [a.id, b.id], severity: "Critical", priority: "P0" },
+      });
+      expect(res.ok()).toBeTruthy();
+
+      for (const id of [a.id, b.id]) {
+        const after = await (await request.get(`/api/projects/${ctx.projectId}/testcases/${id}`)).json();
+        expect(after.severity).toBe("Critical");
+        expect(after.priority).toBe("P0");
+      }
+    } finally {
+      await deleteCase(request, a.id);
+      await deleteCase(request, b.id);
+    }
+  });
+
+  test("bulk-update omitting severity leaves it unchanged, matching priority's leave-unchanged behavior", async ({ request }) => {
+    const created = await createCase(request, { severity: "High" });
+
+    try {
+      await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-update`, {
+        data: { testcaseIds: [created.id], status: "Approved" },
+      });
+      const after = await (
+        await request.get(`/api/projects/${ctx.projectId}/testcases/${created.id}`)
+      ).json();
+      expect(after.severity).toBe("High");
+      expect(after.status).toBe("Approved");
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
+  test("bulk-update sending an empty string for severity leaves it unchanged (same falsy-check as priority)", async ({ request }) => {
+    const created = await createCase(request, { severity: "Medium" });
+
+    try {
+      await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-update`, {
+        data: { testcaseIds: [created.id], severity: "" },
+      });
+      const after = await (
+        await request.get(`/api/projects/${ctx.projectId}/testcases/${created.id}`)
+      ).json();
+      expect(after.severity).toBe("Medium");
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
+  test("bulk-update refuses an over-long severity value", async ({ request }) => {
+    const created = await createCase(request, { severity: "Low" });
+
+    try {
+      const res = await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-update`, {
+        data: { testcaseIds: [created.id], severity: "x".repeat(33) },
+        failOnStatusCode: false,
+      });
+      expect(res.status()).toBe(400);
+
+      const after = await (
+        await request.get(`/api/projects/${ctx.projectId}/testcases/${created.id}`)
+      ).json();
+      expect(after.severity).toBe("Low");
+    } finally {
+      await deleteCase(request, created.id);
+    }
+  });
+
   test("bulk-update no-ops silently on an empty testcaseIds array", { tag: '@tesbo.testId("TES-TC-567")' }, async ({ request }) => {
     const res = await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-update`, {
       data: { testcaseIds: [], priority: "P0" },
