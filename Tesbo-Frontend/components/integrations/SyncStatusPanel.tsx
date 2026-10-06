@@ -6,11 +6,14 @@ import {
   isSyncRunActive,
   syncJiraTickets,
   syncLinearTickets,
+  syncNotionPages,
   type IntegrationProvider,
   type SyncRun,
 } from "@/lib/api";
 
 const POLL_INTERVAL_MS = 2000;
+
+const START_SYNC = { jira: syncJiraTickets, linear: syncLinearTickets, notion: syncNotionPages } as const;
 
 const STAGE_LABELS: Record<string, string> = {
   queued: "Queued…",
@@ -64,7 +67,7 @@ export function useSyncRun(projectId: string, provider: IntegrationProvider, ena
     setStarting(true);
     setError(null);
     try {
-      const result = provider === "jira" ? await syncJiraTickets(projectId) : await syncLinearTickets(projectId);
+      const result = await START_SYNC[provider](projectId);
       setRun(result.run);
       activeRef.current = isSyncRunActive(result.run);
       return result;
@@ -160,7 +163,7 @@ export function SyncStatusPanel({ run, label, className = "" }: { run: SyncRun |
         <span className="text-xs text-[var(--muted)]">
           {run.totalTickets > 0 && (
             <>
-              {run.processedTickets + run.failedTickets} of {run.totalTickets} tickets
+              {run.processedTickets + run.failedTickets} of {run.totalTickets} {label === "Notion" ? "pages" : "tickets"}
               {active ? ` · ${pct}%` : ""}
             </>
           )}

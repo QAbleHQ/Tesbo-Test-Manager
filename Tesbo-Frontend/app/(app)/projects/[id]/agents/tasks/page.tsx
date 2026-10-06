@@ -11,6 +11,7 @@ import {
   type KnowledgeDocument,
   type ZyraAgentState,
   type ZyraTask,
+  zyraTaskTicketKeys,
 } from "@/lib/api";
 import { Button, Field, FieldLabel, Modal, PageLoader, Select, StatusChip, Textarea } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
@@ -374,11 +375,11 @@ export default function ZyraTasksPage() {
                 </div>
                 <div><StatusChip tone={tone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip></div>
                 <div className="flex flex-wrap gap-1.5">
-                  {task.jiraIssueKeys.slice(0, 2).map((key) => (
+                  {zyraTaskTicketKeys(task).slice(0, 2).map((key) => (
                     <span key={key} className={JIRA_BADGE_CLASS}>{key}</span>
                   ))}
-                  {task.jiraIssueKeys.length === 0 && <span className="text-xs text-[var(--muted)]">No tickets</span>}
-                  {task.jiraIssueKeys.length > 2 && <span className="text-xs text-[var(--muted)]">+{task.jiraIssueKeys.length - 2}</span>}
+                  {zyraTaskTicketKeys(task).length === 0 && <span className="text-xs text-[var(--muted)]">No tickets</span>}
+                  {zyraTaskTicketKeys(task).length > 2 && <span className="text-xs text-[var(--muted)]">+{zyraTaskTicketKeys(task).length - 2}</span>}
                 </div>
                 <span className="text-sm text-[var(--foreground)]">{task.generatedCount} testcase{task.generatedCount === 1 ? "" : "s"}</span>
                 <span className="font-mono text-sm text-[var(--muted)]">{task.tokenUsage.total}</span>
@@ -415,14 +416,14 @@ export default function ZyraTasksPage() {
                         <p className="mt-1 line-clamp-2 text-xs text-[var(--error-foreground)]">{latestFailureDetail(task.activities)}</p>
                       )}
                       {task.context?.trim() && <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">{markdownToPlainText(task.context)}</p>}
-                      {task.jiraIssueKeys.length > 0 && (
+                      {zyraTaskTicketKeys(task).length > 0 && (
                         <div className="mt-2 flex flex-wrap gap-1.5">
-                          {task.jiraIssueKeys.slice(0, 3).map((key) => (
+                          {zyraTaskTicketKeys(task).slice(0, 3).map((key) => (
                             <span key={key} className={JIRA_BADGE_CLASS}>{key}</span>
                           ))}
-                          {task.jiraIssueKeys.length > 3 && (
+                          {zyraTaskTicketKeys(task).length > 3 && (
                             <span className="rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 text-[11px] font-medium text-[var(--muted)]">
-                              +{task.jiraIssueKeys.length - 3}
+                              +{zyraTaskTicketKeys(task).length - 3}
                             </span>
                           )}
                         </div>

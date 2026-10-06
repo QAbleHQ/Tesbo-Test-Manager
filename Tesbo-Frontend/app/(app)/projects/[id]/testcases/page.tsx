@@ -53,6 +53,7 @@ import {
   type BugItem,
   type CustomTag,
   type ZyraSourceRef,
+  notionPageKey,
 } from "@/lib/api";
 import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
 
@@ -362,6 +363,8 @@ export default function TestCasesPage() {
   const formSuiteId = isUnfiledView ? null : activeSuiteId;
   const activeJiraIssueKey = searchParams.get("jiraIssueKey") || "";
   const activeLinearIssueKey = searchParams.get("linearIssueKey") || "";
+  // A Notion test case links by full page id; the chip below shows the short `notion:xxxxxxxx` label.
+  const activeNotionPageId = searchParams.get("notionPageId") || "";
 
   // Take over the shared TopBar with this page's breadcrumb + actions (portaled below),
   // and hide the default global "Search projects" search while this page is mounted.
@@ -835,6 +838,7 @@ export default function TestCasesPage() {
         automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
         jiraIssueKey: activeJiraIssueKey || undefined,
         linearIssueKey: activeLinearIssueKey || undefined,
+        notionPageId: activeNotionPageId || undefined,
         search: debouncedSuiteSearch || undefined,
         customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
         customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -860,6 +864,7 @@ export default function TestCasesPage() {
     suiteAutomationFilter,
     activeJiraIssueKey,
     activeLinearIssueKey,
+    activeNotionPageId,
     customFieldFilters,
     suiteTagFilter,
   ]);
@@ -880,6 +885,7 @@ export default function TestCasesPage() {
       automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
       jiraIssueKey: activeJiraIssueKey || undefined,
       linearIssueKey: activeLinearIssueKey || undefined,
+      notionPageId: activeNotionPageId || undefined,
       search: debouncedSuiteSearch || undefined,
       customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
       customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -894,6 +900,7 @@ export default function TestCasesPage() {
       suiteAutomationFilter,
       activeJiraIssueKey,
       activeLinearIssueKey,
+      activeNotionPageId,
       debouncedSuiteSearch,
       customFieldFilters,
       suiteTagFilter,
@@ -1141,6 +1148,7 @@ export default function TestCasesPage() {
           automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
           jiraIssueKey: activeJiraIssueKey || undefined,
           linearIssueKey: activeLinearIssueKey || undefined,
+          notionPageId: activeNotionPageId || undefined,
           search: debouncedSuiteSearch || undefined,
           customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
           customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -2071,6 +2079,16 @@ export default function TestCasesPage() {
                         className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
                       >
                         <span className="opacity-70">Linear:</span> {activeLinearIssueKey}
+                        <IconX size={11} stroke={2.5} />
+                      </button>
+                    )}
+                    {activeNotionPageId && (
+                      <button
+                        type="button"
+                        onClick={() => router.replace(`/projects/${projectId}/testcases`)}
+                        className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
+                      >
+                        <span className="opacity-70">Notion:</span> {notionPageKey(activeNotionPageId)}
                         <IconX size={11} stroke={2.5} />
                       </button>
                     )}

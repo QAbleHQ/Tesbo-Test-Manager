@@ -1881,6 +1881,7 @@ export interface TestCaseExportFilters {
   automationStatus?: string;
   jiraIssueKey?: string;
   linearIssueKey?: string;
+  notionPageId?: string;
   search?: string;
   /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
   customFieldFilters?: string;
@@ -1905,6 +1906,7 @@ export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?
   if (filters?.automationStatus) sp.set("automationStatus", filters.automationStatus);
   if (filters?.jiraIssueKey) sp.set("jiraIssueKey", filters.jiraIssueKey);
   if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
+  if (filters?.notionPageId) sp.set("notionPageId", filters.notionPageId);
   if (filters?.search) sp.set("search", filters.search);
   if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
   if (filters?.customTagIds?.length) sp.set("customTagIds", filters.customTagIds.join(","));
@@ -3204,6 +3206,23 @@ export async function getProjectDashboardSummary(projectId: string): Promise<Pro
 
 export type IntegrationProvider = "jira" | "linear" | "notion";
 
+export const INTEGRATION_PROVIDER_LABELS: Record<IntegrationProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
+
+/** Label for a stored `sourceProvider` string; anything unrecognised (legacy rows) was always Jira. */
+export function integrationProviderLabel(provider: string | null | undefined): string {
+  return INTEGRATION_PROVIDER_LABELS[provider as IntegrationProvider] ?? "Jira";
+}
+
+/** Short display label for a Notion page id, matching the backend's `notion:xxxxxxxx` key. */
+export function notionPageKey(pageId: string): string {
+  return `notion:${pageId.replace(/-/g, "").slice(0, 8)}`;
+}
+
+/** Every ticket a Zyra task was built from, as display keys (Notion page ids shown by their short key). */
+export function zyraTaskTicketKeys(task: Pick<ZyraTask, "jiraIssueKeys" | "linearIssueKeys" | "notionPageIds">): string[] {
+  return [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? []), ...(task.notionPageIds ?? []).map(notionPageKey)];
+}
+
 /**
  * Read-only view of how the deployment is configured for this provider. Credentials come from the
  * backend environment (`<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET`) and cannot be set from the UI, so
@@ -3444,10 +3463,8 @@ export async function getJiraTicket(projectId: string, issueKey: string): Promis
 }
 
 export interface IssueSearchResult {
-  provider: "JIRA" | "LINEAR" | "NOTION";
+  provider: "JIRA" | "LINEAR";
   key: string;
-  /** Notion only: the full page id a test case links by (`key` is the short display label). */
-  pageId?: string;
   summary: string;
   status: string;
   url: string;
@@ -3653,7 +3670,19 @@ export async function listNotionPages(
   );
 }
 
-export async function searchNotionPagesLive(projectId: string, search: string): Promise<{ list: IssueSearchResult[] }> {
+/** A live Notion search hit. Kept apart from IssueSearchResult: Notion is not a bug tracker, so it never feeds the bug pickers. */
+export interface NotionSearchResult {
+  provider: "NOTION";
+  /** Short display label, `notion:xxxxxxxx`. */
+  key: string;
+  /** The full page id a test case links by. */
+  pageId: string;
+  summary: string;
+  status: string;
+  url: string;
+}
+
+export async function searchNotionPagesLive(projectId: string, search: string): Promise<{ list: NotionSearchResult[] }> {
   const sp = new URLSearchParams();
   if (search) sp.set("search", search);
   return api(`/api/projects/${projectId}/notion/search-pages?${sp.toString()}`);

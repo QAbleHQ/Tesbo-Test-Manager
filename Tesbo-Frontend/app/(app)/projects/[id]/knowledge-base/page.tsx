@@ -45,6 +45,7 @@ import {
   type KnowledgeBreadcrumbEntry,
   type KnowledgeFile,
   type KnowledgeBaseSummary,
+  integrationProviderLabel,
 } from "@/lib/api";
 import { Button, Input, Textarea, Modal, Field, FieldLabel, FieldError, PageLoader, StatusChip, EmptyStateBlock } from "@/components/ui";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
@@ -1676,9 +1677,7 @@ function KnowledgeBasePageInner() {
                       // origin are visible without opening the document.
                       const syncedFrom =
                         item.type === "document" && (item as { sourceRole?: string }).sourceRole === "mirror"
-                          ? (item as { sourceProvider?: string }).sourceProvider === "linear"
-                            ? "Linear"
-                            : "Jira"
+                          ? integrationProviderLabel((item as { sourceProvider?: string }).sourceProvider)
                           : null;
                       const syncedBy = (item as { syncedByName?: string }).syncedByName;
                       return (

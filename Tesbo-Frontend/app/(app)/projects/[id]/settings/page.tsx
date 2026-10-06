@@ -11,6 +11,7 @@ import {
   getJiraStatus,
   getBillingInfo,
   getLinearStatus,
+  getNotionStatus,
   listWorkspaceMembers,
   addProjectMember,
   removeProjectMember,
@@ -19,6 +20,7 @@ import {
   listCustomTags,
   type JiraConnection,
   type LinearConnection,
+  type NotionConnection,
   type ProjectIcon,
   type TestEnvironmentSetting,
 } from "@/lib/api";
@@ -131,6 +133,8 @@ export default function ProjectSettingsPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
   const [linearStatus, setLinearStatus] = useState<LinearConnection | null>(null);
+  // Notion is on every plan, so unlike Linear there is no Pro lock state to track here.
+  const [notionStatus, setNotionStatus] = useState<NotionConnection | null>(null);
   /*
    * Basecamp 10191178824 — "Linear is restricted behind a Pro upgrade in Workspace Settings, but the
    * same integration is available in Project Settings → Integrations".
@@ -259,6 +263,7 @@ export default function ProjectSettingsPage() {
     setCurrentUserId(currentUser.userId);
     getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
     getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
+    getNotionStatus(projectId).then(setNotionStatus).catch(() => {});
     getBillingInfo()
       .then((billing) => setLinearIsPro(billing.plan === "pro"))
       .catch(() => setLinearIsPro(null));
@@ -936,8 +941,8 @@ export default function ProjectSettingsPage() {
           <div>
             <h2 className="text-base font-semibold text-[var(--foreground)]">App Integrations</h2>
             <p className="mt-1 text-sm text-[var(--muted)]">
-              Jira and Linear connect once for the whole workspace (Workspace Settings → Integrations).
-              Open a connected integration&apos;s settings to pick which remote project/team feeds <em>this</em>{" "}
+              Jira, Linear and Notion connect once for the whole workspace (Workspace Settings → Integrations).
+              Open a connected integration&apos;s settings to pick which remote project, team or database feeds <em>this</em>{" "}
               project, sync tickets, and configure the rest of its options.
             </p>
           </div>
@@ -1024,7 +1029,7 @@ export default function ProjectSettingsPage() {
               ) : (
                 <p className="mt-2 text-xs text-[var(--muted-soft)]">
                   {linearLocked
-                    ? "Linear is a Pro plan integration — the Launch plan includes Jira only."
+                    ? "Linear is a Pro plan integration — the Launch plan includes Jira and Notion."
                     : "Not connected for this workspace yet."}
                 </p>
               )}
@@ -1050,6 +1055,64 @@ export default function ProjectSettingsPage() {
                   }
                 >
                   {linearLocked ? "Upgrade to Pro" : "Connect in Workspace Settings"}
+                </Link>
+              )}
+            </div>
+          </div>
+
+          {/* Notion Card (every plan, so no Pro lock) */}
+          <div data-testid="notion-project-card" className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
+              <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round">
+                <rect x="4" y="3.5" width="16" height="17" rx="2.5" />
+                <path d="M9 16.5v-9l6 9v-9" />
+              </svg>
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-semibold text-[var(--foreground)]">Notion</h3>
+              <p className="text-xs text-[var(--muted)] mt-0.5">
+                Import pages from a Notion database to use as knowledge base for test generation.
+              </p>
+              {notionStatus?.connected ? (
+                <div className="mt-2 space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                    <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                  </div>
+                  {notionStatus.needsReconnect && (
+                    <p className="text-xs text-[var(--warning-foreground)]">Needs to be reconnected in Workspace Settings.</p>
+                  )}
+                  {notionStatus.connectedProjects && notionStatus.connectedProjects.length > 0 ? (
+                    <p className="text-xs text-[var(--muted)] truncate" title={notionStatus.connectedProjects.map((d) => d.notionDatabaseName).join(", ")}>
+                      Notion database linked to this project:{" "}
+                      {notionStatus.connectedProjects.map((d) => d.notionDatabaseName).join(", ")}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-[var(--muted-soft)]">No Notion database linked to this project yet.</p>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-[var(--muted-soft)]">Not connected for this workspace yet.</p>
+              )}
+            </div>
+            <div className="shrink-0">
+              {notionStatus?.connected ? (
+                <Link
+                  href={`/projects/${projectId}/settings/integrations/notion`}
+                  data-testid="notion-project-settings-link"
+                  aria-label="Notion integration settings"
+                  title="Notion integration settings"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-[var(--border)] text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  <IconSettings size={17} stroke={1.75} />
+                </Link>
+              ) : (
+                <Link
+                  href="/settings/integrations/notion"
+                  data-testid="notion-project-cta"
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                >
+                  Connect in Workspace Settings
                 </Link>
               )}
             </div>

@@ -11,6 +11,7 @@ import {
   getKnowledgeFileDownloadUrl,
   getCustomFieldValues,
   getJiraTicket,
+  integrationProviderLabel,
   type ZyraSourceRef,
   type BugItem,
   type KnowledgeDocument,
@@ -193,7 +194,7 @@ function BugDetail({ data }: { data: BugItem }) {
 
 function KnowledgeDocumentDetail({ data, projectId }: { data: KnowledgeDocument; projectId: string }) {
   const t = useZyraText();
-  const providerLabel = data.sourceProvider === "linear" ? "Linear" : "Jira";
+  const providerLabel = integrationProviderLabel(data.sourceProvider);
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-1.5">

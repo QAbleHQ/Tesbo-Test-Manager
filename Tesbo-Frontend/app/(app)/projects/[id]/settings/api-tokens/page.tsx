@@ -66,8 +66,8 @@ const MCP_TOOL_GROUPS: Array<{ category: string; tools: Array<{ name: string; bl
       { name: "bulk_archive_testcases", blurb: "Archive many test cases in one call." },
       { name: "get_testcase_bugs", blurb: "Bugs linked to one test case." },
       { name: "get_testcase_executions", blurb: "A test case's run history across every cycle." },
-      { name: "link_requirement_to_testcase", blurb: "Attach a Jira/Linear ticket to a test case." },
-      { name: "unlink_requirement_from_testcase", blurb: "Remove a test case's Jira/Linear link." },
+      { name: "link_requirement_to_testcase", blurb: "Attach a Jira ticket, Linear ticket or Notion page to a test case." },
+      { name: "unlink_requirement_from_testcase", blurb: "Remove a test case's Jira, Linear or Notion link." },
     ],
   },
   {

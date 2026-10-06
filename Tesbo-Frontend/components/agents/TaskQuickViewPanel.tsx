@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
-import { closeZyraTask, type ZyraTask } from "@/lib/api";
+import { closeZyraTask, zyraTaskTicketKeys, type ZyraTask } from "@/lib/api";
 import { Button, CopyButton, StatusChip, PriorityBadge, type Priority, type Severity } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
 import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
@@ -154,10 +154,10 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
   const feedbackActivities = activities.filter(isFeedbackActivity);
   const failureDetail = failed ? latestFailureDetail(activities, t("task.failedDefault")) : null;
   const approvalRate = task.generatedCount > 0 ? Math.round((task.savedCount / task.generatedCount) * 100) : null;
-  // A task's ticket lives in jiraIssueKeys OR linearIssueKeys depending on its source — reading only
+  // A task's ticket lives in jiraIssueKeys, linearIssueKeys OR notionPageIds depending on its source. Reading only
   // the Jira list left every Linear task showing a bare "—" placeholder beside its status. Same
   // combined list the full task page uses; a task with no ticket gets no key slot at all.
-  const ticketKey = [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? [])][0];
+  const ticketKey = zyraTaskTicketKeys(task)[0];
   const draftsTsv = toTsv(
     [t("col.title"), t("col.priority"), t("col.severity"), t("col.component"), t("col.preconditions"), t("col.steps"), t("col.expectedResultCap"), t("col.tags")],
     task.drafts.map((draft) => [

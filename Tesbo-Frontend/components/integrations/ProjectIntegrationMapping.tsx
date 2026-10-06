@@ -44,6 +44,8 @@ export function ProjectIntegrationMapping({
   fetchRemoteList,
   saveMapping,
   settingsPanel,
+  itemNoun = "tickets",
+  emptyMessage,
 }: {
   provider: IntegrationProvider;
   label: string;
@@ -58,6 +60,10 @@ export function ProjectIntegrationMapping({
    * of adding a tab to the project settings rail.
    */
   settingsPanel?: React.ReactNode;
+  /** What the remote unit contains, for copy: "tickets" (Jira, Linear) or "pages" (Notion). */
+  itemNoun?: string;
+  /** Replaces the default "nothing found" line when the provider has a specific remedy (Notion: share the database first). */
+  emptyMessage?: React.ReactNode;
 }) {
   const params = useParams();
   const router = useRouter();
@@ -265,7 +271,7 @@ export function ProjectIntegrationMapping({
       <Card className="p-4">
         <h2 className="text-base font-semibold text-[var(--foreground)]">Select a {remoteUnitLabel}</h2>
         <p className="mt-1 text-sm text-[var(--muted)]">
-          One {remoteUnitLabel.toLowerCase()} feeds this project. Its tickets are mirrored into the{" "}
+          One {remoteUnitLabel.toLowerCase()} feeds this project. Its {itemNoun} are mirrored into the{" "}
           <span className="font-medium text-[var(--foreground)]">{label}</span> folder of the Knowledge Base, where Zyra can use them as
           context. Picking a different {remoteUnitLabel.toLowerCase()} replaces the link — already-synced documents are left in place.
         </p>
@@ -276,12 +282,15 @@ export function ProjectIntegrationMapping({
             Loading {remoteUnitLabel.toLowerCase()}s…
           </div>
         ) : remoteItems.length === 0 ? (
-          <p className="mt-4 text-sm text-[var(--muted)]">No {remoteUnitLabel.toLowerCase()}s found in your {label} workspace.</p>
+          <div data-testid="remote-items-empty" className="mt-4 text-sm text-[var(--muted)]">
+            {emptyMessage ?? <p>No {remoteUnitLabel.toLowerCase()}s found in your {label} workspace.</p>}
+          </div>
         ) : (
           <div className="mt-4 space-y-2 max-h-80 overflow-y-auto" role="radiogroup" aria-label={`${label} ${remoteUnitLabel}`}>
             {remoteItems.map((item) => (
               <label
                 key={item.id}
+                data-testid="remote-item"
                 className={`flex items-center gap-3 rounded-lg border px-3 py-2.5 cursor-pointer transition-colors ${
                   selectedId === item.id
                     ? "border-[var(--brand-primary)] bg-[var(--brand-soft)]"
@@ -296,13 +305,13 @@ export function ProjectIntegrationMapping({
                   className="border-[var(--border)] text-[var(--accent-light)] focus:ring-[var(--brand-soft)]"
                 />
                 <div className="min-w-0 flex-1">
-                  <span className="text-sm font-medium text-[var(--foreground)]">{item.name}</span>
+                  <span className="text-sm font-medium text-[var(--foreground)] break-words">{item.name}</span>
                   {item.entityType && (
                     <span className="ml-2 rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[var(--muted)]">
                       {item.entityType}
                     </span>
                   )}
-                  <span className="ml-2 text-xs text-[var(--muted)] font-mono">{item.key}</span>
+                  {item.key && <span className="ml-2 text-xs text-[var(--muted)] font-mono">{item.key}</span>}
                 </div>
               </label>
             ))}
@@ -327,10 +336,9 @@ export function ProjectIntegrationMapping({
 
       {status.connectedProjects && status.connectedProjects.length > 0 && (
         <Card className="p-4">
-          <h2 className="text-base font-semibold text-[var(--foreground)]">Sync Tickets</h2>
+          <h2 className="text-base font-semibold text-[var(--foreground)]">Sync {itemNoun.charAt(0).toUpperCase() + itemNoun.slice(1)}</h2>
           <p className="mt-1 text-sm text-[var(--muted)]">
-            Pulls every ticket from the linked {remoteUnitLabel.toLowerCase()} — description, comments, and an AI summary of the decisions
-            in each thread — into the {label} folder of the Knowledge Base. Runs in the background, so you can leave this page.
+            Pulls every {itemNoun === "tickets" ? "ticket" : "page"} from the linked {remoteUnitLabel.toLowerCase()}: {itemNoun === "tickets" ? "description, comments, and an AI summary of the decisions in each thread" : "its content and properties"}, into the {label} folder of the Knowledge Base. Runs in the background, so you can leave this page.
           </p>
           <div className="mt-3 flex items-center gap-3">
             <Button variant="secondary" onClick={handleSync} disabled={starting || isSyncRunActive(run)}>
