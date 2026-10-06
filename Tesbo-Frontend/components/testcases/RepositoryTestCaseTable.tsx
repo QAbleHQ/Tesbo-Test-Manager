@@ -6,6 +6,7 @@ import { IconArrowsSort, IconColumns, IconSortAscending, IconSortDescending } fr
 import { PriorityBadge, StatusChip, type Priority } from "@/components/ui";
 import type { TestCaseListItem } from "@/lib/api";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
+import { formatDate } from "@/lib/date";
 import { ZyraCitationsBadge } from "@/components/agents/ZyraCitationsBadge";
 
 /** The columns the repository table's header offers a sort control for — mirrors the Test Runs table. */
@@ -526,7 +527,7 @@ export function RepositoryTestCaseTable({
       case "updated":
         return (
           <td key={col} style={tdStyle} className={`${cellClass} text-[11px] font-mono text-[var(--muted)]`}>
-            <span className={innerTruncate}>{new Date(tc.updatedAt).toLocaleDateString()}</span>
+            <span className={innerTruncate}>{formatDate(tc.updatedAt)}</span>
           </td>
         );
       case "type":

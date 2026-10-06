@@ -11,6 +11,12 @@ type ConfirmModalProps = {
   cancelLabel?: string;
   confirmVariant?: "destructive" | "primary";
   loading?: boolean;
+  // What the confirm button says while `loading` — defaults to the original "Removing…" so every
+  // existing caller renders exactly as before.
+  loadingLabel?: string;
+  // Shown under the message; lets a caller keep the dialog open on a failed confirm and say why,
+  // with the confirm button left enabled to retry.
+  error?: string | null;
   onConfirm: () => void;
   onCancel: () => void;
 };
@@ -28,6 +34,8 @@ export default function ConfirmModal({
   cancelLabel = "Cancel",
   confirmVariant = "destructive",
   loading = false,
+  loadingLabel = "Removing…",
+  error = null,
   onConfirm,
   onCancel,
 }: ConfirmModalProps) {
@@ -41,12 +49,13 @@ export default function ConfirmModal({
     >
       <div className="space-y-5">
         <p className="text-sm leading-relaxed text-[var(--muted)]">{message}</p>
+        {error && <p role="alert" className="text-sm text-[var(--error-foreground)]">{error}</p>}
         <div className="flex justify-end gap-2">
           <Button type="button" variant="secondary" onClick={onCancel} disabled={loading}>
             {cancelLabel}
           </Button>
           <Button type="button" variant={confirmVariant} onClick={onConfirm} disabled={loading}>
-            {loading ? "Removing…" : confirmLabel}
+            {loading ? loadingLabel : confirmLabel}
           </Button>
         </div>
       </div>

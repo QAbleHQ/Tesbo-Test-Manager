@@ -3,10 +3,10 @@ import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
 import type { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import type { RagIngestionService } from "../rag/rag-ingestion.service";
-import { IntegrationConnectionInvalidError, IntegrationSyncClient } from "./integration-sync.client";
+import { IntegrationConnectionInvalidError, IntegrationSyncClient, NotionNotSharedError } from "./integration-sync.client";
 import { IntegrationSyncDecisions } from "./integration-sync-decisions";
 import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.builder";
-import { INTEGRATION_SYNC_NIGHTLY_JIRA_JOB, INTEGRATION_SYNC_RUN_JOB } from "./integration-sync.constants";
+import { INTEGRATION_SYNC_NIGHTLY_JIRA_JOB, INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, INTEGRATION_SYNC_RUN_JOB } from "./integration-sync.constants";
 import { IntegrationSyncProcessor } from "./integration-sync.processor";
 import { IntegrationSyncService } from "./integration-sync.service";
 import { RemoteTicket, SyncProvider, SyncRunJobPayload } from "./integration-sync.types";
@@ -399,5 +399,123 @@ describe("IntegrationSyncProcessor#process — a mapping with no name falls back
     const update = (db.query as unknown as jest.Mock).mock.calls.find(([sql]) => String(sql).includes("SET remote_project_key"));
     expect(update?.[1]).toEqual(["run-1", "KAN", null]);
     expect(runs.finishRun).toHaveBeenCalledWith("run-1", "No tickets found in KAN.");
+  });
+});
+
+describe("IntegrationSyncProcessor, notion provider", () => {
+  const payload: SyncRunJobPayload = { runId: "run-1", organizationId: "org-1", projectId: "proj-1", provider: "notion", triggeredBy: "user-1" };
+
+  function notionDb() {
+    return jest.fn((sql: string, _params: unknown[] = []) => {
+      if (sql.includes("FROM notion_project_mappings")) {
+        return Promise.resolve({ rows: [{ remote_id: "db-1", remote_key: "db-1", remote_name: "Product specs" }] });
+      }
+      if (sql.includes("INSERT INTO notion_pages")) return Promise.resolve({ rows: [{ id: "row-1" }] });
+      return Promise.resolve({ rows: [] });
+    });
+  }
+
+  it("fetches through fetchNotionPages with the mapped database id and upserts into notion_pages", async () => {
+    const dbQuery = notionDb();
+    const fetchNotionPages = jest.fn(async (_conn, _db, onPage) => {
+      await onPage([remoteTicket({ issueId: "page-1", issueKey: "notion:aaaaaaaa", properties: { Status: "Open" }, archived: false })]);
+      return { total: 1, truncated: false };
+    });
+    const { processor, runs, client } = makeProcessor({
+      db: { query: dbQuery },
+      client: { loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }), fetchNotionPages }
+    });
+
+    await processor.process(job(INTEGRATION_SYNC_RUN_JOB, { ...payload, since: "2026-01-01T00:00:00.000Z" }));
+
+    expect(client.loadConnection).toHaveBeenCalledWith("org-1", "notion");
+    expect(fetchNotionPages).toHaveBeenCalledWith({ id: "conn-1" }, "db-1", expect.any(Function), "2026-01-01T00:00:00.000Z");
+    expect(runs.failRun).not.toHaveBeenCalled();
+    const queued = (runs.enqueueTicketJobs as jest.Mock).mock.calls[0][0];
+    expect(queued[0]).toMatchObject({ provider: "notion", issueId: "page-1", ticketId: "row-1" });
+
+    const insert = dbQuery.mock.calls.find(([sql]) => String(sql).includes("INSERT INTO notion_pages"))!;
+    const sql = String(insert[0]);
+    expect(sql).toContain("properties_json");
+    expect(sql).toContain("ON CONFLICT (integration_connection_id, notion_page_id, project_id)");
+    // The body is read later, per ticket, so a re-sync must not blank the description already stored.
+    expect(sql).not.toContain("description = EXCLUDED.description");
+    expect(insert[1]).toEqual(expect.arrayContaining([JSON.stringify({ Status: "Open" }), false, "db-1"]));
+  });
+
+  it("shows a clear failure when the database is no longer shared", async () => {
+    const { processor, runs } = makeProcessor({
+      db: { query: notionDb() },
+      client: {
+        loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }),
+        fetchNotionPages: jest.fn().mockRejectedValue(new NotionNotSharedError("The Notion database could not be found. Share it with the Tesbo integration."))
+      }
+    });
+    await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+    expect(runs.failRun).toHaveBeenCalledWith("run-1", expect.stringMatching(/share it with the Tesbo integration/i));
+  });
+
+  it("fails the run when no database is mapped", async () => {
+    const { processor, runs } = makeProcessor({
+      db: { query: jest.fn().mockResolvedValue({ rows: [] }) },
+      client: { loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }) }
+    });
+    await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+    expect(runs.failRun).toHaveBeenCalledWith("run-1", "No Notion database is mapped to this project yet.");
+  });
+
+  it("dispatches the nightly notion job to the notion orchestrator", async () => {
+    const { processor, runs } = makeProcessor();
+    await processor.process(job(INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, {}));
+    expect(runs.listNightlySyncTargets).toHaveBeenCalledWith("notion");
+  });
+
+  it("reads the page body per ticket, stores it, and falls back to the cached body when the read fails", async () => {
+    const updates: unknown[][] = [];
+    const row = {
+      id: "row-1",
+      notion_page_id: "page-1",
+      notion_page_key: "notion:aaaaaaaa",
+      summary: "Spec",
+      description: "cached body",
+      properties_json: { Status: "Open" },
+      comments_hash: "",
+      decision_summary_hash: ""
+    };
+    const build = jest.fn().mockReturnValue({ title: "t", markdown: "m", html: "h" });
+    const fetchNotionBody = jest.fn().mockResolvedValueOnce("fresh body").mockRejectedValueOnce(new Error("boom"));
+    const dbQuery = jest.fn((sql: string, params: unknown[] = []) => {
+      if (sql.startsWith("SELECT * FROM notion_pages")) return Promise.resolve({ rows: [row] });
+      if (sql.startsWith("UPDATE notion_pages SET description")) updates.push(params);
+      return Promise.resolve({ rows: [] });
+    });
+    const processor = new IntegrationSyncProcessor(
+      { query: dbQuery } as unknown as DatabaseService,
+      { recordTicketResult: jest.fn() } as unknown as IntegrationSyncService,
+      { loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }), fetchComments: jest.fn().mockResolvedValue([]), fetchNotionBody } as unknown as IntegrationSyncClient,
+      { buildMirror: build } as unknown as IntegrationSyncDocumentBuilder,
+      { resolveAllocation: jest.fn() } as unknown as IntegrationSyncDecisions,
+      {} as unknown as RagIngestionService,
+      { checkStorageAvailable: jest.fn().mockResolvedValue({ allowed: true }) } as unknown as PlanLimitsService
+    );
+    const ticketJob = {
+      runId: "run-1",
+      organizationId: "org-1",
+      projectId: "proj-1",
+      provider: "notion",
+      ticketId: "row-1",
+      issueId: "page-1",
+      issueKey: "notion:aaaaaaaa",
+      folderId: "f",
+      triggeredBy: null
+    };
+
+    await processor.process(job("sync-ticket", ticketJob));
+    expect(updates).toEqual([["row-1", "fresh body"]]);
+    expect(build.mock.calls[0][0].description).toBe("- **Status:** Open\n\nfresh body");
+
+    await processor.process(job("sync-ticket", ticketJob));
+    expect(updates).toHaveLength(1);
+    expect(build.mock.calls[1][0].description).toBe("- **Status:** Open\n\ncached body");
   });
 });

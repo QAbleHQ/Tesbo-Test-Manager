@@ -1,7 +1,8 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { clearOtpIpRateLimit, disposableEmail, seedOtpCode } from "../utils/otp";
-import { dbControlAvailable, exec, literal } from "../utils/psql";
+import { dbControlAvailable, exec, execAllowingAuditImmutability, execMany, literal, scalar } from "../utils/psql";
+import { removeWelcomeJob } from "../utils/welcome-email-queue";
 
 /*
  * Basecamp 10212498688 — "Profile page should have user name and surname and mobile number fields
@@ -142,5 +143,154 @@ test.describe("passwordless sign-in — one-time profile completion", () => {
     await expect(page.getByText("Last name is required")).toBeVisible();
     // Refused client-side — still on the profile step, not bounced onward with an incomplete profile.
     await expect(page).toHaveURL(/\/complete-profile/);
+  });
+});
+
+/*
+ * "[Sign Up] Resend Verification Code Functionality Is Not Available" — the password-mode code step
+ * on /signup had no way to ask for another code, so a delayed or expired email stranded the user.
+ *
+ * The resend calls signup/start again rather than /otp/request: the pending_signups row expires on
+ * the same timer as the code, so a fresh code alone would pass the OTP check and then fail with "No
+ * pending signup found". Re-starting writes a new pending row and a new code together, which is what
+ * SGN-UI-06 proves by expiring the first pair before resending.
+ */
+test.describe("signup — resend verification code", () => {
+  test.beforeEach(() => clearOtpIpRateLimit());
+
+  const otpBoxes = (page: Page) => page.locator('input[inputmode="numeric"][maxlength="1"]');
+
+  function pendingCount(email: string): number {
+    return Number(scalar(`SELECT COUNT(*) FROM pending_signups WHERE email = ${literal(email.toLowerCase())};`));
+  }
+
+  function usablePendingCount(email: string): number {
+    return Number(
+      scalar(
+        `SELECT COUNT(*) FROM pending_signups WHERE email = ${literal(email.toLowerCase())} ` +
+          "AND consumed_at IS NULL AND expires_at > now();",
+      ),
+    );
+  }
+
+  async function reachCodeStep(page: Page, email: string, lastName: string) {
+    await page.goto("/signup");
+    await page.locator("#signup-first-name").fill("EndToEnd");
+    await page.locator("#signup-last-name").fill(lastName);
+    await page.locator("#signup-email").fill(email);
+    await page.locator("#signup-password").fill("E2eSignPass9f3!");
+    await page.getByRole("button", { name: "Create account" }).click();
+    await expect(page.getByText("Check your email", { exact: true })).toBeVisible();
+  }
+
+  test("SGN-UI-05 resend issues a fresh signup request, clears the code boxes and starts a 30s cooldown", async ({ page }) => {
+    const email = trackedEmail("sgnui-resend");
+    // Fake clock (still running in real time) so the 30s cooldown can be skipped rather than waited
+    // out. Installed before navigation so the page's Date and timers are the controlled ones.
+    await page.clock.install();
+    await reachCodeStep(page, email, "Resend");
+    expect(pendingCount(email)).toBe(1);
+
+    // A half-typed code from the first email must not linger once a new code is on its way.
+    await fillOtpCode(page, "123");
+    await page.getByRole("button", { name: "Resend code" }).click();
+
+    await expect(page.getByRole("status").filter({ hasText: "We sent a new code" })).toBeVisible();
+    // Read straight away: each scalar() below is a ~3s round trip to the hosted database, and the
+    // countdown keeps running in real time meanwhile, so checked later it reads well under 30.
+    const cooling = page.getByRole("button", { name: /Resend in \d+s/ });
+    await expect(cooling).toHaveText(/^Resend in (29|30)s$/);
+    for (let i = 0; i < 6; i++) await expect(otpBoxes(page).nth(i)).toHaveValue("");
+
+    // Persisted, not just a toast: a second pending signup carrying the same details the form held.
+    expect(pendingCount(email)).toBe(2);
+    const newest = scalar(
+      `SELECT first_name || '|' || last_name || '|' || (password_hash IS NOT NULL) FROM pending_signups ` +
+        `WHERE email = ${literal(email.toLowerCase())} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    expect(newest).toBe("EndToEnd|Resend|true");
+
+    // Cooldown: disabled with a countdown, and a forced click (a double-click, say) sends nothing.
+    await expect(cooling).toBeDisabled();
+    await cooling.click({ force: true });
+    expect(pendingCount(email)).toBe(2);
+
+    await page.clock.fastForward(30_000);
+    await expect(page.getByRole("button", { name: "Resend code" })).toBeEnabled();
+  });
+
+  test("SGN-UI-06 after the first code and signup request expire, the resent code still creates the account", async ({ page }) => {
+    // Not tracked in createdEmails: this test completes the signup, which audits the new user, so its
+    // teardown has to tolerate the append-only audit_logs trigger — the shared afterEach does not.
+    const email = disposableEmail("sgnui-resendexpired");
+    const normalized = email.toLowerCase();
+    let userId: string | null = null;
+    try {
+      await reachCodeStep(page, email, "Expired");
+      // The user waited too long: both the first code and the pending signup behind it are dead.
+      execMany([
+        `UPDATE pending_signups SET expires_at = now() - interval '1 minute' WHERE email = ${literal(normalized)}`,
+        `UPDATE otp_codes SET expires_at = now() - interval '1 minute' WHERE email = ${literal(normalized)}`,
+      ]);
+      expect(usablePendingCount(email)).toBe(0);
+
+      await page.getByRole("button", { name: "Resend code" }).click();
+      await expect(page.getByRole("status").filter({ hasText: "We sent a new code" })).toBeVisible();
+      expect(usablePendingCount(email)).toBe(1);
+
+      seedOtpCode(email, "624813");
+      await fillOtpCode(page, "624813");
+      await page.getByRole("button", { name: "Verify and create account" }).click();
+      await page.waitForURL(/\/onboarding/);
+
+      userId = scalar(`SELECT id FROM users WHERE email = ${literal(normalized)};`) || null;
+      expect(userId, "verifying the resent code did not create the account").toBeTruthy();
+      expect(scalar(`SELECT last_name FROM users WHERE email = ${literal(normalized)};`)).toBe("Expired");
+    } finally {
+      removeWelcomeJob(userId);
+      execMany([
+        `DELETE FROM pending_signups WHERE email = ${literal(normalized)}`,
+        `DELETE FROM otp_codes WHERE email = ${literal(normalized)}`,
+        `DELETE FROM otp_rate_limit WHERE email IN (${literal(`send:${normalized}`)}, ${literal(`verify:${normalized}`)}, ${literal(normalized)})`,
+      ]);
+      execAllowingAuditImmutability(`DELETE FROM users WHERE email = ${literal(normalized)};`);
+    }
+  });
+
+  test("SGN-UI-07 a wrong code shows a readable message, not the raw error code", async ({ page }) => {
+    const email = trackedEmail("sgnui-wrongcode");
+    await reachCodeStep(page, email, "WrongCode");
+
+    // Nothing was seeded, so any code is wrong.
+    await fillOtpCode(page, "000000");
+    await page.getByRole("button", { name: "Verify and create account" }).click();
+
+    await expect(page.getByText("That code is invalid or has expired. Request a new one.")).toBeVisible();
+    await expect(page.getByText("invalid_or_expired_otp")).toHaveCount(0);
+    // Still on the code step, where the resend it points to actually is.
+    await expect(page.getByRole("button", { name: "Resend code" })).toBeVisible();
+  });
+
+  test("SGN-UI-08 a failed resend reports the error, keeps the typed code and starts no cooldown", async ({ page }) => {
+    const email = trackedEmail("sgnui-resendfail");
+    await reachCodeStep(page, email, "ResendFail");
+
+    // Stubbed only after the first, real start() — this is the resend's request alone.
+    await page.route("**/api/auth/signup/start", (route) =>
+      route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "Email delivery is temporarily unavailable" }),
+      }),
+    );
+    await fillOtpCode(page, "12");
+    await page.getByRole("button", { name: "Resend code" }).click();
+
+    await expect(page.getByText("Email delivery is temporarily unavailable")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Resend code" })).toBeEnabled();
+    await expect(page.getByText(/We sent a new code/)).toHaveCount(0);
+    await expect(otpBoxes(page).nth(0)).toHaveValue("1");
+    await expect(otpBoxes(page).nth(1)).toHaveValue("2");
+    expect(pendingCount(email)).toBe(1);
   });
 });

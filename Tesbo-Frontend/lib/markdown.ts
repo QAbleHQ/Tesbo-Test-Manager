@@ -1,5 +1,5 @@
-// Small hand-rolled Markdown → HTML renderer (headers, bold/italic, links, inline code, hr,
-// bullet/numbered lists, pipe tables). Escapes HTML first so raw content can never inject
+// Small hand-rolled Markdown → HTML renderer (h1–h6, bold/italic, links, inline code, fenced
+// code blocks, blockquotes, hr, bullet and numbered lists, pipe tables). Escapes HTML first so raw content can never inject
 // markup — safe to render via dangerouslySetInnerHTML. Pair with the `zyra-prose` CSS class
 // (app/globals.css) for styling, and `break-words` on the container so long unbroken tokens
 // (URLs, ids) wrap instead of overflowing a fixed-width container.
@@ -35,10 +35,11 @@ export function markdownToPlainText(text: string): string {
   return text
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line && !/^---+$/.test(line) && !/^\|[\s\-:|]+\|$/.test(line))
+    .filter((line) => line && !/^---+$/.test(line) && !/^\|[\s\-:|]+\|$/.test(line) && !/^```/.test(line))
     .map((line) =>
       line
         .replace(/^#{1,6}\s+/, "")
+        .replace(/^>\s?/, "")
         .replace(/^[-*]\s+/, "")
         .replace(/^\|(.*)\|$/, (_, cells: string) => cells.split("|").map((c) => c.trim()).join(" · "))
         .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
@@ -50,36 +51,74 @@ export function markdownToPlainText(text: string): string {
     .join(" ");
 }
 
+// Zyra task source types whose `detail` is captured document/ticket text, which Jira, Linear and Notion
+// descriptions carry as Markdown. Shared by the task detail page and the quick-view panel so the
+// two can't disagree. `story` is left out: it is the user's own one-line story, shown plain
+// everywhere else (the task heading, Kanban cards).
+const MARKDOWN_SOURCE_TYPES = new Set(["knowledge_base", "context", "jira", "linear", "notion"]);
+
+export function isMarkdownSource(type: string): boolean {
+  return MARKDOWN_SOURCE_TYPES.has(type);
+}
+
 export function renderMarkdown(text: string): string {
   // Quotes matter here, not just `<`/`>`: the link replacement above interpolates its captured URL
   // straight into a double-quoted href attribute, so an unescaped `"` in the source text (e.g.
   // `[x](https://a" onmouseover=alert(1) x=")`) would close that attribute early and let whatever
   // follows land as raw, executing HTML instead of stopping at the closing `)` the regex expects.
   const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  // Everything below operates on already-escaped text: `>` arrives as `&gt;` (hence the blockquote
+  // pattern), and a code block's contents need no further escaping — only no inline formatting.
   const lines = esc(text).split("\n");
   const out: string[] = [];
   let i = 0;
   while (i < lines.length) {
     const t = lines[i].trim();
-    if (/^### /.test(t)) { out.push(`<h3>${mdInline(t.slice(4))}</h3>`); i++; continue; }
-    if (/^## /.test(t)) { out.push(`<h2>${mdInline(t.slice(3))}</h2>`); i++; continue; }
-    if (/^# /.test(t)) { out.push(`<h1>${mdInline(t.slice(2))}</h1>`); i++; continue; }
+    // Fenced code block. Contents are emitted verbatim (untrimmed, no mdInline), so `**`/`*`/`_`
+    // inside code never turn into formatting. An unterminated fence runs to the end of the text.
+    if (/^```/.test(t)) {
+      const code: string[] = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i].trim())) { code.push(lines[i]); i++; }
+      i++; // closing fence
+      out.push(`<pre class="code-block"><code>${code.join("\n")}</code></pre>`);
+      continue;
+    }
+    // ATX headings, all six levels (an optional closing run of #s is dropped, as in CommonMark).
+    // Only # to ### used to be recognised, so a "#### Heading" fell through to a paragraph and
+    // rendered with its #s showing.
+    const heading = /^(#{1,6})\s+(.*?)(?:\s+#+)?$/.exec(t);
+    if (heading) {
+      const level = heading[1].length;
+      out.push(`<h${level}>${mdInline(heading[2])}</h${level}>`);
+      i++;
+      continue;
+    }
     if (/^---+$/.test(t)) { out.push("<hr/>"); i++; continue; }
+    if (/^&gt; ?/.test(t)) {
+      const quoted: string[] = [];
+      while (i < lines.length && /^&gt; ?/.test(lines[i].trim())) { quoted.push(mdInline(lines[i].trim().replace(/^&gt; ?/, ""))); i++; }
+      out.push(`<blockquote><p>${quoted.join("<br/>")}</p></blockquote>`);
+      continue;
+    }
     if (t.startsWith("|")) {
       const tbl: string[] = [];
       while (i < lines.length && lines[i].trim().startsWith("|")) { tbl.push(lines[i]); i++; }
       out.push(mdTable(tbl));
       continue;
     }
-    if (/^[-*] /.test(t) || /^\d+\. /.test(t)) {
+    // A numbered list is an <ol> — it used to be a <ul> with the numbers stripped, which lost step
+    // order. A run of one kind ends where the other kind starts, so each becomes its own list.
+    const ordered = /^(\d+)\. /.exec(t);
+    if (ordered || /^[-*] /.test(t)) {
+      const itemPattern = ordered ? /^\d+\. / : /^[-*] /;
       const items: string[] = [];
-      while (i < lines.length) {
-        const l = lines[i].trim();
-        if (/^[-*] /.test(l)) { items.push(`<li>${mdInline(l.slice(2))}</li>`); i++; }
-        else if (/^\d+\. /.test(l)) { items.push(`<li>${mdInline(l.replace(/^\d+\. /, ""))}</li>`); i++; }
-        else break;
+      while (i < lines.length && itemPattern.test(lines[i].trim())) {
+        items.push(`<li>${mdInline(lines[i].trim().replace(itemPattern, ""))}</li>`);
+        i++;
       }
-      out.push(`<ul>${items.join("")}</ul>`);
+      const start = ordered ? Number(ordered[1]) : 1;
+      out.push(ordered ? `<ol${start !== 1 ? ` start="${start}"` : ""}>${items.join("")}</ol>` : `<ul>${items.join("")}</ul>`);
       continue;
     }
     if (t === "") { out.push("<br/>"); i++; continue; }

@@ -199,6 +199,9 @@ test.describe("zyra / agents (UI)", () => {
     projectId?: string;
     context?: string;
     sources?: Array<{ type: string; title: string; detail: string }>;
+    /** The ticket a Jira- or Linear-linked task carries — both default to none, as before. */
+    jiraIssueKeys?: string[];
+    linearIssueKeys?: string[];
   }
 
   /** Writes a completed Zyra task straight into the table, drafts and all. Returns its id. */
@@ -225,13 +228,15 @@ test.describe("zyra / agents (UI)", () => {
         (project_id, requested_by, provider, model, user_story, requested_count,
          include_happy_flow, include_negative_flow, include_multi_tab, include_cross_browser, include_boundary,
          generated_count, generated_payload, saved_count, save_events, agent_name, task_status,
-         feedback, context, jira_issue_keys, token_input, token_output, token_total, source_summary, activity_log)
+         feedback, context, jira_issue_keys, linear_issue_keys, token_input, token_output, token_total, source_summary, activity_log)
        VALUES (${literal(projectId)}, ${literal(t.owner.userId)}, 'openai', 'gpt-4o-mini',
          ${literal(userStory)}, ${drafts.length},
          true, true, false, false, false,
          ${drafts.length}, ${literal(JSON.stringify(drafts))}::jsonb, 0, '[]'::jsonb,
          ${literal(ZYRA_AGENT_NAME)}, ${literal(options.status ?? "in_review")},
-         '', ${literal(options.context ?? "")}, '[]'::jsonb, 10, 20, 30, ${literal(sources)}::jsonb, ${literal(activity)}::jsonb);`,
+         '', ${literal(options.context ?? "")},
+         ${literal(JSON.stringify(options.jiraIssueKeys ?? []))}::jsonb, ${literal(JSON.stringify(options.linearIssueKeys ?? []))}::jsonb,
+         10, 20, 30, ${literal(sources)}::jsonb, ${literal(activity)}::jsonb);`,
     );
     return scalar(
       `SELECT id FROM ai_generation_requests WHERE project_id = ${literal(projectId)} AND user_story = ${literal(userStory)};`,
@@ -240,7 +245,7 @@ test.describe("zyra / agents (UI)", () => {
 
   interface ChatEntry {
     opType: "create" | "update" | "archive";
-    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; priority?: string; suiteId?: string | null; severity?: string; component?: string };
+    draft?: { title: string; description?: string; preconditions?: string; stepsJson?: string; testData?: string; priority?: string; suiteId?: string | null; severity?: string; component?: string };
     testcaseId?: string;
     externalId?: string;
     fields?: Record<string, unknown>;
@@ -255,18 +260,36 @@ test.describe("zyra / agents (UI)", () => {
    * would once applyZyraChatOperations stages it. Seeded directly for the same reason seedTask()
    * is: reaching this state through the live chat route needs a model this suite never calls.
    */
-  function seedChatReviewBatch(options: { status?: string; entries?: ChatEntry[] } = {}): {
+  //
+  // `sessionId` appends another batch to an existing session (an exhaustive plan posts one message
+  // per batch into the same conversation). `linkMessage: false` writes the message without
+  // review_request_id — the shape every background plan batch was stored in before
+  // postZyraPlanMessage persisted it, while each row still carried its own reviewRequestId.
+  function seedChatReviewBatch(
+    options: {
+      status?: string;
+      entries?: ChatEntry[];
+      sessionId?: string;
+      linkMessage?: boolean;
+      content?: string;
+      /** Snapshot rows without `testData`, the shape a message staged before chatDraftRow carried it has. */
+      legacySnapshot?: boolean;
+    } = {},
+  ): {
     taskId: string;
     sessionId: string;
   } {
     const t = tenant!;
-    exec(
-      "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
-        `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
-    );
-    const sessionId = scalar(
-      `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
-    );
+    let sessionId = options.sessionId;
+    if (!sessionId) {
+      exec(
+        "INSERT INTO zyra_chat_sessions (project_id, user_id, title) VALUES " +
+          `(${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'E2E chat review');`,
+      );
+      sessionId = scalar(
+        `SELECT id FROM zyra_chat_sessions WHERE project_id = ${literal(t.mainProjectId)} ORDER BY created_at DESC LIMIT 1;`,
+      );
+    }
     const entries: ChatEntry[] = options.entries ?? [
       {
         opType: "create",
@@ -300,6 +323,7 @@ test.describe("zyra / agents (UI)", () => {
       preconditions: entry.draft?.preconditions ?? "",
       expectedSummary: entry.draft?.description ?? "",
       stepsJson: entry.draft?.stepsJson ?? "[]",
+      ...(options.legacySnapshot ? {} : { testData: entry.draft?.testData ?? String(entry.fields?.testData ?? "") }),
       // Mirrors chatDraftRow's own severity/component handling (legacy.service.ts) — this row is
       // seeded directly rather than produced by the live endpoint, so it must match that shape.
       severity: entry.draft?.severity ?? entry.fields?.severity ?? null,
@@ -313,7 +337,8 @@ test.describe("zyra / agents (UI)", () => {
     exec(
       "INSERT INTO zyra_chat_messages (session_id, project_id, user_id, role, content, status, testcases, activity, review_request_id) VALUES " +
         `(${literal(sessionId)}, ${literal(t.mainProjectId)}, ${literal(t.owner.userId)}, 'assistant', ` +
-        `'I have drafted these test cases for your review.', 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ${literal(taskId)});`,
+        `${literal(options.content ?? "I have drafted these test cases for your review.")}, 'completed', ${literal(JSON.stringify(rows))}::jsonb, '[]'::jsonb, ` +
+        `${options.linkMessage === false ? "NULL" : literal(taskId)});`,
     );
     exec(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = ${literal(sessionId)};`);
     return { taskId, sessionId };
@@ -1251,6 +1276,61 @@ test.describe("zyra / agents (UI)", () => {
     await expect(kanbanColumn(page, "Pending").getByText(userStory)).toHaveCount(0);
   });
 
+  // ─── The full task page's description (fix for "[Task] Jira/Linear – Task Description Missing in
+  // Full Task Details") ──────────────────────────────────────────────────────
+  //
+  // A Jira/Linear task's ticket description is captured into task.context when the task is created
+  // from Requirements. The quick-view popup rendered it; "View full task" ([taskId]/page.tsx) never
+  // did, so the full page showed no description at all — only a 320-character excerpt under Sources.
+
+  for (const provider of ["Jira", "Linear"] as const) {
+    const keys = (key: string) => (provider === "Jira" ? { jiraIssueKeys: [key] } : { linearIssueKeys: [key] });
+
+    test(`ZYU-122 the full task page renders a ${provider} ticket's description as formatted Markdown`, async ({ browser }) => {
+      const key = provider === "Jira" ? "ZYD-1" : "LIN-D1";
+      const taskId = seedTask({ userStory: stamp(`${provider} description story`), context: TICKET_MARKDOWN, ...keys(key) });
+      const page = await open(browser, `/agents/tasks/${taskId}`);
+
+      const description = page.getByTestId("task-description");
+      await expect(description).toBeVisible();
+      await expect(description.locator("h3")).toHaveText("LIN-05: Submit an Expense Claim");
+      await expect(description.locator("strong")).toHaveText(["Module:", "Priority:", "User Story:"]);
+      await expect(description.locator("li")).toHaveText(["Receipt is mandatory", "Amount must be positive"]);
+      const link = description.getByRole("link", { name: "the claim policy" });
+      await expect(link).toHaveAttribute("href", "https://example.com/claims");
+      await expect(link).toHaveAttribute("rel", /noopener/);
+      const text = (await description.innerText()).replace(/\s+/g, " ");
+      expect(text, "no Markdown syntax is left visible on the full page").not.toMatch(MARKDOWN_SYNTAX);
+      expect(text).toContain("As an employee, I want to submit an expense claim");
+      // The ticket key the task is linked to still shows alongside it.
+      await expect(page.getByText(key, { exact: true })).toBeVisible();
+    });
+
+    test(`ZYU-123 a ${provider} task with no description says so on the full task page`, async ({ browser }) => {
+      const taskId = seedTask({ userStory: stamp(`${provider} empty description story`), context: "", ...keys(provider === "Jira" ? "ZYD-2" : "LIN-D2") });
+      const page = await open(browser, `/agents/tasks/${taskId}`);
+
+      await expect(page.getByTestId("task-description")).toContainText("No description available");
+      // The rest of the page is unaffected by the empty state.
+      await expect(page.getByRole("button", { name: "Generated Testcases (2)" })).toBeVisible();
+    });
+  }
+
+  test("ZYU-124 raw HTML in a task description is shown as text on the full task page, never rendered", async ({ browser }) => {
+    const context = [
+      `<img src=x onerror="window.__zyraTaskXss=1"> <b>not bold</b>`,
+      `[click me](javascript:window.__zyraTaskXss=1)`,
+    ].join("\n");
+    const taskId = seedTask({ userStory: stamp("XSS description story"), context, linearIssueKeys: ["LIN-D3"] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    const description = page.getByTestId("task-description");
+    await expect(description).toContainText("<b>not bold</b>");
+    await expect(description.locator("img, b")).toHaveCount(0);
+    await expect(description.locator('a[href^="javascript"], [onerror]')).toHaveCount(0);
+    expect(await page.evaluate(() => (window as unknown as { __zyraTaskXss?: number }).__zyraTaskXss)).toBeUndefined();
+  });
+
   // ─── The review table, which is where the writes happen ────────────────────
 
   test("ZYU-12 the task detail lists every generated draft with its priority", { tag: '@tesbo.testId("TES-TC-1097")' }, async ({ browser }) => {
@@ -1478,6 +1558,167 @@ test.describe("zyra / agents (UI)", () => {
   });
 
   /*
+   * "Save Test Cases popup — suite target" — the modal used to open on "Existing suite" with that
+   * dropdown's empty value labelled "No suite", so an untouched modal was already submittable and
+   * silently saved unassigned test cases. "No suite" was an option of the wrong dropdown, and Save
+   * had no rule for the existing-suite path at all. The target is now an explicit choice (No suite /
+   * Existing suite / Create new suite) behind a "Select suite" placeholder, and Save is enabled only
+   * when the chosen path is complete. ZYU-128..132 pin each path plus the payload it sends.
+   */
+  const SUITE_TARGET_OPTIONS = ["Select suite", "No suite", "Existing suite", "Create new suite"];
+
+  function isSaveRequest(taskId: string) {
+    // Pathname predicate rather than a glob: the API is on a different origin from the page.
+    return (req: { url(): string; method(): string }) =>
+      req.method() === "POST" && new URL(req.url()).pathname === `/api/projects/${tenant!.mainProjectId}/agents/zyra/tasks/${taskId}/save`;
+  }
+
+  async function seedSuite(name: string): Promise<string> {
+    const res = await api.post(`/api/projects/${tenant!.mainProjectId}/suites`, { data: { name } });
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    return String((await res.json()).id);
+  }
+
+  async function openSaveFor(page: Page, title: string | RegExp): Promise<Locator> {
+    await page.getByRole("row", { name: title }).getByRole("button", { name: "Save" }).click();
+    return modal(page, "Save generated testcases");
+  }
+
+  test("ZYU-128 the Save modal opens on 'Select suite' with Save disabled and no suite fields", async ({ browser }) => {
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, /Sign in with a valid password/);
+
+    const target = dialog.getByRole("combobox");
+    // Exactly one select: the target. The existing-suite picker and name field are not rendered yet.
+    await expect(target).toHaveCount(1);
+    await expect(target).toHaveValue("");
+    await expect(target.locator("option:checked")).toHaveText("Select suite");
+    expect((await target.locator("option").allTextContents()).map((s) => s.trim())).toEqual(SUITE_TARGET_OPTIONS);
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+  });
+
+  test("ZYU-129 'No suite' hides every suite field and saves the draft unassigned", async ({ browser }) => {
+    const title = stamp("No suite draft");
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+
+    await dialog.getByRole("combobox").selectOption("none");
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+    await expect(dialog.getByRole("textbox")).toHaveCount(0);
+    const save = dialog.getByRole("button", { name: "Save" });
+    await expect(save).toBeEnabled();
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await save.click();
+    expect((await request).postDataJSON().suiteId).toBeUndefined();
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText("1 testcase saved.")).toBeVisible();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(suite_id::text, 'NULL') FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe("NULL");
+  });
+
+  test("ZYU-130 'Existing suite' blocks Save until a suite is picked, then saves into that suite", async ({ browser }) => {
+    const title = stamp("Existing suite draft");
+    const suiteName = stamp("Target suite");
+    const suiteId = await seedSuite(suiteName);
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    const save = dialog.getByRole("button", { name: "Save" });
+
+    await dialog.getByRole("combobox").first().selectOption("existing");
+    const picker = dialog.getByRole("combobox").nth(1);
+    await expect(picker).toBeVisible();
+    await expect(picker).toHaveValue("");
+    // "No suite" is a target of its own now, not a value hiding inside this list.
+    const pickerOptions = (await picker.locator("option").allTextContents()).map((s) => s.trim());
+    expect(pickerOptions).not.toContain("No suite");
+    expect(pickerOptions).toContain(suiteName);
+    await expect(save).toBeDisabled();
+
+    await picker.selectOption({ label: suiteName });
+    await expect(save).toBeEnabled();
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await save.click();
+    expect((await request).postDataJSON().suiteId).toBe(suiteId);
+    await expect
+      .poll(() => scalar(`SELECT suite_id::text FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe(suiteId);
+  });
+
+  test("ZYU-131 'Create new suite' keeps Save disabled for a blank name and caps the name at 255", async ({ browser }) => {
+    const taskId = seedTask();
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    const dialog = await openSaveFor(page, /Sign in with a valid password/);
+    const save = dialog.getByRole("button", { name: "Save" });
+
+    await dialog.getByRole("combobox").selectOption("new");
+    const name = dialog.getByRole("textbox");
+    await expect(name).toBeVisible();
+    await expect(save).toBeDisabled();
+
+    await name.fill("   ");
+    await expect(save).toBeDisabled();
+    await expect(dialog.getByText("Suite name is required")).toBeVisible();
+
+    // suites.name is VARCHAR(255); the field stops there instead of letting the API reject it.
+    await name.fill("x".repeat(300));
+    await expect(name).toHaveValue("x".repeat(255));
+    await expect(save).toBeEnabled();
+
+    await name.fill(stamp("Suite"));
+    await expect(dialog.getByText("Suite name is required")).toHaveCount(0);
+    await expect(save).toBeEnabled();
+    // No click: ZYU-14 already proves the create-and-save path end to end.
+  });
+
+  test("ZYU-132 switching target drops the stale suite, and reopening the modal starts clean", async ({ browser }) => {
+    const title = stamp("Switch target draft");
+    const suiteName = stamp("Stale suite");
+    await seedSuite(suiteName);
+    const taskId = seedTask({ drafts: [{ title, priority: "P1", preconditions: "", steps: [] }] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    let dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    const target = dialog.getByRole("combobox").first();
+
+    await target.selectOption("existing");
+    await dialog.getByRole("combobox").nth(1).selectOption({ label: suiteName });
+    await target.selectOption("new");
+    await dialog.getByRole("textbox").fill(stamp("Abandoned"));
+
+    // Cancel and reopen: nothing from the abandoned attempt survives.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    dialog = await openSaveFor(page, new RegExp(escapeRegExp(title)));
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+    await expect(dialog.getByRole("combobox")).toHaveValue("");
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    await dialog.getByRole("combobox").selectOption("existing");
+    await expect(dialog.getByRole("combobox").nth(1)).toHaveValue("");
+    await expect(dialog.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    // Pick a suite, then change your mind: the suite must not ride along with a "No suite" save.
+    await dialog.getByRole("combobox").nth(1).selectOption({ label: suiteName });
+    await dialog.getByRole("combobox").first().selectOption("none");
+    await expect(dialog.getByRole("combobox")).toHaveCount(1);
+
+    const request = page.waitForRequest(isSaveRequest(taskId));
+    await dialog.getByRole("button", { name: "Save" }).click();
+    expect((await request).postDataJSON().suiteId).toBeUndefined();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(suite_id::text, 'NULL') FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`))
+      .toBe("NULL");
+    // And no suite was created by the abandoned "Create new suite" attempt.
+    expect(Number(scalar(`SELECT COUNT(*) FROM suites WHERE project_id = ${literal(tenant!.mainProjectId)} AND name LIKE 'E2E Abandoned %';`))).toBe(0);
+  });
+
+  /*
    * "[Zyra] Save Test Cases error message is hidden behind the modal" — a failed save used to write
    * to the page-level error banner, which sits under the modal's portaled backdrop. The text was in
    * the DOM, so a page-wide toBeVisible() would have passed; the assertion is therefore scoped to
@@ -1507,6 +1748,8 @@ test.describe("zyra / agents (UI)", () => {
 
     await page.getByRole("row", { name: new RegExp(title) }).getByRole("button", { name: "Save" }).click();
     const dialog = modal(page, "Save generated testcases");
+    // The modal opens on "Select suite" and can't submit until a target is chosen (ZYU-128).
+    await dialog.getByRole("combobox").selectOption("none");
     await dialog.getByRole("button", { name: "Save" }).click();
 
     // In flight: the button reports it, and Escape can't dismiss the modal out from under the result.
@@ -1528,6 +1771,8 @@ test.describe("zyra / agents (UI)", () => {
     await expect(dialog.getByRole("alert")).toHaveCount(0);
 
     // Retry goes through the unchanged success path: modal closes, page confirms, the row exists.
+    // Reopening resets the target too (ZYU-132), so it's chosen again.
+    await dialog.getByRole("combobox").selectOption("none");
     await dialog.getByRole("button", { name: "Save" }).click();
     await expect(dialog).toHaveCount(0);
     await expect(page.getByText("1 testcase saved.")).toBeVisible();
@@ -2130,7 +2375,7 @@ test.describe("zyra / agents (UI)", () => {
 
   // ─── Sources tab: label and formatting ─────────────────────────────────────
 
-  test("ZYU-30 the quick-view panel's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+  test("ZYU-30 the quick-view panel's Sources tab labels context 'User Story Context' and keeps each line on its own row", async ({
     browser,
   }) => {
     /*
@@ -2140,6 +2385,9 @@ test.describe("zyra / agents (UI)", () => {
      * flattened paragraph. The real generation flow that builds this source can't be driven end to
      * end here (see the file header — no AI provider is configured for this suite), so the source is
      * seeded the way aiGenerate leaves it and this asserts the panel renders it correctly.
+     *
+     * Context now goes through renderMarkdown (see ZYU-125), which turns each non-blank line into
+     * its own paragraph — so "line breaks kept" is asserted as three rows, not as pre-wrap text.
      */
     const userStory = stamp("Context story");
     const context = "Line one of the story\nLine two of the story\nLine three";
@@ -2157,12 +2405,13 @@ test.describe("zyra / agents (UI)", () => {
     await expect(panel.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
 
     const sourceCard = panel.locator("div.rounded-lg", { has: title });
-    const detail = sourceCard.locator("p");
-    await expect(detail, "the detail paragraph must preserve line breaks visually, not collapse them").toHaveCSS("white-space", "pre-wrap");
-    expect(await detail.textContent()).toBe(context);
+    await expect(
+      sourceCard.locator(".zyra-prose p"),
+      "each line of the context must stay on its own row, not collapse into one paragraph",
+    ).toHaveText(["Line one of the story", "Line two of the story", "Line three"]);
   });
 
-  test("ZYU-31 the task detail page's Sources tab labels context 'User Story Context' and preserves its line breaks", async ({
+  test("ZYU-31 the task detail page's Sources tab labels context 'User Story Context' and keeps each line on its own row", async ({
     browser,
   }) => {
     const context = "Line one of the story\nLine two of the story\nLine three";
@@ -2176,14 +2425,12 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByText("User context", { exact: true }), "the old label must not still be rendered").toHaveCount(0);
 
     const sourceCard = page.locator("div.rounded-lg", { has: title });
-    const detail = sourceCard.locator("p");
-    await expect(detail).toHaveCSS("white-space", "pre-wrap");
-    expect(await detail.textContent()).toBe(context);
+    await expect(sourceCard.locator(".zyra-prose p")).toHaveText(["Line one of the story", "Line two of the story", "Line three"]);
   });
 
   test("ZYU-32 a source with no line breaks in its detail still renders correctly", async ({ browser }) => {
-    // Guard against a regression the other way: whitespace-pre-wrap must not visually alter
-    // single-line detail text (extra wrapping, stray whitespace) — only multi-line text is affected.
+    // Guard against a regression the other way: rendering context as Markdown must not alter
+    // single-line plain text (extra wrapping, stray whitespace) — it stays one paragraph, verbatim.
     const single = "A single line of context with no breaks at all";
     const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: single }] });
 
@@ -2199,10 +2446,10 @@ test.describe("zyra / agents (UI)", () => {
 
   // ─── Sources tab: Knowledge Base Markdown rendering (KAN-6 report) ─────────
   //
-  // legacy.service.ts labels the source object `{ type: "knowledge_base", ... }` — only that type
-  // goes through renderMarkdown (lib/markdown.ts, shared with the Zyra chat page); every other
-  // source type keeps rendering as literal whitespace-pre-wrap text, which is what ZYU-30/31/32
-  // above depend on. Real generation can't be driven end to end in this suite (see file header —
+  // legacy.service.ts labels the source object `{ type: "knowledge_base", ... }`. It goes through
+  // renderMarkdown (lib/markdown.ts, shared with the Zyra chat page), as do `context`, `jira` and
+  // `linear` since ZYU-125 — the gate is isMarkdownSource(). `story` keeps rendering as literal
+  // whitespace-pre-wrap text (ZYU-39). Real generation can't be driven end to end in this suite (see file header —
   // no AI provider is configured), so these seed a `knowledge_base` source directly, the same way
   // the context/story sources above are seeded, and assert on what the panel/page render from it.
 
@@ -2321,23 +2568,109 @@ test.describe("zyra / agents (UI)", () => {
     await expect(panel.getByText("<img", { exact: false })).toBeVisible();
   });
 
-  test("ZYU-39 a non-Knowledge-Base source's Markdown-looking text is not parsed as Markdown", async ({ browser }) => {
-    // Locks the type gate in TaskQuickViewPanel/the task detail page: only `knowledge_base`
-    // sources go through renderMarkdown. Every other type (context, story, jira, linear,
-    // existing_testcase) must keep rendering as literal pre-wrap text — ZYU-30/31/32 depend on
-    // that for `context`, and this pins it against the Markdown-looking text a real Jira
-    // description or user story can plausibly contain (e.g. a literal "- " bullet in prose).
+  test("ZYU-39 a story source's Markdown-looking text is not parsed as Markdown", async ({ browser }) => {
+    // Locks the other side of isMarkdownSource(): `story` is the user's own one-line story, shown
+    // plain in the task heading and on Kanban cards, so the Sources tab must not reinterpret a
+    // literal "# " or "**" in it either. (This test used to pin the same for `context`; ZYU-125
+    // deliberately reversed that, because a Jira/Linear description arrives as Markdown.)
     const raw = "# Not a heading\n**not bold** and a - bullet look-alike";
-    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: raw }] });
+    const taskId = seedTask({ sources: [{ type: "story", title: "User story", detail: raw }] });
 
     const page = await open(browser, `/agents/tasks/${taskId}`);
     await page.getByRole("button", { name: "Sources (1)" }).click();
 
     await expect(page.getByRole("heading", { name: "Not a heading" })).toHaveCount(0);
-    const title = page.getByRole("heading", { name: "User Story Context", level: 3 });
+    const title = page.getByRole("heading", { name: "User story", level: 3 });
     const sourceCard = page.locator("div.rounded-lg", { has: title });
     const detail = sourceCard.locator("p");
     expect(await detail.textContent()).toBe(raw);
+  });
+
+  // ─── Sources tab: Linear/Jira ticket Markdown in context (reported screenshot) ─
+  //
+  // A task created from a Linear ticket stores the ticket's Markdown description as `context`, and
+  // aiGenerate copies its first 320 characters into a "User Story Context" source. Only
+  // `knowledge_base` sources were rendered, so the card showed "- **Status:** Backlog" verbatim.
+  // The fixture is the reported ticket's context, cut at 320 the way legacy.service.ts cuts it.
+  const LINEAR_CONTEXT = [
+    "QAB-241: LIN-01: Create a System User",
+    "# QAB-241: LIN-01: Create a System User",
+    "",
+    "- **Status:** Backlog",
+    "- **Type:** Issue",
+    "- **Priority:** No priority",
+    "- **Assignee:** Namrata Gosai",
+    "- **Reporter:** Namrata Gosai",
+    "- **Created:** 2026-09-22",
+    "- **Updated:** 2026-09-24",
+    "- **Link:** https://linear.app/qable/issue/QAB-241/lin-01-create-a-system-user",
+  ]
+    .join("\n")
+    .slice(0, 320);
+
+  async function expectLinearContextRendered(scope: Page | Locator) {
+    const title = scope.getByRole("heading", { name: "User Story Context", level: 3 });
+    const sourceCard = scope.locator("div.rounded-lg", { has: title });
+    await expect(sourceCard.getByRole("heading", { name: "QAB-241: LIN-01: Create a System User", level: 1 })).toBeVisible();
+    await expect(sourceCard.locator("li")).toHaveCount(8);
+    await expect(sourceCard.locator("li").first()).toHaveText("Status: Backlog");
+    await expect(sourceCard.locator("li strong", { hasText: "Assignee:" })).toBeVisible();
+    await expect(sourceCard.getByText("**", { exact: false }), "no raw bold markers may be shown").toHaveCount(0);
+    await expect(sourceCard.getByText("# QAB-241", { exact: false }), "no raw heading marker may be shown").toHaveCount(0);
+  }
+
+  test("ZYU-125 the task detail page renders a Linear ticket's context source as formatted Markdown", async ({ browser }) => {
+    const taskId = seedTask({ sources: [{ type: "context", title: "User Story Context", detail: LINEAR_CONTEXT }] });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (1)" }).click();
+    await expectLinearContextRendered(page);
+  });
+
+  test("ZYU-126 the quick-view panel renders a Linear ticket's context source as formatted Markdown", async ({ browser }) => {
+    const userStory = stamp("Linear context story");
+    seedTask({ userStory, sources: [{ type: "context", title: "User Story Context", detail: LINEAR_CONTEXT }] });
+
+    const page = await open(browser, "/agents/tasks");
+    await page.getByRole("tab", { name: "Kanban board" }).click();
+    await page.locator("button", { has: page.getByText(userStory) }).click();
+
+    const panel = page.locator(".slide-in-right");
+    await panel.getByRole("button", { name: /^Sources/ }).click();
+    await expectLinearContextRendered(panel);
+  });
+
+  test("ZYU-127 jira and linear sources render Markdown too, a link cut mid-syntax stays plain text, and HTML stays escaped", async ({
+    browser,
+  }) => {
+    const marker = `xss-marker-${Date.now()}`;
+    const taskId = seedTask({
+      sources: [
+        { type: "jira", title: "KAN-9", detail: "Checkout **must** retry\n- once\n- twice" },
+        // The 320-character slice can end inside a link; the unclosed syntax must render as plain
+        // text rather than swallow or break the card.
+        { type: "linear", title: "QAB-9", detail: "- **Status:** Backlog\n- **Link:** [ticket](https://linear.app/qab" },
+        { type: "context", title: "User Story Context", detail: `<img src=x onerror="window.__zyraXss='${marker}'">` },
+      ],
+    });
+
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+    await page.getByRole("button", { name: "Sources (3)" }).click();
+
+    const card = (name: string) => page.locator("div.rounded-lg", { has: page.getByRole("heading", { name, level: 3 }) });
+    await expect(card("KAN-9").locator("strong", { hasText: "must" })).toBeVisible();
+    await expect(card("KAN-9").locator("li")).toHaveText(["once", "twice"]);
+
+    await expect(card("QAB-9").locator("li")).toHaveCount(2);
+    await expect(card("QAB-9").locator("li").first()).toHaveText("Status: Backlog");
+    await expect(card("QAB-9").locator("a"), "a cut-off link must not become an anchor").toHaveCount(0);
+    await expect(card("QAB-9").locator("li").nth(1)).toContainText("[ticket](https://linear.app/qab");
+
+    const contextCard = card("User Story Context");
+    await expect(contextCard.locator("img")).toHaveCount(0);
+    await expect(contextCard.getByText("<img", { exact: false })).toBeVisible();
+    const injected = await page.evaluate(() => (window as unknown as Record<string, unknown>).__zyraXss);
+    expect(injected, "context now goes through renderMarkdown, which escapes HTML first").toBeUndefined();
   });
 
   // ─── Transient network failures (fix for "Failed to fetch" on Zyra staging) ─
@@ -2561,7 +2894,7 @@ test.describe("zyra / agents (UI)", () => {
     const row = page.getByRole("listitem").filter({ hasText: "Sign in with a wrong password" });
     await row.getByRole("button", { name: "Edit" }).click();
     // Field order in ZyraDraftEditor: Title (textbox 0), Priority (combobox 0), Severity
-    // (combobox 1), Component (textbox 1), Preconditions/Expected result/Steps after that.
+    // (combobox 1), Component (textbox 1), Preconditions/Description/Test Data/Steps after that.
     // The seeded draft has no severity, so the placeholder option must read "Select", not "No severity".
     await expect(row.getByRole("combobox").nth(1).locator("option:checked")).toHaveText("Select");
     await row.getByRole("combobox").nth(1).selectOption("Medium");
@@ -2580,6 +2913,117 @@ test.describe("zyra / agents (UI)", () => {
       .poll(() => readDraft("severity"), { message: "the severity edit must persist, not just render client-side" })
       .toBe("Medium");
     expect(readDraft("component")).toBe("Search");
+  });
+
+  /*
+   * "[Zyra] Edit Test Case View Is Missing Fields Available After Saving" — the draft editor showed
+   * the description under an "Expected result" label (below the fold) and had no Test Data field
+   * at all, while zyraSave wrote both onto the real test case.
+   *
+   * FieldLabel renders a <label> with no htmlFor, so getByLabel can't resolve these textareas —
+   * each is the label's next sibling inside its Field wrapper.
+   */
+  function editorTextarea(row: Locator, label: string): Locator {
+    return row.locator("label", { hasText: new RegExp(`^${label}$`) }).locator("xpath=following-sibling::textarea[1]");
+  }
+
+  function readDraftField(taskId: string, title: string, field: string): string {
+    return scalar(
+      `SELECT COALESCE(d->'draft'->>'${field}', '<absent>') FROM ai_generation_requests r, jsonb_array_elements(r.generated_payload) d ` +
+        `WHERE r.id = ${literal(taskId)} AND d->'draft'->>'title' = ${literal(title)};`,
+    );
+  }
+
+  test("ZYU-133 the draft editor shows a proposal's Description and Test Data, and a Test Data edit persists", async ({ browser }) => {
+    const title = stamp("Chat test data case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [
+        { opType: "create", draft: { suiteId: null, title, description: "The post appears in the feed", preconditions: "", stepsJson: "[]", testData: "post: Hello Buzz", priority: "P1" } },
+      ],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit" }).click();
+    await expect(editorTextarea(row, "Description")).toHaveValue("The post appears in the feed");
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("post: Hello Buzz");
+    // The description used to sit under this label; it must not survive as a second, misleading name.
+    await expect(row.locator("label", { hasText: /^Expected result$/ })).toHaveCount(0);
+
+    await editorTextarea(row, "Test Data").fill("post: Edited Buzz");
+    await row.getByRole("button", { name: "Save edit" }).click();
+    await expect(row.getByRole("button", { name: "Save edit" })).toHaveCount(0);
+
+    await expect
+      .poll(() => readDraftField(taskId, title, "testData"), { message: "the test data edit must persist, not just render client-side" })
+      .toBe("post: Edited Buzz");
+    expect(readDraftField(taskId, title, "description"), "editing test data must leave the description alone").toBe("The post appears in the feed");
+
+    // Reopening shows the edited value (the panel's local row was updated, not only the server).
+    await row.getByRole("button", { name: "Edit" }).click();
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("post: Edited Buzz");
+  });
+
+  test("ZYU-134 editing another field of a proposal staged before test data was on the row does not wipe its test data", async ({ browser }) => {
+    const title = stamp("Legacy snapshot case");
+    const { taskId } = seedChatReviewBatch({
+      legacySnapshot: true,
+      entries: [{ opType: "create", draft: { suiteId: null, title, description: "", preconditions: "", stepsJson: "[]", testData: "keep: me", priority: "P2" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    const row = page.getByRole("listitem").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit" }).click();
+    // The message snapshot predates the field, so the editor genuinely has no value to show here.
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("");
+    await editorTextarea(row, "Preconditions").fill("Signed in as an employee");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect
+      .poll(() => readDraftField(taskId, title, "preconditions"), { message: "the preconditions edit must persist" })
+      .toBe("Signed in as an employee");
+    expect(readDraftField(taskId, title, "testData"), "an untouched blank Test Data field must not overwrite the stored value").toBe("keep: me");
+  });
+
+  test("ZYU-135 saving a proposal with a description and test data persists both onto the real test case", async ({ browser }) => {
+    const title = stamp("Chat-saved test data case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [
+        { opType: "create", draft: { suiteId: null, title, description: "Order confirmation is shown", preconditions: "", stepsJson: "[]", testData: "qty: 3", priority: "P2" } },
+      ],
+    });
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(title)).toBeVisible();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect(page.getByText(/saved to the repository/)).toBeVisible();
+
+    const savedField = (column: "description" | "test_data") =>
+      scalar(`SELECT ${column} FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`);
+    await expect.poll(() => savedField("test_data"), { message: "the proposal's test data must reach the saved row" }).toBe("qty: 3");
+    expect(savedField("description")).toBe("Order confirmation is shown");
+    expect(scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("done");
+  });
+
+  test("ZYU-136 a failed draft edit keeps the editor open, shows the error, and stores nothing", async ({ browser }) => {
+    const title = stamp("Failed edit case");
+    const { taskId } = seedChatReviewBatch({
+      entries: [{ opType: "create", draft: { suiteId: null, title, description: "", preconditions: "", stepsJson: "[]", testData: "before", priority: "P2" } }],
+    });
+    const page = await open(browser, "/agents/zyra");
+    await page.route("**/agents/zyra/tasks/*/drafts/*", (route) =>
+      route.request().method() === "PATCH" ? route.fulfill({ status: 500, json: { error: "Simulated edit failure" } }) : route.continue(),
+    );
+
+    const row = page.getByRole("listitem").filter({ hasText: title });
+    await row.getByRole("button", { name: "Edit" }).click();
+    await editorTextarea(row, "Test Data").fill("after");
+    await row.getByRole("button", { name: "Save edit" }).click();
+
+    await expect(page.getByText(/Simulated edit failure|Failed to save the edit/)).toBeVisible();
+    await expect(row.getByRole("button", { name: "Save edit" }), "the editor must stay open so the edit isn't lost").toBeVisible();
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("after");
+    expect(readDraftField(taskId, title, "testData")).toBe("before");
   });
 
   test("ZYU-67 saving selected proposals creates real test cases in their own suite", async ({ browser }) => {
@@ -2648,6 +3092,101 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByText(/This batch was already saved or closed/)).toBeVisible();
     await expect(page.getByRole("checkbox", { name: /Select proposed test case/ })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /Save \d+ to repository/ })).toHaveCount(0);
+  });
+
+  /*
+   * "All – Exhaustive" plans post one assistant message per batch into the same conversation. Every
+   * batch after the first was stored without review_request_id (postZyraPlanMessage never wrote it),
+   * and the panel only rendered off that column — so the header said "5 test cases drafted for
+   * review" with nothing under it. The rows themselves still carried their batch's reviewRequestId;
+   * these pin that every batch renders, earlier ones survive later ones, and each panel acts on its
+   * own batch. api/zyra-chat-consistency.spec.ts ZCC-B-17 pins the stored link for new batches.
+   */
+  function planBatch(label: string, count: number): ChatEntry[] {
+    return Array.from({ length: count }, (_, i) => ({
+      opType: "create" as const,
+      draft: { suiteId: null, title: `${label} case ${i + 1}`, description: "", preconditions: "", stepsJson: "[]", priority: "P2" },
+    }));
+  }
+
+  test("ZYU-125 every batch of an exhaustive plan renders its drafts, including batches stored without the message-level review link", async ({ browser }) => {
+    const b1 = stamp("Plan batch one");
+    const b2 = stamp("Plan batch two");
+    const b3 = stamp("Plan batch three");
+    const first = seedChatReviewBatch({ entries: planBatch(b1, 2), content: "I identified 6 distinct scenarios to cover. Here are the first 2." });
+    const second = seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b2, 2), linkMessage: false, content: "Here are 2 more test case(s) — 4/6 scenarios covered so far." });
+    const third = seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b3, 2), linkMessage: false, content: "Here are the final 2 test case(s) — all 6 scenarios are now covered." });
+    const page = await open(browser, "/agents/zyra");
+
+    for (const label of [b1, b2, b3]) {
+      await expect(page.getByText(`${label} case 1`), `${label} must be reviewable in the chat`).toBeVisible();
+      await expect(page.getByText(`${label} case 2`)).toBeVisible();
+    }
+    await expect(page.getByText(/2 of 2 selected — pending review/), "one review panel per batch").toHaveCount(3);
+
+    // The fallback panel must address ITS batch, not the first one: a discard in batch three
+    // changes batch three's stored drafts and leaves the other two untouched.
+    await page.getByRole("listitem").filter({ hasText: `${b3} case 1` }).getByRole("button", { name: "Discard" }).click();
+    await expect(page.getByText(`${b3} case 1`)).toHaveCount(0);
+    await expect.poll(() => draftTitles(third.taskId)).toEqual([`${b3} case 2`]);
+    expect(draftTitles(second.taskId)).toEqual([`${b2} case 1`, `${b2} case 2`]);
+    expect(draftTitles(first.taskId)).toEqual([`${b1} case 1`, `${b1} case 2`]);
+  });
+
+  test("ZYU-126 a batch landing while the plan runs is appended below the earlier one, which keeps its review state", async ({ browser }) => {
+    const b1 = stamp("Running plan batch one");
+    const b2 = stamp("Running plan batch two");
+    const first = seedChatReviewBatch({ entries: planBatch(b1, 2), content: "I identified 4 distinct scenarios to cover. Here are the first 2." });
+    // A plan row the page polls on — nothing executes it (the batch loop is only ever launched by a
+    // send, a resume, or a backend restart), so this test controls exactly when the next batch lands.
+    const plan = { planId: `e2e-plan-${Date.now()}`, status: "running", remainingScenarios: ["S3", "S4"], batchSize: 2, doneCount: 2, totalCount: 4, originalMessage: "Generate all possible cases" };
+    exec(`UPDATE zyra_chat_sessions SET active_plan = ${literal(JSON.stringify(plan))}::jsonb WHERE id = ${literal(first.sessionId)};`);
+    try {
+      const page = await open(browser, "/agents/zyra");
+      await expect(page.getByText(/Generating remaining scenarios — 2\/4 covered \(50%\)/)).toBeVisible();
+      await expect(page.getByText(`${b1} case 1`)).toBeVisible();
+      // In-progress review work on the earlier batch, which the next poll must not reset.
+      await page.getByRole("checkbox", { name: "Select proposed test case 1" }).first().uncheck();
+      await expect(page.getByText(/1 of 2 selected — pending review/)).toBeVisible();
+
+      // The background loop's next batch, stored the way postZyraPlanMessage now stores it.
+      seedChatReviewBatch({ sessionId: first.sessionId, entries: planBatch(b2, 2), content: "Here are the final 2 test case(s) — all 4 scenarios are now covered." });
+      exec(`UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = ${literal(first.sessionId)};`);
+
+      await expect(page.getByText(`${b2} case 1`), "the new batch must appear without a reload").toBeVisible({ timeout: 15_000 });
+      await expect(page.getByText(`${b2} case 2`)).toBeVisible();
+      await expect(page.getByText(`${b1} case 1`), "the earlier batch must not be replaced").toBeVisible();
+      await expect(page.getByText(/1 of 2 selected — pending review/), "the earlier batch's selection survives the refresh").toBeVisible();
+      await expect(page.getByText(/2 of 2 selected — pending review/)).toHaveCount(1);
+      await expect(page.getByText(/Generating remaining scenarios/)).toHaveCount(0);
+      // Each title rendered once — a refresh replaces the transcript, it never duplicates a batch.
+      await expect(page.getByText(`${b1} case 1`)).toHaveCount(1);
+      await expect(page.getByText(`${b2} case 1`)).toHaveCount(1);
+    } finally {
+      exec(`UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = ${literal(first.sessionId)};`);
+    }
+  });
+
+  test("ZYU-127 an unlinked message whose rows name two different batches gets no guessed review panel", async ({ browser }) => {
+    const label = stamp("Ambiguous batch");
+    const { sessionId, taskId } = seedChatReviewBatch({ entries: planBatch(label, 2) });
+    const otherTask = seedChatReviewBatch({ sessionId, entries: planBatch(stamp("Other batch"), 1) }).taskId;
+    // Rewrite the first message as unlinked, with its second row pointing at the other batch.
+    const rows = JSON.parse(
+      scalar(`SELECT testcases::text FROM zyra_chat_messages WHERE review_request_id = ${literal(taskId)};`) || "[]",
+    ) as Array<Record<string, unknown>>;
+    rows[1].reviewRequestId = otherTask;
+    exec(
+      `UPDATE zyra_chat_messages SET review_request_id = NULL, testcases = ${literal(JSON.stringify(rows))}::jsonb ` +
+        `WHERE review_request_id = ${literal(taskId)};`,
+    );
+    const page = await open(browser, "/agents/zyra");
+
+    await expect(page.getByText(/Other batch case 1/)).toBeVisible();
+    await expect(page.getByText(/1 of 1 selected — pending review/)).toBeVisible();
+    // Only the other, properly linked batch gets a panel — no actions are offered against a guess.
+    await expect(page.getByText(/of 2 selected — pending review/)).toHaveCount(0);
+    await expect(page.getByText(`${label} case 1`)).toHaveCount(0);
   });
 
   test("ZYU-69 saving only part of a batch leaves the rest visible and actionable, not resolved", async ({ browser }) => {
@@ -3320,8 +3859,9 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     expect(res.status(), `seeding the KB doc — ${await res.text()}`).toBe(201);
   }
 
-  async function openChat(browser: Browser): Promise<Page> {
-    const ctx = await browser.newContext({ storageState: ownerState });
+  // `locale` sets the browser language. Zyra must ignore it — its language comes from what is typed.
+  async function openChat(browser: Browser, locale?: string): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: ownerState, ...(locale ? { locale } : {}) });
     contexts.push(ctx);
     const page = await ctx.newPage();
     await page.goto(`/projects/${tenant!.mainProjectId}/agents/zyra`);
@@ -3539,5 +4079,82 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     await expect(running.locator('[data-zyra-step="routing"]')).toContainText("[RUN]");
     await expect(running.locator('[data-zyra-step="context:jira"]')).toContainText("none found");
     await expect(composer(page)).toBeDisabled();
+  });
+
+  /* ───────── Zyra's language follows what the user types (lib/zyra-i18n.ts, V132) ───────── */
+
+  const RU_PLACEHOLDER = "Попросите Zyra создать, обновить или проверить тест-кейсы...";
+
+  test("ZYU-L-01 after a Russian message the chat screen's own labels switch to Russian, and the reply is shown", async ({ browser }) => {
+    await allocateFakeAiKey();
+    // An English browser: the switch comes from the typed text, not from the browser.
+    const page = await openChat(browser, "en-US");
+    const reply = "Для входа нужны email и пароль; после трёх неудачных попыток вход блокируется.";
+    queueAnswer(reply);
+
+    await composer(page).fill("Как работает вход в систему?");
+    await composer(page).press("Enter");
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+
+    // The composer, its send button and its keyboard hints are now Russian.
+    await expect(page.getByPlaceholder(RU_PLACEHOLDER)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Отправить" })).toBeVisible();
+    await expect(page.getByText("— отправить")).toBeVisible();
+    await expect(composer(page), "the English placeholder is gone").toHaveCount(0);
+    // And persisted: the session the page shows is stored as Russian.
+    const sessionId = scalar(`SELECT session_id FROM zyra_chat_messages WHERE project_id = ${literal(tenant!.mainProjectId)} AND role = 'user' LIMIT 1;`);
+    expect(scalar(`SELECT language FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBe("ru");
+  });
+
+  test("ZYU-L-02 a Russian browser typing English keeps the whole screen in English", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser, "ru-RU");
+    const reply = "Sign-in needs an email and a password; three failed attempts lock the account.";
+    queueAnswer(reply);
+
+    await composer(page).fill("How does sign-in work?");
+    await composer(page).press("Enter");
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeVisible();
+    await expect(page.getByPlaceholder(RU_PLACEHOLDER)).toHaveCount(0);
+  });
+
+  test("ZYU-L-03 Russian test cases are shown under Russian column headers, and a later English message switches back", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser);
+    const title = `Вход с неверным паролем отклонён ${Date.now() % 100000}`;
+    ai.queueReply({ reply: "", reasoningSummary: "Создание.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title,
+        preconditions: "Пользователь на странице входа.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Ввести неверный пароль", expectedResult: "Показана ошибка" }]),
+        testData: "",
+        expectedSummary: "Вход отклонён.",
+        priority: "P1",
+        severity: "High",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+    ai.queueReply("Noted.");
+
+    await composer(page).fill("Создай тест-кейс для неверного пароля на странице входа.");
+    await composer(page).press("Enter");
+    await expect(page.getByText(title).first()).toBeVisible({ timeout: 30_000 });
+    // The backend's own reply text and the screen's labels around the drafts are Russian.
+    await expect(page.getByText(/Я подготовил\(а\) 1 тест-кейс\(ов\), изучив:/)).toBeVisible();
+    await expect(page.getByText("Первый шаг").first()).toBeVisible();
+    await expect(page.getByText("Выбрать все").first()).toBeVisible();
+    // The severity a draft carries is stored as High and displayed in Russian.
+    await expect(page.getByText("Высокая").first()).toBeVisible();
+
+    // Now an English message: the next reply and the labels go back to English.
+    const english = "Sure — these cover the wrong-password path.";
+    queueAnswer(english);
+    await page.getByPlaceholder(RU_PLACEHOLDER).fill("Summarize what you just drafted for the login page, please.");
+    await page.getByPlaceholder(RU_PLACEHOLDER).press("Enter");
+    await expect(page.getByText(english)).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeVisible();
   });
 });

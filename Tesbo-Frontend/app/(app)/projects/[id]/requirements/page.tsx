@@ -8,12 +8,15 @@ import { IconRefresh, IconSettings, IconPlug } from "@tabler/icons-react";
 import {
   getJiraStatus,
   getLinearStatus,
+  getNotionStatus,
   createZyraTask,
   listJiraTickets,
   listLinearTickets,
+  listNotionPages,
   listAllTickets,
   listLinkedJiraKeys,
   listLinkedLinearKeys,
+  listLinkedNotionPages,
   getRequirementsSummary,
   getKnowledgeFolderTree,
   type LinkedIssueTaskStatus,
@@ -24,6 +27,7 @@ import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
 import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/components/agents/TaskQuickViewPanel";
+import { formatDate } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
@@ -31,10 +35,10 @@ import { renderMarkdown } from "@/lib/markdown";
 
 const PAGE_SIZE = 25;
 
-type Source = "all" | "jira" | "linear";
-type TicketSource = "jira" | "linear";
+type Source = "all" | "jira" | "linear" | "notion";
+type TicketSource = "jira" | "linear" | "notion";
 
-/** Normalized shape for a past (no-longer-current) Jira project / Linear team-or-project this
+/** Normalized shape for a past (no-longer-current) Jira project / Linear team-or-project / Notion database this
  * project has been mapped to — never deleted, just no longer the active mapping. */
 interface HistoricalSource {
   remoteId: string;
@@ -46,6 +50,8 @@ interface Requirement {
   id: string;
   source: TicketSource;
   key: string;
+  /** What test cases and Zyra tasks link to: the issue key for Jira/Linear, the full page id for Notion (whose `key` is only a short label). */
+  externalId: string;
   summary: string;
   description: string;
   issueType: string;
@@ -91,6 +97,14 @@ const PROVIDERS: ProviderMeta[] = [
     manageLabel: "Linear Teams",
     getStatus: getLinearStatus,
   },
+  {
+    id: "notion",
+    label: "Notion",
+    logoBg: "#191919",
+    logoLetter: "N",
+    manageLabel: "Notion Database",
+    getStatus: getNotionStatus,
+  },
 ];
 
 const ALL_TAB = { id: "all" as const, label: "All Sources", logoBg: "#5A4F80", logoLetter: "Σ" };
@@ -125,6 +139,10 @@ interface RequirementsPageData {
   linkedLinearKeys: Set<string>;
   linearKeyCounts: Record<string, number>;
   linearTaskStatuses: Record<string, LinkedIssueTaskStatus>;
+  // Keyed by full Notion page id, not by the short display key.
+  linkedNotionPages: Set<string>;
+  notionPageCounts: Record<string, number>;
+  notionTaskStatuses: Record<string, LinkedIssueTaskStatus>;
   summary: RequirementsSummary | null;
   providerFolderIds: Partial<Record<TicketSource, string>>;
 }
@@ -257,6 +275,9 @@ export default function RequirementsPage() {
   const [linkedLinearKeys, setLinkedLinearKeys] = useState<Set<string>>(cached?.linkedLinearKeys ?? new Set());
   const [linearKeyCounts, setLinearKeyCounts] = useState<Record<string, number>>(cached?.linearKeyCounts ?? {});
   const [linearTaskStatuses, setLinearTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>(cached?.linearTaskStatuses ?? {});
+  const [linkedNotionPages, setLinkedNotionPages] = useState<Set<string>>(cached?.linkedNotionPages ?? new Set());
+  const [notionPageCounts, setNotionPageCounts] = useState<Record<string, number>>(cached?.notionPageCounts ?? {});
+  const [notionTaskStatuses, setNotionTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>(cached?.notionTaskStatuses ?? {});
   const [syncError, setSyncError] = useState<string | null>(null);
   const [generatingKey, setGeneratingKey] = useState<string | null>(null);
   // Past mappings for whichever single-provider tab is active — tickets from these are never
@@ -273,9 +294,10 @@ export default function RequirementsPage() {
   // their own fetching on whether that provider is connected.
   const jiraSync = useSyncRun(projectId, "jira", connectedSources.includes("jira"));
   const linearSync = useSyncRun(projectId, "linear", connectedSources.includes("linear"));
-  const syncByProvider: Record<TicketSource, ReturnType<typeof useSyncRun>> = { jira: jiraSync, linear: linearSync };
-  const anySyncActive = jiraSync.isActive || linearSync.isActive;
-  const syncStarting = jiraSync.starting || linearSync.starting;
+  const notionSync = useSyncRun(projectId, "notion", connectedSources.includes("notion"));
+  const syncByProvider: Record<TicketSource, ReturnType<typeof useSyncRun>> = { jira: jiraSync, linear: linearSync, notion: notionSync };
+  const anySyncActive = jiraSync.isActive || linearSync.isActive || notionSync.isActive;
+  const syncStarting = jiraSync.starting || linearSync.starting || notionSync.starting;
 
   // Only trackers actually linked to *this* project (not merely connected at the workspace
   // level) are offered as tabs. "All Sources" is always shown alongside them — with zero linked
@@ -291,12 +313,21 @@ export default function RequirementsPage() {
     ? joinLabels(connectedProviders.map((p) => p.label))
     : "your connected issue tracker";
 
+  // Test cases link to a requirement by `externalId` (the issue key, or a Notion page's full id).
+  function linkStateFor(req: Requirement) {
+    return req.source === "jira"
+      ? { linked: linkedJiraKeys, counts: jiraKeyCounts, tasks: jiraTaskStatuses }
+      : req.source === "linear"
+        ? { linked: linkedLinearKeys, counts: linearKeyCounts, tasks: linearTaskStatuses }
+        : { linked: linkedNotionPages, counts: notionPageCounts, tasks: notionTaskStatuses };
+  }
+
   function tcCountFor(req: Requirement): number {
-    return req.source === "jira" ? jiraKeyCounts[req.key] || 0 : linearKeyCounts[req.key] || 0;
+    return linkStateFor(req).counts[req.externalId] || 0;
   }
 
   function isLinked(req: Requirement): boolean {
-    return req.source === "jira" ? linkedJiraKeys.has(req.key) : linkedLinearKeys.has(req.key);
+    return linkStateFor(req).linked.has(req.externalId);
   }
 
   // The latest Zyra task assigned to this ticket, however far along it is — independent of whether
@@ -304,7 +335,7 @@ export default function RequirementsPage() {
   // ai_generation_requests row still exists, but "done" is the case isLinked/tcCountFor already
   // covers via the saved testcase itself), so the two states never fight over the same row.
   function activeTaskFor(req: Requirement): LinkedIssueTaskStatus | undefined {
-    const task = req.source === "jira" ? jiraTaskStatuses[req.key] : linearTaskStatuses[req.key];
+    const task = linkStateFor(req).tasks[req.externalId];
     if (!task || normalizeTaskStatus(task.status) === "done") return undefined;
     return task;
   }
@@ -313,7 +344,7 @@ export default function RequirementsPage() {
   // "N saved"/"Regenerate"), this is the persistent, always-on label: every requirement is always
   // somewhere in the Zyra pipeline, including before any task exists at all ("Not started").
   function zyraStatusFor(req: Requirement): { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" } {
-    const task = req.source === "jira" ? jiraTaskStatuses[req.key] : linearTaskStatuses[req.key];
+    const task = linkStateFor(req).tasks[req.externalId];
     if (!task) return { label: "Not started", tone: "neutral" };
     return { label: taskStatusLabel(task.status), tone: taskStatusTone(task.status) };
   }
@@ -341,7 +372,7 @@ export default function RequirementsPage() {
         if (activeSource === "all") {
           const data = await listAllTickets(projectId, listParams);
           const mapped = data.list.map((t) => ({
-            id: t.id, source: t.source, key: t.key, summary: t.summary, description: t.description,
+            id: t.id, source: t.source, key: t.key, externalId: t.externalId || t.key, summary: t.summary, description: t.description,
             issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
             reporter: t.reporter, labels: t.labels, url: t.url, createdAt: t.createdAt, updatedAt: t.updatedAt,
           }));
@@ -351,19 +382,30 @@ export default function RequirementsPage() {
         } else if (activeSource === "jira") {
           const data = await listJiraTickets(projectId, listParams);
           const mapped = data.list.map((t) => ({
-            id: t.id, source: "jira" as const, key: t.jiraIssueKey, summary: t.summary, description: t.description,
+            id: t.id, source: "jira" as const, key: t.jiraIssueKey, externalId: t.jiraIssueKey, summary: t.summary, description: t.description,
             issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
             reporter: t.reporter, labels: t.labels, url: t.jiraUrl, createdAt: t.jiraCreatedAt, updatedAt: t.jiraUpdatedAt,
           }));
           setTickets(mapped);
           setTotal(data.total);
           return { tickets: mapped, total: data.total };
-        } else {
+        } else if (activeSource === "linear") {
           const data = await listLinearTickets(projectId, listParams);
           const mapped = data.list.map((t) => ({
-            id: t.id, source: "linear" as const, key: t.linearIssueKey, summary: t.summary, description: t.description,
+            id: t.id, source: "linear" as const, key: t.linearIssueKey, externalId: t.linearIssueKey, summary: t.summary, description: t.description,
             issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
             reporter: t.reporter, labels: t.labels, url: t.linearUrl, createdAt: t.linearCreatedAt, updatedAt: t.linearUpdatedAt,
+          }));
+          setTickets(mapped);
+          setTotal(data.total);
+          return { tickets: mapped, total: data.total };
+        } else {
+          // Notion pages are shown under their short `notion:xxxxxxxx` key but link by full page id.
+          const data = await listNotionPages(projectId, listParams);
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: "notion" as const, key: t.notionPageKey, externalId: t.notionPageId, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.notionUrl, createdAt: t.notionCreatedAt, updatedAt: t.notionUpdatedAt,
           }));
           setTickets(mapped);
           setTotal(data.total);
@@ -378,9 +420,10 @@ export default function RequirementsPage() {
   );
 
   const refreshLinkedKeys = useCallback(async () => {
-    const [jiraKeysRes, linearKeysRes] = await Promise.all([
+    const [jiraKeysRes, linearKeysRes, notionPagesRes] = await Promise.all([
       listLinkedJiraKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
       listLinkedLinearKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
+      listLinkedNotionPages(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
     ]);
     const linkedJira = new Set(jiraKeysRes.keys);
     const jiraCounts = jiraKeysRes.counts ?? {};
@@ -388,12 +431,18 @@ export default function RequirementsPage() {
     const linkedLinear = new Set(linearKeysRes.keys);
     const linearCounts = linearKeysRes.counts ?? {};
     const linearTasks = linearKeysRes.tasks ?? {};
+    const linkedNotion = new Set(notionPagesRes.keys);
+    const notionCounts = notionPagesRes.counts ?? {};
+    const notionTasks = notionPagesRes.tasks ?? {};
     setLinkedJiraKeys(linkedJira);
     setJiraKeyCounts(jiraCounts);
     setJiraTaskStatuses(jiraTasks);
     setLinkedLinearKeys(linkedLinear);
     setLinearKeyCounts(linearCounts);
     setLinearTaskStatuses(linearTasks);
+    setLinkedNotionPages(linkedNotion);
+    setNotionPageCounts(notionCounts);
+    setNotionTaskStatuses(notionTasks);
     return {
       linkedJiraKeys: linkedJira,
       jiraKeyCounts: jiraCounts,
@@ -401,6 +450,9 @@ export default function RequirementsPage() {
       linkedLinearKeys: linkedLinear,
       linearKeyCounts: linearCounts,
       linearTaskStatuses: linearTasks,
+      linkedNotionPages: linkedNotion,
+      notionPageCounts: notionCounts,
+      notionTaskStatuses: notionTasks,
     };
   }, [projectId]);
 
@@ -428,9 +480,13 @@ export default function RequirementsPage() {
     if (activeSource === "jira") {
       const status = await getJiraStatus(projectId).catch(() => null);
       history = (status?.history ?? []).map((h) => ({ remoteId: h.jiraProjectId, remoteKey: h.jiraProjectKey, remoteName: h.jiraProjectName }));
-    } else {
+    } else if (activeSource === "linear") {
       const status = await getLinearStatus(projectId).catch(() => null);
       history = (status?.history ?? []).map((h) => ({ remoteId: h.linearTeamId, remoteKey: h.linearTeamKey, remoteName: h.linearTeamName }));
+    } else {
+      // A Notion database has no short key; the title alone identifies it.
+      const status = await getNotionStatus(projectId).catch(() => null);
+      history = (status?.history ?? []).map((h) => ({ remoteId: h.notionDatabaseId, remoteKey: "", remoteName: h.notionDatabaseName }));
     }
     setSourceHistory(history);
     // The initial-load effect fires this without awaiting it (so a slow history lookup never
@@ -466,6 +522,9 @@ export default function RequirementsPage() {
         setLinkedLinearKeys(existing.linkedLinearKeys);
         setLinearKeyCounts(existing.linearKeyCounts);
         setLinearTaskStatuses(existing.linearTaskStatuses);
+        setLinkedNotionPages(existing.linkedNotionPages);
+        setNotionPageCounts(existing.notionPageCounts);
+        setNotionTaskStatuses(existing.notionTaskStatuses);
         setSummary(existing.summary);
         setProviderFolderIds(existing.providerFolderIds);
         setLoading(false);
@@ -505,6 +564,9 @@ export default function RequirementsPage() {
         linkedLinearKeys: linkedResult.linkedLinearKeys,
         linearKeyCounts: linkedResult.linearKeyCounts,
         linearTaskStatuses: linkedResult.linearTaskStatuses,
+        linkedNotionPages: linkedResult.linkedNotionPages,
+        notionPageCounts: linkedResult.notionPageCounts,
+        notionTaskStatuses: linkedResult.notionTaskStatuses,
         summary: summaryResult,
         providerFolderIds: kbFoldersResult,
       });
@@ -573,6 +635,7 @@ export default function RequirementsPage() {
         context,
         jiraIssueKeys: ticket.source === "jira" ? [ticket.key] : undefined,
         linearIssueKeys: ticket.source === "linear" ? [ticket.key] : undefined,
+        notionPageIds: ticket.source === "notion" ? [ticket.externalId] : undefined,
       });
       router.push(`/projects/${projectId}/agents/tasks`);
     } catch (err) {
@@ -710,7 +773,7 @@ export default function RequirementsPage() {
                 <option value="">Current source</option>
                 {sourceHistory.map((h) => (
                   <option key={h.remoteId} value={h.remoteId}>
-                    Previously: {h.remoteKey} — {h.remoteName}
+                    Previously: {h.remoteKey ? `${h.remoteKey}: ` : ""}{h.remoteName}
                   </option>
                 ))}
               </select>
@@ -740,15 +803,16 @@ export default function RequirementsPage() {
           <SyncStatusPanel key={p.id} run={syncByProvider[p.id].run} label={p.label} />
         ))}
 
-      {(syncError || jiraSync.error || linearSync.error) && (
+      {(syncError || jiraSync.error || linearSync.error || notionSync.error) && (
         <div className="flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-4 py-2.5 text-sm text-[var(--error-foreground)]">
-          <span>{syncError || jiraSync.error || linearSync.error}</span>
+          <span>{syncError || jiraSync.error || linearSync.error || notionSync.error}</span>
           <button
             type="button"
             onClick={() => {
               setSyncError(null);
               jiraSync.clearError();
               linearSync.clearError();
+              notionSync.clearError();
             }}
             className="ml-3 text-[var(--error-foreground)] hover:opacity-80"
           >
@@ -899,6 +963,8 @@ export default function RequirementsPage() {
                   return (
                     <React.Fragment key={ticket.id}>
                       <tr
+                        data-testid="requirement-row"
+                        data-source={ticket.source}
                         onClick={() => setExpandedId(expandedId === ticket.id ? null : ticket.id)}
                         className="border-b border-[var(--border-subtle)] hover:bg-[var(--surface-secondary)]/30 cursor-pointer transition-colors"
                       >
@@ -910,13 +976,14 @@ export default function RequirementsPage() {
                               target="_blank"
                               rel="noopener noreferrer"
                               onClick={(e) => e.stopPropagation()}
+                              data-testid="requirement-key"
                               className="font-mono text-xs text-[var(--accent-light)] hover:underline"
                             >
                               {ticket.key}
                             </a>
                           </div>
                         </td>
-                        <td className="px-4 py-2.5 text-[var(--foreground)] truncate max-w-xs">
+                        <td className="px-4 py-2.5 text-[var(--foreground)] truncate max-w-xs" title={ticket.summary}>
                           {ticket.summary}
                         </td>
                         <td className="px-4 py-2.5">
@@ -960,7 +1027,7 @@ export default function RequirementsPage() {
                             )}
                             {linked && (
                               <Link
-                                href={`/projects/${projectId}/testcases?${ticket.source === "jira" ? "jiraIssueKey" : "linearIssueKey"}=${encodeURIComponent(ticket.key)}`}
+                                href={`/projects/${projectId}/testcases?${ticket.source === "jira" ? "jiraIssueKey" : ticket.source === "linear" ? "linearIssueKey" : "notionPageId"}=${encodeURIComponent(ticket.externalId)}`}
                                 onClick={(e) => e.stopPropagation()}
                                 className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
                               >
@@ -1012,10 +1079,10 @@ export default function RequirementsPage() {
                                   <h4 className="text-xs font-semibold text-[var(--muted)] uppercase tracking-wide mb-1">
                                     Description
                                   </h4>
-                                  {/* Linear stores descriptions as Markdown verbatim, so render it. Jira's
+                                  {/* Linear and Notion store descriptions as Markdown verbatim, so render them. Jira's
                                       arrive already flattened to plain text (jiraDescriptionToText) —
                                       running that through renderMarkdown would italicise snake_case. */}
-                                  {ticket.source === "linear" ? (
+                                  {ticket.source === "linear" || ticket.source === "notion" ? (
                                     <div
                                       data-testid="ticket-description"
                                       className="zyra-prose break-words text-sm text-[var(--muted)] max-h-48 overflow-y-auto"
@@ -1039,10 +1106,10 @@ export default function RequirementsPage() {
                                   <span>Labels: <span className="text-[var(--muted)]">{ticket.labels}</span></span>
                                 )}
                                 {ticket.createdAt && (
-                                  <span>Created: <span className="text-[var(--muted)]">{new Date(ticket.createdAt).toLocaleDateString()}</span></span>
+                                  <span>Created: <span className="text-[var(--muted)]">{formatDate(ticket.createdAt)}</span></span>
                                 )}
                                 {ticket.updatedAt && (
-                                  <span>Updated: <span className="text-[var(--muted)]">{new Date(ticket.updatedAt).toLocaleDateString()}</span></span>
+                                  <span>Updated: <span className="text-[var(--muted)]">{formatDate(ticket.updatedAt)}</span></span>
                                 )}
                               </div>
                               <a

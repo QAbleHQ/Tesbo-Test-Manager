@@ -228,6 +228,12 @@ export const EVIDENCE_ALLOWED_EXTENSIONS = [
 
 export const EVIDENCE_MAX_FILE_SIZE = 25 * 1024 * 1024;
 
+// Mirrors BUG_FILE_MAX_SIZE / BUG_MAX_ATTACHMENTS (and BUG_COMMENT_MAX_ATTACHMENTS) in
+// legacy.service.ts: a bug's own files and a comment's files are held to 20MB each and ten in all.
+// Test-run evidence keeps EVIDENCE_MAX_FILE_SIZE.
+export const BUG_FILE_MAX_SIZE = 20 * 1024 * 1024;
+export const BUG_MAX_ATTACHMENTS = 10;
+
 // Mirrors the FilesInterceptor("files", 10, ...) maxCount on the bug- and execution-attachment
 // routes in legacy.controller.ts: Multer rejects a request carrying more files than this outright,
 // so a batch larger than the limit is split into multiple sequential requests (see
@@ -243,13 +249,13 @@ export function formatFileSizeShort(bytes: number): string {
   return `${Math.max(1, Math.round(bytes / 1024))}KB`;
 }
 
-export function validateEvidenceFile(file: { name: string; size: number }): string | null {
+export function validateEvidenceFile(file: { name: string; size: number }, maxSize: number = EVIDENCE_MAX_FILE_SIZE): string | null {
   const ext = file.name.includes(".") ? file.name.split(".").pop()!.toLowerCase() : "";
   if (!ext) return `${file.name} has no file extension, so its type can't be determined.`;
   if (!EVIDENCE_ALLOWED_EXTENSIONS.includes(ext)) return `${file.name}: .${ext} files aren't supported.`;
   if (file.size <= 0) return `${file.name} is empty (0 bytes).`;
-  if (file.size > EVIDENCE_MAX_FILE_SIZE) {
-    return `${file.name} is ${formatFileSizeShort(file.size)}, which is over the ${formatFileSizeShort(EVIDENCE_MAX_FILE_SIZE)} limit.`;
+  if (file.size > maxSize) {
+    return `${file.name} is ${formatFileSizeShort(file.size)}, which is over the ${formatFileSizeShort(maxSize)} limit.`;
   }
   return null;
 }

@@ -26,7 +26,7 @@ const LAUNCH_FEATURES = [
   "Unlimited test cases, plans, runs, and activity within your 2 projects",
   "Bring your own AI provider keys",
   "1 core agent",
-  "Jira integration",
+  "Jira and Notion integrations",
 ];
 
 const PRO_FEATURES = [
@@ -36,7 +36,7 @@ const PRO_FEATURES = [
   "5 GB total workspace storage",
   "Bring your own AI provider keys",
   "Full agent marketplace",
-  "Jira, Linear, and more integrations as they become available",
+  "Jira, Linear, Notion, and more integrations as they become available",
 ];
 
 export default function PricingModal({ open, onClose, billingInfo }: PricingModalProps) {

@@ -43,6 +43,18 @@ const PROVIDERS: {
       </svg>
     ),
   },
+  {
+    id: "notion",
+    name: "Notion",
+    description: "Import pages from a Notion database to use as knowledge base for test generation.",
+    proOnly: false,
+    icon: (
+      <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round">
+        <rect x="4" y="3.5" width="16" height="17" rx="2.5" />
+        <path d="M9 16.5v-9l6 9v-9" />
+      </svg>
+    ),
+  },
 ];
 
 export default function IntegrationsTab() {
@@ -64,13 +76,14 @@ export default function IntegrationsTab() {
 
   const loadData = useCallback(async () => {
     try {
-      const [billing, jira, linear] = await Promise.all([
+      const [billing, jira, linear, notion] = await Promise.all([
         getBillingInfo().catch(() => null),
         getIntegrationStatus("jira").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
         getIntegrationStatus("linear").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
+        getIntegrationStatus("notion").catch(() => ({ connected: false }) as IntegrationConnectionStatus),
       ]);
       setBillingInfo(billing);
-      setStatuses({ jira, linear });
+      setStatuses({ jira, linear, notion });
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load integrations.");
@@ -90,7 +103,7 @@ export default function IntegrationsTab() {
     setError(null);
     try {
       await disconnectIntegration(provider);
-      setMessage(`${provider === "jira" ? "Jira" : "Linear"} disconnected.`);
+      setMessage(`${PROVIDERS.find((p) => p.id === provider)?.name ?? "Integration"} disconnected.`);
       await loadData();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to disconnect.");
@@ -109,7 +122,7 @@ export default function IntegrationsTab() {
       <div>
         <h2 className="text-base font-semibold text-[var(--foreground)]">Integrations</h2>
         <p className="mt-1 text-sm text-[var(--muted)]">
-          Connect Jira, Linear, and more once for the whole workspace, then pick which projects use them.
+          Connect Jira, Linear, Notion, and more once for the whole workspace, then pick which projects use them.
         </p>
       </div>
 
@@ -128,7 +141,7 @@ export default function IntegrationsTab() {
         <div>
           <h3 className="text-sm font-semibold text-[var(--foreground)]">App integrations</h3>
           <p className="mt-1 text-xs text-[var(--muted)]">
-            Once connected, go to a project&apos;s Settings → Integrations tab to pick which remote project/team feeds it.
+            Once connected, go to a project&apos;s Settings → Integrations tab to pick which remote project, team or database feeds it.
           </p>
         </div>
 
@@ -138,6 +151,7 @@ export default function IntegrationsTab() {
           return (
             <div
               key={provider.id}
+              data-testid={`integration-card-${provider.id}`}
               className={`rounded-lg border border-[var(--border)] p-4 flex items-start gap-4 ${locked ? "opacity-75" : ""}`}
             >
               <div className={`shrink-0 w-10 h-10 rounded-lg flex items-center justify-center ${locked ? "bg-[var(--surface-tertiary)]" : "bg-[var(--brand-primary)]"}`}>
@@ -193,6 +207,7 @@ export default function IntegrationsTab() {
                   <>
                     <Link
                       href={`/settings/integrations/${provider.id}`}
+                      data-testid={`integration-manage-${provider.id}`}
                       className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors text-center"
                     >
                       Manage
@@ -203,6 +218,7 @@ export default function IntegrationsTab() {
                         variant="secondary"
                         size="sm"
                         onClick={() => void handleDisconnect(provider.id)}
+                        data-testid={`integration-disconnect-${provider.id}`}
                         disabled={disconnectingProvider === provider.id}
                         className="border-[var(--error)]/50 text-[var(--error-foreground)] hover:bg-[color-mix(in_oklab,var(--error)_8%,white)]"
                       >
@@ -211,12 +227,13 @@ export default function IntegrationsTab() {
                     )}
                   </>
                 ) : locked ? (
-                  <Button type="button" size="sm" onClick={() => setPricingOpen(true)}>
+                  <Button type="button" size="sm" data-testid={`integration-upgrade-${provider.id}`} onClick={() => setPricingOpen(true)}>
                     Upgrade to Pro
                   </Button>
                 ) : (
                   <Link
                     href={`/settings/integrations/${provider.id}`}
+                    data-testid={`integration-configure-${provider.id}`}
                     className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
                   >
                     Configure

@@ -11,25 +11,12 @@ import {
 } from "@/lib/api";
 import { Button } from "@/components/ui";
 import { avatarColor } from "@/lib/avatarColors";
+import { formatRelative } from "@/lib/date";
 
 function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (!parts.length) return "?";
   return (parts[0][0] + (parts.length > 1 ? parts[parts.length - 1][0] : "")).toUpperCase();
-}
-
-function timeAgo(iso: string): string {
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return "";
-  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
-  if (seconds < 60) return "just now";
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  return new Date(iso).toLocaleDateString();
 }
 
 /*
@@ -270,7 +257,7 @@ export function DocumentComments({
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-[13px] font-semibold text-[var(--foreground)]">{thread.authorName}</span>
-                    <span className="text-[11px] text-[var(--muted-soft)]">{timeAgo(thread.createdAt)}</span>
+                    <span className="text-[11px] text-[var(--muted-soft)]">{formatRelative(thread.createdAt)}</span>
                     {thread.isResolved && (
                       <span className="inline-flex items-center gap-1 rounded-full bg-[var(--success-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--success-foreground)]">
                         <IconCheck size={10} /> Resolved{thread.resolvedByName ? ` by ${thread.resolvedByName}` : ""}
@@ -320,7 +307,7 @@ export function DocumentComments({
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-[12px] font-semibold text-[var(--foreground)]">{reply.authorName}</span>
-                          <span className="text-[11px] text-[var(--muted-soft)]">{timeAgo(reply.createdAt)}</span>
+                          <span className="text-[11px] text-[var(--muted-soft)]">{formatRelative(reply.createdAt)}</span>
                         </div>
                         <p className="mt-0.5 whitespace-pre-wrap text-[13px] text-[var(--foreground)]">{reply.body}</p>
                         {canMutate(reply) && (

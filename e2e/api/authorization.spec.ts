@@ -372,6 +372,57 @@ test.describe("bugs", () => {
       await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
     }
   });
+
+  // Project-scoped route (GET /api/projects/:projectId/bugs/:bugId), added so the Bug Details
+  // page's shareable URL can carry either the bug's uuid or its external id. Same refusal is
+  // required of both keys: the external id is not a secret, so this is not a "harder to guess"
+  // substitute for the access check, only a second valid key with the same check behind it.
+  test("a different account can read another project's bug by external id through the project-scoped route", {
+    tag: '@tesbo.testId("TES-TC-3019")',
+  }, async ({ request }) => {
+    const created = await (
+      await request.post(`/api/projects/${ctxA.projectId}/bugs`, {
+        data: { title: `E2E IDOR Bug Scoped ${Date.now()}` },
+      })
+    ).json();
+
+    try {
+      // Account B's own project id, account A's bug code — the project_id scoping in the lookup
+      // itself must refuse this, since B legitimately has access to ctxB.projectId.
+      const byExternalId = await asB.get(`/api/projects/${ctxB.projectId}/bugs/${created.externalId}`, { failOnStatusCode: false });
+      expect(REFUSED, "must refuse a caller from another tenant").toContain(byExternalId.status());
+
+      const byUuid = await asB.get(`/api/projects/${ctxB.projectId}/bugs/${created.id}`, { failOnStatusCode: false });
+      expect(REFUSED, "must refuse a caller from another tenant").toContain(byUuid.status());
+
+      // Account A's real project id, account A's bug code — B is refused before the lookup even
+      // runs, since requireProjectAccess rejects B's membership in A's project outright.
+      const viaRealProject = await asB.get(`/api/projects/${ctxA.projectId}/bugs/${created.externalId}`, { failOnStatusCode: false });
+      expect(REFUSED, "must refuse a caller with no membership in the project at all").toContain(viaRealProject.status());
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a completely unauthenticated request can read another project's bug through the project-scoped route", {
+    tag: '@tesbo.testId("TES-TC-3020")',
+  }, async ({ request }) => {
+    const created = await (
+      await request.post(`/api/projects/${ctxA.projectId}/bugs`, {
+        data: { title: `E2E IDOR Anon Bug Scoped ${Date.now()}` },
+      })
+    ).json();
+
+    try {
+      const byExternalId = await anon.get(`/api/projects/${ctxA.projectId}/bugs/${created.externalId}`, { failOnStatusCode: false });
+      expect(REFUSED, "must refuse an anonymous caller").toContain(byExternalId.status());
+
+      const byUuid = await anon.get(`/api/projects/${ctxA.projectId}/bugs/${created.id}`, { failOnStatusCode: false });
+      expect(REFUSED, "must refuse an anonymous caller").toContain(byUuid.status());
+    } finally {
+      await request.delete(`/api/bugs/${created.id}`, { failOnStatusCode: false });
+    }
+  });
 });
 
 test.describe("public share links", () => {

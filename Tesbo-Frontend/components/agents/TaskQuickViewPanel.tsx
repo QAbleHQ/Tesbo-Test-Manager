@@ -4,11 +4,14 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
-import { closeZyraTask, type ZyraTask } from "@/lib/api";
-import { Button, CopyButton, StatusChip, PriorityBadge, SeverityBadge, type Priority, type Severity } from "@/components/ui";
+import { closeZyraTask, zyraTaskTicketKeys, type ZyraTask } from "@/lib/api";
+import { Button, CopyButton, StatusChip, PriorityBadge, type Priority, type Severity } from "@/components/ui";
 import { toTsv } from "@/lib/tsv";
-import { renderMarkdown } from "@/lib/markdown";
-import { ACTION_LABEL, TechniqueBadges } from "./ZyraChatReviewPanel";
+import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
+import { ZyraLanguageContext, zyraLanguage, zyraText } from "@/lib/zyra-i18n";
+import { formatDateTime } from "@/lib/date";
+import { TechniqueBadges } from "./ZyraChatReviewPanel";
+import { ZyraSeverityBadge } from "./ZyraContextDrawer";
 
 export const JIRA_BADGE_CLASS =
   "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-0.5 font-mono text-[11px] font-medium text-[var(--muted)]";
@@ -30,10 +33,14 @@ export function taskStatusTone(status: string): "neutral" | "info" | "success" |
 
 // The latest "Generation failed" / "Regeneration failed" activity entry, if any — the only
 // place the real failure reason exists server-side. Used to surface it directly on the card
-// instead of making the user open the Activity tab to find out what happened.
-export function latestFailureDetail(activities: ZyraTask["activities"]): string | null {
+// instead of making the user open the Activity tab to find out what happened. `fallback` lets the
+// quick view pass its localized text; other callers keep the English default.
+export function latestFailureDetail(
+  activities: ZyraTask["activities"],
+  fallback = "Zyra failed to generate testcase drafts.",
+): string | null {
   for (let i = activities.length - 1; i >= 0; i -= 1) {
-    if (activities[i].stage === "failed") return activities[i].detail || "Zyra failed to generate testcase drafts.";
+    if (activities[i].stage === "failed") return activities[i].detail || fallback;
   }
   return null;
 }
@@ -47,6 +54,8 @@ export function isFeedbackActivity(activity: ZyraTask["activities"][number]): bo
   return activity.kind === "feedback" || activity.title === "Review feedback submitted";
 }
 
+// English labels for the task list / requirements pages; the quick view itself renders the
+// localized "taskStatus.<status>" key from lib/zyra-i18n.ts (same English text).
 const TASK_STATUS_LABELS: Record<string, string> = {
   todo: "Pending",
   in_progress: "In Progress",
@@ -118,6 +127,9 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
   const [activeTab, setActiveTab] = useState<PanelTab>("testcases");
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The task's own language (set server-side from the script of what the user typed); English when
+  // missing. Also provided as context below, for the shared badges rendered inside the panel.
+  const t = zyraText(zyraLanguage(task.language));
 
   useEffect(() => {
     setActiveTab("testcases");
@@ -141,14 +153,18 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
   // malformed or missing value here must render an empty list rather than throw.
   const activities = Array.isArray(task.activities) ? task.activities : [];
   const feedbackActivities = activities.filter(isFeedbackActivity);
-  const failureDetail = failed ? latestFailureDetail(activities) : null;
+  const failureDetail = failed ? latestFailureDetail(activities, t("task.failedDefault")) : null;
   const approvalRate = task.generatedCount > 0 ? Math.round((task.savedCount / task.generatedCount) * 100) : null;
+  // A task's ticket lives in jiraIssueKeys, linearIssueKeys OR notionPageIds depending on its source. Reading only
+  // the Jira list left every Linear task showing a bare "—" placeholder beside its status. Same
+  // combined list the full task page uses; a task with no ticket gets no key slot at all.
+  const ticketKey = zyraTaskTicketKeys(task)[0];
   const draftsTsv = toTsv(
-    ["Title", "Priority", "Severity", "Component", "Preconditions", "Steps", "Expected Result", "Tags"],
+    [t("col.title"), t("col.priority"), t("col.severity"), t("col.component"), t("col.preconditions"), t("col.steps"), t("col.expectedResultCap"), t("col.tags")],
     task.drafts.map((draft) => [
       draft.title,
       draft.priority,
-      draft.severity ?? "",
+      draft.severity ? t.value("severity", draft.severity) : draft.severity ?? "",
       draft.component ?? "",
       draft.preconditions,
       stepsText(draft.stepsJson),
@@ -164,33 +180,33 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
       const updated = await closeZyraTask(projectId, task.id);
       onTaskUpdated(updated);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to close task.");
+      setError(err instanceof Error ? err.message : t("task.err.close"));
     } finally {
       setWorking(false);
     }
   }
 
   const tabs: Array<{ key: PanelTab; label: string; count?: number }> = [
-    { key: "testcases", label: "Test cases", count: task.drafts.length },
-    { key: "feedback", label: "Feedback", count: feedbackActivities.length },
-    { key: "sources", label: "Sources", count: task.sources.length },
-    { key: "activity", label: "Activity", count: activities.length },
+    { key: "testcases", label: t("task.tab.testcases"), count: task.drafts.length },
+    { key: "feedback", label: t("task.tab.feedback"), count: feedbackActivities.length },
+    { key: "sources", label: t("task.tab.sources"), count: task.sources.length },
+    { key: "activity", label: t("task.tab.activity"), count: activities.length },
   ];
 
   return createPortal(
-    <>
+    <ZyraLanguageContext.Provider value={t.lang}>
       <div role="presentation" className="fixed inset-0 z-40" onClick={onClose} />
       <div className="slide-in-right fixed right-0 top-0 z-50 flex h-screen w-full max-w-[520px] flex-col overflow-hidden border-l border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]">
         {/* Header — kept slim and always visible so the close control never scrolls out of reach */}
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-3">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="font-mono text-xs text-[var(--muted-soft)]">{task.jiraIssueKeys[0] || "—"}</span>
-            <StatusChip tone={taskStatusTone(task.taskStatus)}>{taskStatusLabel(task.taskStatus)}</StatusChip>
+            {ticketKey && <span className="font-mono text-xs text-[var(--muted-soft)]">{ticketKey}</span>}
+            <StatusChip tone={taskStatusTone(task.taskStatus)}>{t.opt(`taskStatus.${normalizedStatus}`) ?? taskStatusLabel(task.taskStatus)}</StatusChip>
           </div>
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close"
+            aria-label={t("close")}
             className="shrink-0 rounded-md p-1.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
           >
             <IconX size={16} stroke={1.75} />
@@ -219,11 +235,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
         <div className="grid shrink-0 grid-cols-3 divide-x divide-[var(--border)] border-b border-[var(--border)]">
           <div className="p-3.5 text-center">
             <div className="font-mono text-lg font-semibold text-[var(--foreground)]">{task.generatedCount}</div>
-            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">Test cases</div>
+            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">{t("task.stat.testcases")}</div>
           </div>
           <div className="p-3.5 text-center">
             <div className="font-mono text-lg font-semibold text-[var(--foreground)]">{task.tokenUsage.total}</div>
-            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">Tokens used</div>
+            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">{t("task.stat.tokens")}</div>
           </div>
           <div className="p-3.5 text-center">
             <div
@@ -232,7 +248,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
             >
               {approvalRate === null ? "—" : `${approvalRate}%`}
             </div>
-            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">Approval rate</div>
+            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">{t("task.stat.approval")}</div>
           </div>
         </div>
 
@@ -265,8 +281,8 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
             <div className="flex flex-col gap-2.5">
               {task.drafts.length > 0 && (
                 <div className="flex justify-end">
-                  <span title="Copy every generated testcase as tab-separated values, ready to paste into Excel.">
-                    <CopyButton value={draftsTsv} label="Copy all" copiedLabel="Copied" />
+                  <span title={t("task.copyAllTitle")}>
+                    <CopyButton value={draftsTsv} label={t("task.copyAll")} copiedLabel={t("copied")} />
                   </span>
                 </div>
               )}
@@ -277,11 +293,11 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                     <div className="mb-1.5 flex items-center gap-2">
                       {draft.action && (
                         <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
-                          {ACTION_LABEL[draft.action] || draft.action}
+                          {t.opt(`draftAction.${draft.action}`) || draft.action}
                         </StatusChip>
                       )}
                       <PriorityBadge priority={draft.priority as Priority} />
-                      {knownSeverity(draft.severity) && <SeverityBadge severity={knownSeverity(draft.severity)!} />}
+                      {knownSeverity(draft.severity) && <ZyraSeverityBadge severity={knownSeverity(draft.severity)!} />}
                       {draft.component && <span className="text-[11px] text-[var(--muted-soft)]">{draft.component}</span>}
                       {draft.externalId && <span className="font-mono text-[11px] text-[var(--muted-soft)]">{draft.externalId}</span>}
                       {draft.tags?.length ? <span className="text-[11px] text-[var(--muted-soft)]">{draft.tags.join(", ")}</span> : null}
@@ -296,7 +312,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                   </div>
                 );
               })}
-              {task.drafts.length === 0 && <p className="text-sm text-[var(--muted)]">No generated testcases remain for this task.</p>}
+              {task.drafts.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noDrafts")}</p>}
             </div>
           )}
 
@@ -317,16 +333,16 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                       >
                         {isAgent ? <IconSparkles size={12} stroke={1.75} className="text-white" /> : <IconUser size={12} stroke={1.75} className="text-white" />}
                       </div>
-                      <span className="text-[12px] font-medium text-[var(--foreground)]">{isAgent ? "Zyra" : "You"}</span>
+                      <span className="text-[12px] font-medium text-[var(--foreground)]">{isAgent ? "Zyra" : t("you")}</span>
                       <span className="ml-auto font-mono text-[11px] text-[var(--muted-soft)]">
-                        {activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}
+                        {activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}
                       </span>
                     </div>
                     <p className="text-[12px] leading-relaxed text-[var(--muted)]">{activity.detail || activity.title}</p>
                   </div>
                 );
               })}
-              {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">No feedback yet.</p>}
+              {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noFeedback")}</p>}
             </div>
           )}
 
@@ -336,7 +352,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                 <div key={`${task.id}-source-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
                   <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
                   <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{source.title}</h3>
-                  {source.type === "knowledge_base" ? (
+                  {isMarkdownSource(source.type) ? (
                     <div
                       className="zyra-prose zyra-prose-compact break-words mt-1 text-[12px] text-[var(--muted)]"
                       dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}
@@ -346,7 +362,7 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                   )}
                 </div>
               ))}
-              {task.sources.length === 0 && <p className="text-sm text-[var(--muted)]">No source summary recorded.</p>}
+              {task.sources.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noSources")}</p>}
             </div>
           )}
 
@@ -359,14 +375,14 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
                       {activity.actor} · {(activity.stage || "").replaceAll("_", " ")}
                     </span>
                     <span className="font-mono text-[11px] text-[var(--muted-soft)]">
-                      {activity.createdAt ? new Date(activity.createdAt).toLocaleString() : ""}
+                      {activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}
                     </span>
                   </div>
                   <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{activity.title}</h3>
                   <p className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--muted)]">{activity.detail}</p>
                 </div>
               ))}
-              {activities.length === 0 && <p className="text-sm text-[var(--muted)]">No activity recorded yet.</p>}
+              {activities.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noActivity")}</p>}
             </div>
           )}
         </div>
@@ -378,16 +394,16 @@ export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpd
             className="flex flex-1 items-center justify-center rounded-[6px] border border-[var(--border)] px-4 text-[13px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
             style={{ height: 34 }}
           >
-            View full task
+            {t("task.viewFull")}
           </Link>
           {!done && (
             <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={working}>
-              {working ? "Closing…" : "Close task"}
+              {working ? t("task.closing") : t("task.closeTask")}
             </Button>
           )}
         </div>
       </div>
-    </>,
+    </ZyraLanguageContext.Provider>,
     document.body
   );
 }

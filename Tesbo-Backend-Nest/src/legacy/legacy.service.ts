@@ -16,13 +16,35 @@ import { externallyReachableBaseUrl } from "../common/external-url.util";
 import { escapeHtml, jiraDescriptionToText } from "../common/integration-text.util";
 import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util";
 import { validatePersonName } from "../common/person-name.util";
+import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
+import { detectScriptLanguage } from "../common/script-language";
+import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
+import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
+import {
+  foldRu,
+  ZYRA_RU,
+  ZYRA_RU_AFFIRMATIVE,
+  ZYRA_RU_ALREADY_DISCLOSED,
+  ZYRA_RU_COMPLETION_CLAIM,
+  ZYRA_RU_OFFER,
+  ZYRA_RU_RESUME,
+  ZYRA_RU_STAGED_AWAITING
+} from "./zyra-replies-ru";
 import { ApiTokenService } from "../auth/api-token.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { RagRetrievalService } from "../rag/rag-retrieval.service";
 import { TESTCASE_UPDATE_THRESHOLD } from "../rag/rag.constants";
 import type { RagRetrievalConfidence } from "../rag/rag.types";
 import { IntegrationSyncService } from "../integration-sync/integration-sync.service";
-import { JIRA_PAGE_SIZE, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
+import { INTEGRATION_SYNC_FETCH_TIMEOUT_MS, JIRA_PAGE_SIZE, NOTION_API_BASE, NOTION_API_VERSION, NOTION_PAGE_SIZE, NOTION_RICH_TEXT_LIMIT, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
+import { NotionApiError, describeNotionError, notionPageKey, notionRequest } from "../integration-sync/notion-api";
+import {
+  markdownToNotionRichText,
+  notionPageTitle,
+  notionPropertiesMarkdown,
+  notionTicketFields,
+  renderNotionProperties
+} from "../integration-sync/notion-render";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RequestCacheService } from "../request-cache/request-cache.service";
 import { ProjectLookupService } from "../request-cache/project-lookup.service";
@@ -38,7 +60,9 @@ import { ZYRA_TRACE_CURRENT_STEP, ZyraTurnTraceRecorder, type ZyraOnStage, type 
 type Body = Record<string, any>;
 
 /** Everything processZyraSaveEntriesSequential/Batched need that isn't `selected` or `client` itself. */
-type TicketProvider = "jira" | "linear";
+type TicketProvider = "jira" | "linear" | "notion";
+
+const TICKET_PROVIDER_LABELS: Record<TicketProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
 
 // See getIntegrationConnection: the access token the caller just had refused (401), to force one renewal.
 interface IntegrationConnectionLoadOptions {
@@ -55,11 +79,19 @@ interface ZyraSaveEntryContext {
   taskId: string;
   chatSessionId: string | null;
   batchSuiteId: string | null;
+  // The task's ticket when it has exactly one (every draft falls back to it); null for a task with
+  // several, whose drafts each carry their own key. See zyraDraftTicketLink.
   jiraIssueKey: string | null;
-  jiraUrl: string | null;
   linearIssueKey: string | null;
-  linearUrl: string | null;
-  existingLinked: { rows: Body[] };
+  // The task's Notion page (testcases.notion_page_id) when it has exactly one ticket and that ticket
+  // is a Notion page, else null: same rule as jiraIssueKey/linearIssueKey.
+  notionPageId: string | null;
+  // Keyed `jira:<key>` / `linear:<key>` / `notion:<pageId>`, for every ticket the task names.
+  ticketUrls: Map<string, string | null>;
+  existingLinkedByTicket: Map<string, Body[]>;
+  // Mutable per-save state for zyraDraftTicketLink's per-ticket positional pairing.
+  linkedPositions: Map<string, number>;
+  claimedLinkedIds: Set<string>;
   // Every suite id a create-type entry in this save could target (batchSuiteId, and each draft's
   // own per-entry suiteId), re-validated live under this same transaction — see zyraSaveAttempt's
   // Q11 handling. A suite resolved once, at generation/staging time, can sit unsaved for hours (a
@@ -250,6 +282,8 @@ type ZyraGenerationInput = {
   knowledge: Array<{ title: string; content: string; citation?: ZyraKnowledgeCitation }>;
   jira: Array<{ key: string; summary: string; description: string }>;
   linear: Array<{ key: string; summary: string; description: string }>;
+  // Optional like `bugs`: every caller that predates Notion keeps compiling and behaving unchanged.
+  notion?: Array<{ key: string; summary: string; description: string }>;
   existingTestcases: Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string; component: string }>;
   // Optional and defaulted to [] wherever built, so every existing caller of the functions this
   // type feeds (zyraGenerationContext, generateZyraChatTestcasesWithAi, ...) keeps compiling and
@@ -263,6 +297,9 @@ type ZyraGenerationInput = {
   // the same distinction the reply-shaping in generateZyraChatTestcasesWithAi already makes for what
   // the user sees after the fact.
   knowledgeConfidence?: RagRetrievalConfidence;
+  // The language the drafts' prose is written in (zyraLanguageInstruction). Undefined is English,
+  // which is what every caller produced before this field existed.
+  language?: ExportLocale;
 };
 
 type ZyraAiUsage = {
@@ -321,6 +358,10 @@ type ZyraChatDecision = {
   // see ZyraTurnContextRefs). Set by buildZyraChatDecision on every decision it returns, persisted to
   // zyra_chat_messages.context_refs by insertZyraAssistantMessage.
   contextRefs?: ZyraTurnContextRefs;
+  // Set by generateZyraChatTestcasesWithAi: per draft (same order as its operations/testcases), the
+  // plan-batch scenario number the model said it covers, or null. Read only by the plan flow
+  // (zyraPlanBatchOutcome) to tell which scenarios of a batch came back without a draft.
+  draftScenarios?: Array<number | null>;
 };
 
 // Which sources a chat turn resolved, by reference only — re-fetched (project-scoped) by the next
@@ -751,10 +792,10 @@ function escapeJql(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
 
-type IntegrationProvider = "jira" | "linear";
+type IntegrationProvider = "jira" | "linear" | "notion";
 
 function assertIntegrationProvider(provider: string): IntegrationProvider {
-  if (provider !== "jira" && provider !== "linear") {
+  if (provider !== "jira" && provider !== "linear" && provider !== "notion") {
     throw new BadRequestException({ error: "Unsupported integration provider." });
   }
   return provider;
@@ -804,6 +845,13 @@ function extractHttpStatus(err: unknown): number | null {
 }
 
 const JIRA_OAUTH_SCOPE = "read:jira-work read:jira-user write:jira-work offline_access";
+// Notion access tokens never expire; this is what token_expires_at (NOT NULL) holds for them.
+const NOTION_TOKEN_EXPIRES_AT = "2999-12-31T00:00:00.000Z";
+const INTEGRATION_MAPPING_TABLES: Record<IntegrationProvider, string> = {
+  jira: "jira_project_mappings",
+  linear: "linear_project_mappings",
+  notion: "notion_project_mappings"
+};
 const LINEAR_OAUTH_SCOPE = "read,write,issues:create,comments:create";
 
 // ── OAuth `state` signing ──
@@ -1270,7 +1318,8 @@ export class LegacyService implements OnModuleInit {
     void this.ragIngestion.enqueueTestcaseEmbedding({ projectId, testcaseId, reason }).catch(() => undefined);
   }
 
-  // "Auto-comment on Jira/Linear ticket" (projects.settings.jiraAutoComment / linearAutoComment,
+  // "Auto-comment on Jira/Linear/Notion ticket" (projects.settings.jiraAutoComment / linearAutoComment /
+  // notionAutoComment,
   // IntegrationAiGenerationSettings.tsx). Called from zyraSave once a save has committed: posts ONE
   // comment per ticket, listing exactly the test cases that save wrote for it. The list is grouped
   // from the committed rows themselves (their own jira_issue_key/linear_issue_key), so a test case
@@ -1298,39 +1347,48 @@ export class LegacyService implements OnModuleInit {
       const settings = this.parseProjectSettings((await this.getProject(projectId)).settings);
       const connected = new Map<TicketProvider, boolean>();
       for (const group of groups) {
-        const enabled = settings[`${group.provider}AutoComment`] === true;
-        if (enabled && !connected.has(group.provider)) {
-          connected.set(group.provider, await this.ticketProviderConnected(projectId, group.provider));
-        }
-        const status = !enabled ? "skipped_disabled" : connected.get(group.provider) ? "pending" : "skipped_not_connected";
-        const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries);
-        const claim = await this.db.query<{ id: string }>(
-          `INSERT INTO integration_ticket_comments
-             (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, posted_by)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
-           ON CONFLICT (generation_request_id, save_event_id, provider, issue_key) DO NOTHING
-           RETURNING id`,
-          [
-            projectId,
-            taskId,
-            saveEventId,
-            group.provider,
-            group.issueKey,
-            JSON.stringify(group.entries.map((entry) => String(entry.row.id))),
-            status,
-            content.markdown,
-            uid
-          ]
-        );
-        const claimId = claim.rows[0]?.id;
-        if (!claimId) continue;
-        const label = group.provider === "jira" ? "Jira" : "Linear";
-        if (status === "pending") {
-          void this.deliverZyraTicketComment(projectId, taskId, claimId, group.provider, group.issueKey, group.entries.length, content).catch(() => undefined);
-        } else if (status === "skipped_disabled") {
-          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${group.issueKey} was not commented on.`);
-        } else {
-          await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${group.issueKey} was not commented on.`);
+        // Each ticket on its own: a failure claiming or recording one ticket's comment must not
+        // stop the save's other tickets from being commented on.
+        try {
+          const enabled = settings[`${group.provider}AutoComment`] === true;
+          if (enabled && !connected.has(group.provider)) {
+            connected.set(group.provider, await this.ticketProviderConnected(projectId, group.provider));
+          }
+          const status = !enabled ? "skipped_disabled" : connected.get(group.provider) ? "pending" : "skipped_not_connected";
+          // A Notion "issue key" is the page id, which means nothing to a reader: the comment and the
+          // task activity name the page by its title instead.
+          const ticketLabel = group.provider === "notion" ? await this.notionPageLabel(projectId, group.issueKey) : group.issueKey;
+          const content = this.zyraTicketCommentContent(projectId, group.issueKey, group.entries, ticketLabel);
+          const claim = await this.db.query<{ id: string }>(
+            `INSERT INTO integration_ticket_comments
+               (project_id, generation_request_id, save_event_id, provider, issue_key, testcase_ids, status, comment_text, posted_by)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+             ON CONFLICT (generation_request_id, save_event_id, provider, issue_key) DO NOTHING
+             RETURNING id`,
+            [
+              projectId,
+              taskId,
+              saveEventId,
+              group.provider,
+              group.issueKey,
+              JSON.stringify(group.entries.map((entry) => String(entry.row.id))),
+              status,
+              content.markdown,
+              uid
+            ]
+          );
+          const claimId = claim.rows[0]?.id;
+          if (!claimId) continue;
+          const label = TICKET_PROVIDER_LABELS[group.provider];
+          if (status === "pending") {
+            void this.deliverZyraTicketComment(projectId, taskId, claimId, group.provider, group.issueKey, group.entries.length, content).catch(() => undefined);
+          } else if (status === "skipped_disabled") {
+            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `Auto-comment on ${label} ticket is off for this project, so ${ticketLabel} was not commented on.`);
+          } else {
+            await this.appendZyraTaskActivity(projectId, taskId, `No ${label} comment posted`, `${label} is not connected, so ${ticketLabel} was not commented on.`);
+          }
+        } catch (err) {
+          this.logger.warn(`Failed to queue the ${group.provider} comment for ${group.issueKey} (task ${taskId}): ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     } catch (err) {
@@ -1349,8 +1407,9 @@ export class LegacyService implements OnModuleInit {
     rows.forEach((row, index) => {
       const action = actions[index];
       if (!row?.id || !action) return;
-      for (const provider of ["jira", "linear"] as const) {
-        const issueKey = String((provider === "jira" ? row.jiraIssueKey : row.linearIssueKey) || "").trim();
+      for (const provider of ["jira", "linear", "notion"] as const) {
+        const linked = provider === "jira" ? row.jiraIssueKey : provider === "linear" ? row.linearIssueKey : row.notionPageId;
+        const issueKey = String(linked || "").trim();
         if (!issueKey) continue;
         const mapKey = `${provider}:${issueKey}`;
         const group = groups.get(mapKey) ?? { provider, issueKey, entries: [] };
@@ -1361,6 +1420,96 @@ export class LegacyService implements OnModuleInit {
       }
     });
     return Array.from(groups.values());
+  }
+
+  // A task that names more than one ticket (the Feedback tab's pickers, or several keys passed to
+  // createZyraTask) is generated in ONE provider call, so which ticket each draft belongs to can only
+  // come from the draft itself: the ticket labels it cites in sourceRefs (the prompt labels every
+  // Jira/Linear ticket by its key). A draft is stamped with a provider's key only when it cites
+  // exactly one of THIS task's tickets on that provider — never a key the model made up, never a
+  // guess between two. A single-ticket task is left untouched: zyraSaveAttempt links every draft to
+  // that one ticket, exactly as it always has. Mutates `drafts`; returns how many of them could not
+  // be attributed to any ticket.
+  //
+  // `knowledgeLabels` (zyraKnowledgeTicketLabels) adds the "KB N" label of each ticket's Knowledge
+  // Base mirror: a ticket picked through the KB reaches the prompt under both, and citing either
+  // means that ticket — but only a ticket this task actually names, never one a stray document
+  // happens to mirror.
+  private zyraAttributeDraftsToTickets(
+    drafts: Body[],
+    jiraIssueKeys: string[],
+    linearIssueKeys: string[],
+    notionPageIds: string[],
+    knowledgeLabels: Map<string, { provider: TicketProvider; issueKey: string }> = new Map()
+  ): number {
+    if (jiraIssueKeys.length + linearIssueKeys.length + notionPageIds.length <= 1) return 0;
+    const byLabel = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    for (const issueKey of jiraIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "jira", issueKey });
+    for (const issueKey of linearIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "linear", issueKey });
+    // The prompt labels a Notion page by its short display key (notionPageKey), not its page id.
+    for (const issueKey of notionPageIds) byLabel.set(notionPageKey(issueKey).toLowerCase(), { provider: "notion", issueKey });
+    for (const [label, ticket] of knowledgeLabels) {
+      const own = (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).find((key) => key.trim().toLowerCase() === ticket.issueKey.trim().toLowerCase());
+      if (own) byLabel.set(label, { provider: ticket.provider, issueKey: own });
+    }
+    let unattributed = 0;
+    for (const draft of drafts) {
+      const cited: Record<TicketProvider, Set<string>> = { jira: new Set(), linear: new Set(), notion: new Set() };
+      for (const ref of Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []) {
+        // A raw label on the task-board path; a resolved {type, id, title} wherever refs were sanitized.
+        const label = typeof ref === "string" ? ref : ref && typeof ref === "object" ? String((ref as Body).id ?? "") : "";
+        const match = byLabel.get(label.trim().toLowerCase());
+        if (match) cited[match.provider].add(match.issueKey);
+      }
+      draft.jiraIssueKey = cited.jira.size === 1 ? Array.from(cited.jira)[0] : null;
+      draft.linearIssueKey = cited.linear.size === 1 ? Array.from(cited.linear)[0] : null;
+      draft.notionPageId = cited.notion.size === 1 ? Array.from(cited.notion)[0] : null;
+      if (!draft.jiraIssueKey && !draft.linearIssueKey && !draft.notionPageId) unattributed += 1;
+    }
+    return unattributed;
+  }
+
+  private zyraUnattributedDraftsActivity(unattributed: number, total: number, createdAt: string): Body[] {
+    if (!unattributed) return [];
+    return [{
+      actor: "system",
+      stage: "in_review",
+      title: "Some drafts not linked to a ticket",
+      detail: `${unattributed} of ${total} draft(s) don't cite exactly one of this task's tickets, so they will be saved without a ticket link and won't appear in any ticket comment.`,
+      createdAt
+    }];
+  }
+
+  // Which ticket one create-type draft is written against, and which already-linked test case (if
+  // any) it regenerates in place. `ctx.jiraIssueKey`/`linearIssueKey` are the task's ticket only when
+  // it has exactly one — every other draft carries its own key (zyraAttributeDraftsToTickets, or a
+  // chat draft's). Already-linked rows are paired per ticket, oldest first: the Nth draft for ticket
+  // K updates the Nth row already linked to K — the same positional pairing a single-ticket task has
+  // always used, kept within one ticket so a regeneration never rewrites another ticket's case. A
+  // row is claimed at most once per save, even if it is linked to two of this task's tickets.
+  private zyraDraftTicketLink(ctx: ZyraSaveEntryContext, draft: Body) {
+    const jiraIssueKey = String(draft.jiraIssueKey || ctx.jiraIssueKey || "").trim() || null;
+    const linearIssueKey = String(draft.linearIssueKey || ctx.linearIssueKey || "").trim() || null;
+    const notionPageId = String(draft.notionPageId || ctx.notionPageId || "").trim() || null;
+    const poolKey = jiraIssueKey ? `jira:${jiraIssueKey}` : linearIssueKey ? `linear:${linearIssueKey}` : notionPageId ? `notion:${notionPageId}` : null;
+    let existingLinkedRow: Body | undefined;
+    if (poolKey) {
+      const pool = ctx.existingLinkedByTicket.get(poolKey) || [];
+      let position = ctx.linkedPositions.get(poolKey) ?? 0;
+      while (position < pool.length && ctx.claimedLinkedIds.has(String(pool[position].id))) position += 1;
+      existingLinkedRow = pool[position];
+      ctx.linkedPositions.set(poolKey, position + 1);
+      if (existingLinkedRow?.id) ctx.claimedLinkedIds.add(String(existingLinkedRow.id));
+    }
+    return {
+      jiraIssueKey,
+      jiraUrl: jiraIssueKey ? ctx.ticketUrls.get(`jira:${jiraIssueKey}`) ?? null : null,
+      linearIssueKey,
+      linearUrl: linearIssueKey ? ctx.ticketUrls.get(`linear:${linearIssueKey}`) ?? null : null,
+      notionPageId,
+      notionUrl: notionPageId ? ctx.ticketUrls.get(`notion:${notionPageId}`) ?? null : null,
+      existingLinkedRow
+    };
   }
 
   // The link a ticket comment gives each test case — read by people other than this deployment's
@@ -1380,7 +1529,8 @@ export class LegacyService implements OnModuleInit {
   private zyraTicketCommentContent(
     projectId: string,
     issueKey: string,
-    entries: Array<{ row: Body; action: "add" | "update" | "archive" }>
+    entries: Array<{ row: Body; action: "add" | "update" | "archive" }>,
+    ticketLabel: string = issueKey
   ): { markdown: string; adf: Body } {
     let budget = ZYRA_TICKET_COMMENT_MAX_ITEMS;
     const sections = (
@@ -1401,7 +1551,7 @@ export class LegacyService implements OnModuleInit {
     const total = entries.length;
     const hidden = total - sections.reduce((sum, section) => sum + section.items.length, 0);
     const heading = "Generated by Tesbo Test Manager";
-    const summary = `Zyra saved ${total} test case${total === 1 ? "" : "s"} for ${issueKey} in Tesbo.`;
+    const summary = `Zyra saved ${total} test case${total === 1 ? "" : "s"} for ${ticketLabel} in Tesbo.`;
     const overflow = hidden > 0 ? `…and ${hidden} more in Tesbo.` : "";
 
     const escapeLinkText = (text: string) => text.replace(/([\[\]\\])/g, "\\$1");
@@ -1459,16 +1609,18 @@ export class LegacyService implements OnModuleInit {
     count: number,
     content: { markdown: string; adf: Body }
   ): Promise<void> {
-    const label = provider === "jira" ? "Jira" : "Linear";
+    const label = TICKET_PROVIDER_LABELS[provider];
     try {
       const remoteId = provider === "jira"
         ? await this.jiraPostComment(projectId, issueKey, content.adf)
-        : await this.linearPostComment(projectId, issueKey, content.markdown);
+        : provider === "notion"
+          ? await this.notionPostComment(projectId, issueKey, content.markdown)
+          : await this.linearPostComment(projectId, issueKey, content.markdown);
       await this.db.query(
         "UPDATE integration_ticket_comments SET status = 'posted', remote_comment_id = $2, posted_at = now(), updated_at = now() WHERE id = $1",
         [claimId, remoteId]
       );
-      await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${issueKey}.`);
+      await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${provider === "notion" ? await this.notionPageLabel(projectId, issueKey) : issueKey}.`);
     } catch (err) {
       const reason = this.integrationErrorReason(err, label);
       this.logger.warn(`Failed to post Zyra ticket comment to ${label} ${issueKey}: ${reason}`);
@@ -1534,7 +1686,7 @@ export class LegacyService implements OnModuleInit {
       throw new ConflictException({ error: `This comment is "${existing.rows[0].status}" — only a failed comment can be retried.` });
     }
     const provider = row.provider as TicketProvider;
-    const label = provider === "jira" ? "Jira" : "Linear";
+    const label = TICKET_PROVIDER_LABELS[provider];
     const content = await this.rebuildZyraTicketCommentContent(projectId, row);
     if (!content) {
       const reason = "None of the test cases in this comment exist anymore, so there is nothing to post.";
@@ -1571,7 +1723,8 @@ export class LegacyService implements OnModuleInit {
           ("add" as const)
       }));
     if (!entries.length) return null;
-    return { ...this.zyraTicketCommentContent(projectId, String(row.issue_key), entries), count: entries.length };
+    const ticketLabel = row.provider === "notion" ? await this.notionPageLabel(projectId, String(row.issue_key)) : String(row.issue_key);
+    return { ...this.zyraTicketCommentContent(projectId, String(row.issue_key), entries, ticketLabel), count: entries.length };
   }
 
   // Which section (Added / Updated / Archived) each test case was listed under in a comment
@@ -1604,7 +1757,7 @@ export class LegacyService implements OnModuleInit {
   private async ticketProviderConnected(projectId: string, provider: TicketProvider): Promise<boolean> {
     if (provider === "jira") return Boolean(await this.getJiraConnection(projectId, false));
     const organizationId = await this.projectOrganizationId(projectId);
-    return Boolean(await this.getIntegrationConnection(organizationId, "linear", false));
+    return Boolean(await this.getIntegrationConnection(organizationId, provider, false));
   }
 
   private async appendZyraTaskActivity(projectId: string, taskId: string, title: string, detail: string): Promise<void> {
@@ -1619,8 +1772,15 @@ export class LegacyService implements OnModuleInit {
   // it as `error` on their response body rather than as the exception's own message. 401 and 403
   // share one generic message everywhere else (cleanAuthErrorOrNull); for a ticket comment they need
   // different fixes, so they get different reasons here.
-  private integrationErrorReason(err: unknown, provider: "Jira" | "Linear"): string {
+  private integrationErrorReason(err: unknown, provider: string): string {
     const providerStatus = (err as { providerStatus?: number })?.providerStatus;
+    // Notion's 403 is about the integration's capabilities or what is shared with it, and
+    // notionFetch already wrote the exact remedy (insert-comment capability, share the page) into
+    // the error, so that text is the reason rather than the Jira/Linear permission wording below.
+    if (provider === "Notion" && providerStatus === 403) {
+      const detail = (err as { getResponse?: () => unknown })?.getResponse?.();
+      if (detail && typeof detail === "object" && typeof (detail as Body).error === "string") return String((detail as Body).error);
+    }
     if (providerStatus === 401) {
       return `${provider} rejected the connection's credentials (401) — the authorization has expired or been revoked. Reconnect ${provider} in workspace settings, then retry.`;
     }
@@ -1632,33 +1792,65 @@ export class LegacyService implements OnModuleInit {
     return err instanceof Error ? err.message : String(err);
   }
 
-  // Which ticket a Task-board task's Knowledge Base selection belongs to (see aiGenerate). Only
-  // mirror documents count — a user's own note that mentions a key is not the ticket — and they
-  // resolve to a key through the ticket table the mirror was written from, because a mirror stores
-  // the provider's issue id in source_external_id, not the key. Project-scoped on both sides, so a
-  // document id from another project resolves to nothing. `linked` is set only when the selection
-  // points at exactly one ticket; `tickets` lists every one it found.
-  private async zyraTicketFromKnowledgeSelection(
+  // Which ticket each Knowledge Base document is the mirror of. Only mirror documents count — a
+  // user's own note that mentions a key is not the ticket — and they resolve to a key through the
+  // ticket table the mirror was written from, because a mirror stores the provider's issue id in
+  // source_external_id, not the key. Project-scoped on both sides, so a document id from another
+  // project resolves to nothing. Keyed by document id; a document that isn't a ticket mirror is
+  // simply absent.
+  private async zyraMirrorTicketsByDocument(
     projectId: string,
-    knowledgeItemIds: string[]
-  ): Promise<{ linked: { provider: TicketProvider; issueKey: string } | null; tickets: Array<{ provider: TicketProvider; issueKey: string }> } | null> {
-    const ids = Array.from(new Set(knowledgeItemIds.filter((id) => isUuid(id))));
-    if (!ids.length) return null;
-    const res = await this.db.query<{ provider: TicketProvider; issue_key: string }>(
-      `SELECT DISTINCT d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key) AS issue_key
+    documentIds: string[]
+  ): Promise<Map<string, { provider: TicketProvider; issueKey: string }>> {
+    const ids = Array.from(new Set(documentIds.filter((id) => isUuid(id))));
+    const byDocument = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    if (!ids.length) return byDocument;
+    const res = await this.db.query<{ id: string; provider: TicketProvider; issue_key: string }>(
+      `SELECT d.id, d.source_provider AS provider, COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) AS issue_key
        FROM knowledge_documents d
        LEFT JOIN jira_tickets j
          ON d.source_provider = 'jira' AND j.project_id = d.project_id AND j.jira_issue_id = d.source_external_id
        LEFT JOIN linear_tickets l
          ON d.source_provider = 'linear' AND l.project_id = d.project_id AND l.linear_issue_id = d.source_external_id
+       LEFT JOIN notion_pages n
+         ON d.source_provider = 'notion' AND n.project_id = d.project_id AND n.notion_page_id = d.source_external_id
        WHERE d.project_id = $1 AND d.id = ANY($2::uuid[]) AND d.is_deleted = false
-         AND d.source_role = 'mirror' AND d.source_provider IN ('jira', 'linear')
-         AND COALESCE(j.jira_issue_key, l.linear_issue_key) IS NOT NULL
-       ORDER BY 1, 2`,
+         AND d.source_role = 'mirror' AND d.source_provider IN ('jira', 'linear', 'notion')
+         AND COALESCE(j.jira_issue_key, l.linear_issue_key, n.notion_page_id) IS NOT NULL`,
       [projectId, ids]
     );
-    const tickets = res.rows.map((row) => ({ provider: row.provider, issueKey: String(row.issue_key) }));
-    return { linked: tickets.length === 1 ? tickets[0] : null, tickets };
+    for (const row of res.rows) byDocument.set(String(row.id), { provider: row.provider, issueKey: String(row.issue_key) });
+    return byDocument;
+  }
+
+  // Every ticket a Task-board task's Knowledge Base selection mirrors (see aiGenerate), one entry
+  // per ticket however many of its documents were picked, ordered by provider then key.
+  private async zyraTicketsFromKnowledgeSelection(
+    projectId: string,
+    knowledgeItemIds: string[]
+  ): Promise<Array<{ provider: TicketProvider; issueKey: string }>> {
+    const unique = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    for (const ticket of (await this.zyraMirrorTicketsByDocument(projectId, knowledgeItemIds)).values()) {
+      unique.set(`${ticket.provider}:${ticket.issueKey}`, ticket);
+    }
+    return Array.from(unique.values()).sort((a, b) => a.provider.localeCompare(b.provider) || a.issueKey.localeCompare(b.issueKey));
+  }
+
+  // "KB N" prompt label (lower-cased, as zyraAttributeDraftsToTickets matches labels) -> the ticket
+  // that knowledge item is the mirror of. A ticket picked through the Knowledge Base reaches the
+  // prompt twice — as "KB N" and under its own key — and a draft may cite either.
+  private async zyraKnowledgeTicketLabels(
+    projectId: string,
+    knowledge: Array<{ citation?: ZyraKnowledgeCitation }>
+  ): Promise<Map<string, { provider: TicketProvider; issueKey: string }>> {
+    const documentIds = knowledge.map((item) => (item.citation?.sourceType === "document" ? item.citation.sourceId : "")).filter(Boolean);
+    const byDocument = await this.zyraMirrorTicketsByDocument(projectId, documentIds);
+    const labels = new Map<string, { provider: TicketProvider; issueKey: string }>();
+    knowledge.forEach((item, index) => {
+      const ticket = item.citation?.sourceType === "document" ? byDocument.get(item.citation.sourceId) : undefined;
+      if (ticket) labels.set(`kb ${index + 1}`, ticket);
+    });
+    return labels;
   }
 
   async onModuleInit(): Promise<void> {
@@ -3523,14 +3715,23 @@ export class LegacyService implements OnModuleInit {
       !query.automationStatus &&
       !query.jiraIssueKey &&
       !query.linearIssueKey &&
+      !query.notionPageId &&
       !query.search &&
       !query.customFieldFilters &&
       LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
+      LegacyService.parseCommaSeparatedIdsParam(query.ids).length === 0 &&
       String(query.includeArchived ?? "").toLowerCase() !== "true"
     );
   }
 
   private static parseCustomTagIdsParam(raw: unknown): string[] {
+    return LegacyService.parseCommaSeparatedIdsParam(raw);
+  }
+
+  // Shared by customTagIds and ids (buildTestcaseFilterFragments): both accept either the param
+  // repeated or one comma-separated value, same as a plain HTML multi-select would produce either
+  // way depending on how the caller built the query string.
+  private static parseCommaSeparatedIdsParam(raw: unknown): string[] {
     const parts = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
     return [...new Set(parts.flatMap((p) => String(p).split(",")).map((s) => s.trim()).filter(Boolean))];
   }
@@ -3630,7 +3831,8 @@ export class LegacyService implements OnModuleInit {
       ["type", "type"],
       ["automationStatus", "automation_status"],
       ["jiraIssueKey", "jira_issue_key"],
-      ["linearIssueKey", "linear_issue_key"]
+      ["linearIssueKey", "linear_issue_key"],
+      ["notionPageId", "notion_page_id"]
     ] as const) {
       if (param === "suiteId" && (wantsUnfiled || wantsSubtree)) continue;
       if (query[param]) {
@@ -3669,6 +3871,25 @@ export class LegacyService implements OnModuleInit {
       filters.push(
         `EXISTS (SELECT 1 FROM testcase_custom_tags tct WHERE tct.testcase_id = testcases.id AND tct.tag_id = ANY($${values.length}::uuid[]))`
       );
+    }
+
+    /*
+     * `ids` — an explicit list of test case ids. Used by the repository's "Export" action once the
+     * user has ticked specific rows: the on-screen checkboxes previously had no effect on Export at
+     * all, which always exported every row matching the suite/column filters regardless of
+     * selection. When present, `ids` is meant to scope the result to exactly those rows (the
+     * frontend drops every other filter field once something is checked — see getExportUrl), but
+     * it is additive here like every other fragment in this method, so a caller that combines it
+     * with another filter narrows rather than silently losing the id scoping.
+     *
+     * Validated the same way as customTagIds above: a malformed id silently ignored would widen an
+     * "export only these" request into "export everything" instead of erroring.
+     */
+    const ids = LegacyService.parseCommaSeparatedIdsParam(query.ids);
+    if (ids.length) {
+      if (!ids.every(isUuid)) throw new BadRequestException({ error: "ids must be valid ids" });
+      values.push(ids);
+      filters.push(`testcases.id = ANY($${values.length}::uuid[])`);
     }
 
     // Custom field filters join custom_field_values once per condition (each scoped 1:1 by
@@ -3749,6 +3970,7 @@ export class LegacyService implements OnModuleInit {
               testcases.automation_status, testcases.automation_tags, testcases.status,
               testcases.suite_id, testcases.owner_id, testcases.updated_at, testcases.jira_issue_key,
               testcases.jira_url, testcases.linear_issue_key, testcases.linear_url,
+              testcases.notion_page_id, testcases.notion_url,
               testcases.severity, testcases.component, testcases.source_refs,
               COALESCE(
                 (SELECT jsonb_object_agg(v.definition_id, v.value) FROM custom_field_values v WHERE v.testcase_id = testcases.id),
@@ -4103,8 +4325,9 @@ export class LegacyService implements OnModuleInit {
        (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
         priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
         automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-        linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28,$29::jsonb)
+        linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs,
+        notion_page_id, notion_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28,$29::jsonb,$30,$31)
        RETURNING *`,
       [
         projectId,
@@ -4144,7 +4367,9 @@ export class LegacyService implements OnModuleInit {
         body.attachments || null,
         uid,
         this.normalizeEstimatedDuration(body.estimatedDuration),
-        JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs))
+        JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs)),
+        body.notionPageId || null,
+        body.notionUrl || null
       ]
     );
     const row = res.rows[0];
@@ -4248,6 +4473,8 @@ export class LegacyService implements OnModuleInit {
         jira_url: row.jiraUrl || null,
         linear_issue_key: row.linearIssueKey || null,
         linear_url: row.linearUrl || null,
+        notion_page_id: row.notionPageId || null,
+        notion_url: row.notionUrl || null,
         attachments: row.attachments || null
       }));
 
@@ -4260,18 +4487,18 @@ export class LegacyService implements OnModuleInit {
            (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
             priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
             automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-            linear_issue_key, linear_url, attachments, created_by, updated_by)
+            linear_issue_key, linear_url, notion_page_id, notion_url, attachments, created_by, updated_by)
          SELECT $1::uuid, r.suite_id, r.external_id, r.title, r.description, r.preconditions, r.postconditions,
                 r.steps, r.test_data, r.priority, r.severity, r.type, r.automation_status, r.automation_repo,
                 r.automation_path, r.automation_test_name, r.automation_framework, r.automation_tags, r.owner_id,
                 r.component, r.status, r.jira_issue_key, r.jira_url, r.linear_issue_key, r.linear_url,
-                r.attachments, $2::uuid, $2::uuid
+                r.notion_page_id, r.notion_url, r.attachments, $2::uuid, $2::uuid
          FROM jsonb_to_recordset($3::jsonb) AS r(
            ord int, suite_id uuid, external_id text, title text, description text, preconditions text,
            postconditions text, steps jsonb, test_data text, priority text, severity text, type text,
            automation_status text, automation_repo text, automation_path text, automation_test_name text,
            automation_framework text, automation_tags text, owner_id uuid, component text, status text,
-           jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, attachments text
+           jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, notion_page_id text, notion_url text, attachments text
          )
          ORDER BY r.ord
          RETURNING *`,
@@ -4493,10 +4720,15 @@ export class LegacyService implements OnModuleInit {
     if (!title) return { rowNumber, error: "Title is required" };
 
     const priority = String(raw?.priority ?? "").trim() || "P2";
-    const severity = String(raw?.severity ?? "").trim() || null;
-    const type = String(raw?.type ?? "").trim() || "Functional";
-    const status = String(raw?.status ?? "").trim() || "Draft";
-    const automationStatus = String(raw?.automationStatus ?? "").trim() || "Not Automated";
+    // A Russian export or template carries translated labels ("Черновик", "Высокая"). These columns
+    // are stored unvalidated, so without mapping them back a re-import would create "Черновик" as a
+    // status every count and filter (which match 'Draft') silently misses. Anything that isn't a
+    // known translation — every English value included — is stored exactly as before.
+    const severity = canonicalizeImportValue("severity", String(raw?.severity ?? "").trim()) || null;
+    const type = canonicalizeImportValue("type", String(raw?.type ?? "").trim()) || "Functional";
+    const status = canonicalizeImportValue("testcaseStatus", String(raw?.status ?? "").trim()) || "Draft";
+    const automationStatus =
+      canonicalizeImportValue("automationStatus", String(raw?.automationStatus ?? "").trim()) || "Not Automated";
     const component = String(raw?.component ?? "").trim() || null;
     const suiteName = String(raw?.suite ?? "").trim();
 
@@ -4873,6 +5105,7 @@ export class LegacyService implements OnModuleInit {
      */
     const clearsJira = body.jiraIssueKey === null || body.jiraIssueKey === "";
     const clearsLinear = body.linearIssueKey === null || body.linearIssueKey === "";
+    const clearsNotion = body.notionPageId === null || body.notionPageId === "";
     const res = await client.query(
       `UPDATE testcases SET
        suite_id=$2, title=COALESCE($3,title), description=COALESCE($4,description),
@@ -4887,6 +5120,8 @@ export class LegacyService implements OnModuleInit {
        jira_url=CASE WHEN $29::boolean THEN NULL ELSE COALESCE($22,jira_url) END,
        linear_issue_key=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($23,linear_issue_key) END,
        linear_url=CASE WHEN $30::boolean THEN NULL ELSE COALESCE($24,linear_url) END,
+       notion_page_id=CASE WHEN $33::boolean THEN NULL ELSE COALESCE($31,notion_page_id) END,
+       notion_url=CASE WHEN $33::boolean THEN NULL ELSE COALESCE($32,notion_url) END,
        attachments=COALESCE($25,attachments), updated_by=$26,
        estimated_duration=COALESCE($27,estimated_duration),
        source_refs=COALESCE($28::jsonb,source_refs), updated_at=now()
@@ -4926,7 +5161,10 @@ export class LegacyService implements OnModuleInit {
         // both validates shape and caps length before it overwrites the column.
         Array.isArray(body.sourceRefs) ? JSON.stringify(LegacyService.sanitizeSourceRefsInput(body.sourceRefs)) : null,
         clearsJira,
-        clearsLinear
+        clearsLinear,
+        body.notionPageId ?? null,
+        body.notionUrl ?? null,
+        clearsNotion
       ]
     );
     const row = res.rows[0];
@@ -4978,8 +5216,8 @@ export class LegacyService implements OnModuleInit {
          (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
           priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
           automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-          linear_issue_key, linear_url, attachments, created_by, updated_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27)
+          linear_issue_key, linear_url, attachments, created_by, updated_by, notion_page_id, notion_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$27,$28,$29)
          RETURNING *`,
         [
           src.project_id,
@@ -5008,7 +5246,9 @@ export class LegacyService implements OnModuleInit {
           src.linear_issue_key,
           src.linear_url,
           src.attachments,
-          uid
+          uid,
+          src.notion_page_id,
+          src.notion_url
         ]
       );
       const row = res.rows[0];
@@ -5108,7 +5348,7 @@ export class LegacyService implements OnModuleInit {
    */
   private async zyraTaskStatusesByIssueKey(
     projectId: string,
-    column: "jira_issue_keys" | "linear_issue_keys"
+    column: "jira_issue_keys" | "linear_issue_keys" | "notion_page_ids"
   ): Promise<Record<string, { taskId: string; status: string }>> {
     const res = await this.db.query(
       `SELECT DISTINCT ON (key) key, id, task_status
@@ -5134,6 +5374,20 @@ export class LegacyService implements OnModuleInit {
     ]);
     const keys = res.rows.map((r) => r.jira_issue_key);
     return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.jira_issue_key, r.count])), tasks };
+  }
+
+  // Notion test cases link by page id, so `keys` are page ids (ticket lists expose them as externalId).
+  async linkedNotionPages(projectId: string, userId?: string | null) {
+    await this.requireProjectAccess(userId, projectId);
+    const [res, tasks] = await Promise.all([
+      this.db.query(
+        "SELECT notion_page_id, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND notion_page_id IS NOT NULL AND deleted_at IS NULL GROUP BY notion_page_id",
+        [projectId]
+      ),
+      this.zyraTaskStatusesByIssueKey(projectId, "notion_page_ids")
+    ]);
+    const keys = res.rows.map((r) => r.notion_page_id);
+    return { keys, counts: Object.fromEntries(res.rows.map((r) => [r.notion_page_id, r.count])), tasks };
   }
 
   async linkedLinearKeys(projectId: string, userId?: string | null) {
@@ -6412,8 +6666,10 @@ export class LegacyService implements OnModuleInit {
     return match;
   }
 
-  private parseBugSeverity(severity: unknown): "Critical" | "High" | "Medium" | "Low" {
-    if (severity === undefined || severity === null || severity === "") return "Medium";
+  private parseBugSeverity(severity: unknown): "Critical" | "High" | "Medium" | "Low" | null {
+    // Absent, null and "" all mean "not selected" (V130), the same convention as parseBugPriority.
+    // This used to return "Medium", which stored a severity nobody had chosen.
+    if (severity === undefined || severity === null || severity === "") return null;
     const match = BUG_SEVERITIES.find((s) => s.toLowerCase() === String(severity).trim().toLowerCase());
     if (!match)
       throw new BadRequestException({
@@ -6506,12 +6762,509 @@ export class LegacyService implements OnModuleInit {
     // After the commit, not inside it: the bug is the record that must exist, and a failure while
     // flipping an execution should not roll back the bug report someone just wrote.
     await this.failLinkedExecutions(projectId, userId, links);
-    return this.getBug(bugId as string);
+    const created: Body = await this.getBug(bugId as string);
+    await this.logProjectActivity(projectId, uid, "bug_created", "bug", String(created.id), String(created.title ?? ""), {
+      status: created.status ?? null,
+      severity: created.severity ?? null,
+      priority: created.priority ?? null,
+      assigneeId: created.assigneeId ?? null,
+      assigneeName: created.assigneeName ?? null
+    });
+    return created;
+  }
+
+  /**
+   * Bug Details' Activity section reads these rows back through the project activity feed
+   * (filtered by entityId), so each meaningful change to a bug is one audit row with the caller as
+   * actor: one per status / severity / priority / assignee change, plus a single `bug_updated`
+   * naming whichever other fields were edited. Compared against the row as it was before the
+   * PATCH, so re-saving an unchanged form logs nothing.
+   */
+  private async logBugChanges(projectId: string, actorId: string, before: Body, after: Body) {
+    const log = (action: string, diff: Body) =>
+      this.logProjectActivity(projectId, actorId, action, "bug", String(after.id), String(after.title ?? ""), diff);
+    const same = (a: unknown, b: unknown) => (a ?? null) === (b ?? null);
+    if (!same(before.status, after.status)) await log("bug_status_changed", { from: before.status ?? null, to: after.status ?? null });
+    if (!same(before.severity, after.severity)) await log("bug_severity_changed", { from: before.severity ?? null, to: after.severity ?? null });
+    if (!same(before.priority, after.priority)) await log("bug_priority_changed", { from: before.priority ?? null, to: after.priority ?? null });
+    if (!same(before.assigneeId, after.assigneeId)) {
+      await log("bug_assignee_changed", {
+        fromId: before.assigneeId ?? null,
+        fromName: before.assigneeName ?? null,
+        toId: after.assigneeId ?? null,
+        toName: after.assigneeName ?? null
+      });
+    }
+    const linkKey = (bug: Body) =>
+      normalizeJsonArray(bug.links)
+        .map((l: Body) => `${l.testcaseId ?? ""}|${l.cycleId ?? ""}|${l.executionId ?? ""}`)
+        .sort()
+        .join(",");
+    const fields = ["title", "description", "externalUrl", "integrationProvider", "integrationIssueKey", "betterbugsUrl"].filter(
+      (field) => !same(before[field], after[field])
+    );
+    if (linkKey(before) !== linkKey(after)) fields.push("links");
+    if (fields.length) await log("bug_updated", { fields });
+  }
+
+  /**
+   * Project members named in a comment as `@Display Name` or `@email`. The comment editor's picker
+   * inserts exactly that text (the stored body is Markdown, with no mention markup), and a typed one
+   * counts the same, so this matches against the project's own members, longest
+   * name first so `@Ann Lee` is not also read as `@Ann`. The `@` must start a word, so the middle
+   * of an email address typed as prose never counts as a mention.
+   */
+  private async bugCommentMentions(projectId: string, text: string): Promise<Array<{ id: string; name: string }>> {
+    if (!text.includes("@")) return [];
+    const members = await this.db.query<{ id: string; name: string | null; email: string }>(
+      `SELECT u.id, NULLIF(TRIM(u.name), '') AS name, u.email
+       FROM project_members pm JOIN users u ON u.id = pm.user_id
+       WHERE pm.project_id = $1`,
+      [projectId]
+    );
+    const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const candidates = members.rows
+      .flatMap((m) => [m.name, m.email].filter((label): label is string => !!label).map((label) => ({ m, label })))
+      .sort((a, b) => b.label.length - a.label.length);
+    let remaining = text;
+    const found = new Map<string, { id: string; name: string }>();
+    for (const { m, label } of candidates) {
+      const pattern = new RegExp(`(^|[^\\p{L}\\p{N}_.@])@${escape(label)}(?![\\p{L}\\p{N}_])`, "giu");
+      if (!pattern.test(remaining)) continue;
+      // Blank the matched text out so a shorter member name inside it is not matched again.
+      remaining = remaining.replace(pattern, (_match, lead: string) => `${lead} `);
+      if (!found.has(String(m.id))) found.set(String(m.id), { id: String(m.id), name: m.name || m.email });
+    }
+    return Array.from(found.values());
   }
 
   async getBugForUser(userId: string | null | undefined, bugId: string) {
     await this.requireBugAccess(userId, bugId);
     return this.getBug(bugId);
+  }
+
+  /**
+   * Project-scoped bug lookup for a shareable Bug Details URL: accepts either the row's uuid or
+   * its external id (e.g. "PRO-BUG-12"), the same dual-key resolution getTestCaseForUser already
+   * uses for test cases. The project id in the URL is what makes the external id (unique only per
+   * project, not globally) resolvable without ambiguity, and makes a bug from another project
+   * "not found" here rather than readable by whoever guesses or is handed its code.
+   */
+  async getBugForUserByIdentifier(userId: string | null | undefined, projectId: string, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const res = isUuid(bugId)
+      ? await this.db.query<{ id: string }>("SELECT id FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [bugId, projectId])
+      : await this.db.query<{ id: string }>("SELECT id FROM bugs WHERE external_id = $1 AND project_id = $2 AND deleted_at IS NULL", [bugId, projectId]);
+    if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+    return this.getBug(res.rows[0].id);
+  }
+
+  // Flat discussion on a bug (V129) — the KB comment shape minus threading, anchors and resolution.
+  // Routed under /api/projects/:projectId so ProjectWriteLockGuard covers the write, which is why
+  // the bug is resolved against the URL's project rather than through requireBugAccess alone.
+
+  private static readonly BUG_COMMENT_MAX_LENGTH = 10000;
+  // Per comment, across edits — the same ten FilesInterceptor allows in a single request.
+  private static readonly BUG_COMMENT_MAX_ATTACHMENTS = 10;
+  // How long after posting the author may still edit (text or files). Deleting has no limit.
+  private static readonly BUG_COMMENT_EDIT_WINDOW_MINUTES = 60;
+  private static readonly BUG_COMMENT_COLUMNS = "id, bug_id, parent_comment_id, author_id, body, created_at, updated_at";
+
+  private bugCommentView(row: Body, attachments: Body[] = []): Body {
+    return {
+      id: String(row.id),
+      bugId: String(row.bug_id),
+      // null for a top-level comment; replies are one level deep (V131).
+      parentCommentId: row.parent_comment_id ? String(row.parent_comment_id) : null,
+      authorId: row.author_id ? String(row.author_id) : null,
+      authorName: row.author_name ? String(row.author_name) : "Unknown",
+      body: String(row.body || ""),
+      // Both timestamps come from the same now() on insert, and updated_at only moves when an edit
+      // actually changes the text or the files (a no-op PATCH leaves it alone), so any gap means edited.
+      isEdited: new Date(row.updated_at).getTime() > new Date(row.created_at).getTime(),
+      // When the author's edit window closes, so the UI can stop offering Edit. Advisory only:
+      // updateBugComment enforces it against the database clock, not this value.
+      editableUntil: new Date(new Date(row.created_at).getTime() + LegacyService.BUG_COMMENT_EDIT_WINDOW_MINUTES * 60_000).toISOString(),
+      attachments,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString()
+    };
+  }
+
+  /** The bug, if it is live and belongs to this project; otherwise the same 404 as a missing bug. */
+  private async bugInProject(projectId: string, bugId: string): Promise<{ id: string; title: string }> {
+    if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
+    const res = await this.db.query<{ id: string; title: string }>(
+      "SELECT id, title FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
+      [bugId, projectId]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+    return res.rows[0];
+  }
+
+  /** A live comment on this bug, or the 404 a missing one gets. */
+  private async bugCommentRow(bugId: string, commentId: string): Promise<Body> {
+    if (!isUuid(commentId)) throw new NotFoundException({ error: "Comment not found" });
+    const res = await this.db.query(
+      `SELECT c.id, c.bug_id, c.parent_comment_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name,
+              c.created_at > now() - make_interval(mins => $3) AS within_edit_window
+       FROM bug_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       WHERE c.id = $1 AND c.bug_id = $2 AND c.is_deleted = false`,
+      [commentId, bugId, LegacyService.BUG_COMMENT_EDIT_WINDOW_MINUTES]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+    return res.rows[0];
+  }
+
+  /*
+   * A comment's files live in the generic `attachments` table as entity_type='bug_comment', exactly
+   * as bug evidence does with 'bug'. Keeping them out of 'bug' is what keeps them out of the bug's
+   * own Attachments list and out of DELETE /api/bugs/attachments/:id, which any project member may
+   * call — removing a comment's file goes through the comment, under the comment's permissions.
+   */
+  private async bugCommentAttachments(commentIds: string[]): Promise<Map<string, Body[]>> {
+    const byComment = new Map<string, Body[]>();
+    if (!commentIds.length) return byComment;
+    const res = await this.db.query(
+      `SELECT id, entity_id, file_name, content_type, file_size, storage_path, created_at
+       FROM attachments
+       WHERE entity_type = 'bug_comment' AND entity_id = ANY($1::uuid[]) AND deleted_at IS NULL
+       ORDER BY created_at ASC, id ASC`,
+      [commentIds]
+    );
+    for (const row of res.rows) {
+      const key = String(row.entity_id);
+      const list = byComment.get(key) ?? [];
+      list.push({
+        id: String(row.id),
+        fileName: String(row.file_name),
+        contentType: row.content_type ? String(row.content_type) : "",
+        fileSize: Number(row.file_size ?? 0),
+        createdAt: new Date(row.created_at).toISOString(),
+        storagePath: String(row.storage_path)
+      });
+      byComment.set(key, list);
+    }
+    return byComment;
+  }
+
+  /** The client-facing shape: the storage key never leaves the server. */
+  private static publicCommentAttachments(list: Body[] = []): Body[] {
+    return list.map(({ storagePath: _storagePath, ...rest }) => rest);
+  }
+
+  /** Comment text, validated the same way on create and edit. */
+  private static bugCommentText(raw: unknown): string {
+    // String() would store an object as "[object Object]" and a number as its digits — refuse
+    // anything that is not text instead.
+    if (raw !== undefined && raw !== null && typeof raw !== "string") {
+      throw new BadRequestException({ error: "Comment must be text." });
+    }
+    const text = ((raw as string | null | undefined) ?? "").trim();
+    if (!text) throw new BadRequestException({ error: "Comment cannot be empty." });
+    if (text.length > LegacyService.BUG_COMMENT_MAX_LENGTH) {
+      throw new BadRequestException({ error: "Comment is too long (10,000 character limit)." });
+    }
+    return text;
+  }
+
+  /**
+   * `removeAttachmentIds` as JSON (an array) or as a multipart field (a JSON-encoded array, or one
+   * bare id). Anything else is a malformed request rather than "remove nothing".
+   */
+  private static attachmentIdList(raw: unknown): string[] {
+    if (raw === undefined || raw === null || raw === "") return [];
+    let value: unknown = raw;
+    if (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        value = [value];
+      }
+    }
+    if (typeof value === "string") value = [value];
+    if (!Array.isArray(value) || !value.every((id) => typeof id === "string")) {
+      throw new BadRequestException({ error: "removeAttachmentIds must be a list of attachment ids." });
+    }
+    return Array.from(new Set(value as string[]));
+  }
+
+  /** Validates a batch of comment files before anything is stored — all or nothing, like bug evidence. */
+  private async assertBugCommentFiles(organizationId: string, files: Array<{ originalname: string; size: number }>, existing: number) {
+    if (existing + files.length > LegacyService.BUG_COMMENT_MAX_ATTACHMENTS) {
+      throw new BadRequestException({
+        error: `A comment can have at most ${LegacyService.BUG_COMMENT_MAX_ATTACHMENTS} attachments.`
+      });
+    }
+    if (!files.length) return;
+    LegacyService.assertValidEvidenceFiles(files, LegacyService.BUG_FILE_MAX_SIZE);
+    await this.planLimits.assertStorageAvailable(organizationId, files.reduce((sum, file) => sum + file.size, 0));
+  }
+
+  /**
+   * Stores already-validated files against a comment. If any write fails, the objects and rows this
+   * call already made are removed again before the error propagates, so a failed upload never leaves
+   * half its files attached (or billed).
+   */
+  private async storeBugCommentFiles(
+    projectId: string,
+    bugId: string,
+    commentId: string,
+    uid: string,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    const stored: Array<{ key: string; id?: string }> = [];
+    try {
+      for (const file of files) {
+        const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
+        const entry: { key: string; id?: string } = {
+          key: `bugs/${projectId}/${bugId}/comments/${commentId}/${randomUUID()}${ext ? `.${ext}` : ""}`
+        };
+        await this.storage.put(entry.key, file.buffer, file.mimetype);
+        stored.push(entry);
+        const res = await this.db.query<{ id: string }>(
+          `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
+           VALUES ($1, 'bug_comment', $2, $3, $4, $5, $6, $7) RETURNING id`,
+          [projectId, commentId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, entry.key, uid]
+        );
+        entry.id = res.rows[0].id;
+      }
+    } catch (err) {
+      for (const entry of stored) {
+        await this.storage.delete(entry.key).catch(() => undefined);
+        if (entry.id) await this.db.query("DELETE FROM attachments WHERE id = $1", [entry.id]).catch(() => undefined);
+      }
+      throw err;
+    }
+  }
+
+  /** Destroys the stored objects and soft-deletes the rows, as deleteBugAttachment does for evidence. */
+  private async removeBugCommentFiles(files: Body[], uid: string) {
+    for (const file of files) {
+      await this.storage.delete(String(file.storagePath));
+      await this.db.query("UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [file.id, uid]);
+    }
+  }
+
+  async listBugComments(projectId: string, userId: string | null | undefined, bugId: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    await this.bugInProject(projectId, bugId);
+    // Flat and oldest first, replies included: grouped by parentCommentId, that is each thread's
+    // replies in date order. A reply whose parent has been deleted is left out — deleteBugComment
+    // removes a thread's replies with it, so this only covers a reply racing that delete.
+    const res = await this.db.query(
+      `SELECT c.id, c.bug_id, c.parent_comment_id, c.author_id, c.body, c.created_at, c.updated_at,
+              COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM bug_comments c
+       LEFT JOIN users a ON a.id = c.author_id
+       LEFT JOIN bug_comments p ON p.id = c.parent_comment_id
+       WHERE c.bug_id = $1 AND c.is_deleted = false
+         AND (c.parent_comment_id IS NULL OR p.is_deleted = false)
+       ORDER BY c.created_at ASC, c.id ASC`,
+      [bugId]
+    );
+    const files = await this.bugCommentAttachments(res.rows.map((row) => String(row.id)));
+    const list = res.rows.map((row) => this.bugCommentView(row, LegacyService.publicCommentAttachments(files.get(String(row.id)))));
+    return { list, total: list.length };
+  }
+
+  /**
+   * `parentCommentId` as sent (JSON or a multipart field): null for a top-level comment, otherwise
+   * a live, top-level comment on this bug — the same rules and messages as Knowledge Base replies.
+   */
+  private async bugCommentParent(bugId: string, raw: unknown): Promise<string | null> {
+    if (raw === undefined || raw === null || raw === "") return null;
+    if (typeof raw !== "string") throw new BadRequestException({ error: "parentCommentId must be a comment id." });
+    const gone = new NotFoundException({ error: "The comment you're replying to no longer exists." });
+    if (!isUuid(raw)) throw gone;
+    const parent = await this.db.query<{ parent_comment_id: string | null }>(
+      "SELECT parent_comment_id FROM bug_comments WHERE id = $1 AND bug_id = $2 AND is_deleted = false",
+      [raw, bugId]
+    );
+    if (!parent.rows[0]) throw gone;
+    // Threads stay one level deep. The UI never sends this — Reply on a reply targets the thread's
+    // top comment — so it only reaches a caller of the API itself.
+    if (parent.rows[0].parent_comment_id) {
+      throw new BadRequestException({ error: "Reply to the top comment of the thread instead of to another reply." });
+    }
+    return raw;
+  }
+
+  /**
+   * JSON `{ body }`, or multipart with a `body` field plus up to ten `files` — one request, so a
+   * comment and its files are saved together: if storing a file fails, the comment is removed again
+   * rather than left posted without the evidence it refers to. With `parentCommentId` it is a reply.
+   */
+  async createBugComment(
+    projectId: string,
+    userId: string | null | undefined,
+    bugId: string,
+    body: Body,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }> = []
+  ) {
+    const uid = this.requireUser(userId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const text = LegacyService.bugCommentText(body?.body);
+    const parentCommentId = await this.bugCommentParent(bugId, body?.parentCommentId);
+    const uploads = files ?? [];
+    await this.assertBugCommentFiles(String(project.organization_id), uploads, 0);
+
+    // The parent is re-checked in the INSERT itself, so a thread deleted since bugCommentParent
+    // read it gets the same 404 rather than a reply nobody can see.
+    const res = await this.db.query(
+      `WITH inserted AS (
+         INSERT INTO bug_comments (project_id, bug_id, parent_comment_id, author_id, body)
+         -- Typed explicitly: INSERT … SELECT does not infer parameter types from the target columns.
+         SELECT $1::uuid, $2::uuid, $5::uuid, $3::uuid, $4::text
+         WHERE $5::uuid IS NULL OR EXISTS (
+           SELECT 1 FROM bug_comments p
+           WHERE p.id = $5::uuid AND p.bug_id = $2::uuid AND p.is_deleted = false AND p.parent_comment_id IS NULL
+         )
+         RETURNING ${LegacyService.BUG_COMMENT_COLUMNS}
+       )
+       SELECT i.*, COALESCE(NULLIF(TRIM(a.name), ''), a.email) AS author_name
+       FROM inserted i
+       LEFT JOIN users a ON a.id = i.author_id`,
+      [projectId, bugId, uid, text, parentCommentId]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "The comment you're replying to no longer exists." });
+    const commentId = String(res.rows[0].id);
+    if (uploads.length) {
+      try {
+        await this.storeBugCommentFiles(projectId, bugId, commentId, uid, uploads);
+      } catch (err) {
+        await this.db.query("DELETE FROM bug_comments WHERE id = $1", [commentId]);
+        throw err;
+      }
+    }
+    // "replied", as Knowledge Base replies are logged.
+    await this.logProjectActivity(projectId, uid, parentCommentId ? "replied" : "commented", "bug", bugId, bug.title, {
+      commentId,
+      ...(parentCommentId ? { parentCommentId } : {})
+    });
+    for (const mentioned of await this.bugCommentMentions(projectId, text)) {
+      await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
+        commentId,
+        mentionedUserId: mentioned.id,
+        mentionedName: mentioned.name
+      });
+    }
+    const attached = await this.bugCommentAttachments([commentId]);
+    return this.bugCommentView(res.rows[0], LegacyService.publicCommentAttachments(attached.get(commentId)));
+  }
+
+  /**
+   * Edits a comment's text and/or its files (`removeAttachmentIds`, new multipart `files`). The
+   * author's alone, as in the Knowledge Base: a manager rewriting someone else's words would
+   * misattribute them. Moderation is deleteBugComment. Only within BUG_COMMENT_EDIT_WINDOW_MINUTES
+   * of posting, so a discussion can't be rewritten after others have read and replied to it.
+   */
+  async updateBugComment(
+    projectId: string,
+    userId: string | null | undefined,
+    bugId: string,
+    commentId: string,
+    body: Body,
+    files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }> = []
+  ) {
+    const uid = this.requireUser(userId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const comment = await this.bugCommentRow(bugId, commentId);
+    if (comment.author_id !== uid) throw new ForbiddenException({ error: "You can only edit your own comments" });
+    // Judged by the database clock (bugCommentRow), the same clock that stamped created_at.
+    if (!comment.within_edit_window) {
+      throw new ForbiddenException({ error: "Comments can only be edited within 1 hour of posting." });
+    }
+
+    const text = body?.body === undefined ? null : LegacyService.bugCommentText(body.body);
+    const removeIds = LegacyService.attachmentIdList(body?.removeAttachmentIds);
+    const current = (await this.bugCommentAttachments([commentId])).get(commentId) ?? [];
+    // Only this comment's own files can be removed through it — an id from another comment or from
+    // the bug's evidence is simply not found here.
+    const removing = current.filter((file) => removeIds.includes(String(file.id)));
+    if (removing.length !== removeIds.length) throw new NotFoundException({ error: "Attachment not found" });
+    const uploads = files ?? [];
+    await this.assertBugCommentFiles(String(project.organization_id), uploads, current.length - removing.length);
+
+    const textChanged = text !== null && text !== String(comment.body);
+    if (!textChanged && !removing.length && !uploads.length) {
+      return this.bugCommentView(comment, LegacyService.publicCommentAttachments(current));
+    }
+
+    // New files first: it is the step that can fail, and nothing destructive has happened yet.
+    if (uploads.length) await this.storeBugCommentFiles(projectId, bugId, commentId, uid, uploads);
+    await this.removeBugCommentFiles(removing, uid);
+    const updated = await this.db.query(
+      `UPDATE bug_comments SET body = COALESCE($2, body), updated_at = now()
+       WHERE id = $1 AND is_deleted = false
+       RETURNING ${LegacyService.BUG_COMMENT_COLUMNS}`,
+      [commentId, textChanged ? text : null]
+    );
+    // Deleted by someone else between the read above and this write.
+    if (!updated.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+
+    await this.logProjectActivity(projectId, uid, "comment_edited", "bug", bugId, bug.title, {
+      commentId,
+      ...(comment.parent_comment_id ? { parentCommentId: String(comment.parent_comment_id) } : {}),
+      ...(textChanged ? { textChanged: true } : {}),
+      ...(uploads.length ? { attachmentsAdded: uploads.length } : {}),
+      ...(removing.length ? { attachmentsRemoved: removing.length } : {})
+    });
+    // Only people the edit newly names — re-saving a comment must not log the same mention again.
+    if (textChanged) {
+      const before = new Set((await this.bugCommentMentions(projectId, String(comment.body))).map((m) => m.id));
+      for (const mentioned of await this.bugCommentMentions(projectId, text!)) {
+        if (before.has(mentioned.id)) continue;
+        await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
+          commentId,
+          mentionedUserId: mentioned.id,
+          mentionedName: mentioned.name
+        });
+      }
+    }
+    const attached = await this.bugCommentAttachments([commentId]);
+    return this.bugCommentView(
+      { ...updated.rows[0], author_name: comment.author_name },
+      LegacyService.publicCommentAttachments(attached.get(commentId))
+    );
+  }
+
+  /**
+   * Soft-deletes a comment and destroys its files. The author, or a project owner/manager. A
+   * top-level comment takes its whole thread with it — replies and their files — as Knowledge Base
+   * threads do, so no reply is left hanging under a comment that is gone.
+   */
+  async deleteBugComment(projectId: string, userId: string | null | undefined, bugId: string, commentId: string) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const bug = await this.bugInProject(projectId, bugId);
+    const comment = await this.bugCommentRow(bugId, commentId);
+    this.kbRequireMutateAccess(await this.kbProjectRole(uid, projectId), comment.author_id ? String(comment.author_id) : null, uid);
+
+    // A reply has no replies of its own, so for one this matches only itself.
+    const deleted = await this.db.query<{ id: string }>(
+      `UPDATE bug_comments SET is_deleted = true, deleted_at = now(), updated_at = now()
+       WHERE (id = $1 OR parent_comment_id = $1) AND is_deleted = false
+       RETURNING id`,
+      [commentId]
+    );
+    const deletedIds = deleted.rows.map((row) => String(row.id));
+    // Deleted by someone else between the read above and this write.
+    if (!deletedIds.includes(commentId)) throw new NotFoundException({ error: "Comment not found" });
+    const files = await this.bugCommentAttachments(deletedIds);
+    await this.removeBugCommentFiles(deletedIds.flatMap((id) => files.get(id) ?? []), uid);
+    const repliesDeleted = deletedIds.length - 1;
+    await this.logProjectActivity(projectId, uid, "comment_deleted", "bug", bugId, bug.title, {
+      commentId,
+      authorId: comment.author_id ? String(comment.author_id) : null,
+      ...(comment.parent_comment_id ? { parentCommentId: String(comment.parent_comment_id) } : {}),
+      ...(repliesDeleted ? { repliesDeleted } : {})
+    });
+    return { success: true };
   }
 
   /**
@@ -6532,8 +7285,10 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     const projectId = await this.requireBugAccess(userId, bugId);
     // Same refusal as createBug — an unknown severity on edit hit the same constraint and the same
-    // opaque 500. Absent/empty leaves the stored value alone via COALESCE, so it isn't parsed.
-    if (body.severity) this.parseBugSeverity(body.severity);
+    // opaque 500. Severity can be cleared since V130, with the same explicit-null-or-"" convention as
+    // priority below; an absent key still leaves the stored value alone.
+    const clearsSeverity = body.severity === null || body.severity === "";
+    const severity = this.parseBugSeverity(body.severity);
     validateBoundedField(body.title, "Bug title", BUG_TITLE_MAX_LENGTH);
     validateBoundedField(body.externalUrl, "External URL", BUG_EXTERNAL_URL_MAX_LENGTH);
     /*
@@ -6548,9 +7303,10 @@ export class LegacyService implements OnModuleInit {
     // hidden from the picker.
     const clearsAssignee = body.assigneeId === null || body.assigneeId === "";
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
+    const before = await this.getBug(bugId);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
-       status=COALESCE($5,status), severity=COALESCE($6,severity), priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
+       status=COALESCE($5,status), severity=CASE WHEN $14::boolean THEN NULL ELSE COALESCE($6,severity) END, priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
        integration_provider=COALESCE($7,integration_provider), integration_issue_key=COALESCE($8,integration_issue_key),
        betterbugs_url=COALESCE($9,betterbugs_url),
        assignee_id=CASE WHEN $12::boolean THEN NULL ELSE COALESCE($13,assignee_id) END,
@@ -6561,14 +7317,15 @@ export class LegacyService implements OnModuleInit {
         body.description || null,
         body.externalUrl || null,
         body.status || null,
-        body.severity || null,
+        severity,
         body.integrationProvider || null,
         body.integrationIssueKey || null,
         body.betterbugsUrl || null,
         clearsPriority,
         priority,
         clearsAssignee,
-        assigneeId
+        assigneeId,
+        clearsSeverity
       ]
     );
     if (Array.isArray(body.links)) {
@@ -6576,7 +7333,9 @@ export class LegacyService implements OnModuleInit {
       const sanitized = await this.sanitizeBugLinks(String(owner.rows[0]?.project_id ?? ""), normalizeJsonArray(body.links));
       await this.db.transaction((client) => this.replaceBugLinks(client, bugId, uid, sanitized));
     }
-    return this.getBug(bugId);
+    const after = await this.getBug(bugId);
+    await this.logBugChanges(projectId, uid, before, after);
+    return after;
   }
 
   async addBugLink(userId: string | null | undefined, bugId: string, body: Body) {
@@ -6625,8 +7384,12 @@ export class LegacyService implements OnModuleInit {
 
   async deleteBug(userId: string | null | undefined, bugId: string) {
     const uid = this.requireUser(userId);
-    await this.requireBugAccess(userId, bugId);
-    await this.db.query("UPDATE bugs SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL", [bugId, uid]);
+    const projectId = await this.requireBugAccess(userId, bugId);
+    const res = await this.db.query<{ title: string }>(
+      "UPDATE bugs SET deleted_at = now(), deleted_by = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING title",
+      [bugId, uid]
+    );
+    if (res.rows[0]) await this.logProjectActivity(projectId, uid, "bug_deleted", "bug", bugId, res.rows[0].title, {});
   }
 
   // The client controls the uploaded filename completely, and it is only ever a display label —
@@ -6674,6 +7437,12 @@ export class LegacyService implements OnModuleInit {
    */
   static readonly EVIDENCE_MAX_FILE_SIZE = Number(process.env.MAX_EVIDENCE_FILE_SIZE) || 25 * 1024 * 1024;
 
+  // Bugs and their comments take less than test-run evidence: 20MB a file, and at most ten files on
+  // a bug (its own evidence) or on any one comment (BUG_COMMENT_MAX_ATTACHMENTS). Test-run evidence
+  // keeps EVIDENCE_MAX_FILE_SIZE. MAX_BUG_FILE_SIZE overrides the size without a code change.
+  static readonly BUG_FILE_MAX_SIZE = Number(process.env.MAX_BUG_FILE_SIZE) || 20 * 1024 * 1024;
+  private static readonly BUG_MAX_ATTACHMENTS = 10;
+
   private static formatFileSize(bytes: number): string {
     if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
     return `${Math.max(1, Math.round(bytes / 1024))}KB`;
@@ -6684,7 +7453,10 @@ export class LegacyService implements OnModuleInit {
    * calling storage.put per file, so rejecting halfway would leave the accepted ones written and
    * billed while the request answers 400. All-or-nothing is the only defensible outcome.
    */
-  private static assertValidEvidenceFiles(files: Array<{ originalname: string; size: number }>) {
+  private static assertValidEvidenceFiles(
+    files: Array<{ originalname: string; size: number }>,
+    maxSize: number = LegacyService.EVIDENCE_MAX_FILE_SIZE
+  ) {
     const supported = [...LegacyService.KB_ALLOWED_EXTENSIONS].sort().join(", ");
     for (const file of files) {
       const name = LegacyService.displayFileName(file.originalname);
@@ -6700,11 +7472,11 @@ export class LegacyService implements OnModuleInit {
       // A zero-byte file is almost always a failed drag-and-drop or a still-being-written file, and
       // it stores nothing useful while still consuming an attachment row and a storage key.
       if (file.size <= 0) throw new BadRequestException({ error: `${name} is empty (0 bytes).` });
-      if (file.size > LegacyService.EVIDENCE_MAX_FILE_SIZE) {
+      if (file.size > maxSize) {
         throw new BadRequestException({
           error:
             `${name} is ${LegacyService.formatFileSize(file.size)}, which is over the ` +
-            `${LegacyService.formatFileSize(LegacyService.EVIDENCE_MAX_FILE_SIZE)} limit for evidence files.`
+            `${LegacyService.formatFileSize(maxSize)} limit for evidence files.`
         });
       }
     }
@@ -6726,9 +7498,18 @@ export class LegacyService implements OnModuleInit {
     const project = await this.requireProjectAccess(uid, projectId);
     if (!files || files.length === 0) throw new BadRequestException({ error: "No files were uploaded" });
     if (!isUuid(bugId)) throw new NotFoundException({ error: "Bug not found" });
-    const bug = await this.db.query("SELECT b.id FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
+    const bug = await this.db.query("SELECT b.id, b.title FROM bugs b WHERE b.id = $1 AND b.project_id = $2 AND b.deleted_at IS NULL", [bugId, projectId]);
     if (!bug.rows[0]) throw new NotFoundException({ error: "Bug not found" });
-    LegacyService.assertValidEvidenceFiles(files);
+    // Counted across every upload to this bug, not per request: Report Bug and Edit Bug send files
+    // in batches, so a per-request cap alone would never stop the eleventh.
+    const existing = await this.db.query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM attachments WHERE entity_type = 'bug' AND entity_id = $1 AND deleted_at IS NULL",
+      [bugId]
+    );
+    if (Number(existing.rows[0].count) + files.length > LegacyService.BUG_MAX_ATTACHMENTS) {
+      throw new BadRequestException({ error: `A bug can have at most ${LegacyService.BUG_MAX_ATTACHMENTS} attachments.` });
+    }
+    LegacyService.assertValidEvidenceFiles(files, LegacyService.BUG_FILE_MAX_SIZE);
     await this.planLimits.assertStorageAvailable(
       project.organization_id,
       files.reduce((sum, file) => sum + file.size, 0)
@@ -6745,19 +7526,24 @@ export class LegacyService implements OnModuleInit {
         [projectId, bugId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
       );
       created.push(toCamel(res.rows[0]));
+      await this.logProjectActivity(projectId, uid, "bug_attachment_added", "bug", bugId, String(bug.rows[0].title ?? ""), {
+        attachmentId: String(res.rows[0].id),
+        fileName: String(res.rows[0].file_name)
+      });
     }
     return { list: created, total: created.length };
   }
 
   // `scopeProjectId` keeps a lookup by attachment id from crossing into another project's
   // evidence: the caller has already been authorized for that project, so the row has to
-  // belong to it too or it simply isn't found.
-  private async bugAttachment(attachmentId: string, scopeProjectId?: string): Promise<Body> {
+  // belong to it too or it simply isn't found. `entityTypes` is 'bug' unless the caller opts in:
+  // only the download widens it to comment files, so the delete route can never reach them.
+  private async bugAttachment(attachmentId: string, scopeProjectId?: string, entityTypes: string[] = ["bug"]): Promise<Body> {
     if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
     const res = await this.db.query(
-      `SELECT * FROM attachments WHERE id = $1 AND entity_type = 'bug' AND deleted_at IS NULL
+      `SELECT * FROM attachments WHERE id = $1 AND entity_type = ANY($3::text[]) AND deleted_at IS NULL
        AND ($2::uuid IS NULL OR project_id = $2::uuid)`,
-      [attachmentId, scopeProjectId ?? null]
+      [attachmentId, scopeProjectId ?? null, entityTypes]
     );
     if (!res.rows[0]) throw new NotFoundException({ error: "Attachment not found" });
     return res.rows[0];
@@ -6767,7 +7553,7 @@ export class LegacyService implements OnModuleInit {
     // Bug evidence is confidential: an attachment id turning up in a link, a log line or an
     // exported report must not be enough to hand the file to whoever holds it.
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    const file = await this.bugAttachment(attachmentId, projectId);
+    const file = await this.bugAttachment(attachmentId, projectId, ["bug", "bug_comment"]);
     if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
@@ -6786,7 +7572,17 @@ export class LegacyService implements OnModuleInit {
     const file = await this.bugAttachment(attachmentId);
     await this.requireProjectAccess(uid, String(file.project_id));
     await this.storage.delete(file.storage_path);
-    await this.db.query("UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL", [attachmentId, uid]);
+    const deleted = await this.db.query(
+      "UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+      [attachmentId, uid]
+    );
+    if (deleted.rows[0]) {
+      const owner = await this.db.query<{ title: string }>("SELECT title FROM bugs WHERE id = $1", [file.entity_id]);
+      await this.logProjectActivity(String(file.project_id), uid, "bug_attachment_deleted", "bug", String(file.entity_id), owner.rows[0]?.title ?? null, {
+        attachmentId,
+        fileName: String(file.file_name)
+      });
+    }
     return { ok: true };
   }
 
@@ -7586,7 +8382,7 @@ export class LegacyService implements OnModuleInit {
     const [counts, requirements, bugSeverity, activeRuns, addedThisWeek, passRateWindows] = await Promise.all([
       this.analytics(projectId),
       this.requirementsSummary(projectId, userId),
-      this.db.query<{ severity: string; count: string }>(
+      this.db.query<{ severity: string | null; count: string }>(
         `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND deleted_at IS NULL AND status IN ('Open', 'Reopened') GROUP BY severity`,
         [projectId]
       ),
@@ -7617,10 +8413,15 @@ export class LegacyService implements OnModuleInit {
     ]);
 
     const bySeverity = { Critical: 0, High: 0, Medium: 0, Low: 0 } as Record<string, number>;
+    // Severity is nullable since V130. Bugs with none get their own count, and the total is summed
+    // over every row — summing only the four buckets dropped them from "Open bugs" altogether.
+    let openBugsNoSeverity = 0;
+    let openBugsTotal = 0;
     for (const row of bugSeverity.rows) {
-      if (row.severity in bySeverity) bySeverity[row.severity] = Number(row.count);
+      openBugsTotal += Number(row.count);
+      if (row.severity === null) openBugsNoSeverity = Number(row.count);
+      else if (row.severity in bySeverity) bySeverity[row.severity] = Number(row.count);
     }
-    const openBugsTotal = Object.values(bySeverity).reduce((a, b) => a + b, 0);
 
     const metrics = LegacyService.computeExecutionMetrics({
       passed: counts.executionStatus.Passed || 0,
@@ -7645,7 +8446,7 @@ export class LegacyService implements OnModuleInit {
       testCases: { total: counts.testCaseCount, addedThisWeek: Number(addedThisWeek.rows[0]?.count || 0) },
       passRate: { value: metrics.passRate, deltaThisWeek: passRateDeltaThisWeek },
       executionProgress: { value: metrics.executionProgress },
-      openBugs: { total: openBugsTotal, bySeverity },
+      openBugs: { total: openBugsTotal, bySeverity, noSeverity: openBugsNoSeverity },
       coverage: { pct: coveragePct, totalRequirements },
       plans: counts.planCount,
       suites: counts.suiteCount,
@@ -7687,7 +8488,15 @@ export class LegacyService implements OnModuleInit {
     const projectId = String(query.projectId || "").trim();
     const search = String(query.search || "").trim();
     const since = String(query.since || "").trim();
+    const entityId = String(query.entityId || "").trim();
 
+    if (entityId) {
+      // One entity's own history — Bug Details' Activity section. entity_id is free text shared by
+      // every entity type (ids, not always uuids), so it is bounded rather than uuid-checked.
+      if (entityId.length > 255) throw new BadRequestException({ error: "entityId is too long" });
+      values.push(entityId);
+      filters.push(`ae.entity_id = $${values.length}`);
+    }
     if (entityType) {
       values.push(entityType.split(",").map((t) => t.trim()).filter(Boolean));
       filters.push(`ae.entity_type = ANY($${values.length}::text[])`);
@@ -7769,6 +8578,13 @@ export class LegacyService implements OnModuleInit {
         WHERE a.project_id IS NULL AND ${orgOnlySql}
       `
       : "";
+    // Bugs filed since bug mutations started writing audit rows (bug_created onwards) have a real,
+    // actor-attributed history in audit_logs, so the synthetic created/updated rows below — which
+    // credit every edit to the reporter — are only kept for older bugs that have nothing else.
+    const bugHasNoAuditTrail = `NOT EXISTS (
+          SELECT 1 FROM audit_logs bx
+          WHERE bx.entity_type = 'bug' AND bx.entity_id = b.id::text AND bx.action = 'bug_created'
+        )`;
     return `
       WITH activity_events AS (
         SELECT
@@ -7853,7 +8669,7 @@ export class LegacyService implements OnModuleInit {
           NULL::text, b.created_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
-        WHERE ${projectScopeSql}
+        WHERE ${projectScopeSql} AND ${bugHasNoAuditTrail}
 
         UNION ALL
         SELECT
@@ -7864,7 +8680,7 @@ export class LegacyService implements OnModuleInit {
           NULL::text, b.updated_at
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
-        WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second'
+        WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second' AND ${bugHasNoAuditTrail}
 
         UNION ALL
         SELECT
@@ -8951,7 +9767,7 @@ export class LegacyService implements OnModuleInit {
     // since the API is reachable directly.
     if (doc.is_read_only) {
       throw new BadRequestException({
-        error: `"${doc.title}" is synced from ${doc.source_provider === "linear" ? "Linear" : "Jira"} and its body can't be edited — the next sync would overwrite your changes. Add a comment on the document instead.`
+        error: `"${doc.title}" is synced from ${PROVIDER_FOLDER_NAMES[String(doc.source_provider || "")] || "an integration"} and its body can't be edited because the next sync would overwrite your changes. Add a comment on the document instead.`
       });
     }
 
@@ -9985,7 +10801,7 @@ export class LegacyService implements OnModuleInit {
     return [];
   }
 
-  // ── App integrations (Jira, Linear) ──
+  // ── App integrations (Jira, Linear, Notion) ──
   // The OAuth connection (and its client id/secret) is workspace-scoped — one per organization
   // per provider — so a customer connects Jira/Linear once instead of re-authenticating every
   // project. Which remote project/team feeds which Tesbo project is a separate per-project mapping
@@ -10061,6 +10877,18 @@ export class LegacyService implements OnModuleInit {
       });
       return { url: `https://auth.atlassian.com/authorize?${params.toString()}` };
     }
+    if (p === "notion") {
+      // No scope parameter: a Notion integration's capabilities (read content, read/insert comments)
+      // are configured on the integration itself, and owner=user asks for a user-level authorization.
+      const params = new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        response_type: "code",
+        owner: "user",
+        state
+      });
+      return { url: `https://api.notion.com/v1/oauth/authorize?${params.toString()}` };
+    }
     const params = new URLSearchParams({
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -10077,6 +10905,11 @@ export class LegacyService implements OnModuleInit {
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
     await this.planLimits.assertIntegrationAllowed(workspace.id, p);
+    // The provider redirects back with ?error=access_denied (and no code) when the user cancels the
+    // consent screen; say so instead of reporting a missing code.
+    if (body.error && !body.code) {
+      throw new BadRequestException({ error: `${PROVIDER_FOLDER_NAMES[p]} authorization was cancelled or denied (${String(body.error).slice(0, 80)}). Start the connection again.` });
+    }
     const code = String(body.code || "");
     if (!code) throw new BadRequestException({ error: "Authorization code is required." });
     verifyOAuthState(String(body.state || ""), p, workspace.id);
@@ -10126,6 +10959,56 @@ export class LegacyService implements OnModuleInit {
         [workspace.id, String(resource.id), String(resource.url), encryptSecret(accessToken), encryptSecret(refreshToken), expiresAt, userId || null]
       );
       return { connectionId: res.rows[0].id, cloudId: res.rows[0].external_id, siteUrl: res.rows[0].site_url };
+    }
+
+    if (p === "notion") {
+      // Notion authenticates the token exchange with HTTP Basic (client_id:client_secret) and a JSON
+      // body, and requires the Notion-Version header. The access token it returns never expires and
+      // has no refresh token, so the row stores an empty refresh_token and a far-future expiry.
+      let res: Response;
+      try {
+        res = await fetch(`${NOTION_API_BASE}/oauth/token`, {
+          method: "POST",
+          headers: {
+            Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`,
+            "Content-Type": "application/json",
+            "Notion-Version": NOTION_API_VERSION
+          },
+          body: JSON.stringify({ grant_type: "authorization_code", code, redirect_uri: redirectUri }),
+          signal: AbortSignal.timeout(INTEGRATION_SYNC_FETCH_TIMEOUT_MS)
+        });
+      } catch {
+        throw new BadRequestException({ error: "Could not reach Notion to finish connecting. Try again in a moment." });
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new BadRequestException({ error: "Notion did not accept the authorization code. Start the connection again.", detail: text.slice(0, 500) });
+      }
+      const token = (await res.json()) as Body;
+      const accessToken = String(token.access_token || "");
+      const workspaceId = String(token.workspace_id || "");
+      if (!accessToken || !workspaceId) throw new BadRequestException({ error: "Notion did not return an OAuth token." });
+      const connected = await this.db.query(
+        `INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at, connected_by, auth_method, personal_token_identifier)
+         VALUES ($1, 'notion', $2, $3, $4, '', $5, $6, 'oauth', NULL)
+         ON CONFLICT (organization_id, provider) DO UPDATE SET
+           external_id = EXCLUDED.external_id,
+           site_url = EXCLUDED.site_url,
+           access_token = EXCLUDED.access_token,
+           refresh_token = '',
+           token_expires_at = EXCLUDED.token_expires_at,
+           connected_by = EXCLUDED.connected_by,
+           auth_method = 'oauth',
+           personal_token_identifier = NULL,
+           disconnected_at = NULL,
+           auth_error = NULL,
+           auth_error_at = NULL,
+           auth_error_refresh_fingerprint = NULL,
+           updated_at = now()
+         RETURNING id, site_url`,
+        [workspace.id, workspaceId, "https://www.notion.so", encryptSecret(accessToken), NOTION_TOKEN_EXPIRES_AT, userId || null]
+      );
+      return { connectionId: connected.rows[0].id, siteUrl: connected.rows[0].site_url, workspaceName: String(token.workspace_name || "") };
     }
 
     // Linear
@@ -10179,7 +11062,7 @@ export class LegacyService implements OnModuleInit {
     // `WHERE status IN ('queued','running')` UPDATE, so two concurrent disconnects racing here just
     // both find nothing left to fail the second time; nothing depends on this being serialized.
     await this.integrationSync.failActiveRunsForConnection(workspace.id, p, "Disconnected before this sync finished.");
-    const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
+    const mappingsTable = INTEGRATION_MAPPING_TABLES[p];
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
     // A soft disconnect, not a DELETE: jira_tickets/linear_tickets and both mapping tables have
     // ON DELETE CASCADE back to this row (V47), so physically deleting it would silently destroy
@@ -10222,7 +11105,7 @@ export class LegacyService implements OnModuleInit {
     const workspace = await this.workspace(userId);
     const connection = await this.getIntegrationConnection(workspace.id, p, false);
     if (!connection) return { connected: false, connectedProjects: [] };
-    const mappingsTable = p === "jira" ? "jira_project_mappings" : "linear_project_mappings";
+    const mappingsTable = INTEGRATION_MAPPING_TABLES[p];
     const connectionColumn = p === "jira" ? "jira_connection_id" : "integration_connection_id";
     const projects = await this.db.query(
       `SELECT m.project_id, p.name AS project_name, p.key AS project_key
@@ -10388,20 +11271,22 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     const organizationId = await this.projectOrganizationId(projectId);
-    const label = provider === "jira" ? "Jira" : "Linear";
+    const label = TICKET_PROVIDER_LABELS[provider];
 
     const connection = await this.getIntegrationConnection(organizationId, provider, false);
     if (!connection) throw new NotFoundException({ error: `${label} is not connected.` });
 
-    const mapping = await this.db.query<{ remote_key: string }>(
-      provider === "jira"
-        ? "SELECT jira_project_key AS remote_key FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1"
-        : "SELECT linear_team_key AS remote_key FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1",
-      [projectId]
-    );
+    const remoteKeySql = {
+      jira: "SELECT jira_project_key AS remote_key FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1",
+      linear: "SELECT linear_team_key AS remote_key FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1",
+      // A Notion database has no short key; its id is the run's remote key.
+      notion: "SELECT notion_database_id AS remote_key FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1"
+    }[provider];
+    const mapping = await this.db.query<{ remote_key: string }>(remoteKeySql, [projectId]);
     const remoteKey = mapping.rows[0]?.remote_key ? String(mapping.rows[0].remote_key) : null;
     if (!remoteKey) {
-      throw new BadRequestException({ error: `Link a ${label} ${provider === "jira" ? "project" : "team"} to this project before syncing.` });
+      const remoteKind = { jira: "project", linear: "team", notion: "database" }[provider];
+      throw new BadRequestException({ error: `Link a ${label} ${remoteKind} to this project before syncing.` });
     }
 
     const { run, alreadyRunning } = await this.integrationSync.startRun(organizationId, projectId, provider, uid, remoteKey);
@@ -10473,6 +11358,30 @@ export class LegacyService implements OnModuleInit {
       values
     );
     return { list: res.rows.map(toCamel), total: count.rows[0]?.count ?? 0 };
+  }
+
+  // One synced ticket by its exact key — what a Zyra "jira_ticket" citation opens. Deliberately NOT
+  // scoped to the currently enabled mapping the way jiraTickets (the Requirements list) is: Zyra
+  // reads jira_tickets by project_id alone (relevantJiraSnapshot/jiraSnapshot), and a disconnect or
+  // re-map keeps the old mapping's rows, so a ticket Zyra read and cited can belong to a mapping that
+  // has since been switched off. Resolving the citation through the list endpoint therefore reported
+  // a ticket Zyra had just read as "could not be found". Same scope as the reader, so anything Zyra
+  // could cite, this can open. Two rows can share a key only across two Jira connections in one
+  // project; the currently mapped one wins, then the most recently synced.
+  async jiraTicketByKey(projectId: string, userId: string | null | undefined, issueKey: string) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const key = String(issueKey || "").trim();
+    if (!key) throw new BadRequestException({ error: "Jira issue key is required." });
+    const res = await this.db.query(
+      `SELECT * FROM jira_tickets
+       WHERE project_id = $1 AND jira_issue_key = $2
+       ORDER BY CASE WHEN mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1) THEN 0 ELSE 1 END,
+                synced_at DESC NULLS LAST
+       LIMIT 1`,
+      [projectId, key]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Jira ticket not found" });
+    return toCamel(res.rows[0]);
   }
 
   async jiraComment(projectId: string, userId: string | null | undefined, body: Body) {
@@ -10591,6 +11500,10 @@ export class LegacyService implements OnModuleInit {
     );
     const connection = res.rows[0] as Body | undefined;
     if (!connection) return null;
+    // Notion tokens never expire and cannot be refreshed (the row holds an empty refresh_token and a
+    // far-future token_expires_at). Returned before any expiry check so a Notion connection can
+    // never enter the Jira/Linear renewal below.
+    if (provider === "notion") return connection;
     const forced = Boolean(options.rejectedAccessToken);
     // Fast, lock-free path: this is what the overwhelming majority of calls hit, so it stays exactly
     // as cheap as it always was. Only a token actually due for refresh pays for the transaction below.
@@ -10774,7 +11687,7 @@ export class LegacyService implements OnModuleInit {
 
   /** Shared fetch+status-check for a provider's OAuth token endpoint — generalizes jiraFetch's
    *  auth-error handling so Linear's token refresh gets the same clean-error treatment. */
-  private async providerTokenFetch<T = unknown>(url: string, init: RequestInit, providerLabel: "Jira" | "Linear"): Promise<T> {
+  private async providerTokenFetch<T = unknown>(url: string, init: RequestInit, providerLabel: "Jira" | "Linear" | "Notion"): Promise<T> {
     const res = await fetch(url, init);
     if (!res.ok) {
       const authError = this.cleanAuthErrorOrNull(providerLabel, res.status);
@@ -10806,7 +11719,7 @@ export class LegacyService implements OnModuleInit {
   // The status also rides along on the exception (non-enumerable, so never serialized into a
   // response) for callers that need to tell the two apart — see integrationErrorReason, where a 403
   // on a ticket comment means "no permission", which reconnecting would not fix.
-  private cleanAuthErrorOrNull(provider: "Jira" | "Linear", status: number): BadRequestException | null {
+  private cleanAuthErrorOrNull(provider: "Jira" | "Linear" | "Notion", status: number): BadRequestException | null {
     if (status !== 401 && status !== 403) return null;
     const error = new BadRequestException({ error: `${provider} access needs to be reconnected — the authorization may have been revoked or expired.` });
     Object.defineProperty(error, "providerStatus", { value: status, enumerable: false });
@@ -11061,7 +11974,7 @@ export class LegacyService implements OnModuleInit {
     const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
     const search = String(query.search || "").trim();
     const combined = `
-      SELECT id, 'jira' AS source, jira_issue_key AS key, summary, description, issue_type, status, priority,
+      SELECT id, 'jira' AS source, jira_issue_key AS key, jira_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, jira_created_at AS created_at, jira_updated_at AS updated_at,
              jira_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL) AS has_coverage
@@ -11069,13 +11982,22 @@ export class LegacyService implements OnModuleInit {
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
       UNION ALL
-      SELECT id, 'linear' AS source, linear_issue_key AS key, summary, description, issue_type, status, priority,
+      SELECT id, 'linear' AS source, linear_issue_key AS key, linear_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, linear_created_at AS created_at, linear_updated_at AS updated_at,
              linear_url AS url, synced_at,
              EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL) AS has_coverage
       FROM linear_tickets
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
+      UNION ALL
+      -- external_id is the full Notion page id: a test case links to a Notion page by that, not by the short display key.
+      SELECT id, 'notion' AS source, notion_page_key AS key, notion_page_id AS external_id, summary, description, issue_type, status, priority,
+             assignee, reporter, labels, notion_created_at AS created_at, notion_updated_at AS updated_at,
+             notion_url AS url, synced_at,
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL) AS has_coverage
+      FROM notion_pages
+      WHERE project_id = $1 AND archived = false
+        AND mapped_remote_id = (SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
     `;
     const filters: string[] = [];
     const values: any[] = [projectId];
@@ -11113,15 +12035,15 @@ export class LegacyService implements OnModuleInit {
   async requirementsSummary(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const bySource = async (
-      table: "jira_tickets" | "linear_tickets",
-      keyColumn: "jira_issue_key" | "linear_issue_key",
-      mappingTable: "jira_project_mappings" | "linear_project_mappings",
-      remoteIdColumn: "jira_project_id" | "linear_team_id"
+      table: "jira_tickets" | "linear_tickets" | "notion_pages",
+      keyColumn: "jira_issue_key" | "linear_issue_key" | "notion_page_id",
+      mappingTable: "jira_project_mappings" | "linear_project_mappings" | "notion_project_mappings",
+      remoteIdColumn: "jira_project_id" | "linear_team_id" | "notion_database_id"
     ) => {
       // Same "scope to the currently mapped entity only" rule as jiraTickets/linearTickets/
       // allTickets, so the stat strip and filter dropdowns never count tickets from a
       // since-switched-away-from project/team alongside the current one.
-      const scope = `project_id = $1 AND mapped_remote_id = (SELECT ${remoteIdColumn} FROM ${mappingTable} WHERE project_id = $1 AND enabled = true LIMIT 1)`;
+      const scope = `project_id = $1 AND mapped_remote_id = (SELECT ${remoteIdColumn} FROM ${mappingTable} WHERE project_id = $1 AND enabled = true LIMIT 1)${table === "notion_pages" ? " AND archived = false" : ""}`;
       const stats = await this.db.query(
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE EXISTS (
@@ -11142,18 +12064,19 @@ export class LegacyService implements OnModuleInit {
         statuses: statuses.rows.map((r) => r.status as string)
       };
     };
-    const [jira, linear] = await Promise.all([
+    const [jira, linear, notion] = await Promise.all([
       bySource("jira_tickets", "jira_issue_key", "jira_project_mappings", "jira_project_id"),
-      bySource("linear_tickets", "linear_issue_key", "linear_project_mappings", "linear_team_id")
+      bySource("linear_tickets", "linear_issue_key", "linear_project_mappings", "linear_team_id"),
+      bySource("notion_pages", "notion_page_id", "notion_project_mappings", "notion_database_id")
     ]);
     const all = {
-      total: jira.total + linear.total,
-      covered: jira.covered + linear.covered,
-      uncovered: jira.uncovered + linear.uncovered,
-      types: Array.from(new Set([...jira.types, ...linear.types])).sort(),
-      statuses: Array.from(new Set([...jira.statuses, ...linear.statuses])).sort()
+      total: jira.total + linear.total + notion.total,
+      covered: jira.covered + linear.covered + notion.covered,
+      uncovered: jira.uncovered + linear.uncovered + notion.uncovered,
+      types: Array.from(new Set([...jira.types, ...linear.types, ...notion.types])).sort(),
+      statuses: Array.from(new Set([...jira.statuses, ...linear.statuses, ...notion.statuses])).sort()
     };
-    return { all, jira, linear };
+    return { all, jira, linear, notion };
   }
 
   async linearComment(projectId: string, userId: string | null | undefined, body: Body) {
@@ -11244,6 +12167,349 @@ export class LegacyService implements OnModuleInit {
       }
     }
     return { list: results.slice(0, 20) };
+  }
+
+  // ── Notion-specific mirrors of the Linear project-scoped methods above ──
+  // Notion's unit of work is a DATABASE (a table of pages): a Tesbo project maps to one database and
+  // its pages are mirrored as tickets (notion_pages). Test cases link to a page by its full id
+  // (testcases.notion_page_id); the short "notion:xxxxxxxx" key is a display label only.
+
+  // One Notion call with the connection's token. A NotionApiError becomes the BadRequestException
+  // shape every other provider call here throws, carrying the HTTP status as a non-enumerable
+  // `providerStatus` (see cleanAuthErrorOrNull) and a plain-language cause as `error`.
+  private async notionFetch<T = unknown>(
+    connection: Body,
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+    what: "database" | "page" | "content" = "content"
+  ): Promise<T> {
+    try {
+      return await notionRequest<T>(decryptSecret(String(connection.access_token || "")), method, path, body);
+    } catch (err) {
+      if (!(err instanceof NotionApiError)) throw err;
+      const error = new BadRequestException({ error: describeNotionError(err, what) });
+      Object.defineProperty(error, "providerStatus", { value: err.status, enumerable: false });
+      throw error;
+    }
+  }
+
+  // Notion ids arrive dashed or compact. Canonicalised to the dashed form (what the API returns and
+  // what the sync stores) and rejected otherwise, so nothing but a UUID ever reaches a request path.
+  private normalizeNotionId(raw: unknown): string | null {
+    const compact = String(raw ?? "").trim().replace(/-/g, "").toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(compact)) return null;
+    return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
+  }
+
+  // Same name collision as jiraStatus()/linearStatus(): connection status, not page status.
+  async notionStatus(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) return { connected: false, connectedProjects: [], history: [] };
+    const databases = await this.db.query(
+      `SELECT id, notion_database_id, notion_database_name, created_at
+       FROM notion_project_mappings
+       WHERE project_id = $1 AND enabled = true
+       ORDER BY notion_database_name`,
+      [projectId]
+    );
+    // Every database this Tesbo project has ever been linked to (never deleted, only disabled).
+    const history = await this.db.query(
+      `SELECT id, notion_database_id, notion_database_name, created_at
+       FROM notion_project_mappings
+       WHERE project_id = $1 AND enabled = false
+       ORDER BY created_at DESC`,
+      [projectId]
+    );
+    return {
+      connected: true,
+      ...this.integrationConnectionHealth(connection, "notion"),
+      id: connection.id,
+      siteUrl: connection.site_url,
+      tokenExpiresAt: connection.token_expires_at,
+      connectedBy: connection.connected_by,
+      createdAt: connection.created_at,
+      connectedProjects: databases.rows.map(toCamel),
+      history: history.rows.map(toCamel)
+    };
+  }
+
+  /**
+   * Every database the Tesbo integration has been shared with (Notion's search only returns content
+   * the integration can see), as a pickable list. A workspace with nothing shared yields [], not an
+   * error: the picker shows its own "share a database with the integration" hint.
+   */
+  async notionDatabases(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+
+    const found: Body[] = [];
+    let cursor: string | undefined;
+    // Bounded: 20 pages of 100 is far past any realistic number of databases shared with one integration.
+    for (let page = 0; page < 20; page++) {
+      const data: Body = await this.notionFetch<Body>(connection, "POST", "/search", {
+        filter: { property: "object", value: "database" },
+        page_size: NOTION_PAGE_SIZE,
+        ...(cursor ? { start_cursor: cursor } : {})
+      });
+      found.push(...normalizeJsonArray(data.results));
+      if (!data.has_more || !data.next_cursor) break;
+      cursor = String(data.next_cursor);
+    }
+
+    const connected = await this.db.query<{ notion_database_id: string }>(
+      "SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true",
+      [projectId]
+    );
+    const connectedIds = new Set(connected.rows.map((row) => String(row.notion_database_id)));
+    return found
+      .filter((database) => database.id && database.archived !== true && database.in_trash !== true)
+      .map((database) => {
+        const id = String(database.id);
+        return {
+          id,
+          name: normalizeJsonArray(database.title).map((part) => String(part.plain_text || "")).join("").trim() || "Untitled database",
+          url: String(database.url || ""),
+          connected: connectedIds.has(id)
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async connectNotionDatabase(projectId: string, userId: string | null | undefined, body: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+
+    // An explicit JSON null unlinks (disables the current mapping, like an empty Linear request); a
+    // missing or blank databaseId is a mistake and is rejected.
+    const unlink = body.databaseId === null;
+    let database: { id: string; name: string } | null = null;
+    if (!unlink) {
+      const id = this.normalizeNotionId(body.databaseId);
+      if (!id) throw new BadRequestException({ error: "A valid Notion databaseId is required." });
+      // Confirms the database exists and is shared with the integration right now (a 404 here is the
+      // "not shared" message, not a mapping that fails later at sync time), and supplies the name
+      // when the caller did not send one.
+      const remote = await this.notionFetch<Body>(connection, "GET", `/databases/${id}`, undefined, "database");
+      const remoteName = normalizeJsonArray(remote.title).map((part) => String(part.plain_text || "")).join("").trim();
+      database = { id, name: String(body.databaseName || "").trim() || remoteName || "Untitled database" };
+    }
+
+    // One database per Tesbo project, same invariant as Jira and Linear. Disabled, never deleted, so
+    // the outgoing mapping's pages and mirrored documents stay valid and re-linking restores them.
+    try {
+      await this.db.transaction(async (client) => {
+        await client.query("UPDATE notion_project_mappings SET enabled = false WHERE project_id = $1 AND enabled = true", [projectId]);
+        if (!database) return;
+        await client.query(
+          `INSERT INTO notion_project_mappings (integration_connection_id, project_id, notion_database_id, notion_database_name)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (integration_connection_id, notion_database_id, project_id) DO UPDATE SET
+             notion_database_name = EXCLUDED.notion_database_name,
+             enabled = true`,
+          [connection.id, projectId, database.id, database.name.slice(0, 512)]
+        );
+      });
+    } catch (error) {
+      // idx_notion_project_mappings_one_per_project rejects a second concurrent save for this project
+      // (a double-click or two tabs); answer with the same 409 Jira and Linear give.
+      if ((error as { code?: string })?.code === "23505") {
+        throw new ConflictException({ error: "This project's Notion link was just changed by another action. Reload and try again." });
+      }
+      throw error;
+    }
+    return { linked: database ? 1 : 0 };
+  }
+
+  async syncNotion(userId: string | null | undefined, projectId: string) {
+    return this.startIntegrationSync(userId, projectId, "notion");
+  }
+
+  async notionPages(projectId: string, userId: string | null | undefined, query: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const limit = pageNumber(query.limit, 25, 0, 100);
+    const offset = pageNumber(query.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+    const search = String(query.search || "").trim();
+    // Archived/trashed pages are kept for history but never listed.
+    const filters = ["project_id = $1", "archived = false"];
+    const values: any[] = [projectId];
+    // Default scope is the currently mapped database only; remoteId opts into a past mapping.
+    const remoteId = String(query.remoteId || "").trim();
+    if (remoteId) {
+      values.push(remoteId);
+      filters.push(`mapped_remote_id = $${values.length}`);
+    } else {
+      filters.push(`mapped_remote_id = (SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)`);
+    }
+    if (search) {
+      values.push(`%${search}%`);
+      filters.push(`(notion_page_key ILIKE $${values.length} OR summary ILIKE $${values.length})`);
+    }
+    if (query.issueType) {
+      values.push(String(query.issueType));
+      filters.push(`issue_type = $${values.length}`);
+    }
+    if (query.status) {
+      values.push(String(query.status));
+      filters.push(`status = $${values.length}`);
+    }
+    if (query.coverage === "covered" || query.coverage === "uncovered") {
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL)`;
+      filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
+    }
+    const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM notion_pages WHERE ${filters.join(" AND ")}`, values);
+    values.push(limit, offset);
+    const res = await this.db.query(
+      `SELECT * FROM notion_pages
+       WHERE ${filters.join(" AND ")}
+       ORDER BY notion_updated_at DESC NULLS LAST, synced_at DESC
+       LIMIT $${values.length - 1} OFFSET $${values.length}`,
+      values
+    );
+    return { list: res.rows.map(toCamel), total: count.rows[0]?.count ?? 0 };
+  }
+
+  async notionComment(projectId: string, userId: string | null | undefined, body: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+    const pageId = this.normalizeNotionId(body.pageId || body.notionPageId || body.issueKey);
+    const comment = String(body.comment || body.body || "").trim();
+    if (!pageId || !comment) throw new BadRequestException({ error: "Notion page id and comment are required." });
+    await this.notionCreateComment(connection, pageId, comment);
+    return { ok: true };
+  }
+
+  // Internal counterpart of notionComment for callers that have already authorized (the Zyra ticket
+  // auto-comment). `body` is the markdown the comment builder produces. Returns Notion's comment id.
+  private async notionPostComment(projectId: string, pageId: string, body: string): Promise<string | null> {
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+    const id = this.normalizeNotionId(pageId);
+    if (!id) throw new BadRequestException({ error: "This test case's Notion page id is not valid." });
+    return this.notionCreateComment(connection, id, body);
+  }
+
+  private async notionCreateComment(connection: Body, pageId: string, markdown: string): Promise<string | null> {
+    const created = await this.notionFetch<Body>(
+      connection,
+      "POST",
+      "/comments",
+      { parent: { page_id: pageId }, rich_text: markdownToNotionRichText(markdown, NOTION_RICH_TEXT_LIMIT) },
+      "page"
+    );
+    return created?.id ? String(created.id) : null;
+  }
+
+  // Live search inside the mapped database (not the notion_pages sync cache), like linearSearchIssues.
+  async notionSearchPages(projectId: string, userId: string | null | undefined, query: Body) {
+    await this.requireProjectAccess(this.requireUser(userId), projectId);
+    const organizationId = await this.projectOrganizationId(projectId);
+    const connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    if (!connection) throw new NotFoundException({ error: "Notion is not connected." });
+    const mappings = await this.db.query(
+      "SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND integration_connection_id = $2 AND enabled = true",
+      [projectId, connection.id]
+    );
+    const databaseId = mappings.rows[0]?.notion_database_id ? String(mappings.rows[0].notion_database_id) : "";
+    if (!databaseId) return { list: [] };
+
+    const search = String(query.search || query.q || "").trim();
+    const request: Body = { page_size: 20, sorts: [{ timestamp: "last_edited_time", direction: "descending" }] };
+    if (search) {
+      // A title filter needs the title property's name, which is whatever the database calls it.
+      const schema = await this.notionFetch<Body>(connection, "GET", `/databases/${encodeURIComponent(databaseId)}`, undefined, "database");
+      const titleName = Object.entries((schema.properties || {}) as Body).find(([, prop]) => (prop as Body)?.type === "title")?.[0];
+      if (titleName) request.filter = { property: titleName, title: { contains: search } };
+    }
+    const data = await this.notionFetch<Body>(connection, "POST", `/databases/${encodeURIComponent(databaseId)}/query`, request, "database");
+    return {
+      list: normalizeJsonArray(data.results).map((page) => ({
+        provider: "NOTION",
+        key: notionPageKey(String(page.id || "")),
+        pageId: String(page.id || ""),
+        summary: notionPageTitle(page.properties),
+        status: notionTicketFields(page.properties).status,
+        url: String(page.url || "")
+      }))
+    };
+  }
+
+  // Cache-only, like linearSnapshot: reads notion_pages, never calls Notion. `keys` are page ids.
+  private async notionSnapshot(projectId: string, pageIds: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
+    const selected = Array.from(new Set(pageIds.map((id) => id.trim()).filter(Boolean)));
+    if (!selected.length) return [];
+    const res = await this.db.query(
+      `SELECT notion_page_id, notion_page_key, summary, description, status, properties_json FROM notion_pages
+       WHERE project_id = $1 AND notion_page_id = ANY($2::text[])`,
+      [projectId, selected]
+    ).catch(() => ({ rows: [] as any[] }));
+    const byId = new Map<string, { key: string; summary: string; description: string; status: string }>(
+      res.rows.map((row) => [
+        String(row.notion_page_id),
+        {
+          key: String(row.notion_page_key),
+          summary: String(row.summary || ""),
+          // Properties first (status, owner, dates), then the page body, the same order the mirrored document uses.
+          description: [notionPropertiesMarkdown(row.properties_json), String(row.description || "").trim()].filter(Boolean).join("\n\n"),
+          status: String(row.status || "")
+        }
+      ])
+    );
+    return selected.map((id) => byId.get(id) || {
+      key: notionPageKey(id),
+      summary: "Selected Notion page",
+      description: "Page details were not available from the local cache, but the selected page was included for Zyra context.",
+      status: ""
+    });
+  }
+
+  // A page's title for human-facing text (ticket comments, task activity); the id when it is not cached.
+  private async notionPageLabel(projectId: string, pageId: string): Promise<string> {
+    const res = await this.db
+      .query<{ summary: string }>("SELECT summary FROM notion_pages WHERE project_id = $1 AND notion_page_id = $2 LIMIT 1", [projectId, pageId])
+      .catch(() => ({ rows: [] as Array<{ summary: string }> }));
+    return String(res.rows[0]?.summary || "").trim() || pageId;
+  }
+
+  // Archive-sweep lookup for a test case linked to a Notion page. A page has no status category, so
+  // "done" means Notion itself reports the page archived or in the trash; anything else is not done.
+  // A 404 is "not found" (deleted, or no longer shared), never "done".
+  private async fetchLiveNotionPageCategory(projectId: string, pageId: string): Promise<TicketCategoryLookup> {
+    let organizationId: string;
+    try {
+      organizationId = await this.projectOrganizationId(projectId);
+    } catch {
+      return NOT_CONNECTED_RESULT;
+    }
+    let connection: Body | null;
+    try {
+      connection = await this.getIntegrationConnection(organizationId, "notion", false);
+    } catch {
+      connection = null;
+    }
+    if (!connection) return NOT_CONNECTED_RESULT;
+    const id = this.normalizeNotionId(pageId);
+    if (!id) return NOT_FOUND_RESULT;
+
+    let page: Body;
+    try {
+      page = await this.notionFetch<Body>(connection, "GET", `/pages/${id}`, undefined, "page");
+    } catch (err) {
+      const status = (err as { providerStatus?: number })?.providerStatus;
+      if (status === 404) return NOT_FOUND_RESULT;
+      return { found: false, doneness: null, rawCategory: null, reason: "error", detail: (err instanceof Error ? err.message : String(err)).slice(0, 300) };
+    }
+    const archived = page?.archived === true || page?.in_trash === true;
+    return { found: true, doneness: archived ? "done" : "not_done", rawCategory: archived ? "archived" : "active", reason: "ok" };
   }
 
   /*
@@ -11548,7 +12814,8 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Chat session not found" });
     const session = await this.db.query(
-      `SELECT id, project_id, user_id, title, created_at, updated_at, active_plan,
+      // language: the Zyra screens render their labels in it (see V132_zyra_generation_language.sql).
+      `SELECT id, project_id, user_id, title, created_at, updated_at, active_plan, language,
               (processing_since IS NOT NULL AND processing_since >= now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes') AS turn_alive
        FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
       [sessionId, projectId]
@@ -11706,6 +12973,9 @@ export class LegacyService implements OnModuleInit {
     if (!message) throw new BadRequestException({ error: "message is required" });
     const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    // The language of what the user just typed (detectScriptLanguage). A message with no signal —
+    // "ok", "да", a bare ticket key — leaves the session's language as it was.
+    await this.rememberZyraSessionLanguage(projectId, sessionId, detectScriptLanguage(message));
 
     // Claim this session for the duration of one turn. Without this, two overlapping requests for
     // the same session (a double-click on "yes", a client retry after a slow reply, two open tabs)
@@ -11804,7 +13074,18 @@ export class LegacyService implements OnModuleInit {
    * releases the session claim, and, for a background turn, settles the user message's status only
    * AFTER the reply row exists, so a client polling for `sent` never sees it before the answer.
    */
+  // Runs the turn inside the session's language (zyra-language-context.ts), so every reply builder
+  // below it writes Russian for a Russian session without each one needing the session. Read after
+  // beginZyraChatTurn stored this message's language, so it is this turn's.
   private async runZyraChatTurn(
+    turn: Awaited<ReturnType<LegacyService["beginZyraChatTurn"]>>,
+    recorder: ZyraTurnTraceRecorder
+  ): Promise<{ message: Body; session: Body }> {
+    const language = await this.zyraSessionLanguage(turn.projectId, turn.sessionId);
+    return runInZyraLanguage(language, () => this.runZyraChatTurnInLanguage(turn, recorder));
+  }
+
+  private async runZyraChatTurnInLanguage(
     turn: Awaited<ReturnType<LegacyService["beginZyraChatTurn"]>>,
     recorder: ZyraTurnTraceRecorder
   ): Promise<{ message: Body; session: Body }> {
@@ -11998,9 +13279,10 @@ export class LegacyService implements OnModuleInit {
       const appliedCount = applied.testcases.length;
       const proposedCount = applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length;
       let bannerFired: string | null = null;
-      if (finalReply.includes("Sorry! Nothing was saved")) bannerFired = "false-completion-claim";
-      else if (finalReply.includes("⚠️ Nothing was saved.")) bannerFired = "zero-applied";
-      else if (/were drafted for review\.?$/m.test(finalReply.split("\n")[0] || "")) bannerFired = "partial-application";
+      // Recognises the Russian banners too, so a Russian turn's trace records the same outcome.
+      if (finalReply.includes("Sorry! Nothing was saved") || finalReply.includes(ZYRA_RU.falseClaimBanner.split("\n")[0])) bannerFired = "false-completion-claim";
+      else if (finalReply.includes("⚠️ Nothing was saved.") || finalReply.startsWith("⚠️ Ничего не сохранено.")) bannerFired = "zero-applied";
+      else if (/were drafted for review\.?$/m.test(finalReply.split("\n")[0] || "") || (finalReply.split("\n")[0] || "").includes("Подготовлено для проверки операций с тест-кейсами")) bannerFired = "partial-application";
       await recordReconciliation(
         { messageId: traceMessageId, sessionId, projectId, userId: uid },
         {
@@ -12134,7 +13416,25 @@ export class LegacyService implements OnModuleInit {
    * inline, plus threading onStage through for SSE narration and tracking resume_attempt so
    * repeated failures can eventually be capped.
    */
+  // Same as runZyraChatTurn: a resumed turn writes in the session's language.
   private async processZyraChatResume(
+    projectId: string,
+    uid: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    checkpoint: Partial<ZyraResumeCheckpoint>,
+    priorAttempts: number,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void
+  ): Promise<void> {
+    const language = await this.zyraSessionLanguage(projectId, sessionId);
+    return runInZyraLanguage(language, () =>
+      this.processZyraChatResumeInLanguage(projectId, uid, userId, sessionId, messageId, checkpoint, priorAttempts, onStage, onSettled)
+    );
+  }
+
+  private async processZyraChatResumeInLanguage(
     projectId: string,
     uid: string,
     userId: string | null | undefined,
@@ -12239,15 +13539,20 @@ export class LegacyService implements OnModuleInit {
     // pause, if any, is decided and applied under the row lock in zyraPlanTransition below, the
     // same guard continueZyraChatPlan's own batch commits use, so a Stop click landing the same
     // moment a batch is mid-commit can't race it (see zyraPlanTransition's own comment).
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan, language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    // Stop/Resume are clicks, not turns, so no language context is set around them — the plan
+    // message they post reads the session's language directly.
+    const sessionLanguage = LegacyService.zyraStoredLanguage(sessionRes.rows[0].language);
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     if (plan && plan.status !== "paused") {
       await this.zyraPlanTransition(sessionId, String(plan.planId || ""), null, async (client, current) => {
         // Report progress from the LOCKED read, not the fast-path one above — a batch may have
         // just committed doneCount forward between the two.
-        const doneCount = Number(current.doneCount || 0);
+        // Covered scenarios, and the real queue length — retried scenarios make totalCount - doneCount wrong.
+        const doneCount = LegacyService.zyraPlanCovered(current);
         const totalCount = Number(current.totalCount || 0);
+        const remainingCount = normalizeJsonArray(current.remainingScenarios).length;
         await client.query(
           "UPDATE zyra_chat_sessions SET active_plan = $2::jsonb WHERE id = $1",
           [sessionId, JSON.stringify({ ...current, status: "paused" })]
@@ -12257,11 +13562,13 @@ export class LegacyService implements OnModuleInit {
           projectId,
           sessionId,
           uid,
-          `Stopped at your request — ${doneCount}/${totalCount} scenarios covered. Say "continue" any time and I'll pick back up with the remaining ${totalCount - doneCount}.`,
+          sessionLanguage === "ru"
+            ? ZYRA_RU.planStopped(doneCount, totalCount, remainingCount)
+            : `Stopped at your request — ${doneCount}/${totalCount} scenarios covered. Say "continue" any time and I'll pick back up with the remaining ${remainingCount}.`,
           [],
           [],
           "answer",
-          LegacyService.zyraSingleStepTrace("plan:stop", { doneCount, totalCount, remainingCount: totalCount - doneCount })
+          LegacyService.zyraSingleStepTrace("plan:stop", { doneCount, totalCount, remainingCount })
         );
       });
     }
@@ -12269,7 +13576,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private isZyraResumeIntent(message: string): boolean {
-    return /\b(continue|resume|keep going|carry on|go ahead|proceed|pick up where)\b/i.test(message);
+    return /\b(continue|resume|keep going|carry on|go ahead|proceed|pick up where)\b/i.test(message) || ZYRA_RU_RESUME.test(foldRu(message));
   }
 
   // Reactivates a paused plan under a fresh planId (so any stale in-flight batch from before
@@ -12281,8 +13588,11 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     // Fast-path check only, same reasoning as stopZyraChatPlan — the actual reactivation is decided
     // and applied under the row lock below.
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan, language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    // Stop/Resume are clicks, not turns, so no language context is set around them — the plan
+    // message they post reads the session's language directly.
+    const sessionLanguage = LegacyService.zyraStoredLanguage(sessionRes.rows[0].language);
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     const remainingScenarios = normalizeJsonArray(plan?.remainingScenarios).map(String);
     if (!plan || plan.status !== "paused" || !remainingScenarios.length) {
@@ -12296,7 +13606,7 @@ export class LegacyService implements OnModuleInit {
     let totalCount = 0;
     let scenariosRemaining = 0;
     const resumed = await this.zyraPlanTransition(sessionId, String(plan.planId || ""), null, async (client, current) => {
-      doneCount = Number(current.doneCount || 0);
+      doneCount = LegacyService.zyraPlanCovered(current);
       totalCount = Number(current.totalCount || 0);
       scenariosRemaining = normalizeJsonArray(current.remainingScenarios).length;
       if (current.status !== "paused" || !scenariosRemaining) throw new Error("ZYRA_PLAN_NOT_PAUSED");
@@ -12309,7 +13619,9 @@ export class LegacyService implements OnModuleInit {
         projectId,
         sessionId,
         uid,
-        `Resuming — ${doneCount}/${totalCount} scenarios covered so far, continuing with the remaining ${scenariosRemaining}.`,
+        sessionLanguage === "ru"
+          ? ZYRA_RU.planResuming(doneCount, totalCount, scenariosRemaining)
+          : `Resuming — ${doneCount}/${totalCount} scenarios covered so far, continuing with the remaining ${scenariosRemaining}.`,
         [],
         [],
         "answer",
@@ -12628,6 +13940,8 @@ export class LegacyService implements OnModuleInit {
     const provider = String(key.provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, key.default_model);
     const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
+    // Stored by beginZyraChatTurn from this very message, so it is already this turn's language.
+    const replyLanguage = await this.zyraSessionLanguage(projectId, sessionId);
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
@@ -12706,7 +14020,8 @@ export class LegacyService implements OnModuleInit {
       "Recent chat (each assistant turn is annotated with what it actually wrote to the repository —",
       "trust the annotation over the wording of the reply, which may describe testcases that were never saved):",
       this.zyraTranscript(chronologicalHistory),
-      confirmationHint ? `\nCRITICAL — this turn already has its confirmation: ${confirmationHint} Do not choose 'answer' again for this message; emit the operation(s).` : ""
+      confirmationHint ? `\nCRITICAL — this turn already has its confirmation: ${confirmationHint} Do not choose 'answer' again for this message; emit the operation(s).` : "",
+      LegacyService.zyraReplyLanguageInstruction(replyLanguage)
     ].join("\n");
 
     // Resuming a turn whose drafting call already timed out once the router had resolved it — skip
@@ -13023,7 +14338,7 @@ export class LegacyService implements OnModuleInit {
         });
         return {
           ...gated,
-          reply: [
+          reply: zyraReplyLanguage() === "ru" ? ZYRA_RU.retryNarrowed(attempt, cause, LegacyService.ZYRA_RETRY_BATCH, gated.reply) : [
             `⚠️ My first attempt to ${attempt} didn't work — ${cause}.`,
             `I changed approach and tried again with a smaller batch of ${LegacyService.ZYRA_RETRY_BATCH}. That went through:`,
             "",
@@ -13031,7 +14346,9 @@ export class LegacyService implements OnModuleInit {
             "",
             "Ask me to continue and I'll add the rest in batches this size."
           ].join("\n"),
-          reasoningSummary: `First generation attempt failed (${detail}); retried with a ${LegacyService.ZYRA_RETRY_BATCH}-case batch. ${gated.reasoningSummary}`
+          reasoningSummary: zyraReplyLanguage() === "ru"
+            ? `Первая попытка генерации не удалась (${detail}); повтор с пакетом из ${LegacyService.ZYRA_RETRY_BATCH}. ${gated.reasoningSummary}`
+            : `First generation attempt failed (${detail}); retried with a ${LegacyService.ZYRA_RETRY_BATCH}-case batch. ${gated.reasoningSummary}`
         };
       } catch (retryErr) {
         if (this.isZyraTimeoutError(retryErr)) {
@@ -13069,7 +14386,9 @@ export class LegacyService implements OnModuleInit {
          */
         return {
           reply: LegacyService.zyraFailureReply(attempt, retryDetail || detail, true),
-          reasoningSummary: `Generation failed after routing (${detail}); the narrowed retry also failed (${retryDetail}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
+          reasoningSummary: zyraReplyLanguage() === "ru"
+            ? `Генерация не удалась после маршрутизации (${detail}); уменьшенный повтор тоже не удался (${retryDetail}). ${this.defaultReasoningSummary(existingTestcases.length)}`
+            : `Generation failed after routing (${detail}); the narrowed retry also failed (${retryDetail}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
           actionType: "answer",
           operations: [],
           testcases: []
@@ -13097,12 +14416,15 @@ export class LegacyService implements OnModuleInit {
     // only stage that still has just one.
     timeoutMs: number = LegacyService.ZYRA_ROUTER_TIMEOUT_MS
   ): ZyraChatDecision {
+    const ru = zyraReplyLanguage() === "ru";
     return {
-      reply: [
+      reply: ru ? ZYRA_RU.timedOut : [
         "⏱️ I didn't hear back from the AI provider in time — nothing was created or changed, and nothing was lost.",
         "Click **Continue** below and I'll pick up right where this left off, rather than starting over."
       ].join(" "),
-      reasoningSummary: `Provider call timed out at stage '${stage}' after ${timeoutMs}ms. ${this.defaultReasoningSummary(existingCount)}`,
+      reasoningSummary: ru
+        ? ZYRA_RU.timedOutReasoning(stage, timeoutMs, this.defaultReasoningSummary(existingCount))
+        : `Provider call timed out at stage '${stage}' after ${timeoutMs}ms. ${this.defaultReasoningSummary(existingCount)}`,
       actionType: "answer",
       operations: [],
       testcases: [],
@@ -13129,8 +14451,12 @@ export class LegacyService implements OnModuleInit {
    */
   private zyraSalvagedRouterDecision(existingCount: number): ZyraChatDecision {
     return {
-      reply: "My response got cut off before I could finish deciding what to do with this — nothing was created, updated, or changed. Try again, or ask for fewer test cases at once if this was a large request.",
-      reasoningSummary: `Router response was unparseable JSON on two consecutive attempts; only fragments of reply/reasoningSummary text could be recovered, not a structured decision. ${this.defaultReasoningSummary(existingCount)}`,
+      reply: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.salvagedRouter
+        : "My response got cut off before I could finish deciding what to do with this — nothing was created, updated, or changed. Try again, or ask for fewer test cases at once if this was a large request.",
+      reasoningSummary: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.salvagedReasoning(this.defaultReasoningSummary(existingCount))
+        : `Router response was unparseable JSON on two consecutive attempts; only fragments of reply/reasoningSummary text could be recovered, not a structured decision. ${this.defaultReasoningSummary(existingCount)}`,
       actionType: "answer",
       operations: [],
       testcases: [],
@@ -13662,6 +14988,8 @@ export class LegacyService implements OnModuleInit {
     // background batches re-gather knowledge themselves but don't carry a confidence signal through
     // yet), which the ungrounded check below treats as "unknown, don't second-guess presence".
     knowledgeConfidence?: RagRetrievalConfidence;
+    // The session's language (zyraSessionLanguage). Undefined generates in English.
+    language?: ExportLocale;
   }): Promise<ZyraChatDecision> {
     // Prefer the Jira context already gathered for this turn (explicit keys plus relevance-matched
     // tickets); fall back to an explicit-key lookup only when a caller supplied none.
@@ -13692,7 +15020,8 @@ export class LegacyService implements OnModuleInit {
       bugs,
       requestedCount: params.requestedCount,
       testcaseRange: params.testcaseRange,
-      knowledgeConfidence: params.knowledgeConfidence
+      knowledgeConfidence: params.knowledgeConfidence,
+      language: params.language
     };
     const aiResult = await this.generateZyraWithProvider({
       provider: params.provider,
@@ -13845,7 +15174,14 @@ export class LegacyService implements OnModuleInit {
     const weaklyGrounded = !ungrounded && params.knowledge.length > 0 && jira.length === 0 && bugs.length === 0
       && (params.knowledgeConfidence === "weak" || params.knowledgeConfidence === "none");
     const stagedSuiteName = matchedSuite?.name ?? LegacyService.ZYRA_DRAFT_SUITE_NAME;
-    const groundedReply = [
+    const groundedReply = zyraReplyLanguage() === "ru"
+      ? ZYRA_RU.draftedAfterReading(finalResult.drafts.length, [
+          ZYRA_RU.sourceKnowledge(params.knowledge.length, jiraFromKnowledge),
+          ZYRA_RU.sourceJira(jira.length),
+          ZYRA_RU.sourceExisting(params.existingTestcases.length),
+          bugs.length ? ZYRA_RU.sourceBugs(bugs.length) : ""
+        ].filter(Boolean)) + `\n\n${LegacyService.zyraDraftFilingHint(stagedSuiteName)}`
+      : [
         `I drafted ${finalResult.drafts.length} test case(s) after reading`,
         [
           `${params.knowledge.length} knowledge-base item(s)${jiraFromKnowledge ? ` (${jiraFromKnowledge} mirrored from Jira)` : ""}`,
@@ -13870,7 +15206,9 @@ export class LegacyService implements OnModuleInit {
         : weaklyGrounded
           ? [LegacyService.zyraWeakGroundingNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
           : groundedReply,
-      reasoningSummary: `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${finalResult.usage.input}, output ${finalResult.usage.output}.`,
+      reasoningSummary: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.generationReasoning(params.provider, params.model, params.jiraIssueKeys, finalResult.usage.input, finalResult.usage.output)
+        : `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${finalResult.usage.input}, output ${finalResult.usage.output}.`,
       actionType: "create",
       operations: finalResult.drafts.map((draft, index) => {
         const updateTarget = updateTargetsByIndex[index];
@@ -13925,7 +15263,8 @@ export class LegacyService implements OnModuleInit {
           reason: "Generated by AI from Zyra chat context."
         };
       }),
-      testcases: finalResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context."))
+      testcases: finalResult.drafts.map((draft) => this.chatDraftRow(draft, "suggested", "Generated by AI from Zyra chat context.")),
+      draftScenarios: finalResult.drafts.map((draft) => (typeof draft.scenario === "number" ? draft.scenario : null))
     };
   }
 
@@ -14097,6 +15436,10 @@ export class LegacyService implements OnModuleInit {
   // than "extensive". Each batch is its own generation call, so a larger plan only adds batches; it
   // never enlarges any single call. The planner's output budget in zyraJsonCompletion is sized for it.
   private static readonly ZYRA_PLAN_MAX_SCENARIOS = 100;
+  // A plan below this share of ZYRA_PLAN_MAX_SCENARIOS gets one top-up planning call (planZyraChatScenarios).
+  private static readonly ZYRA_PLAN_TOPUP_BELOW = 0.9;
+  // What the planner works through before it may stop short of the target.
+  private static readonly ZYRA_PLAN_COVERAGE_AREAS = "happy paths, alternative flows, negative paths, field validation, boundary values, roles and permissions, state transitions, error handling, data variations, UI behaviour and integrations";
   // The most testcases one chat generation can ask for: the top of the 30-50 tier, and the clamp
   // chatTestcasePlan applies to an explicit count.
   private static readonly ZYRA_CHAT_MAX_REQUESTED = 50;
@@ -14117,13 +15460,78 @@ export class LegacyService implements OnModuleInit {
    */
   private static readonly ZYRA_MEMORY_DOC_TITLE = "Zyra AI Memory";
 
+  // The scenario list was planned against the existing testcases already (planZyraChatScenarios is
+  // told to avoid scenarios that have coverage). Without saying so, the generation prompt's general
+  // "not a duplicate of existing testcases" rule re-judged each scenario and the model silently
+  // dropped one in most batches — 4 drafts for 5 scenarios — while the plan still counted all 5.
+  // Each draft also names the scenario it covers, so a dropped scenario can be identified and retried
+  // (zyraPlanBatchOutcome) rather than only noticed as a short count.
   private zyraBatchMessage(originalMessage: string, batch: string[]): string {
     return [
       originalMessage,
       "",
       "Generate exactly one distinct testcase for each of these scenarios (do not add extras, do not skip any):",
-      ...batch.map((scenario, index) => `${index + 1}. ${scenario}`)
+      ...batch.map((scenario, index) => `${index + 1}. ${scenario}`),
+      "",
+      "These scenarios were already checked against the existing testcases when this plan was made, so each one is new coverage. If an existing testcase looks related, make the draft's title and steps clearly distinct from it instead of dropping or merging the scenario.",
+      `Set "scenario" on every draft to the number (1-${batch.length}) of the scenario above that it covers.`
     ].join("\n");
+  }
+
+  /*
+   * Which of a batch's scenarios actually got a draft. A batch is one model call asked for one draft
+   * per scenario, and it does not always comply — a real run drafted 4 for 5 in most batches. When
+   * every draft names a valid scenario number, the missing ones are known: each goes back in the
+   * queue once (`requeue`), and one that comes back empty again is given up (`skipped`), so a
+   * scenario the model keeps refusing cannot loop forever. When the drafts can't be mapped (a draft
+   * with no valid number), nothing can be retried — the shortfall is only counted (`unmapped`).
+   */
+  private static zyraPlanBatchOutcome(batch: string[], draftScenarios: Array<number | null>, retried: string[]): { covered: number; requeue: string[]; skipped: number; unmapped: number } {
+    const mapped = draftScenarios.every((n) => n !== null && Number.isInteger(n) && n >= 1 && n <= batch.length);
+    if (!mapped) {
+      const covered = Math.min(draftScenarios.length, batch.length);
+      return { covered, requeue: [], skipped: 0, unmapped: batch.length - covered };
+    }
+    const hit = new Set(draftScenarios as number[]);
+    const missing = batch.filter((_, index) => !hit.has(index + 1));
+    const requeue = missing.filter((scenario) => !retried.includes(scenario));
+    return { covered: batch.length - missing.length, requeue, skipped: missing.length - requeue.length, unmapped: 0 };
+  }
+
+  /** Scenarios that have a test case. A plan started before coveredCount existed only tracked doneCount. */
+  private static zyraPlanCovered(plan: Body): number {
+    return Number(plan.coveredCount ?? plan.doneCount ?? 0);
+  }
+
+  /*
+   * The reply posted with each plan batch. "X/Y scenarios covered" counts scenarios that actually
+   * have a test case — doneCount (scenarios handed to a batch, which grows with retries) is the plan's
+   * internal cursor and zyraPlanTransition's guard, not progress. A batch that fully delivered keeps
+   * the original wording; anything retried, given up or unaccounted for is said, never implied covered.
+   */
+  private static zyraPlanBatchReply(p: { drafted: number; covered: number; totalCount: number; remaining: number; requeued: number; skipped: number; unmapped: number }): string {
+    if (zyraReplyLanguage() === "ru") {
+      const notesRu = [
+        p.requeued ? ZYRA_RU.planNoteRequeued(p.requeued) : "",
+        p.skipped ? ZYRA_RU.planNoteSkipped(p.skipped) : "",
+        p.unmapped ? ZYRA_RU.planNoteUnmapped(p.unmapped) : ""
+      ].join("");
+      if (p.remaining) return ZYRA_RU.planBatchMore(p.drafted, p.covered, p.totalCount, notesRu, p.remaining);
+      if (p.covered >= p.totalCount) return ZYRA_RU.planBatchFinalAll(p.drafted, p.totalCount);
+      return ZYRA_RU.planBatchFinalPartial(p.drafted, p.covered, p.totalCount, notesRu);
+    }
+    const notes = [
+      p.requeued ? ` ${p.requeued} scenario(s) in this batch came back without a test case and will be retried in a later batch.` : "",
+      p.skipped ? ` ${p.skipped} scenario(s) still produced no test case after a retry and were skipped.` : "",
+      p.unmapped ? ` ${p.unmapped} scenario(s) in this batch did not produce a test case.` : ""
+    ].join("");
+    if (p.remaining) {
+      return `Here are ${p.drafted} more test case(s) — ${p.covered}/${p.totalCount} scenarios covered so far.${notes} Still working on the remaining ${p.remaining}; I'll post the next batch shortly.`;
+    }
+    if (p.covered >= p.totalCount) {
+      return `Here are the final ${p.drafted} test case(s) — all ${p.totalCount} scenarios are now covered. Feel free to review and let me know if you'd like any changes.`;
+    }
+    return `Here are the final ${p.drafted} test case(s) — ${p.covered} of ${p.totalCount} scenarios are covered; ${p.totalCount - p.covered} produced no test case.${notes} Feel free to review and let me know if you'd like any changes.`;
   }
 
   // "All possible cases" no longer asks the model for everything in one shot (that instruction
@@ -14152,6 +15560,8 @@ export class LegacyService implements OnModuleInit {
     trace?: TurnHandle;
     knowledgeConfidence?: RagRetrievalConfidence;
     contextRefs?: ZyraTurnContextRefs;
+    // The session's language, read by generateZyraChatCreateDecision.
+    language?: ExportLocale;
   }): Promise<ZyraChatDecision> {
     let scenarios: string[] = [];
     try {
@@ -14189,12 +15599,12 @@ export class LegacyService implements OnModuleInit {
         jira: params.jira,
         bugs: params.bugs,
         trace: params.trace,
-        knowledgeConfidence: params.knowledgeConfidence
+        knowledgeConfidence: params.knowledgeConfidence,
+        language: params.language
       });
     }
 
     const firstBatch = scenarios.slice(0, LegacyService.ZYRA_PLAN_BATCH_SIZE);
-    const remaining = scenarios.slice(LegacyService.ZYRA_PLAN_BATCH_SIZE);
     const decision = await this.generateZyraChatTestcasesWithAi({
       projectId: params.projectId,
       userId: params.userId,
@@ -14212,9 +15622,13 @@ export class LegacyService implements OnModuleInit {
       jira: params.jira,
       bugs: params.bugs,
       trace: params.trace,
-      knowledgeConfidence: params.knowledgeConfidence
+      knowledgeConfidence: params.knowledgeConfidence,
+      language: params.language
     });
 
+    // A first-batch scenario that came back without a draft goes to the end of the queue for one retry.
+    const first = LegacyService.zyraPlanBatchOutcome(firstBatch, decision.draftScenarios ?? [], []);
+    const remaining = [...scenarios.slice(LegacyService.ZYRA_PLAN_BATCH_SIZE), ...first.requeue];
     if (!remaining.length) return decision;
 
     const planId = randomUUID();
@@ -14232,14 +15646,32 @@ export class LegacyService implements OnModuleInit {
         remainingScenarios: remaining,
         batchSize: LegacyService.ZYRA_PLAN_BATCH_SIZE,
         doneCount: firstBatch.length,
-        totalCount: scenarios.length
+        totalCount: scenarios.length,
+        // Scenarios that have a test case — what progress shows (see zyraPlanBatchReply). doneCount
+        // stays the cursor zyraPlanTransition guards on.
+        coveredCount: first.covered,
+        // Scenarios already put back once; one that comes back empty again is skipped, not retried.
+        retriedScenarios: first.requeue
       })]
     );
     void this.continueZyraChatPlan(params.projectId, params.userId, params.sessionId, planId).catch(() => undefined);
 
+    if (zyraReplyLanguage() === "ru") {
+      const intro = first.requeue.length
+        ? ZYRA_RU.planFirstIntroRequeued(decision.testcases.length, firstBatch.length, first.requeue.length)
+        : first.unmapped
+          ? ZYRA_RU.planFirstIntroUnmapped(decision.testcases.length, firstBatch.length, first.unmapped)
+          : ZYRA_RU.planFirstIntro(firstBatch.length);
+      return { ...decision, reply: ZYRA_RU.planStarted(scenarios.length, intro, remaining.length, decision.reply) };
+    }
+    const firstIntro = first.requeue.length
+      ? `Here are ${decision.testcases.length} test case(s) for the first ${firstBatch.length} — ${first.requeue.length} scenario(s) came back without a test case and will be retried in a later batch.`
+      : first.unmapped
+        ? `Here are ${decision.testcases.length} test case(s) for the first ${firstBatch.length} — ${first.unmapped} of those scenario(s) did not produce a test case.`
+        : `Here are the first ${firstBatch.length}.`;
     return {
       ...decision,
-      reply: `I identified ${scenarios.length} distinct scenarios to cover. Here are the first ${firstBatch.length} — I'll keep generating the rest (${remaining.length} more) and post them here as they're ready; feel free to review these in the meantime.\n\n${decision.reply}`
+      reply: `I identified ${scenarios.length} distinct scenarios to cover. ${firstIntro} I'll keep generating the rest (${remaining.length} more) and post them here as they're ready; feel free to review these in the meantime.\n\n${decision.reply}`
     };
   }
 
@@ -14258,12 +15690,16 @@ export class LegacyService implements OnModuleInit {
    */
   // `trace`: a plan message answers no user message of its own, so it carries its own trace — what
   // this batch (or this stop/resume) actually did.
-  private async postZyraPlanMessage(client: ZyraQueryClient, projectId: string, sessionId: string, userId: string | null, reply: string, testcases: Body[], activity: Body[], actionType: "create" | "answer" = "answer", trace: ZyraTurnTrace | null = null): Promise<void> {
+  // `reviewRequestId`: the ai_generation_requests row applyZyraChatOperations staged this batch's
+  // proposed drafts into. The frontend only renders proposed rows inside a review panel addressed by
+  // the message's review_request_id — omitting it (as every batch after the first once did) left
+  // "N test cases drafted for review" with nothing under it. Status-only messages pass null.
+  private async postZyraPlanMessage(client: ZyraQueryClient, projectId: string, sessionId: string, userId: string | null, reply: string, testcases: Body[], activity: Body[], actionType: "create" | "answer" = "answer", trace: ZyraTurnTrace | null = null, reviewRequestId: string | null = null): Promise<void> {
     await client.query(
       `INSERT INTO zyra_chat_messages
-       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, trace)
-       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb,$9::jsonb)`,
-      [sessionId, projectId, userId, reply, "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity), trace ? JSON.stringify(trace) : null]
+       (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, trace, review_request_id)
+       VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb,$9::jsonb,$10)`,
+      [sessionId, projectId, userId, reply, zyraReplyLanguage() === "ru" ? ZYRA_RU.planMessageReasoning : "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity), trace ? JSON.stringify(trace) : null, reviewRequestId]
     );
     await client.query("UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = $1", [sessionId]);
   }
@@ -14354,17 +15790,30 @@ export class LegacyService implements OnModuleInit {
    * "stop, don't guess" by default rather than needing this line updated in lockstep with wherever
    * that status gets introduced.
    */
+  // The background loop has no turn around it — it runs after the request returned, or on boot with
+  // no request at all — so it sets the session's language itself for the plan messages it posts. A
+  // new message would supersede the plan, so the language read here holds for the plan's lifetime.
   private async continueZyraChatPlan(projectId: string, userId: string | null, sessionId: string, planId: string): Promise<void> {
+    const language = await this.zyraSessionLanguage(projectId, sessionId);
+    return runInZyraLanguage(language, () => this.continueZyraChatPlanInLanguage(projectId, userId, sessionId, planId));
+  }
+
+  private async continueZyraChatPlanInLanguage(projectId: string, userId: string | null, sessionId: string, planId: string): Promise<void> {
     for (;;) {
-      const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+      // language is re-read with the plan on every batch, so a message sent from a Russian browser
+      // mid-plan switches the remaining batches too — and a plan resumed on boot, with no request
+      // at all, still writes in the language its session was last spoken in.
+      const sessionRes = await this.db.query("SELECT active_plan, language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
       const plan = sessionRes.rows[0]?.active_plan as Body | undefined;
       if (!plan || plan.planId !== planId || plan.status !== "running") return;
+      const language = LegacyService.zyraStoredLanguage(sessionRes.rows[0]?.language);
 
       const remainingScenarios = normalizeJsonArray(plan.remainingScenarios).map(String);
       const batchSize = Number(plan.batchSize) || LegacyService.ZYRA_PLAN_BATCH_SIZE;
       const batch = remainingScenarios.slice(0, batchSize);
       const doneCount = Number(plan.doneCount || 0);
       const totalCount = Number(plan.totalCount || 0);
+      const retried = normalizeJsonArray(plan.retriedScenarios).map(String);
       if (!batch.length) {
         await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
           await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
@@ -14377,7 +15826,15 @@ export class LegacyService implements OnModuleInit {
       // batch whose commit is discarded (superseded, stale) posts nothing, trace included.
       const recorder = new ZyraTurnTraceRecorder();
       const stage = recorder.onStage;
-      stage("plan:batch", { fromScenario: doneCount + 1, toScenario: doneCount + batch.length, totalCount });
+      // doneCount runs past totalCount once retried scenarios come round again — the label stays
+      // within the plan's size and says how many of this batch are retries.
+      const retrying = batch.filter((scenario) => retried.includes(scenario)).length;
+      stage("plan:batch", {
+        fromScenario: Math.min(doneCount + 1, totalCount),
+        toScenario: Math.min(doneCount + batch.length, totalCount),
+        totalCount,
+        ...(retrying ? { retrying } : {})
+      });
 
       // Hoisted so the catch block below can still record tokens from a billed-but-unparsed
       // response even though provider/model are only known once the allocation resolves.
@@ -14388,7 +15845,7 @@ export class LegacyService implements OnModuleInit {
         if (!allocation.key) {
           stage("plan:batch", { status: "blocked", reason: allocation.reason }, "update");
           await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
-            await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I couldn't continue generating more test cases — ${allocation.reason}`, [], [], "answer", recorder.finish());
+            await this.postZyraPlanMessage(client, projectId, sessionId, userId, zyraReplyLanguage() === "ru" ? ZYRA_RU.planNoKey(allocation.reason) : `I couldn't continue generating more test cases — ${allocation.reason}`, [], [], "answer", recorder.finish());
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           });
           return;
@@ -14397,7 +15854,7 @@ export class LegacyService implements OnModuleInit {
         if (!capabilities.generation) {
           stage("plan:batch", { status: "blocked", reason: "Test case generation is off for this project" }, "update");
           await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
-            await this.postZyraPlanMessage(client, projectId, sessionId, userId, "Test case generation was disabled for Zyra in this project, so I stopped generating the remaining scenarios. Enable it under Zyra → Settings → Capabilities to continue.", [], [], "answer", recorder.finish());
+            await this.postZyraPlanMessage(client, projectId, sessionId, userId, zyraReplyLanguage() === "ru" ? ZYRA_RU.planGenerationDisabled : "Test case generation was disabled for Zyra in this project, so I stopped generating the remaining scenarios. Enable it under Zyra → Settings → Capabilities to continue.", [], [], "answer", recorder.finish());
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           });
           return;
@@ -14440,7 +15897,8 @@ export class LegacyService implements OnModuleInit {
           suites,
           // Carried in the plan so every batch files into the suite the user asked for, not just
           // the first — a routed suite id is not recoverable from the original message text.
-          routedSuite: (plan.routedSuite as { id?: string; name?: string } | null) || null
+          routedSuite: (plan.routedSuite as { id?: string; name?: string } | null) || null,
+          language
         });
         stage("generating", { draftedCount: LegacyService.zyraDraftedCount(decision) }, "update");
         const gated = this.applyStorageGateToGenerated(decision, capabilities);
@@ -14461,17 +15919,26 @@ export class LegacyService implements OnModuleInit {
         });
         const batchTrace = recorder.finish();
 
+        // doneCount is the cursor zyraPlanTransition guards on, so it advances by every scenario this
+        // batch was handed even when some go back in the queue; coveredCount is what progress shows.
         const newDoneCount = doneCount + batch.length;
-        const remaining = remainingScenarios.slice(batch.length);
+        const outcome = LegacyService.zyraPlanBatchOutcome(batch, decision.draftScenarios ?? [], retried);
+        const remaining = [...remainingScenarios.slice(batch.length), ...outcome.requeue];
+        const newCovered = LegacyService.zyraPlanCovered(plan) + outcome.covered;
         // Never announce a batch that wrote nothing — the same false-success trap the chat path had.
-        const reply = !testcases.length
+        const reply = !testcases.length && zyraReplyLanguage() === "ru"
+          ? [
+              ZYRA_RU.planBatchSavedNothing(batch.length),
+              outcome.requeue.length ? ZYRA_RU.planBatchRetryLater(outcome.requeue.length) : "",
+              remaining.length ? ZYRA_RU.planContinuingRemaining(remaining.length) : ZYRA_RU.planLastBatch
+            ].filter(Boolean).join(" ")
+          : !testcases.length
           ? [
               `⚠️ This batch saved nothing — none of the ${batch.length} scenario(s) produced a stored test case.`,
+              outcome.requeue.length ? `${outcome.requeue.length} of them will be retried in a later batch.` : "",
               remaining.length ? `Continuing with the remaining ${remaining.length}.` : "That was the last batch."
-            ].join(" ")
-          : remaining.length
-            ? `Here are ${testcases.length} more test case(s) — ${newDoneCount}/${totalCount} scenarios covered so far. Still working on the remaining ${remaining.length}; I'll post the next batch shortly.`
-            : `Here are the final ${testcases.length} test case(s) — all ${totalCount} scenarios are now covered. Feel free to review and let me know if you'd like any changes.`;
+            ].filter(Boolean).join(" ")
+          : LegacyService.zyraPlanBatchReply({ drafted: testcases.length, covered: newCovered, totalCount, remaining: remaining.length, requeued: outcome.requeue.length, skipped: outcome.skipped, unmapped: outcome.unmapped });
 
         // The atomic commit: re-checks planId AND doneCount under the row lock, then posts the
         // message and advances (or clears) active_plan in the same transaction. If this returns
@@ -14482,7 +15949,7 @@ export class LegacyService implements OnModuleInit {
           // 'create' only when this batch genuinely produced staged rows — a "saved nothing" batch
           // (testcases.length === 0) gets 'answer' via the default, matching how a zero-mutation
           // reply is classified everywhere else in this file.
-          await this.postZyraPlanMessage(client, projectId, sessionId, userId, reply, testcases, applied.activity, testcases.length ? "create" : "answer", batchTrace);
+          await this.postZyraPlanMessage(client, projectId, sessionId, userId, reply, testcases, applied.activity, testcases.length ? "create" : "answer", batchTrace, applied.reviewRequestId);
           if (!remaining.length) {
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           } else {
@@ -14493,7 +15960,7 @@ export class LegacyService implements OnModuleInit {
             // independently of doneCount would silently roll back under a live batch.
             await client.query(
               "UPDATE zyra_chat_sessions SET active_plan = $2::jsonb, updated_at = now() WHERE id = $1",
-              [sessionId, JSON.stringify({ ...current, remainingScenarios: remaining, doneCount: newDoneCount })]
+              [sessionId, JSON.stringify({ ...current, remainingScenarios: remaining, doneCount: newDoneCount, coveredCount: newCovered, retriedScenarios: [...retried, ...outcome.requeue] })]
             );
           }
         });
@@ -14509,7 +15976,7 @@ export class LegacyService implements OnModuleInit {
         // `detail` is already what the pause message itself tells the user.
         const failedTrace = recorder.fail(detail || "This batch did not complete.");
         await this.zyraPlanTransition(sessionId, planId, doneCount, async (client, current) => {
-          await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${doneCount}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], [], "answer", failedTrace);
+          await this.postZyraPlanMessage(client, projectId, sessionId, userId, zyraReplyLanguage() === "ru" ? ZYRA_RU.planPausedOnError(detail, LegacyService.zyraPlanCovered(plan), totalCount) : `I ran into an issue generating more test cases (${detail}). Pausing here — ${LegacyService.zyraPlanCovered(plan)}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], [], "answer", failedTrace);
           // Spread the locked read, not the outer closure's `plan` — same reasoning as the
           // success-path commit above.
           await client.query(
@@ -14586,6 +16053,8 @@ export class LegacyService implements OnModuleInit {
     if (!story) throw new BadRequestException({ error: "story is required" });
     const jiraIssueKeys = normalizeJsonArray(body.jiraIssueKeys).map(String);
     const linearIssueKeys = normalizeJsonArray(body.linearIssueKeys).map(String);
+    // Notion pages are referenced by page id, not by their short display key.
+    const notionPageIds = normalizeJsonArray(body.notionPageIds).map(String);
     const knowledgeItemIds = normalizeJsonArray(body.knowledgeItemIds).map(String).filter(Boolean);
     const feedback = String(body.feedback || "").trim();
     const now = new Date().toISOString();
@@ -14599,35 +16068,28 @@ export class LegacyService implements OnModuleInit {
     // and stored in jira_issue_keys/linear_issue_keys like an explicit key, so everything downstream
     // (the save's ticket link and tags, regeneration, the ticket auto-comment) reads one source of
     // truth instead of re-deriving it from a selection that is not itself persisted.
-    const derivedTicket = jiraIssueKeys.length || linearIssueKeys.length
-      ? null
-      : await this.zyraTicketFromKnowledgeSelection(projectId, knowledgeItemIds);
-    if (derivedTicket?.linked) {
-      (derivedTicket.linked.provider === "jira" ? jiraIssueKeys : linearIssueKeys).push(derivedTicket.linked.issueKey);
-    } else if (derivedTicket?.tickets.length) {
-      // More than one ticket behind the selection: the save links every test case to exactly one
-      // ticket, so none of them can be attributed to the right one — link none rather than guess.
-      activityLog.push({
-        actor: "system",
-        stage: "todo",
-        title: "Not linked to a ticket",
-        detail: `The selected Knowledge Base documents belong to ${derivedTicket.tickets.length} tickets (${derivedTicket.tickets.map((t) => t.issueKey).join(", ")}). Test cases from this task won't be linked to a ticket and no ticket comment will be posted. Create one task per ticket to link them.`,
-        createdAt: now
-      });
-    }
-    const derivedKey = derivedTicket?.linked?.issueKey;
+    // Several tickets behind the selection are all linked: each draft is attributed to the one it
+    // cites at generation time (zyraAttributeDraftsToTickets — "KB N" citations of a ticket's mirror
+    // included), so every ticket's comment lists only its own test cases.
+    const derivedTickets = jiraIssueKeys.length || linearIssueKeys.length || notionPageIds.length
+      ? []
+      : await this.zyraTicketsFromKnowledgeSelection(projectId, knowledgeItemIds);
+    for (const ticket of derivedTickets) (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).push(ticket.issueKey);
+    const derivedKeys = new Set(derivedTickets.map((ticket) => `${ticket.provider}:${ticket.issueKey}`));
+    const derivedDetail = derivedTickets.length === 1 ? "Linked from the selected Knowledge Base document." : "Linked from the selected Knowledge Base documents.";
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
       ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
-      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Jira ticket queued for Zyra." })),
-      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: key === derivedKey ? "Linked from the selected Knowledge Base document." : "Selected Linear ticket queued for Zyra." }))
+      ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: derivedKeys.has(`jira:${key}`) ? derivedDetail : "Selected Jira ticket queued for Zyra." })),
+      ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: derivedKeys.has(`linear:${key}`) ? derivedDetail : "Selected Linear ticket queued for Zyra." })),
+      ...notionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: derivedKeys.has(`notion:${id}`) ? derivedDetail : "Selected Notion page queued for Zyra." }))
     ];
     const res = await this.db.query(
       `INSERT INTO ai_generation_requests
        (project_id, requested_by, provider, model, user_story, acceptance_criteria, custom_prompt, requested_count,
         generated_count, generated_payload, agent_name, task_status, feedback, context, jira_issue_keys, linear_issue_keys,
-        token_input, token_output, token_total, source_summary, activity_log)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,'[]'::jsonb,$9,'todo',$10,$11,$12::jsonb,$13::jsonb,0,0,0,$14::jsonb,$15::jsonb)
+        token_input, token_output, token_total, source_summary, activity_log, language, notion_page_ids)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,'[]'::jsonb,$9,'todo',$10,$11,$12::jsonb,$13::jsonb,0,0,0,$14::jsonb,$15::jsonb,$16,$17::jsonb)
        RETURNING *`,
       [
         projectId,
@@ -14644,7 +16106,11 @@ export class LegacyService implements OnModuleInit {
         JSON.stringify(jiraIssueKeys),
         JSON.stringify(linearIssueKeys),
         JSON.stringify(sourceSummary),
-        JSON.stringify(activityLog)
+        JSON.stringify(activityLog),
+        // The language the task's own text is written in (detectScriptLanguage), stored because
+        // processZyraTask runs after this request has returned. No signal is English.
+        detectScriptLanguage([story, acceptanceCriteria, context].join("\n")) ?? "en",
+        JSON.stringify(notionPageIds)
       ]
     );
     void this.processZyraTask(projectId, res.rows[0].id, { userId: uid, knowledgeItemIds }).catch(() => undefined);
@@ -14736,6 +16202,7 @@ export class LegacyService implements OnModuleInit {
       const feedback = String(task.feedback || "");
       const jiraIssueKeys = normalizeJsonArray(task.jira_issue_keys).map(String);
       const linearIssueKeys = normalizeJsonArray(task.linear_issue_keys).map(String);
+      const notionPageIds = normalizeJsonArray(task.notion_page_ids).map(String);
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
       const testcaseRange = String((projectSettings as Body).testcaseRange || "30-50");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
@@ -14744,6 +16211,7 @@ export class LegacyService implements OnModuleInit {
       const { knowledge, knowledgeConfidence } = await this.zyraTaskKnowledge(projectId, options.knowledgeItemIds || [], [story, context, acceptanceCriteria]);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
+      const notion = await this.notionSnapshot(projectId, notionPageIds);
       const existingTestcases = await this.existingTestcaseSnapshot(projectId, story, context);
       const aiResult = await this.generateZyraWithProvider({
         provider,
@@ -14753,9 +16221,12 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.rows[0].auth_header_name,
         authScheme: allocation.rows[0].auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, notion, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: LegacyService.zyraStoredLanguage(task.language) }
       });
       const drafts = aiResult.drafts;
+      // Stamped into generated_payload together with the drafts themselves, so the save reads the
+      // ticket each draft was generated for rather than re-deriving it later.
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
       const inputText = [
         story,
         context,
@@ -14764,6 +16235,7 @@ export class LegacyService implements OnModuleInit {
         knowledge.map((item) => `${item.title}\n${item.content}`).join("\n"),
         jira.map((t) => `${t.key} ${t.summary}`).join("\n"),
         linear.map((t) => `${t.key} ${t.summary}`).join("\n"),
+        notion.map((t) => `${t.key} ${t.summary}`).join("\n"),
         existingTestcases.map((tc) => `${tc.externalId} ${tc.title} ${tc.description}`).join("\n")
       ].join("\n");
       const tokenInput = aiResult.usage.input || estimateTokens(inputText);
@@ -14774,13 +16246,15 @@ export class LegacyService implements OnModuleInit {
         ...knowledge.map((item) => ({ type: "knowledge_base", title: item.title, detail: truncateAtWordBoundary(item.content, 1500) })),
         ...jira.map((item) => ({ type: "jira", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...linear.map((item) => ({ type: "linear", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
+        ...notion.map((item) => ({ type: "notion", title: item.key, detail: `${item.summary} ${item.description}`.trim().slice(0, 320) })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))
       ];
       const finishedAt = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Read available sources", detail: `Considered ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel(options.knowledgeItemIds, knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and the supplied story/context.`, createdAt: finishedAt },
         { actor: "agent", stage: "in_progress", title: "Generation plan", detail: this.zyraThinking({ story, context, acceptanceCriteria, feedback, knowledgeCount: knowledge.length, jiraCount: jira.length, linearCount: linear.length }), createdAt: finishedAt },
-        { actor: "agent", stage: "in_review", title: "Generated testcase drafts", detail: `Generated ${drafts.length} testcase draft(s) with ${provider}${aiResult.requestId ? ` request ${aiResult.requestId}` : ""}. Cached input tokens: ${aiResult.usage.cached}.`, createdAt: finishedAt }
+        { actor: "agent", stage: "in_review", title: "Generated testcase drafts", detail: `Generated ${drafts.length} testcase draft(s) with ${provider}${aiResult.requestId ? ` request ${aiResult.requestId}` : ""}. Cached input tokens: ${aiResult.usage.cached}.`, createdAt: finishedAt },
+        ...this.zyraUnattributedDraftsActivity(unattributedDrafts, drafts.length, finishedAt)
       ];
       const successRes = await this.db.query(
         `UPDATE ai_generation_requests
@@ -14916,6 +16390,7 @@ export class LegacyService implements OnModuleInit {
     const referenceNote = String(body.referenceNote || "").trim();
     const additionalJiraIssueKeys = normalizeJsonArray(body.jiraIssueKeys).map(String).filter(Boolean);
     const additionalLinearIssueKeys = normalizeJsonArray(body.linearIssueKeys).map(String).filter(Boolean);
+    const additionalNotionPageIds = normalizeJsonArray(body.notionPageIds).map(String).filter(Boolean);
     const feedback = [
       feedbackText,
       referenceNote ? `Referenced docs or tickets for knowledge base:\n${referenceNote}` : ""
@@ -14943,14 +16418,18 @@ export class LegacyService implements OnModuleInit {
         feedbackText,
         referenceNote ? `References: ${referenceNote}` : "",
         additionalJiraIssueKeys.length ? `Jira tickets: ${additionalJiraIssueKeys.join(", ")}` : "",
-        additionalLinearIssueKeys.length ? `Linear tickets: ${additionalLinearIssueKeys.join(", ")}` : ""
+        additionalLinearIssueKeys.length ? `Linear tickets: ${additionalLinearIssueKeys.join(", ")}` : "",
+        additionalNotionPageIds.length ? `Notion pages: ${additionalNotionPageIds.join(", ")}` : ""
       ].filter(Boolean).join("\n"),
       createdAt: new Date().toISOString()
     }];
     const claimRes = await this.db.query(
-      `UPDATE ai_generation_requests SET task_status = 'todo', feedback = $3, activity_log = activity_log || $4::jsonb, updated_at = now()
+      // language follows the feedback's own text: Russian feedback on an English task regenerates in
+      // Russian; feedback with no signal ("ok", a ticket key) keeps the task's language.
+      `UPDATE ai_generation_requests SET task_status = 'todo', feedback = $3, activity_log = activity_log || $4::jsonb, updated_at = now(),
+              language = COALESCE($6, language)
        WHERE id = $1 AND project_id = $2 AND task_status = $5 RETURNING *`,
-      [taskId, projectId, feedback, JSON.stringify(feedbackActivity), statusBeforeFeedback]
+      [taskId, projectId, feedback, JSON.stringify(feedbackActivity), statusBeforeFeedback, detectScriptLanguage(feedbackText)]
     );
     if (claimRes.rowCount === 0) {
       // Lost the race: something else (another feedback submission, a close, a save) changed the
@@ -14963,6 +16442,7 @@ export class LegacyService implements OnModuleInit {
     const acceptanceCriteria = existing.rows[0].acceptance_criteria || "";
     const jiraIssueKeys = Array.from(new Set([...normalizeJsonArray(existing.rows[0].jira_issue_keys).map(String), ...additionalJiraIssueKeys]));
     const linearIssueKeys = Array.from(new Set([...normalizeJsonArray(existing.rows[0].linear_issue_keys).map(String), ...additionalLinearIssueKeys]));
+    const notionPageIds = Array.from(new Set([...normalizeJsonArray(existing.rows[0].notion_page_ids).map(String), ...additionalNotionPageIds]));
     // Re-read the project's current range (rather than trusting the stored requested_count alone)
     // so a regenerate keeps the same "generate exhaustively" instruction the initial run used —
     // otherwise this falls back to the generic "generate exactly N" phrasing, which reads very
@@ -14988,14 +16468,17 @@ export class LegacyService implements OnModuleInit {
       referenceNote,
       jiraIssueKeys,
       linearIssueKeys,
+      notionPageIds,
       additionalJiraIssueKeys,
       additionalLinearIssueKeys,
+      additionalNotionPageIds,
       requestedCount,
       testcaseRange,
       provider,
       model,
       allocation: allocation.rows[0],
-      previousSourceSummary: existing.rows[0].source_summary
+      previousSourceSummary: existing.rows[0].source_summary,
+      language: LegacyService.zyraStoredLanguage(claimRes.rows[0].language)
     }).catch(() => undefined);
     return {
       generationRequestId: taskId,
@@ -15023,19 +16506,22 @@ export class LegacyService implements OnModuleInit {
       referenceNote: string;
       jiraIssueKeys: string[];
       linearIssueKeys: string[];
+      notionPageIds: string[];
       additionalJiraIssueKeys: string[];
       additionalLinearIssueKeys: string[];
+      additionalNotionPageIds: string[];
       requestedCount: number;
       testcaseRange: string;
       provider: string;
       model: string;
       allocation: Body;
       previousSourceSummary: unknown;
+      language?: ExportLocale;
     }
   ): Promise<void> {
     const {
       userId, story, context, acceptanceCriteria, feedback, feedbackText, referenceNote,
-      jiraIssueKeys, linearIssueKeys, additionalJiraIssueKeys, additionalLinearIssueKeys,
+      jiraIssueKeys, linearIssueKeys, notionPageIds, additionalJiraIssueKeys, additionalLinearIssueKeys, additionalNotionPageIds,
       requestedCount, testcaseRange, provider, model, allocation, previousSourceSummary
     } = options;
     try {
@@ -15050,10 +16536,11 @@ export class LegacyService implements OnModuleInit {
       // a single document cover both, so a reviewer pivoting to something the initial story never
       // mentioned (e.g. "also check the session timeout") would match nothing at all. feedback is
       // guaranteed non-empty here — zyraFeedback (the caller) already rejects an empty one.
-      const [{ knowledge, knowledgeConfidence }, jira, linear, existingTestcases] = await Promise.all([
+      const [{ knowledge, knowledgeConfidence }, jira, linear, notion, existingTestcases] = await Promise.all([
         this.zyraTaskKnowledge(projectId, [], [feedback]),
         this.jiraSnapshot(projectId, jiraIssueKeys),
         this.linearSnapshot(projectId, linearIssueKeys),
+        this.notionSnapshot(projectId, notionPageIds),
         this.existingTestcaseSnapshot(projectId, story, context)
       ]);
       const aiResult = await this.generateZyraWithProvider({
@@ -15064,16 +16551,20 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.auth_header_name,
         authScheme: allocation.auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, notion, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: options.language }
       });
       // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
       // branch) — the provider call happened and was billed either way.
       await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, aiResult.usage);
+      // Against the FULL key list (original + any the reviewer added), which is what the UPDATE below
+      // stores alongside these drafts — see processZyraTask's identical call.
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
         { actor: "agent", stage: "in_progress", title: "Re-read sources with feedback", detail: `Reused the same task and applied feedback against ${knowledge.length} knowledge-base item(s) (${this.zyraKnowledgeSourceLabel([], knowledgeConfidence)}), ${jira.length} Jira ticket(s), ${linear.length} Linear ticket(s), ${existingTestcases.length} existing testcase(s), Zyra memory, and ${referenceNote ? "the referenced docs/tickets" : "the existing context"}.`, createdAt: now },
-        { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now }
+        { actor: "agent", stage: "in_review", title: "Regenerated testcase drafts", detail: `Updated this task with ${aiResult.drafts.length} regenerated draft(s). Cached input tokens: ${aiResult.usage.cached}.`, createdAt: now },
+        ...this.zyraUnattributedDraftsActivity(unattributedDrafts, aiResult.drafts.length, now)
       ];
       const previousSources = normalizeJsonArray(previousSourceSummary);
       const nextSources = [
@@ -15081,6 +16572,7 @@ export class LegacyService implements OnModuleInit {
         ...(referenceNote ? [{ type: "feedback_reference", title: "Reviewer reference", detail: referenceNote.slice(0, 320) }] : []),
         ...additionalJiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: "Referenced by reviewer feedback." })),
         ...additionalLinearIssueKeys.map((key) => ({ type: "linear", title: key, detail: "Referenced by reviewer feedback." })),
+        ...additionalNotionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: "Referenced by reviewer feedback." })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))
       ];
       const res = await this.db.query(
@@ -15088,7 +16580,7 @@ export class LegacyService implements OnModuleInit {
          SET generated_count = $3, generated_payload = $4::jsonb, feedback = $5,
              token_input = token_input + $6, token_output = token_output + $7, token_total = token_total + $8,
              activity_log = activity_log || $9::jsonb, source_summary = $10::jsonb, jira_issue_keys = $11::jsonb,
-             linear_issue_keys = $12::jsonb, task_status = 'in_review', updated_at = now()
+             linear_issue_keys = $12::jsonb, notion_page_ids = $13::jsonb, task_status = 'in_review', updated_at = now()
          WHERE id = $1 AND project_id = $2 AND task_status = 'todo'
          RETURNING *`,
         [
@@ -15103,7 +16595,8 @@ export class LegacyService implements OnModuleInit {
           JSON.stringify(activity),
           JSON.stringify(nextSources),
           JSON.stringify(jiraIssueKeys),
-          JSON.stringify(linearIssueKeys)
+          JSON.stringify(linearIssueKeys),
+          JSON.stringify(notionPageIds)
         ]
       );
       const responseRow = res.rows[0];
@@ -15136,7 +16629,8 @@ export class LegacyService implements OnModuleInit {
           `Regenerated ${aiResult.drafts.length} testcase draft(s) after applying reviewer feedback.`,
           referenceNote ? `Reviewer references: ${referenceNote}` : "",
           additionalJiraIssueKeys.length ? `Jira references: ${additionalJiraIssueKeys.join(", ")}` : "",
-          additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : ""
+          additionalLinearIssueKeys.length ? `Linear references: ${additionalLinearIssueKeys.join(", ")}` : "",
+          additionalNotionPageIds.length ? `Notion references: ${additionalNotionPageIds.join(", ")}` : ""
         ].filter(Boolean).join(" ")
       });
     } catch (error) {
@@ -15330,27 +16824,53 @@ export class LegacyService implements OnModuleInit {
 
       const jiraKeys = normalizeJsonArray(existing.jira_issue_keys).map(String).filter(Boolean);
       const linearKeys = normalizeJsonArray(existing.linear_issue_keys).map(String).filter(Boolean);
-      const jiraIssueKey = jiraKeys[0] || null;
-      const linearIssueKey = linearKeys[0] || null;
-      const jiraTicket = jiraIssueKey
-        ? await client.query("SELECT jira_url FROM jira_tickets WHERE project_id = $1 AND jira_issue_key = $2 LIMIT 1", [projectId, jiraIssueKey]).catch(() => ({ rows: [] as Body[] }))
-        : { rows: [] as Body[] };
-      const jiraUrl = jiraTicket.rows[0]?.jira_url || null;
-      const linearTicket = linearIssueKey
-        ? await client.query("SELECT linear_url FROM linear_tickets WHERE project_id = $1 AND linear_issue_key = $2 LIMIT 1", [projectId, linearIssueKey]).catch(() => ({ rows: [] as Body[] }))
-        : { rows: [] as Body[] };
-      const linearUrl = linearTicket.rows[0]?.linear_url || null;
-      // A task carries either Jira or Linear keys, never both (the Requirements page creates one
-      // task per ticket) — this just resolves whichever one applies for the "already linked, update
-      // in place" lookup below. Chat-staged rows never set these, so this is always empty for them
-      // — every chat create draft goes through the plain "create new testcase" branch.
-      // severity/component now selected alongside id (previously id-only) so the create/update
-      // payload below can decide "only fill if blank" for those two fields — see its own comment.
-      const existingLinked = jiraIssueKey
-        ? await client.query("SELECT id, severity, component FROM testcases WHERE project_id = $1 AND jira_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, jiraIssueKey])
-        : linearIssueKey
-        ? await client.query("SELECT id, severity, component FROM testcases WHERE project_id = $1 AND linear_issue_key = $2 AND deleted_at IS NULL ORDER BY updated_at ASC", [projectId, linearIssueKey])
-        : { rows: [] as Body[] };
+      // A task can name several tickets, across both providers (the Feedback tab's pickers, or
+      // several keys passed to createZyraTask). Only a single-ticket task links every draft to its
+      // ticket; with more, each draft carries the one it was attributed to at generation time
+      // (zyraAttributeDraftsToTickets) — never "the first key" for all of them, which posted every
+      // test case to one ticket and, with Jira + Linear, to both. Chat-staged rows never set these,
+      // so all of this is empty for them — every chat create draft goes through the plain "create
+      // new testcase" branch.
+      const notionPageIds = normalizeJsonArray(existing.notion_page_ids).map(String).filter(Boolean);
+      const singleTicket = jiraKeys.length + linearKeys.length + notionPageIds.length === 1;
+      const jiraIssueKey = singleTicket ? jiraKeys[0] ?? null : null;
+      const linearIssueKey = singleTicket ? linearKeys[0] ?? null : null;
+      const notionPageId = singleTicket ? notionPageIds[0] ?? null : null;
+      const ticketUrls = new Map<string, string | null>();
+      if (jiraKeys.length) {
+        const res = await client.query("SELECT jira_issue_key, jira_url FROM jira_tickets WHERE project_id = $1 AND jira_issue_key = ANY($2::text[])", [projectId, jiraKeys]).catch(() => ({ rows: [] as Body[] }));
+        for (const row of res.rows) if (!ticketUrls.get(`jira:${row.jira_issue_key}`)) ticketUrls.set(`jira:${row.jira_issue_key}`, row.jira_url || null);
+      }
+      if (linearKeys.length) {
+        const res = await client.query("SELECT linear_issue_key, linear_url FROM linear_tickets WHERE project_id = $1 AND linear_issue_key = ANY($2::text[])", [projectId, linearKeys]).catch(() => ({ rows: [] as Body[] }));
+        for (const row of res.rows) if (!ticketUrls.get(`linear:${row.linear_issue_key}`)) ticketUrls.set(`linear:${row.linear_issue_key}`, row.linear_url || null);
+      }
+      if (notionPageIds.length) {
+        const res = await client.query("SELECT notion_page_id, notion_url FROM notion_pages WHERE project_id = $1 AND notion_page_id = ANY($2::text[])", [projectId, notionPageIds]).catch(() => ({ rows: [] as Body[] }));
+        for (const row of res.rows) if (!ticketUrls.get(`notion:${row.notion_page_id}`)) ticketUrls.set(`notion:${row.notion_page_id}`, row.notion_url || null);
+      }
+      // The test cases already linked to each of the task's tickets, oldest first, for the
+      // "already linked, update in place" pairing (zyraDraftTicketLink). severity/component are
+      // selected alongside id so the create/update payload below can decide "only fill if blank"
+      // for those two fields — see its own comment.
+      const existingLinkedByTicket = new Map<string, Body[]>();
+      if (jiraKeys.length || linearKeys.length || notionPageIds.length) {
+        const linked = await client.query(
+          `SELECT id, severity, component, jira_issue_key, linear_issue_key, notion_page_id FROM testcases
+           WHERE project_id = $1 AND deleted_at IS NULL
+             AND (jira_issue_key = ANY($2::text[]) OR linear_issue_key = ANY($3::text[]) OR notion_page_id = ANY($4::text[]))
+           ORDER BY updated_at ASC`,
+          [projectId, jiraKeys, linearKeys, notionPageIds]
+        );
+        for (const row of linked.rows) {
+          const pools = [
+            ...(row.jira_issue_key && jiraKeys.includes(row.jira_issue_key) ? [`jira:${row.jira_issue_key}`] : []),
+            ...(row.linear_issue_key && linearKeys.includes(row.linear_issue_key) ? [`linear:${row.linear_issue_key}`] : []),
+            ...(row.notion_page_id && notionPageIds.includes(row.notion_page_id) ? [`notion:${row.notion_page_id}`] : [])
+          ];
+          for (const pool of pools) existingLinkedByTicket.set(pool, [...(existingLinkedByTicket.get(pool) || []), row]);
+        }
+      }
 
       // Pre-validate every update/archive target still exists before writing anything, so a target
       // deleted between staging and saving aborts the whole batch with a clear list, rather than an
@@ -15419,10 +16939,12 @@ export class LegacyService implements OnModuleInit {
         chatSessionId: existing.chat_session_id ?? null,
         batchSuiteId,
         jiraIssueKey,
-        jiraUrl,
         linearIssueKey,
-        linearUrl,
-        existingLinked,
+        notionPageId,
+        ticketUrls,
+        existingLinkedByTicket,
+        linkedPositions: new Map(),
+        claimedLinkedIds: new Set(),
         validSuiteIds
       };
       // Selected by ZYRA_SET_BASED_SAVE_ENABLED (default off — see the flag's own comment). Both
@@ -15527,13 +17049,9 @@ export class LegacyService implements OnModuleInit {
     // say: an update and an archive push the exact same row shape (a plain toCamel'd testcases
     // row), distinguishable only here, at the point `opType` is actually known.
     const touchedActions: Array<"add" | "update" | "archive"> = [];
-    // existingLinked pairs positionally with create-type entries only ("the Nth create draft in
-    // this save" ↔ "the Nth already-Jira/Linear-linked testcase, oldest first") — mirrors the
-    // original single-item-per-transaction zyraSave exactly, which iterated `selected` under the
-    // assumption every entry was a create (true for every Task-board batch, the only source that
-    // ever populates jiraIssueKey/linearIssueKey in the first place). A running counter here keeps
-    // that same pairing correct even though `selected` can now also hold update/archive entries.
-    let createPosition = 0;
+    // Already-linked testcases pair positionally with create-type entries only, per ticket ("the
+    // Nth create draft for ticket K" ↔ "the Nth testcase already linked to K, oldest first") — see
+    // zyraDraftTicketLink. Update/archive entries never consume a position.
     for (const entry of selected) {
       const opType = entry.opType || "create";
       if (opType === "update" || opType === "archive") {
@@ -15548,9 +17066,9 @@ export class LegacyService implements OnModuleInit {
         );
         continue;
       }
-      const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const existingLinkedRow = ctx.existingLinked.rows[linkedIndex];
+      const link = this.zyraDraftTicketLink(ctx, draft);
+      const existingLinkedRow = link.existingLinkedRow;
       // Q11: whichever suite this entry would have targeted, re-validated live (see zyraSaveAttempt)
       // rather than trusted from whenever it was resolved — a soft-deleted suite falls back to
       // unassigned instead of failing this entry or the batch.
@@ -15560,8 +17078,9 @@ export class LegacyService implements OnModuleInit {
       const tags = Array.from(new Set([
         ...baseTags,
         "zyra",
-        ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
-        ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
+        ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
+        ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
+        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -15590,10 +17109,12 @@ export class LegacyService implements OnModuleInit {
         type: draft.type || "Functional",
         status: draft.status || "Draft",
         automationTags: tags,
-        jiraIssueKey: draft.jiraIssueKey || ctx.jiraIssueKey,
-        jiraUrl: ctx.jiraUrl,
-        linearIssueKey: ctx.linearIssueKey,
-        linearUrl: ctx.linearUrl,
+        jiraIssueKey: link.jiraIssueKey,
+        jiraUrl: link.jiraUrl,
+        linearIssueKey: link.linearIssueKey,
+        linearUrl: link.linearUrl,
+        notionPageId: link.notionPageId,
+        notionUrl: link.notionUrl,
         // Carried from the staged draft (already resolved+verified at generation time) onto the
         // real row at the moment it's actually written — a Task-board draft (no chat pipeline,
         // no sourceRefs ever attached) simply carries none, same as it always has. Same "only fill
@@ -15608,12 +17129,12 @@ export class LegacyService implements OnModuleInit {
       };
       this.assertTestcaseFieldLengths(payload);
       if (existingLinkedRow?.id) {
-        const linkedId = ctx.existingLinked.rows[linkedIndex].id;
+        const linkedId = existingLinkedRow.id;
         const row = toCamel(await this.updateTestCaseWithClient(client, ctx.projectId, linkedId, ctx.uid, payload));
         // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
         // sync-integration wiring in zyraSave has something to target — this row IS what was just
         // written to `payload.jiraIssueKey`/`payload.linearIssueKey` above, not a guess.
-        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey });
+        touched.push({ id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey, notionPageId: payload.notionPageId });
         touchedActions.push("update");
       } else {
         const row = toCamel(await this.insertTestCaseWithClient(client, ctx.projectId, ctx.uid, payload));
@@ -15652,7 +17173,6 @@ export class LegacyService implements OnModuleInit {
     // identical field for why this can't be derived from `touched` alone after the fact.
     const touchedActionSlots: Array<"add" | "update" | "archive" | null> = new Array(selected.length).fill(null);
     const toInsert: Array<{ slot: number; payload: Body; draft: Body; entryReason: unknown }> = [];
-    let createPosition = 0;
 
     for (let slot = 0; slot < selected.length; slot += 1) {
       const entry = selected[slot];
@@ -15670,9 +17190,9 @@ export class LegacyService implements OnModuleInit {
         continue;
       }
 
-      const linkedIndex = createPosition++;
       const draft = entry.draft || entry;
-      const existingLinkedRow = ctx.existingLinked.rows[linkedIndex];
+      const link = this.zyraDraftTicketLink(ctx, draft);
+      const existingLinkedRow = link.existingLinkedRow;
       // Q11: same live re-validation as processZyraSaveEntriesSequential — see that function's
       // identical comment.
       const rawTargetSuiteId = draft.suiteId || ctx.batchSuiteId;
@@ -15681,8 +17201,9 @@ export class LegacyService implements OnModuleInit {
       const tags = Array.from(new Set([
         ...baseTags,
         "zyra",
-        ...(ctx.jiraIssueKey ? [`jira:${ctx.jiraIssueKey}`] : []),
-        ...(ctx.linearIssueKey ? [`linear:${ctx.linearIssueKey}`] : []),
+        ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
+        ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
+        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -15707,10 +17228,12 @@ export class LegacyService implements OnModuleInit {
         type: draft.type || "Functional",
         status: draft.status || "Draft",
         automationTags: tags,
-        jiraIssueKey: draft.jiraIssueKey || ctx.jiraIssueKey,
-        jiraUrl: ctx.jiraUrl,
-        linearIssueKey: ctx.linearIssueKey,
-        linearUrl: ctx.linearUrl,
+        jiraIssueKey: link.jiraIssueKey,
+        jiraUrl: link.jiraUrl,
+        linearIssueKey: link.linearIssueKey,
+        linearUrl: link.linearUrl,
+        notionPageId: link.notionPageId,
+        notionUrl: link.notionUrl,
         // Same "only overwrite when this run resolved something" rule as processZyraSaveEntriesSequential's
         // identical field — see that function's comment for why null (not []) is what protects an
         // already-linked row's existing citations from being wiped by an ungrounded regeneration.
@@ -15726,7 +17249,7 @@ export class LegacyService implements OnModuleInit {
         // jiraIssueKey/linearIssueKey included (unlike the bare shape this used to push) so the
         // sync-integration wiring in zyraSave has something to target — see the sequential path's
         // identical comment.
-        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey };
+        touchedSlots[slot] = { id: linkedId, title: draft.title, updated: true, externalId: row.externalId, jiraIssueKey: payload.jiraIssueKey, linearIssueKey: payload.linearIssueKey, notionPageId: payload.notionPageId };
         touchedActionSlots[slot] = "update";
       } else {
         // Deferred — actually written once, below, as a single batch insert by
@@ -15822,6 +17345,8 @@ export class LegacyService implements OnModuleInit {
       jira_url: payload.jiraUrl || null,
       linear_issue_key: payload.linearIssueKey || null,
       linear_url: payload.linearUrl || null,
+      notion_page_id: payload.notionPageId || null,
+      notion_url: payload.notionUrl || null,
       attachments: null,
       estimated_duration: null,
       source_refs: LegacyService.sanitizeSourceRefsInput(payload.sourceRefs)
@@ -15832,18 +17357,18 @@ export class LegacyService implements OnModuleInit {
          (project_id, suite_id, external_id, title, description, preconditions, postconditions, steps, test_data,
           priority, severity, type, automation_status, automation_repo, automation_path, automation_test_name,
           automation_framework, automation_tags, owner_id, component, status, jira_issue_key, jira_url,
-          linear_issue_key, linear_url, attachments, created_by, updated_by, estimated_duration, source_refs)
+          linear_issue_key, linear_url, notion_page_id, notion_url, attachments, created_by, updated_by, estimated_duration, source_refs)
        SELECT $1::uuid, r.suite_id, r.external_id, r.title, r.description, r.preconditions, r.postconditions,
               r.steps, r.test_data, r.priority, r.severity, r.type, r.automation_status, r.automation_repo,
               r.automation_path, r.automation_test_name, r.automation_framework, r.automation_tags, r.owner_id,
               r.component, r.status, r.jira_issue_key, r.jira_url, r.linear_issue_key, r.linear_url,
-              r.attachments, $2::uuid, $2::uuid, r.estimated_duration, r.source_refs
+              r.notion_page_id, r.notion_url, r.attachments, $2::uuid, $2::uuid, r.estimated_duration, r.source_refs
        FROM jsonb_to_recordset($3::jsonb) AS r(
          suite_id uuid, external_id text, title text, description text, preconditions text,
          postconditions text, steps jsonb, test_data text, priority text, severity text, type text,
          automation_status text, automation_repo text, automation_path text, automation_test_name text,
          automation_framework text, automation_tags text, owner_id uuid, component text, status text,
-         jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, attachments text,
+         jira_issue_key text, jira_url text, linear_issue_key text, linear_url text, notion_page_id text, notion_url text, attachments text,
          estimated_duration text, source_refs jsonb
        )
        RETURNING *`,
@@ -16721,7 +18246,9 @@ export class LegacyService implements OnModuleInit {
   async fetchLiveTicketCategory(projectId: string, provider: IntegrationProvider, issueKey: string): Promise<TicketCategoryLookup> {
     const key = issueKey.trim();
     if (!key) return NOT_FOUND_RESULT;
-    return provider === "jira" ? this.fetchLiveJiraTicketCategory(projectId, key) : this.fetchLiveLinearTicketCategory(projectId, key);
+    if (provider === "jira") return this.fetchLiveJiraTicketCategory(projectId, key);
+    if (provider === "notion") return this.fetchLiveNotionPageCategory(projectId, key);
+    return this.fetchLiveLinearTicketCategory(projectId, key);
   }
 
   private mapJiraStatusCategory(categoryKey: string): NormalizedTicketDoneness | null {
@@ -16926,13 +18453,14 @@ export class LegacyService implements OnModuleInit {
     // jiraIssueKeys attached at creation.
     const jiraIssueKeys = row.jiraIssueKey ? [String(row.jiraIssueKey)] : [];
     const linearIssueKeys = row.linearIssueKey ? [String(row.linearIssueKey)] : [];
+    const notionPageIds = row.notionPageId ? [String(row.notionPageId)] : [];
 
     try {
       await this.db.query(
         `INSERT INTO ai_generation_requests
            (project_id, requested_by, provider, model, user_story, requested_count, generated_count,
-            generated_payload, agent_name, task_status, activity_log, sweep_testcase_id, jira_issue_keys, linear_issue_keys)
-         VALUES ($1, NULL, $2, NULL, $3, 1, 1, $4::jsonb, $5, 'in_review', $6::jsonb, $7, $8::jsonb, $9::jsonb)`,
+            generated_payload, agent_name, task_status, activity_log, sweep_testcase_id, jira_issue_keys, linear_issue_keys, notion_page_ids)
+         VALUES ($1, NULL, $2, NULL, $3, 1, 1, $4::jsonb, $5, 'in_review', $6::jsonb, $7, $8::jsonb, $9::jsonb, $10::jsonb)`,
         [
           projectId,
           ZYRA_ARCHIVE_SWEEP_PROVIDER,
@@ -16942,7 +18470,8 @@ export class LegacyService implements OnModuleInit {
           JSON.stringify(activityLog),
           row.id,
           JSON.stringify(jiraIssueKeys),
-          JSON.stringify(linearIssueKeys)
+          JSON.stringify(linearIssueKeys),
+          JSON.stringify(notionPageIds)
         ]
       );
       return "staged";
@@ -17073,6 +18602,8 @@ export class LegacyService implements OnModuleInit {
     const linear = input.linear.length
       ? input.linear.map((item) => `${item.key}: ${item.summary}\n${item.description}`).join("\n\n")
       : "No Linear tickets were selected.";
+    // Only present when a Notion page was selected, so a prompt without one is byte-identical to before.
+    const notion = input.notion?.length ? input.notion.map((item) => `${item.key}: ${item.summary}\n${item.description}`).join("\n\n") : "";
     const existingTestcases = input.existingTestcases.length
       ? input.existingTestcases.map((item) => `${item.externalId}: ${item.title}\nPriority: ${item.priority}; Status: ${item.status}; Component: ${item.component || "unset"}\n${item.description}\nSteps: ${item.stepsSummary}`).join("\n\n")
       : "No existing testcases were available.";
@@ -17085,8 +18616,9 @@ export class LegacyService implements OnModuleInit {
       knowledge,
       "Jira tickets (cite by its ticket key):",
       jira,
-      "Linear tickets:",
+      "Linear tickets (cite by its ticket key):",
       linear,
+      ...(notion ? ["Notion pages (cite by its page key):", notion] : []),
       "Existing testcases to review for context and duplicate avoidance (cite by its external id):",
       existingTestcases,
       "Related bugs from this project's bug tracker (cite by its 'BUG N' label):",
@@ -17215,8 +18747,76 @@ export class LegacyService implements OnModuleInit {
       input.feedback ? `Reviewer feedback to apply to this same task:\n${input.feedback}` : "",
       "For every draft, use the selected knowledge, Jira context, Zyra memory, and existing testcase repository context.",
       "Make sure every draft is specific, detailed, testable, and not a duplicate of existing testcases or another generated draft.",
-      groundingNote
+      groundingNote,
+      LegacyService.zyraLanguageInstruction(input.language)
     ].filter(Boolean).join("\n\n");
+  }
+
+  /*
+   * Asks for the drafts' prose in the user's language (see V132_zyra_generation_language.sql for
+   * where it comes from). It goes here, in the per-request dynamic prompt, not in zyraSystemPrompt:
+   * the system prompt and the static source block are prompt-cached per project, and a per-language
+   * line there would split that cache by language for no gain. Placed last so it is the final word,
+   * the same reason groundingNote sits where it does.
+   *
+   * Everything machine-read stays English: the JSON keys, priority and severity (normalizeAiDrafts /
+   * normalizeZyraSeverity accept only the English values and would drop "Высокая" to null), the
+   * technique names, and the source labels that sanitizeZyraSourceRefs matches verbatim.
+   */
+  /** A stored `language` column read back as a supported locale; anything else (NULL, a typo) is English. */
+  private static zyraStoredLanguage(value: unknown): ExportLocale {
+    return (EXPORT_LOCALES as readonly string[]).includes(String(value)) ? (value as ExportLocale) : "en";
+  }
+
+  private async zyraSessionLanguage(projectId: string, sessionId: string): Promise<ExportLocale> {
+    const res = await this.db.query<{ language: string }>(
+      "SELECT language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      [sessionId, projectId]
+    );
+    return LegacyService.zyraStoredLanguage(res.rows[0]?.language);
+  }
+
+  /*
+   * Records the language of the message that is about to start chat work on this session, before
+   * that work is detached. Called only after the caller's own access check. Null — a message that
+   * carries no language signal — leaves the stored language as it is.
+   */
+  private async rememberZyraSessionLanguage(projectId: string, sessionId: string, language: ExportLocale | null): Promise<void> {
+    if (!language) return;
+    await this.db.query(
+      "UPDATE zyra_chat_sessions SET language = $3 WHERE id = $1 AND project_id = $2 AND language IS DISTINCT FROM $3",
+      [sessionId, projectId, language]
+    );
+  }
+
+  /*
+   * The chat router's counterpart to zyraLanguageInstruction: the `reply` (and reasoningSummary) the
+   * user reads, in the session's language. The router decides actions, so every machine-read field
+   * of its envelope stays as specified. Empty for English, so an English turn's prompt is unchanged.
+   *
+   * The wording rule matters as much as the language: the English prompt forbids past-tense
+   * "created/saved" claims about staged work, and reconcileZyraReply polices it with
+   * ZYRA_COMPLETION_CLAIM — which only knows English verbs. ZYRA_COMPLETION_CLAIM_RU is the Russian
+   * counterpart; this instruction tells the model the same rule in Russian terms so it rarely fires.
+   */
+  private static zyraReplyLanguageInstruction(language: ExportLocale | undefined): string {
+    if (language !== "ru") return "";
+    return [
+      "",
+      "LANGUAGE: the user is writing in Russian. Write the reply and reasoningSummary fields in Russian.",
+      "Keep everything else exactly as specified above, in English: the JSON keys, action, actionType, operation types, and any suite name, external id or other value copied from the context.",
+      "The staged-work rule applies in Russian too: describe drafts as 'подготовлены'/'предложены' and staged for review ('ожидают проверки'), never as 'созданы', 'сохранены', 'добавлены', 'обновлены' or 'архивированы'."
+    ].join("\n");
+  }
+
+  private static zyraLanguageInstruction(language: ExportLocale | undefined): string {
+    if (language !== "ru") return "";
+    return [
+      "Write every draft in Russian: title, preconditions, each step's action and expectedResult inside stepsJson, testData, and expectedSummary.",
+      "For component, reuse an existing component name exactly as written when the draft belongs to that area; only a new component name is written in Russian.",
+      "Keep these exactly as specified, in English, whatever the language: the JSON keys, priority (P1/P2/P3), severity (Critical/High/Medium/Low), the technique names, and the sourceRefs labels.",
+      "Values the sources state — names, error messages, codes, URLs, field labels as they appear in the product — are copied as written, not translated."
+    ].join("\n");
   }
 
   /**
@@ -17297,7 +18897,10 @@ export class LegacyService implements OnModuleInit {
         // Raw, unvalidated labels straight from the model — sanitizeZyraSourceRefs (called by
         // whichever generation path has the turn's known-label index in scope) is what turns this
         // into a trustworthy citation list. Never rendered or persisted as-is.
-        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : []
+        sourceRefs: Array.isArray(draft.sourceRefs) ? draft.sourceRefs : [],
+        // Only a plan batch asks for it (zyraBatchMessage): which listed scenario this draft covers.
+        // Added only when present, so every other generation path's drafts are unchanged.
+        ...(Number.isInteger(Number(draft.scenario)) && Number(draft.scenario) > 0 ? { scenario: Number(draft.scenario) } : {})
       };
     });
   }
@@ -17593,12 +19196,49 @@ export class LegacyService implements OnModuleInit {
       "Existing testcases (avoid proposing scenarios that already have coverage):",
       params.existingTestcases.map((tc) => `${tc.externalId} | ${tc.title}`).join("\n") || "None.",
       "",
-      `Return ONLY JSON: {"scenarios": ["short scenario label", ...]}. List up to ${params.maxScenarios} scenarios, ordered from most to least important. No markdown, no commentary.`
+      // A target, not a ceiling: "List up to 100" let the model stop wherever it felt done — a real
+      // "All – Exhaustive" run planned 49 — so the tier meant as "everything" fell well short of it.
+      `Return ONLY JSON: {"scenarios": ["short scenario label", ...]}. List ${params.maxScenarios} scenarios, ordered from most to least important. This is exhaustive coverage: keep working through ${LegacyService.ZYRA_PLAN_COVERAGE_AREAS} until you reach ${params.maxScenarios}. Stop short only if the feature genuinely has no more distinct scenarios that the existing testcases do not already cover. No markdown, no commentary.`
     ].join("\n");
     const parsed = await this.zyraJsonCompletion(params.provider, params.model, params.key, systemPrompt, userPrompt);
     await this.recordZyraTokenUsage(params.projectId, "chat_plan", params.provider, params.model, parsed.__zyraUsage || {});
-    const scenarios = normalizeJsonArray(parsed.scenarios).map((item) => String(item || "").trim()).filter(Boolean);
-    return scenarios.slice(0, params.maxScenarios);
+    const scenarios = LegacyService.mergeZyraScenarios([], parsed.scenarios, params.maxScenarios);
+
+    // One top-up round when the first answer still stops well short of the target — models tend to
+    // end a long list early. It sees the list so far and may answer [] when nothing distinct is left,
+    // so a small feature is never padded with filler. Bounded to one call; a failure keeps the plan.
+    if (scenarios.length >= 2 && scenarios.length < Math.ceil(params.maxScenarios * LegacyService.ZYRA_PLAN_TOPUP_BELOW)) {
+      try {
+        const topUpPrompt = [
+          userPrompt,
+          "",
+          "Scenarios already planned (do not repeat or reword any of these):",
+          scenarios.map((scenario, index) => `${index + 1}. ${scenario}`).join("\n"),
+          "",
+          `Return ONLY JSON: {"scenarios": [...]} with up to ${params.maxScenarios - scenarios.length} MORE distinct scenarios that neither the list above nor the existing testcases cover, ordered from most to least important. Return {"scenarios": []} if there are genuinely none left.`
+        ].join("\n");
+        const more = await this.zyraJsonCompletion(params.provider, params.model, params.key, systemPrompt, topUpPrompt);
+        await this.recordZyraTokenUsage(params.projectId, "chat_plan", params.provider, params.model, more.__zyraUsage || {});
+        return LegacyService.mergeZyraScenarios(scenarios, more.scenarios, params.maxScenarios);
+      } catch (err) {
+        this.logger.warn(`Scenario top-up failed for project ${params.projectId}, keeping the ${scenarios.length}-scenario plan: ${err instanceof Error ? err.message : err}`);
+      }
+    }
+    return scenarios;
+  }
+
+  /** Appends `raw` labels to `base`, dropping blanks and case/spacing-insensitive repeats, capped at `max`. */
+  private static mergeZyraScenarios(base: string[], raw: unknown, max: number): string[] {
+    const key = (label: string) => label.toLowerCase().replace(/\s+/g, " ");
+    const seen = new Set(base.map(key));
+    const merged = [...base];
+    for (const item of normalizeJsonArray(raw)) {
+      const label = String(item || "").trim();
+      if (!label || seen.has(key(label))) continue;
+      seen.add(key(label));
+      merged.push(label);
+    }
+    return merged.slice(0, max);
   }
 
   private async generateZyraWithOpenAi(params: {
@@ -17985,12 +19625,19 @@ export class LegacyService implements OnModuleInit {
     reason: string
   ): ZyraChatDecision {
     const intent = this.detectZyraChatIntent(message);
-    const note = `⚠️ Zyra's AI provider is unavailable right now (${reason}), so this is a best-effort answer from the test repository only — no test cases were generated or changed.`;
+    const ru = zyraReplyLanguage() === "ru";
+    const note = ru
+      ? ZYRA_RU.degradedNote(reason)
+      : `⚠️ Zyra's AI provider is unavailable right now (${reason}), so this is a best-effort answer from the test repository only — no test cases were generated or changed.`;
     // Generation genuinely cannot happen without the provider — say so rather than pretending.
     if (intent === "create" || intent === "update" || intent === "archive" || intent === "suite") {
       return {
-        reply: `${note}\n\nI can't ${intent === "create" ? "generate test cases" : "change the test repository"} until the provider is reachable. Check Settings → AI Providers, then ask me again.`,
-        reasoningSummary: `Degraded mode (${reason}). Refused a ${intent} request rather than mutating the repository without AI context.`,
+        reply: ru
+          ? ZYRA_RU.degradedRefuse(note, intent === "create")
+          : `${note}\n\nI can't ${intent === "create" ? "generate test cases" : "change the test repository"} until the provider is reachable. Check Settings → AI Providers, then ask me again.`,
+        reasoningSummary: ru
+          ? `Режим без ИИ (${reason}). Запрос «${intent}» отклонён, чтобы не изменять репозиторий без контекста ИИ.`
+          : `Degraded mode (${reason}). Refused a ${intent} request rather than mutating the repository without AI context.`,
         actionType: "answer",
         operations: [],
         testcases: []
@@ -17999,8 +19646,10 @@ export class LegacyService implements OnModuleInit {
     // Read-only requests can still be served from the repository snapshot, as a table.
     if (intent === "list" && existingTestcases.length) {
       return {
-        reply: `${note}\n\nHere is the nearest existing coverage I could match.`,
-        reasoningSummary: `Degraded mode (${reason}). Listed ${existingTestcases.length} existing testcase(s) from repository context.`,
+        reply: ru ? ZYRA_RU.degradedList(note) : `${note}\n\nHere is the nearest existing coverage I could match.`,
+        reasoningSummary: ru
+          ? `Режим без ИИ (${reason}). Показаны существующие тест-кейсы из репозитория: ${existingTestcases.length}.`
+          : `Degraded mode (${reason}). Listed ${existingTestcases.length} existing testcase(s) from repository context.`,
         actionType: "answer",
         operations: [],
         testcases: existingTestcases.slice(0, 25).map((tc) => this.chatDraftRow(tc, "covered", "Existing coverage matched without AI."))
@@ -18008,7 +19657,9 @@ export class LegacyService implements OnModuleInit {
     }
     return {
       reply: `${note}\n\n${this.defaultZyraReply(message, existingTestcases)}`,
-      reasoningSummary: `Degraded mode (${reason}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
+      reasoningSummary: ru
+        ? `Режим без ИИ (${reason}). ${this.defaultReasoningSummary(existingTestcases.length)}`
+        : `Degraded mode (${reason}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
       actionType: "answer",
       operations: [],
       testcases: []
@@ -18145,7 +19796,12 @@ export class LegacyService implements OnModuleInit {
     if (actionType === "create" || actionType === "archive" || actionType === "update") {
       return { kind: "proposal", actionType, content };
     }
-    if (LegacyService.ZYRA_OFFER_PATTERN.test(content) || LegacyService.ZYRA_STAGED_AWAITING_PATTERN.test(content)) {
+    if (
+      LegacyService.ZYRA_OFFER_PATTERN.test(content) ||
+      LegacyService.ZYRA_STAGED_AWAITING_PATTERN.test(content) ||
+      ZYRA_RU_OFFER.test(foldRu(content)) ||
+      ZYRA_RU_STAGED_AWAITING.test(foldRu(content))
+    ) {
       return { kind: "offer", content };
     }
     return null;
@@ -18175,8 +19831,10 @@ export class LegacyService implements OnModuleInit {
   private static readonly ZYRA_AFFIRMATIVE_PATTERN =
     /^(yes please|yes|yeah|yep|yup|sure|ok|okay|confirmed?|correct|go ahead|do it|please do it|please do|do that|please proceed|proceed|sounds good|go for it)[\s.!]*$/i;
 
+  // The Russian alternatives are OR-ed in for every session: a Russian word cannot occur in an
+  // English message, so English confirmations behave exactly as before.
   private zyraIsConfirmation(message: string): boolean {
-    return LegacyService.ZYRA_AFFIRMATIVE_PATTERN.test(message.trim());
+    return LegacyService.ZYRA_AFFIRMATIVE_PATTERN.test(message.trim()) || ZYRA_RU_AFFIRMATIVE.test(foldRu(message.trim()));
   }
 
   // Resolve the router's suite against reality: an id only counts if the suite exists, a name is
@@ -18246,10 +19904,14 @@ export class LegacyService implements OnModuleInit {
       testcaseStorage: "Test case storage operations (create, update, delete, bulk)",
       suiteOperations: "Suite operations (create, move/assign)"
     };
-    const reason = `${label[capability]} is currently disabled for Zyra in this project. Enable it under Zyra → Settings → Capabilities, then try again.`;
+    const reason = zyraReplyLanguage() === "ru"
+      ? ZYRA_RU.capabilityDisabled(ZYRA_RU.capabilityLabel[capability])
+      : `${label[capability]} is currently disabled for Zyra in this project. Enable it under Zyra → Settings → Capabilities, then try again.`;
     return {
       reply: reason,
-      reasoningSummary: `Requested a disabled Zyra capability (${capability}). ${existingCount} nearby testcase(s) available for context.`,
+      reasoningSummary: zyraReplyLanguage() === "ru"
+        ? `Запрошена отключённая возможность Zyra (${capability}). Ближайших тест-кейсов для контекста: ${existingCount}.`
+        : `Requested a disabled Zyra capability (${capability}). ${existingCount} nearby testcase(s) available for context.`,
       actionType: "answer",
       operations: [],
       testcases: []
@@ -18263,7 +19925,9 @@ export class LegacyService implements OnModuleInit {
       ...decision,
       operations: [],
       actionType: "answer",
-      reply: `Test case storage is disabled for Zyra in this project, so these are suggestions only — I did not save them. Enable "Test case storage operations" under Zyra → Settings → Capabilities to let me save generated testcases.\n\n${decision.reply}`
+      reply: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.storageGate(decision.reply)
+        : `Test case storage is disabled for Zyra in this project, so these are suggestions only — I did not save them. Enable "Test case storage operations" under Zyra → Settings → Capabilities to let me save generated testcases.\n\n${decision.reply}`
     };
   }
 
@@ -18300,7 +19964,9 @@ export class LegacyService implements OnModuleInit {
     return [
       cleaned,
       "",
-      "_Those test cases were only described in chat — they were not saved to the repository. Ask me to generate them and they'll be created and shown in the table above._"
+      zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.strippedTable
+        : "_Those test cases were only described in chat — they were not saved to the repository. Ask me to generate them and they'll be created and shown in the table above._"
     ].join("\n").trim();
   }
 
@@ -18379,12 +20045,18 @@ export class LegacyService implements OnModuleInit {
    * staged, and says how to file them, so the state on screen and the state in the sentence agree.
    */
   private static zyraDraftFilingHint(suiteName: string | null): string {
+    if (zyraReplyLanguage() === "ru") {
+      return suiteName === LegacyService.ZYRA_DRAFT_SUITE_NAME
+        ? ZYRA_RU.draftFilingHintDraftSuite(LegacyService.ZYRA_DRAFT_SUITE_NAME)
+        : ZYRA_RU.draftFilingHintSuite(suiteName);
+    }
     return suiteName === LegacyService.ZYRA_DRAFT_SUITE_NAME
       ? `They're staged as drafts in **${LegacyService.ZYRA_DRAFT_SUITE_NAME}** — say "save them to <suite>" and I'll file them where they belong.`
       : `They're drafts in **${suiteName}** — review them there, or say "save them to <suite>" to move them.`;
   }
 
   private static zyraUngroundedNote(count: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.ungroundedNote(count);
     return [
       "ℹ️ I don't have anything about this in the project's knowledge base, and no Jira ticket matched it either.",
       "",
@@ -18395,6 +20067,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private static zyraKnowledgeBaseOffNote(count: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.knowledgeBaseOffNote(count);
     return [
       "ℹ️ I don't have access to the Knowledge Base — Access to Knowledge Base is turned off for Zyra in this project.",
       "",
@@ -18409,6 +20082,7 @@ export class LegacyService implements OnModuleInit {
   // "I found nothing", and collapsing the two into one message would either overstate a weak match
   // as real coverage or understate a genuine (if imperfect) one as nothing at all.
   private static zyraWeakGroundingNote(count: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.weakGroundingNote(count);
     return [
       "⚠️ What I found in the project's knowledge base only loosely matches this request — not a strong enough match to call this real coverage.",
       "",
@@ -18492,7 +20166,23 @@ export class LegacyService implements OnModuleInit {
     return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
   }
 
+  // The English classification decides; a Russian session gets the same entry from ZYRA_RU.failure.
   private static zyraFailureCause(detail: string): { cause: string; advice: string } {
+    const english = LegacyService.zyraFailureCauseEn(detail);
+    if (zyraReplyLanguage() !== "ru") return english;
+    const key = (
+      {
+        "the AI's answer came back incomplete, so I couldn't read the test cases out of it": "truncated",
+        "the AI provider is rate-limiting this workspace right now": "rateLimited",
+        "the AI provider rejected the workspace's key": "badKey",
+        "the AI provider didn't answer in time": "timeout",
+        "no AI provider is configured for this workspace": "noProvider"
+      } as Record<string, keyof typeof ZYRA_RU.failure>
+    )[english.cause] ?? "generic";
+    return ZYRA_RU.failure[key];
+  }
+
+  private static zyraFailureCauseEn(detail: string): { cause: string; advice: string } {
     const text = String(detail || "").toLowerCase();
     if (/json|parse|truncat|unterminated|unexpected token|no testcase drafts|no drafts/.test(text)) {
       return {
@@ -18537,6 +20227,18 @@ export class LegacyService implements OnModuleInit {
     jiraCount: number;
     suiteName?: string | null;
   }): string {
+    if (zyraReplyLanguage() === "ru") {
+      const targetRu = input.requestedCount && input.requestedCount > 0 ? ZYRA_RU.attemptCount(input.requestedCount) : ZYRA_RU.attemptCountGeneric;
+      const sourcesRu = [
+        input.knowledgeCount ? ZYRA_RU.attemptKnowledge(input.knowledgeCount) : null,
+        input.jiraCount ? ZYRA_RU.attemptJira(input.jiraCount) : null
+      ].filter((s): s is string => Boolean(s));
+      return [
+        ZYRA_RU.attemptGenerate(targetRu),
+        input.suiteName ? ZYRA_RU.attemptForSuite(input.suiteName) : null,
+        sourcesRu.length ? ZYRA_RU.attemptFrom(sourcesRu) : ZYRA_RU.attemptFromRequestOnly
+      ].filter(Boolean).join(" ");
+    }
     const target = input.requestedCount && input.requestedCount > 0 ? `${input.requestedCount} test case(s)` : "test cases";
     const sources = [
       input.knowledgeCount ? `${input.knowledgeCount} knowledge-base item(s)` : null,
@@ -18557,6 +20259,7 @@ export class LegacyService implements OnModuleInit {
    */
   private static zyraFailureReply(attempt: string, detail: string, retried: boolean): string {
     const { cause, advice } = LegacyService.zyraFailureCause(detail);
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.failureReply(attempt, retried, cause, advice);
     return [
       "⚠️ I ran into a problem and couldn't finish this — **nothing was created or saved.**",
       "",
@@ -18664,6 +20367,13 @@ export class LegacyService implements OnModuleInit {
   private zyraMoveBreakdownSuffix(moveBreakdown: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }> | undefined): string {
     if (!moveBreakdown || !moveBreakdown.length) return "";
     const total = moveBreakdown.reduce((sum, entry) => sum + entry.count, 0);
+    if (zyraReplyLanguage() === "ru") {
+      const partsRu = moveBreakdown.map((entry) => {
+        const label = entry.created ? ZYRA_RU.moveSuiteCreated(entry.suiteName) : entry.suiteName;
+        return entry.count > 0 ? `${label}: ${entry.count}` : ZYRA_RU.moveNoneMatched(label);
+      });
+      return ZYRA_RU.movedToSuites(partsRu, total);
+    }
     const parts = moveBreakdown.map((entry) => {
       const label = entry.created ? `${entry.suiteName} (created)` : entry.suiteName;
       return entry.count > 0 ? `${label}: ${entry.count}` : `${label}: 0 (none matched)`;
@@ -18690,6 +20400,7 @@ export class LegacyService implements OnModuleInit {
   // success ("Created the Regression suite") never trips this on the word "suite" itself, while an
   // unrelated hallucinated testcase claim in the same reply still does.
   private zyraFalseCompletionBanner(reply: string, salvaged = false, claimPattern: RegExp = LegacyService.ZYRA_COMPLETION_CLAIM): string {
+    if (zyraReplyLanguage() === "ru") return this.zyraFalseCompletionBannerRu(reply, salvaged, claimPattern);
     if (!claimPattern.test(reply)) return "";
     if (!salvaged && LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
     return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
@@ -18713,7 +20424,25 @@ export class LegacyService implements OnModuleInit {
   private static readonly ZYRA_PERSISTED_CLAIM =
     /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|saved|archived|updated|deleted|removed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|saved|archived|updated|removed)\b|\b(test\s?cases?|suite)\b[^.!?\n,;]{0,10}\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s\w{1,12}\s)(created|added|saved|archived|updated|deleted|removed)\b/i;
 
+  /*
+   * A Russian session's reply is checked against BOTH languages: the Russian claim pattern for the
+   * Russian prose it was asked to write, and the English one in case the model answered in English
+   * anyway. Either language's disclosure phrases exempt it, exactly as in English.
+   */
+  private zyraFalseCompletionBannerRu(reply: string, salvaged: boolean, englishPattern: RegExp): string {
+    const folded = foldRu(reply);
+    if (!englishPattern.test(reply) && !ZYRA_RU_COMPLETION_CLAIM.test(folded)) return "";
+    if (!salvaged && (LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply) || ZYRA_RU_ALREADY_DISCLOSED.test(folded))) return "";
+    return ZYRA_RU.falseClaimBanner;
+  }
+
   private zyraPersistedClaimBanner(reply: string): string {
+    if (zyraReplyLanguage() === "ru") {
+      const folded = foldRu(reply);
+      const claims = LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || ZYRA_RU_COMPLETION_CLAIM.test(folded);
+      const disclosed = LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply) || ZYRA_RU_ALREADY_DISCLOSED.test(folded);
+      return claims && !disclosed ? ZYRA_RU.falseClaimBanner : "";
+    }
     if (!LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
     return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
   }
@@ -18751,6 +20480,11 @@ export class LegacyService implements OnModuleInit {
     const requested = decision.operations.filter((op) => op.type !== "create_suite").length;
     const appliedCount = applied.testcases.length;
 
+    const ru = zyraReplyLanguage() === "ru";
+    if (!appliedCount && ru) {
+      const detailRu = decision.operations.length ? ZYRA_RU.nothingSavedMissing : ZYRA_RU.nothingSavedNoOps;
+      return [ZYRA_RU.nothingSaved(detailRu), "", decision.reply].join("\n") + moveSuffix;
+    }
     if (!appliedCount) {
       const detail = decision.operations.length
         ? "The test cases it referred to do not exist in this project, so there was nothing to change."
@@ -18767,7 +20501,9 @@ export class LegacyService implements OnModuleInit {
     // no longer accurate even when every requested operation produced a row. Appended after the
     // model's own prose rather than replacing it, so the reply keeps whatever specifics it named.
     const proposedCount = applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length;
-    const reviewHint = proposedCount > 0
+    const reviewHint = proposedCount > 0 && ru
+      ? ZYRA_RU.reviewHint(proposedCount)
+      : proposedCount > 0
       ? `\n\n📝 ${proposedCount} of them ${proposedCount === 1 ? "is" : "are"} staged for your review — open the review panel to select, edit, or discard, then Save to add ${proposedCount === 1 ? "it" : "them"} to the repository. Nothing has been written to the repository yet.`
       : "";
 
@@ -18795,6 +20531,19 @@ export class LegacyService implements OnModuleInit {
       // The two shortfalls are independent and can both be true in the same turn (an update that
       // never resolved to a row, and a move that only partially matched its named ids) — state
       // whichever applies rather than picking one wording and silently dropping the other.
+      if (ru) {
+        // The activity reasons are English sentences from the activity log — not pasted into a
+        // Russian reply; the headline still states both shortfalls.
+        const headlineRu = [
+          appliedCount < requested ? ZYRA_RU.partialHeadline(appliedCount, requested) : "",
+          unresolvedMoves > 0 ? ZYRA_RU.partialUnresolvedMoves(unresolvedMoves) : ""
+        ].filter(Boolean).join(" ");
+        return bannerPrefix + [
+          `⚠️ ${headlineRu}` + (appliedCount < requested ? ZYRA_RU.partialRestNotDrafted : ""),
+          "",
+          decision.reply + reviewHint
+        ].join("\n") + moveSuffix;
+      }
       const headline = [
         appliedCount < requested ? `${appliedCount} of ${requested} test case operation(s) were drafted for review.` : "",
         unresolvedMoves > 0 ? `${unresolvedMoves} named test case(s) could not be moved.` : ""
@@ -18944,6 +20693,9 @@ export class LegacyService implements OnModuleInit {
     contextRefs?: ZyraTurnContextRefs;
   }): Promise<ZyraChatDecision> {
     const plan = this.chatTestcasePlan(params.message, params.projectTestcaseRange, params.routedCount);
+    // Read here rather than threaded down from the turn: this is the one function every interactive
+    // chat create (first try and the smaller retry) goes through, and it already has the session.
+    const language = await this.zyraSessionLanguage(params.projectId, params.sessionId);
     if (plan.testcaseRange === "all") {
       return this.startZyraChatPlan({
         projectId: params.projectId,
@@ -18963,7 +20715,8 @@ export class LegacyService implements OnModuleInit {
         bugs: params.bugs,
         trace: params.trace,
         knowledgeConfidence: params.knowledgeConfidence,
-        contextRefs: params.contextRefs
+        contextRefs: params.contextRefs,
+        language
       });
     }
     return this.generateZyraChatTestcasesWithAi({
@@ -18983,6 +20736,7 @@ export class LegacyService implements OnModuleInit {
       bugs: params.bugs,
       trace: params.trace,
       knowledgeConfidence: params.knowledgeConfidence,
+      language,
       ...plan
     });
   }
@@ -19165,7 +20919,13 @@ export class LegacyService implements OnModuleInit {
       reason: "No active testcase is linked to this Jira issue key."
     }));
     const coveragePct = totalTickets ? Math.round((coveredTickets / totalTickets) * 100) : 0;
-    const reply = totalTickets
+    const reply = zyraReplyLanguage() === "ru"
+      ? totalTickets
+        ? ZYRA_RU.jiraCoverage(totalTickets, coveredTickets, pendingTickets, linkedTestcases, coveragePct, Boolean(pendingTickets))
+        : connected
+          ? ZYRA_RU.jiraNotSynced
+          : ZYRA_RU.jiraNotConnected
+      : totalTickets
       ? [
           `I checked the Jira ticket cache and testcase links for this project.`,
           `Total Jira tickets: ${totalTickets}.`,
@@ -19190,6 +20950,11 @@ export class LegacyService implements OnModuleInit {
   }
 
   private defaultZyraReply(message: string, existingTestcases: ZyraGenerationInput["existingTestcases"]): string {
+    if (zyraReplyLanguage() === "ru") {
+      if (existingTestcases.length) return ZYRA_RU.defaultRelated(existingTestcases.length);
+      if (/\b(example|sample|for example|how would|how to)\b/i.test(message) || /(пример|как бы|как сделать)/i.test(message)) return ZYRA_RU.defaultExample;
+      return ZYRA_RU.defaultGeneric;
+    }
     if (existingTestcases.length) {
       return `I found ${existingTestcases.length} related testcase(s) in the repository context. At a high level, I would use them as reference coverage, then look for gaps around negative flows, boundaries, permissions, data state, and audit behavior. Ask me to show the related testcases if you want the table.`;
     }
@@ -19200,6 +20965,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private defaultReasoningSummary(existingCount: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.defaultReasoning(existingCount);
     return `Reviewed available knowledge-base notes, recent chat context, and ${existingCount} nearby testcase(s). Focused on coverage gaps, duplicate avoidance, edge cases, boundary values, permissions, data integrity, state transitions, and auditability.`;
   }
 
@@ -19292,6 +21058,10 @@ export class LegacyService implements OnModuleInit {
       preconditions: value.preconditions || "",
       expectedSummary: value.expectedSummary || value.description || "",
       stepsJson: value.stepsJson || value.stepsSummary || value.steps || "[]",
+      // Basecamp: "[Zyra] Edit Test Case View Is Missing Fields Available After Saving" — generation,
+      // staging and save all carry testData; this row (what the review editor is seeded from) was
+      // the one place it was dropped, so the editor had nothing to show.
+      testData: value.testData || "",
       // Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generation
       // and save already carry both fields correctly; this row is what the chat/task-board UI
       // actually renders, and it was rebuilding every field except these two. `?? null` (not `||`)
@@ -19324,6 +21094,7 @@ export class LegacyService implements OnModuleInit {
       preconditions: row.preconditions,
       description: row.description,
       stepsJson: row.steps,
+      testData: row.testData,
       severity: row.severity,
       component: row.component,
       sourceRefs: row.sourceRefs
@@ -19352,8 +21123,15 @@ export class LegacyService implements OnModuleInit {
     item.drafts = await Promise.all(rawDrafts.map((entry: Body) => this.normalizeAiTaskDraftEntry(entry)));
     item.jiraIssueKeys = normalizeJsonArray(row.jira_issue_keys);
     item.linearIssueKeys = normalizeJsonArray(row.linear_issue_keys);
+    item.notionPageIds = normalizeJsonArray(row.notion_page_ids);
     item.sources = normalizeJsonArray(row.source_summary);
     item.activities = normalizeJsonArray(row.activity_log);
+    // A Russian task's timeline and sources are rendered in Russian; the stored English is untouched
+    // (see zyra-task-activity-ru.ts). Every other task is returned exactly as before.
+    if (row.language === "ru") {
+      item.sources = item.sources.map((entry: Body) => localizeZyraTaskEntry(entry));
+      item.activities = item.activities.map((entry: Body) => localizeZyraTaskEntry(entry));
+    }
     item.tokenUsage = {
       input: Number(row.token_input || 0),
       output: Number(row.token_output || 0),

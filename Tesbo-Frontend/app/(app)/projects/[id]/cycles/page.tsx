@@ -28,7 +28,7 @@ import {
   deleteTestRun,
   listPlans,
   type TestRunListItem,
-  type TestEnvironmentSetting,
+  getTestRunEnvironments,
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
 import { useAppData } from "@/components/app/AppDataProvider";
@@ -99,10 +99,6 @@ function StatTile({ label, value, color }: { label: string; value: string; color
   );
 }
 
-type ProjectSettingsPayload = {
-  testRunEnvironments?: Array<{ name?: string; url?: string }>;
-};
-
 export default function TestRunsPage() {
   const params = useParams();
   const router = useRouter();
@@ -146,33 +142,7 @@ export default function TestRunsPage() {
     }
   }, [searchParams]);
 
-  function parseProjectSettings(raw: unknown): ProjectSettingsPayload {
-    if (typeof raw !== "string" || !raw.trim()) return {};
-    try {
-      const parsed = JSON.parse(raw) as ProjectSettingsPayload;
-      return parsed && typeof parsed === "object" ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-
-  function normalizeTestRunEnvironments(raw: unknown): TestEnvironmentSetting[] {
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .map((item) => {
-        const candidate = item as { name?: unknown; url?: unknown };
-        const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
-        const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
-        if (!name || !url) return null;
-        return { name, url };
-      })
-      .filter((item): item is TestEnvironmentSetting => item !== null);
-  }
-
-  const environmentOptions = useMemo(
-    () => normalizeTestRunEnvironments(parseProjectSettings(project.settings).testRunEnvironments),
-    [project]
-  );
+  const environmentOptions = useMemo(() => getTestRunEnvironments(project.settings), [project]);
   const canManageRuns = useMemo(() => {
     const myRole = typeof project.myRole === "string" ? project.myRole.toLowerCase() : "";
     return !myRole || ["owner", "admin", "manager"].includes(myRole);
@@ -623,7 +593,7 @@ export default function TestRunsPage() {
               {environmentOptions.length === 0 && (
                 <p className="mt-1 text-xs text-[var(--warning-foreground)]">
                   No environments configured. Add one in{" "}
-                  <Link href={`/projects/${projectId}/settings?tab=general`} className="underline">
+                  <Link href={`/projects/${projectId}/settings?tab=testRuns`} className="underline">
                     Project settings
                   </Link>
                   .

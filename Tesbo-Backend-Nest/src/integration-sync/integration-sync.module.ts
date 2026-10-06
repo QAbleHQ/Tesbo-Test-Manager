@@ -13,6 +13,8 @@ import {
   INTEGRATION_SYNC_NIGHTLY_JIRA_SCHEDULER_ID,
   INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB,
   INTEGRATION_SYNC_NIGHTLY_LINEAR_SCHEDULER_ID,
+  INTEGRATION_SYNC_NIGHTLY_NOTION_JOB,
+  INTEGRATION_SYNC_NIGHTLY_NOTION_SCHEDULER_ID,
   INTEGRATION_SYNC_QUEUE,
   INTEGRATION_SYNC_WATCHDOG_JOB,
   INTEGRATION_SYNC_WATCHDOG_SCHEDULER_ID,
@@ -69,6 +71,15 @@ export class IntegrationSyncModule implements OnModuleInit {
       )
       .then(() => this.logger.log(`Nightly Linear sync scheduler registered (${NIGHTLY_SYNC_CRON} ${NIGHTLY_SYNC_TZ}).`))
       .catch((err) => this.logger.warn(`Failed to register nightly Linear sync scheduler: ${err instanceof Error ? err.message : err}`));
+
+    await this.queue
+      .upsertJobScheduler(
+        INTEGRATION_SYNC_NIGHTLY_NOTION_SCHEDULER_ID,
+        { pattern: NIGHTLY_SYNC_CRON, tz: NIGHTLY_SYNC_TZ },
+        { name: INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, data: {} }
+      )
+      .then(() => this.logger.log(`Nightly Notion sync scheduler registered (${NIGHTLY_SYNC_CRON} ${NIGHTLY_SYNC_TZ}).`))
+      .catch((err) => this.logger.warn(`Failed to register nightly Notion sync scheduler: ${err instanceof Error ? err.message : err}`));
 
     // The periodic half of stuck-run recovery — failInterruptedRuns above only runs at boot, so
     // this is what catches a run that stalls without a restart (a hung DB/Redis call, a worker

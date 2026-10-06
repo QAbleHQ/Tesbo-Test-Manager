@@ -16,6 +16,7 @@ import { Button, Card, Modal, Input, Field, FieldLabel, StatusChip, CopyButton }
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { formatDate as formatDateShared } from "@/lib/date";
 
 type ConnectTab = "claudeCode" | "claudeDesktop" | "other";
 
@@ -28,7 +29,7 @@ function normalizeRole(role: string): "owner" | "manager" | "qa_engineer" {
 
 function formatDate(iso: string | null): string {
   if (!iso) return "Never";
-  return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  return formatDateShared(iso);
 }
 
 function scopeLabel(scopes: string[]): string {
@@ -66,8 +67,8 @@ const MCP_TOOL_GROUPS: Array<{ category: string; tools: Array<{ name: string; bl
       { name: "bulk_archive_testcases", blurb: "Archive many test cases in one call." },
       { name: "get_testcase_bugs", blurb: "Bugs linked to one test case." },
       { name: "get_testcase_executions", blurb: "A test case's run history across every cycle." },
-      { name: "link_requirement_to_testcase", blurb: "Attach a Jira/Linear ticket to a test case." },
-      { name: "unlink_requirement_from_testcase", blurb: "Remove a test case's Jira/Linear link." },
+      { name: "link_requirement_to_testcase", blurb: "Attach a Jira ticket, Linear ticket or Notion page to a test case." },
+      { name: "unlink_requirement_from_testcase", blurb: "Remove a test case's Jira, Linear or Notion link." },
     ],
   },
   {

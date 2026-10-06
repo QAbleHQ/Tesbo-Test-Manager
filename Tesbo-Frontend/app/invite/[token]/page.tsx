@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { Button, Card, CardBody, CardHeader, CardTitle } from "@/components/ui";
 import { BrandLogo } from "@/components/BrandLogo";
+import { formatDate } from "@/lib/date";
 
 function roleLabel(role: string): string {
   const n = (role ?? "").trim().toLowerCase();
@@ -182,7 +183,7 @@ export default function InviteAcceptancePage() {
                 )}
                 <p className="mt-1 text-xs text-[var(--ink-400)]">
                   Invite sent to {invite.email} · expires{" "}
-                  {new Date(invite.expiresAt).toLocaleDateString()}
+                  {formatDate(invite.expiresAt)}
                 </p>
               </div>
 

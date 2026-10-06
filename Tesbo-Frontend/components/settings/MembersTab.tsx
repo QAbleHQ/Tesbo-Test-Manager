@@ -27,6 +27,8 @@ import {
   ConfirmModal,
 } from "@/components/ui";
 import { useAppData } from "@/components/app/AppDataProvider";
+import { inviteRoleDescription, invitableRoleOptions } from "@/lib/workspaceRoles";
+import { formatDate } from "@/lib/date";
 
 // ─── Role helpers ─────────────────────────────────────────────────────────────
 
@@ -87,13 +89,7 @@ function InviteModal({ open, onClose, onInvited, callerRole, projects }: InviteM
     }
   }, [open]);
 
-  const roleOptions =
-    callerRole === "owner"
-      ? [
-          { value: "manager", label: "Manager" },
-          { value: "qa_engineer", label: "QA Engineer" },
-        ]
-      : [{ value: "qa_engineer", label: "QA Engineer" }];
+  const roleOptions = invitableRoleOptions(callerRole);
 
   function toggleProject(id: string) {
     setSelectedProjectIds((prev) =>
@@ -161,9 +157,7 @@ function InviteModal({ open, onClose, onInvited, callerRole, projects }: InviteM
             ))}
           </Select>
           <p className="mt-1 text-xs text-[var(--ink-400)]">
-            {role === "manager"
-              ? "Can create projects, invite QA Engineers, and manage assigned projects."
-              : "Can work inside assigned projects."}
+            {inviteRoleDescription(role)}
           </p>
         </Field>
 
@@ -393,7 +387,7 @@ export default function MembersTab() {
                         )}
                       </td>
                       <td className="text-[var(--ink-400)]">
-                        {m.joinedAt ? new Date(m.joinedAt).toLocaleDateString() : "—"}
+                        {m.joinedAt ? formatDate(m.joinedAt) : "—"}
                       </td>
                       <td className="text-right">
                         {canRemove && (
@@ -476,10 +470,10 @@ export default function MembersTab() {
                             {inv.invitedByName || inv.invitedByEmail || "—"}
                           </td>
                           <td className="text-[var(--ink-400)]">
-                            {new Date(inv.createdAt).toLocaleDateString()}
+                            {formatDate(inv.createdAt)}
                           </td>
                           <td className="text-[var(--ink-400)]">
-                            {new Date(inv.expiresAt).toLocaleDateString()}
+                            {formatDate(inv.expiresAt)}
                           </td>
                           <td>
                             <span className={statusBadgeClass(inv.status)}>

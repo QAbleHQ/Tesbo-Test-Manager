@@ -830,6 +830,10 @@ test.describe("account screen and password reset (UI)", () => {
 
     await userMenuTrigger(page).click();
     await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
+    // The menu item now asks first (TopBar.tsx's ConfirmModal); the dialog's own Logout button runs
+    // the unchanged useLogout flow. Modal renders without role="dialog", so it's reached by text.
+    await expect(page.getByText("Are you sure you want to log out?")).toBeVisible();
+    await page.getByRole("button", { name: "Logout", exact: true }).click();
 
     await page.waitForURL(/\/login/);
     const status = await page.evaluate(async () => (await fetch("/api/auth/me", { credentials: "include" })).status);

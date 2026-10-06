@@ -42,10 +42,11 @@ async function activeNavLabels(page: Page): Promise<string[]> {
 }
 
 /*
- * Logout and the theme toggle used to live in the sidebar footer too, with their own Yes/No
- * confirmation dialog. Both were removed from there once they became duplicates of the top-right
- * user menu (TopBar.tsx) — this is the one place either control exists now, so every test below
- * that used to drive the sidebar's copies goes through this menu instead.
+ * Logout and the theme toggle used to live in the sidebar footer too. Both were removed from there
+ * once they became duplicates of the top-right user menu (TopBar.tsx) — this is the one place either
+ * control exists now, so every test below that used to drive the sidebar's copies goes through this
+ * menu instead. The menu's Logout item opens a confirmation (ConfirmModal) whose own Logout button
+ * does the actual logout; Modal renders without role="dialog", so the dialog is reached by its text.
  */
 function userMenuTrigger(page: Page) {
   return page.getByRole("button", { name: "User menu" });
@@ -55,9 +56,19 @@ function userMenu(page: Page) {
   return page.locator('[role="menu"][aria-label="User menu"]');
 }
 
-async function logoutViaUserMenu(page: Page) {
+function logoutConfirmButton(page: Page) {
+  return page.getByRole("button", { name: /^(Logout|Logging out…)$/ });
+}
+
+async function openLogoutConfirm(page: Page) {
   await userMenuTrigger(page).click();
   await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
+  await expect(page.getByText("Are you sure you want to log out?")).toBeVisible();
+}
+
+async function logoutViaUserMenu(page: Page) {
+  await openLogoutConfirm(page);
+  await logoutConfirmButton(page).click();
 }
 
 test.describe("side navigation — workspace mode", () => {
@@ -546,10 +557,10 @@ test.describe("side navigation — behaviour", () => {
    * NAV-B-05/05b/05c/05d used to pin the sidebar footer's own theme toggle, Logout button, and its
    * Yes/No confirmation dialog (collapsed-rail usability, opening the dialog, dismissing it via No,
    * dismissing it via Escape — TES-TC-717/1345/1346/1347). All of that was removed from the sidebar
-   * once it became a duplicate of the top-right user menu (TopBar.tsx), which has no confirmation
-   * step at all — clicking Logout there logs out immediately (see ACU-20 in account.spec.ts). There
-   * is nothing left in the sidebar for those four tests to exercise, so they're gone rather than
-   * retargeted; the user menu's own open/close/keyboard behavior is covered by ACU-16/ACU-17 there.
+   * once it became a duplicate of the top-right user menu (TopBar.tsx), whose Logout item now opens
+   * its own confirmation (see ACU-20 in account.spec.ts). There is nothing left in the sidebar for
+   * those four tests to exercise, so they're gone rather than retargeted; the user menu's own
+   * open/close/keyboard behavior is covered by ACU-16/ACU-17 there.
    */
 
   test("NAV-B-06/09 logging out via the user menu ends the session and Back cannot resurrect it", async ({ browser }) => {
@@ -580,19 +591,19 @@ test.describe("side navigation — behaviour", () => {
     }
   });
 
-  test("NAV-B-07 a failed logout says so in the user menu and leaves Logout usable to retry", async ({ page }) => {
+  test("NAV-B-07 a failed logout says so in the logout dialog and leaves Logout usable to retry", async ({ page }) => {
     await page.goto("/projects");
     // Matched by predicate, not glob: the frontend posts to the backend origin (:1021) while the
     // page sits on :1020, and a relative glob is resolved against baseURL, so it never matches.
     await page.route((url) => url.pathname === "/api/auth/logout", (route) => route.abort("failed"));
 
-    await userMenuTrigger(page).click();
-    await userMenu(page).getByRole("menuitem", { name: "Logout" }).click();
+    await openLogoutConfirm(page);
+    await logoutConfirmButton(page).click();
 
-    // The menu is deliberately left open on failure, not dismissed, so the user can retry without
-    // reopening it (TopBar.tsx's Logout button only closes the menu on success, via the redirect).
-    await expect(userMenu(page).getByText("Could not log out. Please try again.")).toBeVisible();
-    await expect(userMenu(page).getByRole("menuitem", { name: "Logout" })).toBeEnabled();
+    // The dialog is deliberately left open on failure, not dismissed, so the user can retry without
+    // reopening it (only a successful logout leaves the page, via the redirect).
+    await expect(page.getByText("Could not log out. Please try again.")).toBeVisible();
+    await expect(logoutConfirmButton(page)).toBeEnabled();
     await expect(page).toHaveURL(/\/projects/);
   });
 
@@ -611,10 +622,10 @@ test.describe("side navigation — behaviour", () => {
       await route.continue();
     });
 
-    await userMenuTrigger(page).click();
-    const logoutItem = userMenu(page).getByRole("menuitem", { name: /^(Logout|Logging out…)$/ });
-    await logoutItem.click();
-    await logoutItem.click({ force: true }).catch(() => undefined);
+    await openLogoutConfirm(page);
+    const confirm = logoutConfirmButton(page);
+    await confirm.click();
+    await confirm.click({ force: true }).catch(() => undefined);
     await page.waitForURL("**/login");
 
     expect(logoutCalls).toBe(1);

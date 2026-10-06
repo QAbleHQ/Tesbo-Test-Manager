@@ -27,6 +27,18 @@ import { CustomFieldsService } from "../custom-fields/custom-fields.service";
 import { CustomFieldDefinitionDto, normalizeTestcaseHeader, RESERVED_TESTCASE_HEADERS } from "../custom-fields/custom-fields.types";
 import { ZyraProgressService } from "./zyra-progress.service";
 import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
+import {
+  collidesWithLocalizedHeader,
+  ExportLocale,
+  exportReportMetric,
+  exportReportSection,
+  exportSheetName,
+  exportValue,
+  ExportValueField,
+  localizeRows,
+  resolveExportLocale,
+  UTF8_BOM
+} from "../common/export-i18n";
 
 const TESTCASE_EXPORT_BASE_HEADERS = [
   "externalId",
@@ -66,6 +78,27 @@ const REPORT_EXPORT_VIEWS = ["overview", "execution", "matrix", "repository", "i
 type ReportExportView = (typeof REPORT_EXPORT_VIEWS)[number];
 
 const REPORT_LONG_HEADERS = ["section", "label", "metric", "value"];
+
+// Which columns of each generated file carry a fixed vocabulary that a non-English export translates
+// (see common/export-i18n.ts). Keyed by the internal column key; columns absent here pass through.
+const TESTCASE_EXPORT_VALUE_FIELDS: Partial<Record<string, ExportValueField>> = {
+  status: "testcaseStatus",
+  type: "type",
+  severity: "severity",
+  automationStatus: "automationStatus"
+};
+
+const CYCLE_EXPORT_VALUE_FIELDS: Partial<Record<string, ExportValueField>> = {
+  status: "executionStatus",
+  type: "type"
+};
+
+const REPORT_MATRIX_VALUE_FIELDS: Partial<Record<string, ExportValueField>> = {
+  testcaseStatus: "testcaseStatus",
+  runStatus: "runStatus",
+  executionStatus: "executionStatus",
+  bugStatus: "bugStatus"
+};
 
 const REPORT_EXECUTION_HEADERS = [
   "groupName",
@@ -140,9 +173,13 @@ export class LegacyController {
   // named "Title" or "externalId". Field creation now rejects new names like that (see
   // CustomFieldsService), but this stays as a defensive fallback for any field named that way
   // before the guard existed, so a generated file never has two columns that read as the same header.
-  private sampleColumnName(definition: CustomFieldDefinitionDto): string {
+  // A Russian template's base columns are Russian words, which normalizeTestcaseHeader folds to ""
+  // — so a custom field named e.g. "Статус" is checked against the localized headers as well.
+  private sampleColumnName(definition: CustomFieldDefinitionDto, locale: ExportLocale = "en", baseKeys: string[] = []): string {
     const name = this.sanitizeFormulaCell(definition.name);
-    return RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name)) ? `${name} (Custom Field)` : name;
+    if (RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name))) return `${name} (Custom Field)`;
+    if (collidesWithLocalizedHeader(locale, name, baseKeys)) return `${name} (Пользовательское поле)`;
+    return name;
   }
 
   // Builds a value that is valid for the definition's own config, so the template's worked example
@@ -186,6 +223,20 @@ export class LegacyController {
       default:
         return "";
     }
+  }
+
+  private exportLocale(req: AuthenticatedRequest, query: Record<string, any> = {}): ExportLocale {
+    return resolveExportLocale(req.headers["accept-language"], query.lang);
+  }
+
+  // A non-English CSV is prefixed with a UTF-8 BOM: without it Excel on Windows decodes the file in
+  // the ANSI codepage and every Cyrillic header and value reads as mojibake, and SheetJS (which the
+  // import modal parses uploads with) does the same. English files stay byte-for-byte what they
+  // were, BOM-less, for any parser that already reads them by their first header.
+  private sendCsv(res: Response, locale: ExportLocale, fileName: string, headers: string[], rows: Record<string, unknown>[]) {
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.send((locale === "en" ? "" : UTF8_BOM) + this.rowsToCsv(headers, rows));
   }
 
   private rowsToCsv(headers: string[], rows: Record<string, unknown>[]): string {
@@ -484,6 +535,11 @@ export class LegacyController {
   @Get("/api/projects/:projectId/testcases/linked-linear-keys")
   linkedLinearKeys(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
     return this.legacy.linkedLinearKeys(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/testcases/linked-notion-pages")
+  linkedNotionPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.linkedNotionPages(projectId, req.userId);
   }
 
   @Get("/api/projects/:projectId/testcases/:testcaseId")
@@ -852,6 +908,15 @@ export class LegacyController {
     return this.legacy.getBugForUser(req.userId, bugId);
   }
 
+  // Project-scoped (unlike /api/bugs/:bugId above) so the Bug Details page's shareable URL can
+  // carry the bug's external id (e.g. "PRO-BUG-12"), not just its uuid — the external id is only
+  // unique per project, so resolving it needs the project id from the URL. Read-only; existing
+  // mutation routes above are unaffected.
+  @Get("/api/projects/:projectId/bugs/:bugId")
+  getProjectBug(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("bugId") bugId: string) {
+    return this.legacy.getBugForUserByIdentifier(req.userId, projectId, bugId);
+  }
+
   @Patch("/api/bugs/:bugId")
   updateBug(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string, @Body() body: Record<string, any>) {
     return this.legacy.updateBug(req.userId, bugId, body);
@@ -870,6 +935,50 @@ export class LegacyController {
   @Delete("/api/bugs/:bugId/links/:linkId")
   removeBugLink(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string, @Param("linkId") linkId: string) {
     return this.legacy.removeBugLink(req.userId, bugId, linkId);
+  }
+
+  // Project-scoped (unlike the /api/bugs/:bugId routes above) so ProjectWriteLockGuard refuses a
+  // new comment on a read-only locked project while still letting it be read.
+  @Get("/api/projects/:projectId/bugs/:bugId/comments")
+  listBugComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("bugId") bugId: string) {
+    return this.legacy.listBugComments(projectId, req.userId, bugId);
+  }
+
+  // JSON, or multipart with `body` + `files` when the comment carries attachments. Multer passes a
+  // non-multipart request straight through, so the JSON contract is unchanged.
+  @Post("/api/projects/:projectId/bugs/:bugId/comments")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  createBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Body() body: Record<string, any>,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.createBugComment(projectId, req.userId, bugId, body, files);
+  }
+
+  @Patch("/api/projects/:projectId/bugs/:bugId/comments/:commentId")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  updateBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Param("commentId") commentId: string,
+    @Body() body: Record<string, any>,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.updateBugComment(projectId, req.userId, bugId, commentId, body, files);
+  }
+
+  @Delete("/api/projects/:projectId/bugs/:bugId/comments/:commentId")
+  deleteBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Param("commentId") commentId: string
+  ) {
+    return this.legacy.deleteBugComment(projectId, req.userId, bugId, commentId);
   }
 
   @Post("/api/projects/:projectId/bugs/:bugId/attachments")
@@ -913,10 +1022,10 @@ export class LegacyController {
   ) {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
     const rows = await this.legacy.exportTestCases(projectId, definitions, query);
-    const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", 'attachment; filename="testcases.csv"');
-    res.send(this.rowsToCsv(headers, rows));
+    const keys = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
+    const locale = this.exportLocale(req, query);
+    const localized = localizeRows(locale, keys, rows, TESTCASE_EXPORT_VALUE_FIELDS, keys.slice(TESTCASE_EXPORT_BASE_HEADERS.length));
+    this.sendCsv(res, locale, "testcases.csv", localized.headers, localized.rows);
   }
 
   @Get("/api/projects/:projectId/testcases/export/xlsx")
@@ -928,8 +1037,10 @@ export class LegacyController {
   ) {
     const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
     const rows = await this.legacy.exportTestCases(projectId, definitions, query);
-    const headers = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
-    await this.sendWorkbook(res, "testcases.xlsx", "Test Cases", rows, headers);
+    const keys = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
+    const locale = this.exportLocale(req, query);
+    const localized = localizeRows(locale, keys, rows, TESTCASE_EXPORT_VALUE_FIELDS, keys.slice(TESTCASE_EXPORT_BASE_HEADERS.length));
+    await this.sendWorkbook(res, "testcases.xlsx", exportSheetName(locale, "Test Cases"), localized.rows, localized.headers);
   }
 
   @Get("/api/projects/:projectId/testcases/import/template")
@@ -937,6 +1048,7 @@ export class LegacyController {
     @Req() req: AuthenticatedRequest,
     @Param("projectId") projectId: string,
     @Query("format") format: string | undefined,
+    @Query("lang") lang: string | undefined,
     @Res() res: Response
   ) {
     // The payload is a constant, but the route is project-scoped and only ever linked to from a
@@ -977,20 +1089,37 @@ export class LegacyController {
       automationStatus: "Not Automated",
       attachments: "Screenshot attached: successful-login.png"
     };
-    const headers = Object.keys(row);
-    for (const definition of definitions) {
-      const column = this.sampleColumnName(definition);
-      row[column] = this.sampleCustomFieldValue(definition);
-      headers.push(column);
+    const locale = this.exportLocale(req, { lang });
+    // The worked example is our own copy, not user data, so a Russian template gets a Russian one.
+    // The step DSL's "=>" and " | " separators and the "10m" duration are syntax, not prose.
+    if (locale === "ru") {
+      Object.assign(row, {
+        title: "Пример теста входа",
+        description: "Проверить, что пользователь с верными данными может войти.",
+        preconditions: "Учётная запись пользователя существует.",
+        postconditions: "Пользователь попадает на панель управления с активной сессией.",
+        steps:
+          "Открыть страницу входа => Отображается форма входа | Ввести верные учётные данные => Поля принимают ввод | Отправить форму => Пользователь перенаправлен на панель управления",
+        action: "Открыть страницу входа",
+        expectedResult: "Отображается форма входа",
+        suite: "Аутентификация",
+        component: "Вход",
+        attachments: "Приложен снимок экрана: successful-login.png"
+      });
     }
-    const rows = [row];
+    const baseKeys = Object.keys(row);
+    const keys = [...baseKeys];
+    for (const definition of definitions) {
+      const column = this.sampleColumnName(definition, locale, baseKeys);
+      row[column] = this.sampleCustomFieldValue(definition);
+      keys.push(column);
+    }
+    const localized = localizeRows(locale, keys, [row], TESTCASE_EXPORT_VALUE_FIELDS, keys.slice(baseKeys.length));
     if (format === "xlsx") {
-      await this.sendWorkbook(res, "testcase-import-template.xlsx", "Test Cases", rows, headers);
+      await this.sendWorkbook(res, "testcase-import-template.xlsx", exportSheetName(locale, "Test Cases"), localized.rows, localized.headers);
       return;
     }
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", 'attachment; filename="testcase-import-template.csv"');
-    res.send(this.rowsToCsv(headers, rows));
+    this.sendCsv(res, locale, "testcase-import-template.csv", localized.headers, localized.rows);
   }
 
   /*
@@ -1008,12 +1137,17 @@ export class LegacyController {
    */
 
   @Get("/api/cycles/:cycleId/export/csv")
-  async exportCycle(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Res() res: Response) {
+  async exportCycle(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
     const rows = await this.legacy.exportCycleExecutions(req.userId, cycleId);
-    const headers = ["externalId", "title", "status", "priority", "type", "actualResult", "executedAt", "defectKey", "defectUrl"];
-    res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", 'attachment; filename="test-run.csv"');
-    res.send(this.rowsToCsv(headers, rows));
+    const keys = ["externalId", "title", "status", "priority", "type", "actualResult", "executedAt", "defectKey", "defectUrl"];
+    const locale = this.exportLocale(req, query);
+    const localized = localizeRows(locale, keys, rows, CYCLE_EXPORT_VALUE_FIELDS);
+    this.sendCsv(res, locale, "test-run.csv", localized.headers, localized.rows);
   }
 
   @Get("/api/projects/:projectId/analytics")
@@ -1087,15 +1221,45 @@ export class LegacyController {
       });
     }
     const typedView = view as ReportExportView;
-    const { headers, rows } = await this.reportExportRows(req, projectId, typedView, query);
+    const locale = this.exportLocale(req, query);
+    const { headers: keys, rows: rawRows } = await this.reportExportRows(req, projectId, typedView, query);
+    const { headers, rows } = this.localizeReportRows(locale, typedView, keys, rawRows);
     const fileName = `report-${typedView}`;
     if (format === "csv") {
-      res.setHeader("Content-Type", "text/csv; charset=utf-8");
-      res.setHeader("Content-Disposition", `attachment; filename="${fileName}.csv"`);
-      res.send(this.rowsToCsv(headers, rows));
+      this.sendCsv(res, locale, `${fileName}.csv`, headers, rows);
       return;
     }
-    await this.sendWorkbook(res, `${fileName}.xlsx`, REPORT_VIEW_SHEET_NAMES[typedView], rows, headers);
+    await this.sendWorkbook(res, `${fileName}.xlsx`, exportSheetName(locale, REPORT_VIEW_SHEET_NAMES[typedView]), rows, headers);
+  }
+
+  // Applied after reportExportRows so the English file is built exactly as before and the
+  // translation is one pass over it. In the long-form views the section and metric columns are our
+  // own keys and are translated; the label column is user data (suite and run names) except where
+  // a section's labels are themselves a product vocabulary (byStatus), and the value column is data
+  // except for the two health labels the service computes.
+  private localizeReportRows(
+    locale: ExportLocale,
+    view: ReportExportView,
+    keys: string[],
+    rows: Record<string, unknown>[]
+  ): { headers: string[]; rows: Record<string, unknown>[] } {
+    if (locale === "en") return { headers: keys, rows };
+    if (view === "execution") return localizeRows(locale, keys, rows);
+    if (view === "matrix") return localizeRows(locale, keys, rows, REPORT_MATRIX_VALUE_FIELDS);
+    const translated = rows.map((row) => {
+      const section = String(row.section ?? "");
+      const metric = String(row.metric ?? "");
+      return {
+        section: exportReportSection(locale, section),
+        label: section === "byStatus" ? exportValue(locale, "testcaseStatus", row.label) : row.label,
+        metric: exportReportMetric(locale, metric),
+        value:
+          metric === "healthLabel" || metric === "flakinessLabel"
+            ? exportValue(locale, metric, row.value)
+            : row.value
+      };
+    });
+    return localizeRows(locale, keys, translated);
   }
 
   private longRow(section: string, label: string, metric: string, value: unknown): Record<string, unknown> {
@@ -1805,7 +1969,7 @@ export class LegacyController {
     return this.legacy.knowledgeItemFile(projectId, req.userId, itemId);
   }
 
-  // ── Workspace-scoped app integrations (Jira, Linear) ──
+  // ── Workspace-scoped app integrations (Jira, Linear, Notion) ──
   // Connecting/configuring an app is workspace-wide; see the project-scoped mapping/sync/ticket
   // routes further below for picking which remote project/team feeds a given Tesbo project.
 
@@ -1859,6 +2023,11 @@ export class LegacyController {
   @Get("/api/projects/:projectId/jira/tickets")
   jiraTickets(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
     return this.legacy.jiraTickets(projectId, req.userId, query);
+  }
+
+  @Get("/api/projects/:projectId/jira/tickets/:issueKey")
+  jiraTicketByKey(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("issueKey") issueKey: string) {
+    return this.legacy.jiraTicketByKey(projectId, req.userId, issueKey);
   }
 
   @Post("/api/projects/:projectId/jira/comment")
@@ -1920,7 +2089,45 @@ export class LegacyController {
     return this.legacy.linearSearchIssues(projectId, req.userId, query);
   }
 
-  // ── Requirements page: cross-source (Jira + Linear) aggregates ──
+  // ── Project-scoped Notion mapping/sync/pages ──
+  // One Notion database per Tesbo project; its pages are the tickets. Same shape as the Linear routes.
+
+  @Get("/api/projects/:projectId/notion/status")
+  notionStatus(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.notionStatus(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/notion/databases")
+  notionDatabases(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.notionDatabases(projectId, req.userId);
+  }
+
+  @Post("/api/projects/:projectId/notion/databases")
+  connectNotionDatabase(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.connectNotionDatabase(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/notion/sync")
+  syncNotion(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.syncNotion(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/notion/pages")
+  notionPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.notionPages(projectId, req.userId, query);
+  }
+
+  @Post("/api/projects/:projectId/notion/comment")
+  notionComment(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.notionComment(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/notion/search-pages")
+  notionSearchPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.notionSearchPages(projectId, req.userId, query);
+  }
+
+  // ── Requirements page: cross-source (Jira + Linear + Notion) aggregates ──
 
   @Get("/api/projects/:projectId/tickets/summary")
   requirementsSummary(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {

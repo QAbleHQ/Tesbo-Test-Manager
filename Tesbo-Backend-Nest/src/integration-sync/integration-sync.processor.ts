@@ -7,7 +7,13 @@ import { truncateForColumn } from "../common/integration-text.util";
 import { summarizeTextChange } from "../common/text-diff.util";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
-import { IntegrationConnectionInvalidError, IntegrationSyncClient, LinearEntityNotFoundError } from "./integration-sync.client";
+import {
+  IntegrationConnectionInvalidError,
+  IntegrationSyncClient,
+  LinearEntityNotFoundError,
+  NotionNotSharedError,
+  NotionPermissionError
+} from "./integration-sync.client";
 import { IntegrationSyncDecisions } from "./integration-sync-decisions";
 import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.builder";
 import { IntegrationSyncService } from "./integration-sync.service";
@@ -15,6 +21,7 @@ import {
   INTEGRATION_SYNC_CONCURRENCY,
   INTEGRATION_SYNC_NIGHTLY_JIRA_JOB,
   INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB,
+  INTEGRATION_SYNC_NIGHTLY_NOTION_JOB,
   INTEGRATION_SYNC_QUEUE,
   INTEGRATION_SYNC_RUN_JOB,
   INTEGRATION_SYNC_TICKET_JOB,
@@ -28,7 +35,7 @@ import { RemoteComment, RemoteTicket, SyncProvider, SyncRunJobPayload, SyncTicke
 type Row = Record<string, any>;
 
 /**
- * Per-provider column names. Jira and Linear keep separate ticket tables (their APIs and units of
+ * Per-provider column names. Jira, Linear and Notion keep separate ticket tables (their APIs and units of
  * work differ enough that forcing one shape on both was rejected in V47), so the shared pipeline
  * parameterises the column names instead. Every value here is a compile-time constant — never
  * user input — so interpolating them into SQL is safe.
@@ -70,6 +77,20 @@ const TICKET_TABLES: Record<SyncProvider, {
     // by Project.
     mappingSql: `SELECT linear_team_id AS remote_id, linear_team_key AS remote_key, linear_team_name AS remote_name, entity_type
                  FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
+  },
+  notion: {
+    table: "notion_pages",
+    connectionCol: "integration_connection_id",
+    issueIdCol: "notion_page_id",
+    issueKeyCol: "notion_page_key",
+    createdCol: "notion_created_at",
+    updatedCol: "notion_updated_at",
+    urlCol: "notion_url",
+    conflict: "(integration_connection_id, notion_page_id, project_id)",
+    // A Notion database has no short key, so its id doubles as remote_key (the run row's
+    // remote_project_key); remote_name is what the UI shows.
+    mappingSql: `SELECT notion_database_id AS remote_id, notion_database_id AS remote_key, notion_database_name AS remote_name
+                 FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
   }
 };
 
@@ -94,6 +115,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
     if (job.name === INTEGRATION_SYNC_TICKET_JOB) return this.processTicket(job.data as SyncTicketJobPayload);
     if (job.name === INTEGRATION_SYNC_NIGHTLY_JIRA_JOB) return this.processNightlyOrchestrator("jira");
     if (job.name === INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB) return this.processNightlyOrchestrator("linear");
+    if (job.name === INTEGRATION_SYNC_NIGHTLY_NOTION_JOB) return this.processNightlyOrchestrator("notion");
     if (job.name === INTEGRATION_SYNC_WATCHDOG_JOB) return this.runs.failStaleRuns();
     this.logger.warn(`Unknown integration-sync job name: ${job.name}`);
   }
@@ -151,7 +173,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
       const mapping = await this.db.query<{ remote_id: string; remote_key: string; remote_name: string; entity_type?: string }>(config.mappingSql, [projectId]);
       const remote = mapping.rows[0];
       if (!remote) {
-        await this.runs.failRun(runId, `No ${PROVIDER_FOLDER_NAMES[provider]} project is mapped to this project yet.`);
+        await this.runs.failRun(runId, `No ${PROVIDER_FOLDER_NAMES[provider]} ${provider === "notion" ? "database" : "project"} is mapped to this project yet.`);
         return;
       }
       // Runs record and show the mapped project name (V126), not the key — a Jira key ("KAN") is
@@ -191,9 +213,12 @@ export class IntegrationSyncProcessor extends WorkerHost {
         await this.runs.setTotals(runId, queued.length);
       };
 
-      const { truncated } = provider === "jira"
-        ? await this.client.fetchJiraTickets(connection, remote.remote_key, onPage, since)
-        : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since, remote.entity_type === "project" ? "project" : "team");
+      const { truncated } =
+        provider === "jira"
+          ? await this.client.fetchJiraTickets(connection, remote.remote_key, onPage, since)
+          : provider === "notion"
+            ? await this.client.fetchNotionPages(connection, remote.remote_id, onPage, since)
+            : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since, remote.entity_type === "project" ? "project" : "team");
 
       await this.runs.setTotals(runId, queued.length);
 
@@ -243,7 +268,9 @@ export class IntegrationSyncProcessor extends WorkerHost {
           ? `Sync run ${runId} could not use its ${provider} connection: ${message}`
           : err instanceof LinearEntityNotFoundError
             ? `Sync run ${runId} has a stale Linear mapping: ${message}`
-            : `Sync run ${runId} failed: ${message}`
+            : err instanceof NotionNotSharedError || err instanceof NotionPermissionError
+              ? `Sync run ${runId} cannot read its Notion database: ${message}`
+              : `Sync run ${runId} failed: ${message}`
       );
       await this.runs.failRun(runId, message);
     }
@@ -257,16 +284,20 @@ export class IntegrationSyncProcessor extends WorkerHost {
     mappedRemoteId: string
   ): Promise<string> {
     const c = TICKET_TABLES[provider];
+    // Notion differs in two ways. Its page body is read later, in the per-ticket job, so a re-sync must
+    // not blank the description it already holds (the conflict branch leaves it alone). And it also
+    // stores the rendered properties and the archived flag.
+    const isNotion = provider === "notion";
     const res = await this.db.query<{ id: string }>(
       `INSERT INTO ${c.table} (
          project_id, ${c.connectionCol}, ${c.issueIdCol}, ${c.issueKeyCol}, summary, description,
-         issue_type, status, priority, assignee, reporter, labels, ${c.createdCol}, ${c.updatedCol}, ${c.urlCol}, synced_at, mapped_remote_id
+         issue_type, status, priority, assignee, reporter, labels, ${c.createdCol}, ${c.updatedCol}, ${c.urlCol}, synced_at, mapped_remote_id${isNotion ? ", properties_json, archived" : ""}
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),$16)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),$16${isNotion ? ", $17::jsonb, $18" : ""})
        ON CONFLICT ${c.conflict} DO UPDATE SET
          ${c.issueKeyCol} = EXCLUDED.${c.issueKeyCol},
          summary = EXCLUDED.summary,
-         description = EXCLUDED.description,
+         ${isNotion ? "properties_json = EXCLUDED.properties_json, archived = EXCLUDED.archived," : "description = EXCLUDED.description,"}
          issue_type = EXCLUDED.issue_type,
          status = EXCLUDED.status,
          priority = EXCLUDED.priority,
@@ -298,7 +329,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
         ticket.createdAt,
         ticket.updatedAt,
         truncateForColumn(ticket.url, 1024),
-        mappedRemoteId
+        mappedRemoteId,
+        ...(isNotion ? [JSON.stringify(ticket.properties || {}), ticket.archived === true] : [])
       ]
     );
     return res.rows[0].id;
@@ -336,6 +368,11 @@ export class IntegrationSyncProcessor extends WorkerHost {
 
     const connection = await this.client.loadConnection(organizationId, provider);
     if (!connection) throw new Error(`${provider} connection disappeared mid-run`);
+
+    // A Notion page's body is read here, per ticket, with the same tolerance as comments: a failed
+    // read reuses the body already cached on the row rather than failing the ticket or blanking the
+    // mirrored document.
+    if (provider === "notion") ticket.description = await this.notionDescription(connection, c.table, ticketId, ticket.issueId, row);
 
     // Comment fetch failures are tolerated: a document with a stale (or absent) Comments section
     // still beats failing the ticket and leaving nothing in the Knowledge Base.
@@ -460,6 +497,19 @@ export class IntegrationSyncProcessor extends WorkerHost {
       comments: comments.length,
       decisions: summarized && decisionSummary ? 1 : 0
     });
+  }
+
+  private async notionDescription(connection: Row, table: string, ticketId: string, pageId: string, row: Row): Promise<string> {
+    let body = String(row.description || "");
+    try {
+      body = await this.client.fetchNotionBody(connection, pageId);
+      if (body !== String(row.description || "")) {
+        await this.db.query(`UPDATE ${table} SET description = $2 WHERE id = $1`, [ticketId, body]);
+      }
+    } catch (err) {
+      this.logger.warn(`Body fetch failed for Notion page ${pageId}, reusing cached: ${err instanceof Error ? err.message : err}`);
+    }
+    return IntegrationSyncClient.composeNotionDescription(row.properties_json, body);
   }
 
   private storedComments(row: Row): RemoteComment[] {

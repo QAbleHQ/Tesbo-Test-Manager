@@ -349,3 +349,48 @@ describe("IntegrationSyncService#failStaleRuns — periodic watchdog for a run s
     expect(store[0].status).toBe("running");
   });
 });
+
+describe("IntegrationSyncService#listNightlySyncTargets, notion", () => {
+  function nightlyService(isIntegrationAllowed: jest.Mock) {
+    const query = jest.fn().mockResolvedValue({
+      rows: [
+        { organization_id: "org-1", project_id: "p1", remote_key: "db-1" },
+        { organization_id: "org-2", project_id: "p2", remote_key: "db-2" }
+      ]
+    });
+    const service = new IntegrationSyncService({} as unknown as Queue, { query } as unknown as DatabaseService, { isIntegrationAllowed } as unknown as PlanLimitsService);
+    return { service, query };
+  }
+
+  it("reads notion_project_mappings keyed by database id and passes each workspace through the entitlement check", async () => {
+    const isIntegrationAllowed = jest.fn(async (orgId: string) => orgId === "org-1");
+    const { service, query } = nightlyService(isIntegrationAllowed);
+    const targets = await service.listNightlySyncTargets("notion");
+    expect(targets).toEqual([{ organizationId: "org-1", projectId: "p1", remoteKey: "db-1" }]);
+    expect(isIntegrationAllowed).toHaveBeenCalledWith("org-1", "notion");
+    const sql = String(query.mock.calls[0][0]);
+    expect(sql).toContain("notion_project_mappings");
+    expect(sql).toContain("m.notion_database_id AS remote_key");
+    expect(sql).toContain("m.integration_connection_id");
+  });
+
+  it("does not entitlement-check jira, and checks linear under its own name", async () => {
+    const isIntegrationAllowed = jest.fn().mockResolvedValue(true);
+    const { service } = nightlyService(isIntegrationAllowed);
+    await service.listNightlySyncTargets("jira");
+    expect(isIntegrationAllowed).not.toHaveBeenCalled();
+    await service.listNightlySyncTargets("linear");
+    expect(isIntegrationAllowed).toHaveBeenCalledWith("org-1", "linear");
+  });
+});
+
+describe("IntegrationSyncService#startRun, notion", () => {
+  it("records the mapped database name on the run", async () => {
+    const { db } = makeRunsDb([]);
+    const queue = { add: jest.fn().mockResolvedValue(undefined) } as unknown as Queue;
+    const service = new IntegrationSyncService(queue, db, {} as unknown as PlanLimitsService);
+    await service.startRun("org-1", "proj-1", "notion", "user-1", "db-1");
+    const insertSql = (db.query as jest.Mock).mock.calls.map((c) => String(c[0])).find((s) => s.includes("INSERT INTO integration_sync_runs"))!;
+    expect(insertSql).toContain("SELECT notion_database_name FROM notion_project_mappings");
+  });
+});

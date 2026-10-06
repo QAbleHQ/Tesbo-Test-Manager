@@ -9,6 +9,7 @@ import { useTopBarSlots } from "@/components/TopBarSlots";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useLogout } from "@/lib/useLogout";
 import ThemeToggle from "@/components/ThemeToggle";
+import { ConfirmModal } from "@/components/ui";
 
 const MAX_RESULTS = 8;
 
@@ -60,7 +61,16 @@ export default function TopBar() {
 
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const userMenuRef = useRef<HTMLDivElement>(null);
-  const { isLoggingOut, error: logoutError, logout: onLogout } = useLogout();
+  const { isLoggingOut, error: logoutError, logout: onLogout, resetError: resetLogoutError } = useLogout();
+  // Logout asks first. The menu item only opens this dialog; its Logout button runs useLogout's
+  // flow unchanged. Dismissal (Cancel / Esc / backdrop / close) is ignored mid-request by
+  // ConfirmModal itself, since pulling the dialog out from under an in-flight logout would strand it.
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
+  const closeLogoutConfirm = () => {
+    if (isLoggingOut) return;
+    setLogoutConfirmOpen(false);
+    resetLogoutError();
+  };
 
   // Only used for the tooltip text on the search button — the ⌘K/Ctrl+K shortcut itself works on
   // every platform regardless. Resolved after mount so SSR and the first client render still match.
@@ -427,35 +437,44 @@ export default function TopBar() {
               <button
                 type="button"
                 role="menuitem"
-                disabled={isLoggingOut}
                 /*
-                 * Deliberately not closing the menu here: a successful logout redirects to /login,
-                 * which unmounts this menu anyway, but a failed one leaves the user on the same page
-                 * with useLogout's error set — closing the menu on click would hide that error and
-                 * the retry affordance right along with it, the same silent-failure gap that keeping
-                 * the old sidebar's confirmation dialog open on failure was there to avoid.
+                 * Opens the logout confirmation rather than logging out directly — the menu closes so
+                 * the dialog stands alone; a failed logout is reported inside that dialog, which stays
+                 * open with Logout enabled to retry.
                  *
                  * Styled as a destructive action throughout — red label at rest (text-[var(--error-
                  * foreground)]) AND a red-tinted hover (bg-[var(--error-soft)] instead of the neutral
                  * hover every other item uses) — the same convention as Button's own "danger" variant,
                  * so Logout reads unmistakably differently from "My Account" in every state.
                  */
-                onClick={() => void onLogout()}
-                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--error-foreground)] transition-colors hover:bg-[var(--error-soft)] disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  resetLogoutError();
+                  setLogoutConfirmOpen(true);
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--error-foreground)] transition-colors hover:bg-[var(--error-soft)]"
               >
                 <IconLogout size={16} stroke={1.75} className="shrink-0" />
-                {isLoggingOut ? "Logging out…" : "Logout"}
+                Logout
               </button>
-              {logoutError && (
-                <p role="none" className="px-2.5 pb-1.5 pt-1 text-[13px] text-[var(--error-foreground)]">
-                  {logoutError}
-                </p>
-              )}
             </div>
           )}
         </div>
       </div>
       </div>
+      <ConfirmModal
+        open={logoutConfirmOpen}
+        title="Log out"
+        message="Are you sure you want to log out?"
+        confirmLabel="Logout"
+        cancelLabel="Cancel"
+        confirmVariant="destructive"
+        loading={isLoggingOut}
+        loadingLabel="Logging out…"
+        error={logoutError}
+        onConfirm={() => void onLogout()}
+        onCancel={closeLogoutConfirm}
+      />
     </header>
   );
 }

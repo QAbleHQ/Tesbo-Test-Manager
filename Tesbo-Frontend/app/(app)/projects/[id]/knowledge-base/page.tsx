@@ -45,12 +45,15 @@ import {
   type KnowledgeBreadcrumbEntry,
   type KnowledgeFile,
   type KnowledgeBaseSummary,
+  integrationProviderLabel,
 } from "@/lib/api";
 import { Button, Input, Textarea, Modal, Field, FieldLabel, FieldError, PageLoader, StatusChip, EmptyStateBlock } from "@/components/ui";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import FileViewerModal from "@/components/knowledge-base/FileViewerModal";
+import { markdownToDocument } from "@/components/knowledge-base/editorExtensions";
+import { looksLikeMarkdown } from "@/components/knowledge-base/markdownPaste";
 import { Menu, MenuItem } from "@/components/knowledge-base/Menu";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -68,6 +71,7 @@ import {
 } from "@/lib/validation";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+import { formatDate as formatDateShared } from "@/lib/date";
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
@@ -237,7 +241,7 @@ function formatDate(value: string): string {
   const date = new Date(value);
   const now = new Date();
   if (date.toDateString() === now.toDateString()) return "Today";
-  return date.toLocaleDateString();
+  return formatDateShared(date);
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -1230,17 +1234,28 @@ function KnowledgeBasePageInner() {
     setSaving(true);
     setError(null);
     try {
-      const content =
-        template.key === "blank" && blankContent
-          ? doc(...blankContent.split(/\n+/).map((line) => paragraph(line)).filter((p) => p.content))
-          : template.content;
+      let body: { contentJson?: unknown; contentHtml?: string; contentText?: string };
+      if (template.key === "blank" && blankContent && looksLikeMarkdown(blankContent)) {
+        // The Content box is plain text, so Markdown typed or pasted into it (# headings, * lists,
+        // **bold**) is parsed into real formatting here — otherwise it was stored verbatim.
+        const parsed = markdownToDocument(blankContent);
+        body = { contentJson: parsed.json, contentHtml: parsed.html, contentText: parsed.text };
+      } else {
+        const content =
+          template.key === "blank" && blankContent
+            ? doc(...blankContent.split(/\n+/).map((line) => paragraph(line)).filter((p) => p.content))
+            : template.content;
+        body = {
+          contentJson: content || undefined,
+          contentHtml: content ? docNodeToHtml(content) : undefined,
+          contentText: content ? docNodeToText(content) : undefined,
+        };
+      }
       const created = await createKnowledgeDocument(projectId, {
         folderId: selectedFolderId,
         title,
         documentType: template.documentType,
-        contentJson: content || undefined,
-        contentHtml: content ? docNodeToHtml(content) : undefined,
-        contentText: content ? docNodeToText(content) : undefined,
+        ...body,
       });
       if (template.key === "blank") {
         try {
@@ -1663,9 +1678,7 @@ function KnowledgeBasePageInner() {
                       // origin are visible without opening the document.
                       const syncedFrom =
                         item.type === "document" && (item as { sourceRole?: string }).sourceRole === "mirror"
-                          ? (item as { sourceProvider?: string }).sourceProvider === "linear"
-                            ? "Linear"
-                            : "Jira"
+                          ? integrationProviderLabel((item as { sourceProvider?: string }).sourceProvider)
                           : null;
                       const syncedBy = (item as { syncedByName?: string }).syncedByName;
                       return (

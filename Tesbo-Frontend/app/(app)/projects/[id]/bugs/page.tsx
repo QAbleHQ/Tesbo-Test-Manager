@@ -1,21 +1,18 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { IconPencil, IconTrash } from "@tabler/icons-react";
+import { IconPencil, IconShare2, IconTrash } from "@tabler/icons-react";
 import {
   listBugs,
   createBug,
-  updateBug,
   deleteBug,
   getJiraStatus,
   getLinearStatus,
   uploadBugAttachments,
-  deleteBugAttachment,
-  getBugAttachmentDownloadUrl,
   listTestRuns,
   type BugItem,
-  type BugAttachment,
   type BugSeverity,
   type BugPriority,
   type IssueSearchResult,
@@ -23,26 +20,37 @@ import {
 import {
   Button,
   Card,
+  CopyButton,
   Input,
+  Drawer,
   Field,
   FieldLabel,
   Modal,
   PageLoader,
   Textarea,
   Select,
-  StatusChip,
-  PriorityBadge,
-  SeverityBadge,
 } from "@/components/ui";
 import { PageHeader, ListWorkspaceLayout, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
-import { avatarColor } from "@/lib/avatarColors";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
 import TrackingDestinationField, { type TrackingDestination } from "@/components/TrackingDestinationField";
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import IssuePickerModal from "@/components/IssuePickerModal";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
+import { formatDate } from "@/lib/date";
+import {
+  BUG_PRIORITIES,
+  BUG_SEVERITIES,
+  BUG_STATUSES,
+  BugAssignee,
+  BugPriorityBadge,
+  BugSeverityBadge,
+  BugStatusBadge,
+  MemberAvatar,
+} from "@/components/bugs/BugBadges";
+import BugDiscussion from "@/components/bugs/BugDiscussion";
+import BugDetailsBody from "@/components/bugs/BugDetailsBody";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 interface BugsData {
@@ -51,65 +59,7 @@ interface BugsData {
 
 type ViewMode = "kanban" | "list";
 
-const BUG_STATUSES = ["Open", "In Progress", "Reopened", "Closed"] as const;
-const BUG_SEVERITIES: BugSeverity[] = ["Critical", "High", "Medium", "Low"];
-/*
- * Basecamp 10226247009 — severity says how bad the defect is, priority says how soon it is worked
- * on. P0..P3 mirrors how test cases already express priority and stays visually distinct from
- * severity's words, so a row reading "Critical · P3" is unambiguous. Empty means untriaged.
- */
-const BUG_PRIORITIES: BugPriority[] = ["P0", "P1", "P2", "P3"];
-
-function BugPriorityBadge({ priority }: { priority: BugPriority | null }) {
-  if (!priority) return <span className="text-xs text-[var(--muted-soft)]">—</span>;
-  return <PriorityBadge priority={priority} />;
-}
-
-/* ───── Assignee avatar ─────
- * Seeded on the assignee's id, not their name, matching the same convention used for executions
- * (cycles/[cycleId]/page.tsx) so a person keeps the same colour everywhere they're shown assigned.
- */
-function getInitials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "U";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return `${parts[0][0] ?? ""}${parts[1][0] ?? ""}`.toUpperCase();
-}
-
-function MemberAvatar({ name, seed, size = 20 }: { name: string; seed?: string | null; size?: number }) {
-  return (
-    <span
-      className="inline-flex shrink-0 items-center justify-center rounded-full border-2 border-[var(--surface)] font-semibold text-white"
-      style={{ background: avatarColor(seed || name), width: size, height: size, fontSize: size * 0.42 }}
-      title={name}
-    >
-      {getInitials(name)}
-    </span>
-  );
-}
-
-function BugAssignee({ id, name }: { id: string | null; name: string | null }) {
-  if (!id) return <span className="text-xs text-[var(--muted-soft)]">Unassigned</span>;
-  // Assigned, but the join in bugSelect turned up no actor_profiles row (a deleted actor). Still a
-  // real assignment — distinct from Unassigned — just with nothing to render a name or colour from.
-  if (!name) return <span className="text-xs text-[var(--muted-soft)]">Unknown assignee</span>;
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <MemberAvatar name={name} seed={id} size={20} />
-      <span className="text-xs text-[var(--muted)] truncate max-w-[120px]" title={name}>
-        {name}
-      </span>
-    </span>
-  );
-}
 const PAGE_SIZE = 15;
-
-const STATUS_TONE: Record<string, "error" | "success" | "info" | "warning"> = {
-  Open: "error",
-  Closed: "success",
-  "In Progress": "info",
-  Reopened: "warning",
-};
 
 const STATUS_COLOR: Record<string, string> = {
   Open: "var(--error)",
@@ -118,16 +68,11 @@ const STATUS_COLOR: Record<string, string> = {
   Closed: "var(--success)",
 };
 
-/* ───── Status badge ───── */
-function BugStatusBadge({ status }: { status: string }) {
-  return (
-    <StatusChip tone={STATUS_TONE[status] || "error"}>{status}</StatusChip>
-  );
-}
-
-/* ───── Severity badge ───── */
-function BugSeverityBadge({ severity }: { severity: BugSeverity }) {
-  return <SeverityBadge severity={severity} />;
+/** The Bug Details page's own shareable URL — keyed on the bug's unique id, not its uuid, so the
+ *  copied link stays readable and stable even after a reporting/import round trip. */
+function bugShareUrl(projectId: string, externalId: string): string {
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  return `${origin}/projects/${projectId}/bugs/${externalId}`;
 }
 
 /* ───── View toggle buttons ───── */
@@ -173,11 +118,13 @@ function ViewToggle({
 /* ───── Kanban card ───── */
 function KanbanCard({
   bug,
+  projectId,
   onView,
   onEdit,
   onDelete,
 }: {
   bug: BugItem;
+  projectId: string;
   onView: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -197,7 +144,17 @@ function KanbanCard({
     >
       <div className="flex items-start justify-between gap-2 mb-2">
         <div className="min-w-0">
-          <p className="font-mono text-[11px] text-[var(--muted-soft)]">{bug.integrationIssueKey || bug.externalId}</p>
+          {/* The bug's own unique id, always — not the linked Jira/Linear ticket key (that still
+              shows in the details body's tracker link). Navigates straight to the shareable Bug
+              Details URL; stopPropagation keeps it from also firing the card's own onView
+              (open-in-drawer) click. */}
+          <Link
+            href={`/projects/${projectId}/bugs/${bug.externalId}`}
+            onClick={(e) => e.stopPropagation()}
+            className="block font-mono text-[11px] text-[var(--muted-soft)] hover:text-[var(--accent-light)] hover:underline"
+          >
+            {bug.externalId}
+          </Link>
           <h4 className="text-sm font-medium text-[var(--foreground)] leading-snug line-clamp-2 break-words">
             {bug.title}
           </h4>
@@ -279,7 +236,7 @@ function KanbanCard({
         <div className="flex items-center gap-1.5">
           {bug.assigneeId && bug.assigneeName && <MemberAvatar name={bug.assigneeName} seed={bug.assigneeId} size={16} />}
           <span className="text-[10px] text-[var(--muted-soft)]">
-            {new Date(bug.createdAt).toLocaleDateString()}
+            {formatDate(bug.createdAt)}
           </span>
         </div>
       </div>
@@ -291,12 +248,14 @@ function KanbanCard({
 function KanbanColumn({
   status,
   bugs,
+  projectId,
   onView,
   onEdit,
   onDelete,
 }: {
   status: string;
   bugs: BugItem[];
+  projectId: string;
   onView: (b: BugItem) => void;
   onEdit: (b: BugItem) => void;
   onDelete: (id: string) => void;
@@ -322,6 +281,7 @@ function KanbanColumn({
             <KanbanCard
               key={b.id}
               bug={b}
+              projectId={projectId}
               onView={() => onView(b)}
               onEdit={() => onEdit(b)}
               onDelete={() => onDelete(b.id)}
@@ -461,7 +421,7 @@ export default function BugsPage() {
   const [createTitle, setCreateTitle] = useState("");
   const [createDesc, setCreateDesc] = useState("");
   const [createPriority, setCreatePriority] = useState<BugPriority | "">("");
-  const [createSeverity, setCreateSeverity] = useState<BugSeverity>("Medium");
+  const [createSeverity, setCreateSeverity] = useState<BugSeverity | "">("");
   const [createLinks, setCreateLinks] = useState<LinkRow[]>([]);
   const [createDestination, setCreateDestination] = useState<TrackingDestination>("TESBO");
   const [createSelfSystem, setCreateSelfSystem] = useState<SelfLoggedSystem>("OTHER");
@@ -497,45 +457,6 @@ export default function BugsPage() {
    */
   const createdBugIdRef = useRef<string | null>(null);
 
-  /* edit modal */
-  const [editBug, setEditBug] = useState<BugItem | null>(null);
-  const [editTitle, setEditTitle] = useState("");
-  const [editDesc, setEditDesc] = useState("");
-  const [editPriority, setEditPriority] = useState<BugPriority | "">("");
-  const [editSeverity, setEditSeverity] = useState<BugSeverity>("Medium");
-  const [editLinks, setEditLinks] = useState<LinkRow[]>([]);
-  const [editDestination, setEditDestination] = useState<TrackingDestination>("TESBO");
-  const [editSelfSystem, setEditSelfSystem] = useState<SelfLoggedSystem>("OTHER");
-  const [editUrl, setEditUrl] = useState("");
-  // The Jira/Linear ticket currently linked to the bug being edited, so Edit Bug can offer a
-  // searchable picker (reusing IssuePickerModal) instead of a plain URL box for those systems.
-  const [editSelectedIssue, setEditSelectedIssue] = useState<IssueSearchResult | null>(null);
-  const [editIssuePickerOpen, setEditIssuePickerOpen] = useState(false);
-
-  // Switching which system (Jira/Linear/Other) is selected has to drop a previously-picked issue
-  // that belongs to a different provider — otherwise a Jira key saved while Linear is selected
-  // would be submitted under integrationProvider: "LINEAR", and the stale ticket would also leak
-  // into the Linear picker's result list (it's kept "selected" there purely by key match failing
-  // to exclude it).
-  function handleEditSystemChange(system: SelfLoggedSystem) {
-    setEditSelfSystem(system);
-    setEditSelectedIssue((prev) => {
-      if (prev && prev.provider !== system) {
-        // The URL field tracked the old provider's ticket — clear it along with the pick so a
-        // Jira browse link can't linger under integrationProvider: "LINEAR" (or "OTHER").
-        setEditUrl("");
-        return null;
-      }
-      return prev;
-    });
-  }
-  const [editEvidenceMode, setEditEvidenceMode] = useState<EvidenceMode>("FILES");
-  const [editStagedFiles, setEditStagedFiles] = useState<File[]>([]);
-  const [editAttachments, setEditAttachments] = useState<BugAttachment[]>([]);
-  const [editBetterbugsUrl, setEditBetterbugsUrl] = useState("");
-  const [editStatus, setEditStatus] = useState("");
-  const [editAssigneeId, setEditAssigneeId] = useState("");
-  const [saving, setSaving] = useState(false);
   /*
    * Basecamp 10226296533: createBug/updateBug succeeded, uploadBugAttachments then threw, and the
    * throw went nowhere — `finally` cleared the spinner but the modal stayed open unchanged with no
@@ -544,7 +465,6 @@ export default function BugsPage() {
    * verbatim: it names the file.
    */
   const [createError, setCreateError] = useState<string | null>(null);
-  const [editError, setEditError] = useState<string | null>(null);
 
   /* detail view modal */
   const [viewBug, setViewBug] = useState<BugItem | null>(null);
@@ -663,7 +583,7 @@ export default function BugsPage() {
     setCreateError(null);
     setCreateTitle("");
     setCreateDesc("");
-    setCreateSeverity("Medium");
+    setCreateSeverity("");
     setCreatePriority("");
     setCreateLinks([]);
     setCreateDestination("TESBO");
@@ -694,7 +614,8 @@ export default function BugsPage() {
         const bug = await createBug(projectId, {
           title: createTitle.trim(),
           description: createDesc.trim(),
-          severity: createSeverity,
+          // Not selected is stored as no severity (V130), the same as an untriaged priority.
+          severity: createSeverity || undefined,
           priority: createPriority || null,
           assigneeId: createAssigneeId || null,
           externalUrl: selfLogged ? createUrl.trim() : undefined,
@@ -729,90 +650,13 @@ export default function BugsPage() {
     }
   }
 
-  /* open edit */
+  /*
+   * The pencil on a List row or a Board card opens the full bug page straight into its in-place
+   * edit form, as the side panel's Edit button does, rather than the Edit Bug dialog — one place
+   * to edit a bug, with its comments and history beside the form.
+   */
   function openEdit(bug: BugItem) {
-    setEditBug(bug);
-    setEditTitle(bug.title);
-    setEditDesc(bug.description);
-    setEditSeverity(bug.severity);
-    setEditPriority(bug.priority ?? "");
-    setEditLinks(
-      bug.links.map((link) => ({
-        cycleId: link.cycleId || "",
-        cycleName: link.cycleName || "",
-        testcaseId: link.testcaseId || "",
-        testcaseTitle: link.testcaseTitle || "",
-        executionId: link.executionId || undefined,
-      }))
-    );
-    setEditDestination(bug.externalUrl ? "SELF" : "TESBO");
-    // updateBug/createBug store integrationProvider verbatim — unlike severity/priority, there is
-    // no backend normalization — so a value ever written as "jira"/"Jira" instead of "JIRA" (an
-    // older client, a hand-crafted API call) has to still be recognized here, or a bug with a
-    // perfectly real Jira/Linear link falls through to "Other".
-    const normalizedProvider = bug.integrationProvider?.toUpperCase();
-    const detectedProvider: SelfLoggedSystem =
-      normalizedProvider === "JIRA" || normalizedProvider === "LINEAR" ? normalizedProvider : "OTHER";
-    setEditSelfSystem(detectedProvider);
-    setEditUrl(bug.externalUrl || "");
-    setEditSelectedIssue(
-      (detectedProvider === "JIRA" || detectedProvider === "LINEAR") && bug.integrationIssueKey
-        ? { provider: detectedProvider, key: bug.integrationIssueKey, summary: "", status: "", url: bug.externalUrl || "" }
-        : null
-    );
-    setEditEvidenceMode(bug.betterbugsUrl ? "BETTERBUGS" : "FILES");
-    setEditStagedFiles([]);
-    setEditAttachments(bug.attachments);
-    setEditBetterbugsUrl(bug.betterbugsUrl || "");
-    setEditStatus(bug.status);
-    setEditAssigneeId(bug.assigneeId || "");
-  }
-
-  /* remove an already-uploaded attachment from the bug being edited */
-  async function handleRemoveEditAttachment(attachmentId: string) {
-    await deleteBugAttachment(attachmentId);
-    setEditAttachments((prev) => prev.filter((a) => a.id !== attachmentId));
-  }
-
-  /* save edit */
-  async function handleEditSave() {
-    if (!editBug || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired) return;
-    const selfLogged = (jiraConnected || linearConnected) && editDestination === "SELF";
-    setSaving(true);
-    setEditError(null);
-    try {
-      await updateBug(editBug.id, {
-        title: editTitle.trim(),
-        description: editDesc.trim(),
-        status: editStatus,
-        severity: editSeverity,
-        priority: editPriority || null,
-        assigneeId: editAssigneeId || null,
-        externalUrl: selfLogged ? editUrl.trim() : undefined,
-        integrationProvider: selfLogged && editSelfSystem !== "OTHER" ? editSelfSystem : null,
-        integrationIssueKey: selfLogged && editSelfSystem !== "OTHER" ? editSelectedIssue?.key || null : null,
-        betterbugsUrl: editEvidenceMode === "BETTERBUGS" ? editBetterbugsUrl.trim() : undefined,
-        links: editLinks.map((link) => ({
-          testcaseId: link.testcaseId,
-          cycleId: link.cycleId,
-          executionId: link.executionId,
-        })),
-      });
-      if (editEvidenceMode === "FILES" && editStagedFiles.length) {
-        // Drop each batch from the staged list as it lands, so a retry after a later batch fails
-        // only resends the files that never made it, not ones already attached to the bug.
-        await uploadBugAttachments(projectId, editBug.id, editStagedFiles, (batch) => {
-          setEditStagedFiles((prev) => prev.slice(batch.length));
-        });
-      }
-      setEditBug(null);
-      load();
-    } catch (err) {
-      load();
-      setEditError(err instanceof Error ? err.message : "Something went wrong while saving this bug.");
-    } finally {
-      setSaving(false);
-    }
+    router.push(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
   }
 
   /* delete */
@@ -830,14 +674,6 @@ export default function BugsPage() {
     return <PageLoader variant="content" />;
   }
 
-  // Requirement: switching Jira <-> Linear (or picking Jira/Linear for the first time) clears the
-  // previous pick and must not be saveable again until a ticket from the NEW provider is chosen —
-  // otherwise Save would silently persist integrationProvider set with integrationIssueKey null.
-  const editIssueRequired =
-    (jiraConnected || linearConnected) &&
-    editDestination === "SELF" &&
-    (editSelfSystem === "JIRA" || editSelfSystem === "LINEAR") &&
-    !editSelectedIssue;
   // Same rule for Create: picking Jira/Linear as the system requires an actual ticket before
   // Report Bug is enabled, so a fresh bug can't be saved with a provider set and no key.
   const createIssueRequired =
@@ -978,6 +814,7 @@ export default function BugsPage() {
                       key={col.status}
                       status={col.status}
                       bugs={col.bugs}
+                      projectId={projectId}
                       onView={setViewBug}
                       onEdit={openEdit}
                       onDelete={setDeletingId}
@@ -1012,7 +849,8 @@ export default function BugsPage() {
                           <th>Reporter</th>
                           <th>Assignee</th>
                           <th>Reported</th>
-                          <th className="w-8"></th>
+                          {/* Labelled so the row's edit/delete read as a column, as on every other list. */}
+                          <th>Actions</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -1041,7 +879,17 @@ export default function BugsPage() {
                               */}
                             <td>
                               <div className="flex flex-col gap-0.5 max-w-sm">
-                                <span className="font-mono text-[11px] text-[var(--muted-soft)]">{b.integrationIssueKey || b.externalId}</span>
+                                {/* The bug's own unique id, always — not the linked Jira/Linear ticket key
+                                    (that still shows in the details body's tracker link). Navigates to the
+                                    shareable Bug Details URL; stopPropagation keeps it from also firing the
+                                    row's own open-in-drawer click. */}
+                                <Link
+                                  href={`/projects/${projectId}/bugs/${b.externalId}`}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="font-mono text-[11px] text-[var(--muted-soft)] hover:text-[var(--accent-light)] hover:underline w-fit"
+                                >
+                                  {b.externalId}
+                                </Link>
                                 <span
                                   title={b.title}
                                   className="line-clamp-2 text-sm font-medium text-[var(--accent-light)] hover:underline break-words"
@@ -1124,7 +972,7 @@ export default function BugsPage() {
                               <BugAssignee id={b.assigneeId} name={b.assigneeName} />
                             </td>
                             <td className="text-xs text-[var(--muted-soft)] whitespace-nowrap">
-                              {new Date(b.createdAt).toLocaleDateString()}
+                              {formatDate(b.createdAt)}
                             </td>
                             <td>
                               <div
@@ -1184,183 +1032,75 @@ export default function BugsPage() {
         </ListWorkspaceLayout>
       </main>
 
-      {/* ───── Bug Detail Modal ───── */}
-      <Modal
+      {/* ───── Bug Detail Panel (right side) ─────
+          Same shared Drawer the Test Run detail panel uses: header with the close control, a
+          scrolling body, and footer actions pinned below it. */}
+      <Drawer
         open={!!viewBug}
         onClose={() => setViewBug(null)}
-        title="Bug Details"
+        title={
+          viewBug && (
+            <div className="min-w-0">
+              <p className="mb-0.5 text-xs font-medium uppercase tracking-wide text-[var(--muted-soft)]">Bug Details</p>
+              {/* Bug Key + Title — severity/priority/status are labelled fields in the body. Always
+                  the bug's own unique id, not the linked Jira/Linear ticket key (that still shows
+                  in the details body's tracker link) — the shareable URL is keyed on this id. */}
+              <Link
+                href={`/projects/${projectId}/bugs/${viewBug.externalId}`}
+                className="block w-fit font-mono text-xs text-[var(--muted-soft)] mb-0.5 hover:text-[var(--accent-light)] hover:underline"
+              >
+                {viewBug.externalId}
+              </Link>
+              <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
+                {viewBug.title}
+              </h3>
+            </div>
+          )
+        }
+        headerExtra={
+          viewBug && (
+            <CopyButton
+              value={bugShareUrl(projectId, viewBug.externalId)}
+              icon={IconShare2}
+              iconOnly
+              label="Share"
+              copiedLabel="Link copied"
+              size="md"
+            />
+          )
+        }
       >
         {viewBug && (
-          <div className="space-y-5">
-            {/* Bug Key + Title + Status */}
-            <div>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  {/* Falls back to the bug's own per-project id when it has no external tracker
-                      ticket — same "Bug Key" fallback the Test Run and Test Case Detail screens use. */}
-                  <p className="font-mono text-xs text-[var(--muted-soft)] mb-0.5">{viewBug.integrationIssueKey || viewBug.externalId}</p>
-                  <h3 className="text-base font-semibold text-[var(--foreground)] break-words leading-snug">
-                    {viewBug.title}
-                  </h3>
-                </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <BugSeverityBadge severity={viewBug.severity} />
-                  <BugPriorityBadge priority={viewBug.priority} />
-                  <BugStatusBadge status={viewBug.status} />
-                </div>
-              </div>
-            </div>
-
-            {/* Description */}
-            {viewBug.description && (
-              <div>
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-                  Description
-                </p>
-                <div className="rounded-lg bg-[var(--background)] border border-[var(--border-subtle)] p-3">
-                  <p className="text-sm text-[var(--foreground)] whitespace-pre-wrap break-words">
-                    {viewBug.description}
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {/* Bug Link */}
-            {viewBug.externalUrl && (
-              <div>
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-                  {viewBug.integrationProvider ? `${viewBug.integrationProvider === "JIRA" ? "Jira" : "Linear"} Ticket` : "Bug Link"}
-                </p>
-                <a
-                  href={viewBug.externalUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 text-sm text-[var(--accent-light)] hover:underline break-all"
-                >
-                  <svg
-                    className="w-4 h-4 shrink-0"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"
-                    />
-                  </svg>
-                  {viewBug.integrationIssueKey || viewBug.externalUrl}
-                </a>
-              </div>
-            )}
-
-            {/* Evidence */}
-            {viewBug.betterbugsUrl ? (
-              <div>
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">BetterBugs Session</p>
-                <a
-                  href={viewBug.betterbugsUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 text-sm text-[var(--accent-light)] hover:underline break-all"
-                >
-                  {viewBug.betterbugsUrl}
-                </a>
-              </div>
-            ) : viewBug.attachments.length > 0 ? (
-              <div>
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">Attachments</p>
-                <ul className="space-y-1">
-                  {viewBug.attachments.map((att) => (
-                    <li key={att.id}>
-                      <a
-                        href={getBugAttachmentDownloadUrl(projectId, att.id)}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-sm text-[var(--accent-light)] hover:underline break-all"
-                      >
-                        {att.fileName}
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-
-            {/* Metadata grid */}
-            <div className="grid grid-cols-2 gap-4">
-              <div className="col-span-2">
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-                  Linked Test Cases &amp; Runs
-                </p>
-                {viewBug.links.length ? (
-                  <ul className="space-y-1">
-                    {viewBug.links.map((link) => (
-                      <li key={link.id} className="text-sm text-[var(--foreground)]">
-                        <span className="font-mono text-xs text-[var(--muted-soft)]">{link.testcaseExternalId}</span>{" "}
-                        {link.testcaseTitle}
-                        <span className="text-[var(--muted)]"> — {link.cycleName}</span>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <span className="text-sm text-[var(--muted-soft)]">Not linked</span>
-                )}
-              </div>
-              <div>
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-                  Reported By
-                </p>
-                <span className="text-sm text-[var(--foreground)]">
-                  {viewBug.reporterName || viewBug.reporterEmail || "Unknown"}
-                </span>
-              </div>
-              <div>
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-                  Assigned To
-                </p>
-                <BugAssignee id={viewBug.assigneeId} name={viewBug.assigneeName} />
-              </div>
-              <div>
-                <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-                  Reported On
-                </p>
-                <span className="text-sm text-[var(--foreground)]">
-                  {new Date(viewBug.createdAt).toLocaleString()}
-                </span>
-              </div>
-            </div>
-
-            {viewBug.updatedAt !== viewBug.createdAt && (
-              <p className="text-xs text-[var(--muted-soft)]">
-                Last updated: {new Date(viewBug.updatedAt).toLocaleString()}
-              </p>
-            )}
-
-            {/* Actions */}
-            <div className="flex items-center justify-between pt-2 border-t border-[var(--border-subtle)]">
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={() => {
-                  setDeletingId(viewBug.id);
-                  setViewBug(null);
+          <section aria-label="Bug details" className="flex h-full flex-col">
+            <div className="flex-1 space-y-5 overflow-y-auto p-5">
+              <BugDetailsBody
+                bug={viewBug}
+                projectId={projectId}
+                onAttachmentDeleted={(attachmentId) => {
+                  // The panel renders its own copy of the bug, so drop the file there at once, then
+                  // reload the list so its rows and the next open are current too.
+                  setViewBug((prev) => (prev ? { ...prev, attachments: prev.attachments.filter((a) => a.id !== attachmentId) } : prev));
+                  load();
                 }}
-                className="!bg-transparent !text-[var(--error-foreground)] hover:!bg-[var(--error)]/10 hover:!opacity-100"
-              >
-                Delete Bug
-              </Button>
-              <div className="flex gap-2">
-                <Button variant="secondary" onClick={() => setViewBug(null)}>
-                  Close
-                </Button>
+              />
+              {/* Comments and Activity as tabs, Comments first; keyed so each bug opens on Comments. */}
+              <BugDiscussion
+                key={viewBug.id}
+                projectId={projectId}
+                bugId={viewBug.id}
+                refreshKey={`${viewBug.updatedAt}|${viewBug.attachments.length}`}
+              />
+            </div>
+
+            {/* Footer actions — primary on the left, destructive on the right, as in the Test Case
+                detail panel. */}
+            <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[var(--border)] p-4">
+              <div className="flex items-center gap-2">
+                {/* Opens the full bug page straight into its in-place edit form, rather than the
+                    Edit Bug dialog the list row and board card still use. */}
                 <Button
                   variant="primary"
-                  onClick={() => {
-                    openEdit(viewBug);
-                    setViewBug(null);
-                  }}
+                  onClick={() => router.push(`/projects/${projectId}/bugs/${viewBug.id}?edit=1`)}
                 >
                   <svg
                     className="w-4 h-4"
@@ -1377,11 +1117,35 @@ export default function BugsPage() {
                   </svg>
                   Edit
                 </Button>
+                <Button variant="secondary" onClick={() => setViewBug(null)}>
+                  Close
+                </Button>
+              </div>
+              <div className="flex items-center gap-3">
+                {/* Same link the Test Run detail panel offers for its full-page view. */}
+                <Link
+                  href={`/projects/${projectId}/bugs/${viewBug.id}`}
+                  className="text-[12.5px] font-medium hover:underline"
+                  style={{ color: "var(--accent-light)" }}
+                >
+                  Open full page
+                </Link>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => {
+                    setDeletingId(viewBug.id);
+                    setViewBug(null);
+                  }}
+                  className="!bg-transparent !text-[var(--error-foreground)] hover:!bg-[var(--error)]/10 hover:!opacity-100"
+                >
+                  Delete Bug
+                </Button>
               </div>
             </div>
-          </div>
+          </section>
         )}
-      </Modal>
+      </Drawer>
 
       {/* ───── Create Bug Modal ───── */}
       <Modal
@@ -1420,8 +1184,15 @@ export default function BugsPage() {
           </Field>
           <div className="grid grid-cols-3 gap-3">
             <Field>
+              {/* Neither Severity nor Priority is required, and both open on "Not selected" rather
+                  than a preselected value, so nothing is filed with a value nobody chose. */}
               <FieldLabel>Severity</FieldLabel>
-              <Select value={createSeverity} onChange={(e) => setCreateSeverity(e.target.value as BugSeverity)}>
+              <Select
+                value={createSeverity}
+                onChange={(e) => setCreateSeverity(e.target.value as BugSeverity | "")}
+                aria-label="Bug severity"
+              >
+                <option value="">Not selected</option>
                 {BUG_SEVERITIES.map((s) => (
                   <option key={s} value={s}>
                     {s}
@@ -1438,7 +1209,7 @@ export default function BugsPage() {
                 onChange={(e) => setCreatePriority(e.target.value as BugPriority | "")}
                 aria-label="Bug priority"
               >
-                <option value="">Not set</option>
+                <option value="">Not selected</option>
                 {BUG_PRIORITIES.map((p) => (
                   <option key={p} value={p}>
                     {p}
@@ -1554,208 +1325,6 @@ export default function BugsPage() {
               disabled={creating || !createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired}
             >
               {creating ? "Creating…" : "Report Bug"}
-            </Button>
-          </div>
-        </div>
-      </Modal>
-
-      {/* ───── Edit Bug Modal ───── */}
-      <Modal
-        open={!!editBug}
-        onClose={() => {
-          setEditError(null);
-          setEditBug(null);
-          setEditIssuePickerOpen(false);
-        }}
-        title="Edit Bug"
-      >
-        <div className="space-y-4">
-          {editError && (
-            <p
-              data-testid="edit-bug-error"
-              className="rounded-[var(--radius-control)] border border-[var(--error)] bg-[var(--error)]/10 px-3 py-2 text-[13px] text-[var(--error-foreground)]"
-            >
-              {editError}
-            </p>
-          )}
-          <Field>
-            <FieldLabel>
-              Bug Title <span className="text-[var(--error-foreground)]">*</span>
-            </FieldLabel>
-            <Input
-              type="text"
-              value={editTitle}
-              onChange={(e) => setEditTitle(e.target.value)}
-            />
-          </Field>
-          <Field>
-            <FieldLabel>Description</FieldLabel>
-            <Textarea
-              value={editDesc}
-              onChange={(e) => setEditDesc(e.target.value)}
-              rows={3}
-            />
-          </Field>
-          {/* Status is edit-only (Create Bug always starts "Open"), so it has no equivalent slot in
-              that form's Severity/Priority/Assign-to row. Kept as its own field right before them
-              rather than disrupting that row's order. */}
-          <Field>
-            <FieldLabel>Status</FieldLabel>
-            <Select
-              value={editStatus}
-              onChange={(e) => setEditStatus(e.target.value)}
-            >
-              <option value="Open">Open</option>
-              <option value="In Progress">In Progress</option>
-              <option value="Closed">Closed</option>
-              <option value="Reopened">Reopened</option>
-            </Select>
-          </Field>
-          <div className="grid grid-cols-3 gap-3">
-            <Field>
-              <FieldLabel>Severity</FieldLabel>
-              <Select value={editSeverity} onChange={(e) => setEditSeverity(e.target.value as BugSeverity)} aria-label="Severity">
-                {BUG_SEVERITIES.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-            <Field>
-              <FieldLabel>Priority</FieldLabel>
-              <Select
-                value={editPriority}
-                onChange={(e) => setEditPriority(e.target.value as BugPriority | "")}
-                aria-label="Bug priority"
-              >
-                <option value="">Not set</option>
-                {BUG_PRIORITIES.map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-            <Field>
-              <FieldLabel>Assign to</FieldLabel>
-              <Select
-                value={editAssigneeId}
-                onChange={(e) => setEditAssigneeId(e.target.value)}
-                aria-label="Assign to"
-              >
-                <option value="">Unassigned</option>
-                {members.map((m) => (
-                  <option key={m.userId} value={m.userId}>
-                    {m.name || m.email}
-                  </option>
-                ))}
-                {/* Current assignee not among this project's members — an AI agent or a stale row.
-                    Kept visible as a disabled option so Save doesn't silently clear a real
-                    assignment nobody touched. */}
-                {editAssigneeId && !members.some((m) => m.userId === editAssigneeId) && (
-                  <option value={editAssigneeId} disabled>
-                    {editBug?.assigneeName || "Unknown assignee"} (not a project member)
-                  </option>
-                )}
-              </Select>
-            </Field>
-          </div>
-          <BugEvidenceField
-            mode={editEvidenceMode}
-            onModeChange={setEditEvidenceMode}
-            stagedFiles={editStagedFiles}
-            onStagedFilesChange={setEditStagedFiles}
-            existingAttachments={editAttachments}
-            onRemoveExisting={handleRemoveEditAttachment}
-            downloadUrl={(attachmentId) => getBugAttachmentDownloadUrl(projectId, attachmentId)}
-            betterbugsUrl={editBetterbugsUrl}
-            onBetterbugsUrlChange={setEditBetterbugsUrl}
-          />
-          <Field>
-            <FieldLabel>
-              Linked Test Case(s) &amp; Run(s) {hasTestRuns && <span className="text-[var(--error-foreground)]">*</span>}
-            </FieldLabel>
-            <TestCaseRunPicker projectId={projectId} value={editLinks} onChange={setEditLinks} />
-            {!hasTestRuns && (
-              <p className="text-[13px] text-[var(--muted)]">
-                This project has no test runs yet, so this bug will stay unlinked. You can link it once a run exists.
-              </p>
-            )}
-          </Field>
-          {(jiraConnected || linearConnected) && (
-            <Field>
-              <FieldLabel>Where should this be tracked?</FieldLabel>
-              <TrackingDestinationField destination={editDestination} onChange={setEditDestination} />
-            </Field>
-          )}
-          {(jiraConnected || linearConnected) && editDestination === "SELF" && (
-            <SelfLoggedTrackerField
-              jiraConnected={jiraConnected}
-              linearConnected={linearConnected}
-              system={editSelfSystem}
-              onSystemChange={handleEditSystemChange}
-              url={editUrl}
-              onUrlChange={setEditUrl}
-              renderUrlField={(system, defaultField) => {
-                if (system === "OTHER") return defaultField;
-                return (
-                  <div className="mt-2 space-y-1">
-                    <div className="flex items-center justify-between gap-2 rounded-[var(--radius-control)] border border-[var(--border)] px-3 py-2 text-[13px]">
-                      {editSelectedIssue ? (
-                        <a
-                          href={editSelectedIssue.url || editUrl || undefined}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="truncate text-[var(--foreground)] hover:underline"
-                        >
-                          {editSelectedIssue.key}
-                          {editSelectedIssue.summary ? ` — ${editSelectedIssue.summary}` : ""}
-                        </a>
-                      ) : (
-                        <span className="text-[var(--muted)]">No issue selected.</span>
-                      )}
-                      <Button type="button" size="sm" variant="secondary" onClick={() => setEditIssuePickerOpen(true)}>
-                        {editSelectedIssue ? "Change issue" : "Select issue"}
-                      </Button>
-                    </div>
-                    {editIssueRequired && (
-                      <p className="text-[13px] text-[var(--error-foreground)]">
-                        Select a {system === "JIRA" ? "Jira" : "Linear"} ticket before saving.
-                      </p>
-                    )}
-                  </div>
-                );
-              }}
-            />
-          )}
-          {(editSelfSystem === "JIRA" || editSelfSystem === "LINEAR") && (
-            <IssuePickerModal
-              projectId={projectId}
-              testcaseId={null}
-              cycleId={null}
-              provider={editSelfSystem}
-              open={editIssuePickerOpen}
-              onClose={() => setEditIssuePickerOpen(false)}
-              selectedIssues={editSelectedIssue ? [editSelectedIssue] : []}
-              mode="single"
-              onConfirm={(issues) => {
-                const issue = issues[0] ?? null;
-                setEditSelectedIssue(issue);
-                setEditUrl(issue?.url ?? "");
-              }}
-            />
-          )}
-          <div className="flex justify-end gap-2 pt-2">
-            <Button variant="secondary" onClick={() => setEditBug(null)}>
-              Cancel
-            </Button>
-            <Button
-              variant="primary"
-              onClick={handleEditSave}
-              disabled={saving || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired}
-            >
-              {saving ? "Saving…" : "Save Changes"}
             </Button>
           </div>
         </div>

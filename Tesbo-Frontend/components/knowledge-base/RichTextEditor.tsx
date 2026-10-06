@@ -1,13 +1,8 @@
 "use client";
 
 import { useEditor, EditorContent, type Editor, type JSONContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
-import ImageExtension from "@tiptap/extension-image";
-import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
-import TaskList from "@tiptap/extension-task-list";
-import TaskItem from "@tiptap/extension-task-item";
-import { Markdown } from "@tiptap/markdown";
 import { useEffect, useRef } from "react";
+import { KB_EDITOR_EXTENSIONS } from "./editorExtensions";
 import { isMarkdownPaste } from "./markdownPaste";
 import {
   IconBold,
@@ -44,7 +39,7 @@ export type RichTextEditorHandle = {
   getText: () => string;
 };
 
-function ToolbarButton({
+export function ToolbarButton({
   onClick,
   active,
   disabled,
@@ -95,19 +90,7 @@ export default function RichTextEditor({
   const editor = useEditor({
     immediatelyRender: false,
     editable,
-    extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
-      ImageExtension,
-      TaskList,
-      TaskItem.configure({ nested: true }),
-      Table.configure({ resizable: true }),
-      TableRow,
-      TableHeader,
-      TableCell,
-      // Only consulted when a caller passes `contentType: "markdown"` (the paste handler below) —
-      // loading, saving and restoring documents still go through JSON/HTML exactly as before.
-      Markdown,
-    ],
+    extensions: KB_EDITOR_EXTENSIONS,
     content: contentJson || contentHtml || "<p></p>",
     onUpdate: ({ editor: instance }) => {
       onUpdate?.({ json: instance.getJSON(), html: instance.getHTML(), text: instance.getText() });
