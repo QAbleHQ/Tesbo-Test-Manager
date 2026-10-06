@@ -266,7 +266,7 @@ export default function ProjectSettingsPage() {
     getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
     getNotionStatus(projectId).then(setNotionStatus).catch(() => {});
     getBillingInfo()
-      .then((billing) => setLinearIsPro(billing.plan === "pro"))
+      .then((billing) => setLinearIsPro(billing.enabled === false || billing.plan === "pro"))
       .catch(() => setLinearIsPro(null));
     listApiKeys(projectId).then((l) => setApiTokenCount(l.length)).catch(() => {});
     listCustomFieldDefinitions(projectId).then((l) => setCustomFieldCount(l.length)).catch(() => {});
