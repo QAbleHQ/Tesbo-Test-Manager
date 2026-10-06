@@ -983,6 +983,8 @@ export interface ZyraTask {
   tokenUsage: { input: number; output: number; total: number };
   createdAt: string;
   updatedAt: string;
+  /** "en" | "ru", set server-side from the script of what the user typed; drives the task view's UI language (lib/zyra-i18n.ts). Missing/unknown renders as English. */
+  language?: string;
 }
 
 export interface ZyraCapabilities {
@@ -1148,6 +1150,8 @@ export interface ZyraChatSession {
   activePlan?: ZyraChatActivePlan | null;
   /** Only present on list responses; absent (falsy) on a session just returned from create/get. */
   hasMessages?: boolean;
+  /** Set server-side from the script of what the user typed; drives the chat UI language (lib/zyra-i18n.ts). Missing/unknown renders as English. */
+  language?: "en" | "ru" | string;
 }
 
 export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
