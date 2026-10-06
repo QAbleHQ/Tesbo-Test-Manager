@@ -3859,8 +3859,9 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     expect(res.status(), `seeding the KB doc — ${await res.text()}`).toBe(201);
   }
 
-  async function openChat(browser: Browser): Promise<Page> {
-    const ctx = await browser.newContext({ storageState: ownerState });
+  // `locale` sets the browser language. Zyra must ignore it — its language comes from what is typed.
+  async function openChat(browser: Browser, locale?: string): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: ownerState, ...(locale ? { locale } : {}) });
     contexts.push(ctx);
     const page = await ctx.newPage();
     await page.goto(`/projects/${tenant!.mainProjectId}/agents/zyra`);
@@ -4078,5 +4079,82 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     await expect(running.locator('[data-zyra-step="routing"]')).toContainText("[RUN]");
     await expect(running.locator('[data-zyra-step="context:jira"]')).toContainText("none found");
     await expect(composer(page)).toBeDisabled();
+  });
+
+  /* ───────── Zyra's language follows what the user types (lib/zyra-i18n.ts, V132) ───────── */
+
+  const RU_PLACEHOLDER = "Попросите Zyra создать, обновить или проверить тест-кейсы...";
+
+  test("ZYU-L-01 after a Russian message the chat screen's own labels switch to Russian, and the reply is shown", async ({ browser }) => {
+    await allocateFakeAiKey();
+    // An English browser: the switch comes from the typed text, not from the browser.
+    const page = await openChat(browser, "en-US");
+    const reply = "Для входа нужны email и пароль; после трёх неудачных попыток вход блокируется.";
+    queueAnswer(reply);
+
+    await composer(page).fill("Как работает вход в систему?");
+    await composer(page).press("Enter");
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+
+    // The composer, its send button and its keyboard hints are now Russian.
+    await expect(page.getByPlaceholder(RU_PLACEHOLDER)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Отправить" })).toBeVisible();
+    await expect(page.getByText("— отправить")).toBeVisible();
+    await expect(composer(page), "the English placeholder is gone").toHaveCount(0);
+    // And persisted: the session the page shows is stored as Russian.
+    const sessionId = scalar(`SELECT session_id FROM zyra_chat_messages WHERE project_id = ${literal(tenant!.mainProjectId)} AND role = 'user' LIMIT 1;`);
+    expect(scalar(`SELECT language FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`)).toBe("ru");
+  });
+
+  test("ZYU-L-02 a Russian browser typing English keeps the whole screen in English", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser, "ru-RU");
+    const reply = "Sign-in needs an email and a password; three failed attempts lock the account.";
+    queueAnswer(reply);
+
+    await composer(page).fill("How does sign-in work?");
+    await composer(page).press("Enter");
+    await expect(page.getByText(reply)).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeVisible();
+    await expect(page.getByPlaceholder(RU_PLACEHOLDER)).toHaveCount(0);
+  });
+
+  test("ZYU-L-03 Russian test cases are shown under Russian column headers, and a later English message switches back", async ({ browser }) => {
+    await allocateFakeAiKey();
+    const page = await openChat(browser);
+    const title = `Вход с неверным паролем отклонён ${Date.now() % 100000}`;
+    ai.queueReply({ reply: "", reasoningSummary: "Создание.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({
+      drafts: [{
+        title,
+        preconditions: "Пользователь на странице входа.",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Ввести неверный пароль", expectedResult: "Показана ошибка" }]),
+        testData: "",
+        expectedSummary: "Вход отклонён.",
+        priority: "P1",
+        severity: "High",
+        tags: ["zyra"],
+        sourceRefs: [],
+      }],
+    });
+    ai.queueReply("Noted.");
+
+    await composer(page).fill("Создай тест-кейс для неверного пароля на странице входа.");
+    await composer(page).press("Enter");
+    await expect(page.getByText(title).first()).toBeVisible({ timeout: 30_000 });
+    // The backend's own reply text and the screen's labels around the drafts are Russian.
+    await expect(page.getByText(/Я подготовил\(а\) 1 тест-кейс\(ов\), изучив:/)).toBeVisible();
+    await expect(page.getByText("Первый шаг").first()).toBeVisible();
+    await expect(page.getByText("Выбрать все").first()).toBeVisible();
+    // The severity a draft carries is stored as High and displayed in Russian.
+    await expect(page.getByText("Высокая").first()).toBeVisible();
+
+    // Now an English message: the next reply and the labels go back to English.
+    const english = "Sure — these cover the wrong-password path.";
+    queueAnswer(english);
+    await page.getByPlaceholder(RU_PLACEHOLDER).fill("Summarize what you just drafted for the login page, please.");
+    await page.getByPlaceholder(RU_PLACEHOLDER).press("Enter");
+    await expect(page.getByText(english)).toBeVisible({ timeout: 30_000 });
+    await expect(composer(page)).toBeVisible();
   });
 });

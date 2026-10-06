@@ -16,6 +16,20 @@ import { externallyReachableBaseUrl } from "../common/external-url.util";
 import { escapeHtml, jiraDescriptionToText } from "../common/integration-text.util";
 import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util";
 import { validatePersonName } from "../common/person-name.util";
+import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
+import { detectScriptLanguage } from "../common/script-language";
+import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
+import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
+import {
+  foldRu,
+  ZYRA_RU,
+  ZYRA_RU_AFFIRMATIVE,
+  ZYRA_RU_ALREADY_DISCLOSED,
+  ZYRA_RU_COMPLETION_CLAIM,
+  ZYRA_RU_OFFER,
+  ZYRA_RU_RESUME,
+  ZYRA_RU_STAGED_AWAITING
+} from "./zyra-replies-ru";
 import { ApiTokenService } from "../auth/api-token.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
 import { RagRetrievalService } from "../rag/rag-retrieval.service";
@@ -268,6 +282,9 @@ type ZyraGenerationInput = {
   // the same distinction the reply-shaping in generateZyraChatTestcasesWithAi already makes for what
   // the user sees after the fact.
   knowledgeConfidence?: RagRetrievalConfidence;
+  // The language the drafts' prose is written in (zyraLanguageInstruction). Undefined is English,
+  // which is what every caller produced before this field existed.
+  language?: ExportLocale;
 };
 
 type ZyraAiUsage = {
@@ -3654,11 +3671,19 @@ export class LegacyService implements OnModuleInit {
       !query.search &&
       !query.customFieldFilters &&
       LegacyService.parseCustomTagIdsParam(query.customTagIds).length === 0 &&
+      LegacyService.parseCommaSeparatedIdsParam(query.ids).length === 0 &&
       String(query.includeArchived ?? "").toLowerCase() !== "true"
     );
   }
 
   private static parseCustomTagIdsParam(raw: unknown): string[] {
+    return LegacyService.parseCommaSeparatedIdsParam(raw);
+  }
+
+  // Shared by customTagIds and ids (buildTestcaseFilterFragments): both accept either the param
+  // repeated or one comma-separated value, same as a plain HTML multi-select would produce either
+  // way depending on how the caller built the query string.
+  private static parseCommaSeparatedIdsParam(raw: unknown): string[] {
     const parts = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
     return [...new Set(parts.flatMap((p) => String(p).split(",")).map((s) => s.trim()).filter(Boolean))];
   }
@@ -3797,6 +3822,25 @@ export class LegacyService implements OnModuleInit {
       filters.push(
         `EXISTS (SELECT 1 FROM testcase_custom_tags tct WHERE tct.testcase_id = testcases.id AND tct.tag_id = ANY($${values.length}::uuid[]))`
       );
+    }
+
+    /*
+     * `ids` — an explicit list of test case ids. Used by the repository's "Export" action once the
+     * user has ticked specific rows: the on-screen checkboxes previously had no effect on Export at
+     * all, which always exported every row matching the suite/column filters regardless of
+     * selection. When present, `ids` is meant to scope the result to exactly those rows (the
+     * frontend drops every other filter field once something is checked — see getExportUrl), but
+     * it is additive here like every other fragment in this method, so a caller that combines it
+     * with another filter narrows rather than silently losing the id scoping.
+     *
+     * Validated the same way as customTagIds above: a malformed id silently ignored would widen an
+     * "export only these" request into "export everything" instead of erroring.
+     */
+    const ids = LegacyService.parseCommaSeparatedIdsParam(query.ids);
+    if (ids.length) {
+      if (!ids.every(isUuid)) throw new BadRequestException({ error: "ids must be valid ids" });
+      values.push(ids);
+      filters.push(`testcases.id = ANY($${values.length}::uuid[])`);
     }
 
     // Custom field filters join custom_field_values once per condition (each scoped 1:1 by
@@ -4621,10 +4665,15 @@ export class LegacyService implements OnModuleInit {
     if (!title) return { rowNumber, error: "Title is required" };
 
     const priority = String(raw?.priority ?? "").trim() || "P2";
-    const severity = String(raw?.severity ?? "").trim() || null;
-    const type = String(raw?.type ?? "").trim() || "Functional";
-    const status = String(raw?.status ?? "").trim() || "Draft";
-    const automationStatus = String(raw?.automationStatus ?? "").trim() || "Not Automated";
+    // A Russian export or template carries translated labels ("Черновик", "Высокая"). These columns
+    // are stored unvalidated, so without mapping them back a re-import would create "Черновик" as a
+    // status every count and filter (which match 'Draft') silently misses. Anything that isn't a
+    // known translation — every English value included — is stored exactly as before.
+    const severity = canonicalizeImportValue("severity", String(raw?.severity ?? "").trim()) || null;
+    const type = canonicalizeImportValue("type", String(raw?.type ?? "").trim()) || "Functional";
+    const status = canonicalizeImportValue("testcaseStatus", String(raw?.status ?? "").trim()) || "Draft";
+    const automationStatus =
+      canonicalizeImportValue("automationStatus", String(raw?.automationStatus ?? "").trim()) || "Not Automated";
     const component = String(raw?.component ?? "").trim() || null;
     const suiteName = String(raw?.suite ?? "").trim();
 
@@ -12246,7 +12295,8 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Chat session not found" });
     const session = await this.db.query(
-      `SELECT id, project_id, user_id, title, created_at, updated_at, active_plan,
+      // language: the Zyra screens render their labels in it (see V132_zyra_generation_language.sql).
+      `SELECT id, project_id, user_id, title, created_at, updated_at, active_plan, language,
               (processing_since IS NOT NULL AND processing_since >= now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes') AS turn_alive
        FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
       [sessionId, projectId]
@@ -12404,6 +12454,9 @@ export class LegacyService implements OnModuleInit {
     if (!message) throw new BadRequestException({ error: "message is required" });
     const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    // The language of what the user just typed (detectScriptLanguage). A message with no signal —
+    // "ok", "да", a bare ticket key — leaves the session's language as it was.
+    await this.rememberZyraSessionLanguage(projectId, sessionId, detectScriptLanguage(message));
 
     // Claim this session for the duration of one turn. Without this, two overlapping requests for
     // the same session (a double-click on "yes", a client retry after a slow reply, two open tabs)
@@ -12502,7 +12555,18 @@ export class LegacyService implements OnModuleInit {
    * releases the session claim, and, for a background turn, settles the user message's status only
    * AFTER the reply row exists, so a client polling for `sent` never sees it before the answer.
    */
+  // Runs the turn inside the session's language (zyra-language-context.ts), so every reply builder
+  // below it writes Russian for a Russian session without each one needing the session. Read after
+  // beginZyraChatTurn stored this message's language, so it is this turn's.
   private async runZyraChatTurn(
+    turn: Awaited<ReturnType<LegacyService["beginZyraChatTurn"]>>,
+    recorder: ZyraTurnTraceRecorder
+  ): Promise<{ message: Body; session: Body }> {
+    const language = await this.zyraSessionLanguage(turn.projectId, turn.sessionId);
+    return runInZyraLanguage(language, () => this.runZyraChatTurnInLanguage(turn, recorder));
+  }
+
+  private async runZyraChatTurnInLanguage(
     turn: Awaited<ReturnType<LegacyService["beginZyraChatTurn"]>>,
     recorder: ZyraTurnTraceRecorder
   ): Promise<{ message: Body; session: Body }> {
@@ -12696,9 +12760,10 @@ export class LegacyService implements OnModuleInit {
       const appliedCount = applied.testcases.length;
       const proposedCount = applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length;
       let bannerFired: string | null = null;
-      if (finalReply.includes("Sorry! Nothing was saved")) bannerFired = "false-completion-claim";
-      else if (finalReply.includes("⚠️ Nothing was saved.")) bannerFired = "zero-applied";
-      else if (/were drafted for review\.?$/m.test(finalReply.split("\n")[0] || "")) bannerFired = "partial-application";
+      // Recognises the Russian banners too, so a Russian turn's trace records the same outcome.
+      if (finalReply.includes("Sorry! Nothing was saved") || finalReply.includes(ZYRA_RU.falseClaimBanner.split("\n")[0])) bannerFired = "false-completion-claim";
+      else if (finalReply.includes("⚠️ Nothing was saved.") || finalReply.startsWith("⚠️ Ничего не сохранено.")) bannerFired = "zero-applied";
+      else if (/were drafted for review\.?$/m.test(finalReply.split("\n")[0] || "") || (finalReply.split("\n")[0] || "").includes("Подготовлено для проверки операций с тест-кейсами")) bannerFired = "partial-application";
       await recordReconciliation(
         { messageId: traceMessageId, sessionId, projectId, userId: uid },
         {
@@ -12832,7 +12897,25 @@ export class LegacyService implements OnModuleInit {
    * inline, plus threading onStage through for SSE narration and tracking resume_attempt so
    * repeated failures can eventually be capped.
    */
+  // Same as runZyraChatTurn: a resumed turn writes in the session's language.
   private async processZyraChatResume(
+    projectId: string,
+    uid: string,
+    userId: string | null | undefined,
+    sessionId: string,
+    messageId: string,
+    checkpoint: Partial<ZyraResumeCheckpoint>,
+    priorAttempts: number,
+    onStage?: ZyraOnStage,
+    onSettled?: (result: { ok: true; payload: unknown } | { ok: false; message: string }) => void
+  ): Promise<void> {
+    const language = await this.zyraSessionLanguage(projectId, sessionId);
+    return runInZyraLanguage(language, () =>
+      this.processZyraChatResumeInLanguage(projectId, uid, userId, sessionId, messageId, checkpoint, priorAttempts, onStage, onSettled)
+    );
+  }
+
+  private async processZyraChatResumeInLanguage(
     projectId: string,
     uid: string,
     userId: string | null | undefined,
@@ -12937,8 +13020,11 @@ export class LegacyService implements OnModuleInit {
     // pause, if any, is decided and applied under the row lock in zyraPlanTransition below, the
     // same guard continueZyraChatPlan's own batch commits use, so a Stop click landing the same
     // moment a batch is mid-commit can't race it (see zyraPlanTransition's own comment).
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan, language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    // Stop/Resume are clicks, not turns, so no language context is set around them — the plan
+    // message they post reads the session's language directly.
+    const sessionLanguage = LegacyService.zyraStoredLanguage(sessionRes.rows[0].language);
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     if (plan && plan.status !== "paused") {
       await this.zyraPlanTransition(sessionId, String(plan.planId || ""), null, async (client, current) => {
@@ -12957,7 +13043,9 @@ export class LegacyService implements OnModuleInit {
           projectId,
           sessionId,
           uid,
-          `Stopped at your request — ${doneCount}/${totalCount} scenarios covered. Say "continue" any time and I'll pick back up with the remaining ${remainingCount}.`,
+          sessionLanguage === "ru"
+            ? ZYRA_RU.planStopped(doneCount, totalCount, remainingCount)
+            : `Stopped at your request — ${doneCount}/${totalCount} scenarios covered. Say "continue" any time and I'll pick back up with the remaining ${remainingCount}.`,
           [],
           [],
           "answer",
@@ -12969,7 +13057,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private isZyraResumeIntent(message: string): boolean {
-    return /\b(continue|resume|keep going|carry on|go ahead|proceed|pick up where)\b/i.test(message);
+    return /\b(continue|resume|keep going|carry on|go ahead|proceed|pick up where)\b/i.test(message) || ZYRA_RU_RESUME.test(foldRu(message));
   }
 
   // Reactivates a paused plan under a fresh planId (so any stale in-flight batch from before
@@ -12981,8 +13069,11 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     // Fast-path check only, same reasoning as stopZyraChatPlan — the actual reactivation is decided
     // and applied under the row lock below.
-    const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
+    const sessionRes = await this.db.query("SELECT active_plan, language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
+    // Stop/Resume are clicks, not turns, so no language context is set around them — the plan
+    // message they post reads the session's language directly.
+    const sessionLanguage = LegacyService.zyraStoredLanguage(sessionRes.rows[0].language);
     const plan = sessionRes.rows[0].active_plan as Body | undefined;
     const remainingScenarios = normalizeJsonArray(plan?.remainingScenarios).map(String);
     if (!plan || plan.status !== "paused" || !remainingScenarios.length) {
@@ -13009,7 +13100,9 @@ export class LegacyService implements OnModuleInit {
         projectId,
         sessionId,
         uid,
-        `Resuming — ${doneCount}/${totalCount} scenarios covered so far, continuing with the remaining ${scenariosRemaining}.`,
+        sessionLanguage === "ru"
+          ? ZYRA_RU.planResuming(doneCount, totalCount, scenariosRemaining)
+          : `Resuming — ${doneCount}/${totalCount} scenarios covered so far, continuing with the remaining ${scenariosRemaining}.`,
         [],
         [],
         "answer",
@@ -13328,6 +13421,8 @@ export class LegacyService implements OnModuleInit {
     const provider = String(key.provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, key.default_model);
     const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
+    // Stored by beginZyraChatTurn from this very message, so it is already this turn's language.
+    const replyLanguage = await this.zyraSessionLanguage(projectId, sessionId);
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
@@ -13406,7 +13501,8 @@ export class LegacyService implements OnModuleInit {
       "Recent chat (each assistant turn is annotated with what it actually wrote to the repository —",
       "trust the annotation over the wording of the reply, which may describe testcases that were never saved):",
       this.zyraTranscript(chronologicalHistory),
-      confirmationHint ? `\nCRITICAL — this turn already has its confirmation: ${confirmationHint} Do not choose 'answer' again for this message; emit the operation(s).` : ""
+      confirmationHint ? `\nCRITICAL — this turn already has its confirmation: ${confirmationHint} Do not choose 'answer' again for this message; emit the operation(s).` : "",
+      LegacyService.zyraReplyLanguageInstruction(replyLanguage)
     ].join("\n");
 
     // Resuming a turn whose drafting call already timed out once the router had resolved it — skip
@@ -13723,7 +13819,7 @@ export class LegacyService implements OnModuleInit {
         });
         return {
           ...gated,
-          reply: [
+          reply: zyraReplyLanguage() === "ru" ? ZYRA_RU.retryNarrowed(attempt, cause, LegacyService.ZYRA_RETRY_BATCH, gated.reply) : [
             `⚠️ My first attempt to ${attempt} didn't work — ${cause}.`,
             `I changed approach and tried again with a smaller batch of ${LegacyService.ZYRA_RETRY_BATCH}. That went through:`,
             "",
@@ -13731,7 +13827,9 @@ export class LegacyService implements OnModuleInit {
             "",
             "Ask me to continue and I'll add the rest in batches this size."
           ].join("\n"),
-          reasoningSummary: `First generation attempt failed (${detail}); retried with a ${LegacyService.ZYRA_RETRY_BATCH}-case batch. ${gated.reasoningSummary}`
+          reasoningSummary: zyraReplyLanguage() === "ru"
+            ? `Первая попытка генерации не удалась (${detail}); повтор с пакетом из ${LegacyService.ZYRA_RETRY_BATCH}. ${gated.reasoningSummary}`
+            : `First generation attempt failed (${detail}); retried with a ${LegacyService.ZYRA_RETRY_BATCH}-case batch. ${gated.reasoningSummary}`
         };
       } catch (retryErr) {
         if (this.isZyraTimeoutError(retryErr)) {
@@ -13769,7 +13867,9 @@ export class LegacyService implements OnModuleInit {
          */
         return {
           reply: LegacyService.zyraFailureReply(attempt, retryDetail || detail, true),
-          reasoningSummary: `Generation failed after routing (${detail}); the narrowed retry also failed (${retryDetail}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
+          reasoningSummary: zyraReplyLanguage() === "ru"
+            ? `Генерация не удалась после маршрутизации (${detail}); уменьшенный повтор тоже не удался (${retryDetail}). ${this.defaultReasoningSummary(existingTestcases.length)}`
+            : `Generation failed after routing (${detail}); the narrowed retry also failed (${retryDetail}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
           actionType: "answer",
           operations: [],
           testcases: []
@@ -13797,12 +13897,15 @@ export class LegacyService implements OnModuleInit {
     // only stage that still has just one.
     timeoutMs: number = LegacyService.ZYRA_ROUTER_TIMEOUT_MS
   ): ZyraChatDecision {
+    const ru = zyraReplyLanguage() === "ru";
     return {
-      reply: [
+      reply: ru ? ZYRA_RU.timedOut : [
         "⏱️ I didn't hear back from the AI provider in time — nothing was created or changed, and nothing was lost.",
         "Click **Continue** below and I'll pick up right where this left off, rather than starting over."
       ].join(" "),
-      reasoningSummary: `Provider call timed out at stage '${stage}' after ${timeoutMs}ms. ${this.defaultReasoningSummary(existingCount)}`,
+      reasoningSummary: ru
+        ? ZYRA_RU.timedOutReasoning(stage, timeoutMs, this.defaultReasoningSummary(existingCount))
+        : `Provider call timed out at stage '${stage}' after ${timeoutMs}ms. ${this.defaultReasoningSummary(existingCount)}`,
       actionType: "answer",
       operations: [],
       testcases: [],
@@ -13829,8 +13932,12 @@ export class LegacyService implements OnModuleInit {
    */
   private zyraSalvagedRouterDecision(existingCount: number): ZyraChatDecision {
     return {
-      reply: "My response got cut off before I could finish deciding what to do with this — nothing was created, updated, or changed. Try again, or ask for fewer test cases at once if this was a large request.",
-      reasoningSummary: `Router response was unparseable JSON on two consecutive attempts; only fragments of reply/reasoningSummary text could be recovered, not a structured decision. ${this.defaultReasoningSummary(existingCount)}`,
+      reply: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.salvagedRouter
+        : "My response got cut off before I could finish deciding what to do with this — nothing was created, updated, or changed. Try again, or ask for fewer test cases at once if this was a large request.",
+      reasoningSummary: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.salvagedReasoning(this.defaultReasoningSummary(existingCount))
+        : `Router response was unparseable JSON on two consecutive attempts; only fragments of reply/reasoningSummary text could be recovered, not a structured decision. ${this.defaultReasoningSummary(existingCount)}`,
       actionType: "answer",
       operations: [],
       testcases: [],
@@ -14362,6 +14469,8 @@ export class LegacyService implements OnModuleInit {
     // background batches re-gather knowledge themselves but don't carry a confidence signal through
     // yet), which the ungrounded check below treats as "unknown, don't second-guess presence".
     knowledgeConfidence?: RagRetrievalConfidence;
+    // The session's language (zyraSessionLanguage). Undefined generates in English.
+    language?: ExportLocale;
   }): Promise<ZyraChatDecision> {
     // Prefer the Jira context already gathered for this turn (explicit keys plus relevance-matched
     // tickets); fall back to an explicit-key lookup only when a caller supplied none.
@@ -14392,7 +14501,8 @@ export class LegacyService implements OnModuleInit {
       bugs,
       requestedCount: params.requestedCount,
       testcaseRange: params.testcaseRange,
-      knowledgeConfidence: params.knowledgeConfidence
+      knowledgeConfidence: params.knowledgeConfidence,
+      language: params.language
     };
     const aiResult = await this.generateZyraWithProvider({
       provider: params.provider,
@@ -14545,7 +14655,14 @@ export class LegacyService implements OnModuleInit {
     const weaklyGrounded = !ungrounded && params.knowledge.length > 0 && jira.length === 0 && bugs.length === 0
       && (params.knowledgeConfidence === "weak" || params.knowledgeConfidence === "none");
     const stagedSuiteName = matchedSuite?.name ?? LegacyService.ZYRA_DRAFT_SUITE_NAME;
-    const groundedReply = [
+    const groundedReply = zyraReplyLanguage() === "ru"
+      ? ZYRA_RU.draftedAfterReading(finalResult.drafts.length, [
+          ZYRA_RU.sourceKnowledge(params.knowledge.length, jiraFromKnowledge),
+          ZYRA_RU.sourceJira(jira.length),
+          ZYRA_RU.sourceExisting(params.existingTestcases.length),
+          bugs.length ? ZYRA_RU.sourceBugs(bugs.length) : ""
+        ].filter(Boolean)) + `\n\n${LegacyService.zyraDraftFilingHint(stagedSuiteName)}`
+      : [
         `I drafted ${finalResult.drafts.length} test case(s) after reading`,
         [
           `${params.knowledge.length} knowledge-base item(s)${jiraFromKnowledge ? ` (${jiraFromKnowledge} mirrored from Jira)` : ""}`,
@@ -14570,7 +14687,9 @@ export class LegacyService implements OnModuleInit {
         : weaklyGrounded
           ? [LegacyService.zyraWeakGroundingNote(finalResult.drafts.length), LegacyService.zyraDraftFilingHint(stagedSuiteName)].join("\n\n")
           : groundedReply,
-      reasoningSummary: `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${finalResult.usage.input}, output ${finalResult.usage.output}.`,
+      reasoningSummary: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.generationReasoning(params.provider, params.model, params.jiraIssueKeys, finalResult.usage.input, finalResult.usage.output)
+        : `AI generation used ${params.provider}/${params.model}. It considered Jira keys ${params.jiraIssueKeys.length ? params.jiraIssueKeys.join(", ") : "none explicitly mentioned"}, knowledge-base context, existing coverage for duplicate avoidance, and Zyra memory. Tokens: input ${finalResult.usage.input}, output ${finalResult.usage.output}.`,
       actionType: "create",
       operations: finalResult.drafts.map((draft, index) => {
         const updateTarget = updateTargetsByIndex[index];
@@ -14872,6 +14991,16 @@ export class LegacyService implements OnModuleInit {
    * the original wording; anything retried, given up or unaccounted for is said, never implied covered.
    */
   private static zyraPlanBatchReply(p: { drafted: number; covered: number; totalCount: number; remaining: number; requeued: number; skipped: number; unmapped: number }): string {
+    if (zyraReplyLanguage() === "ru") {
+      const notesRu = [
+        p.requeued ? ZYRA_RU.planNoteRequeued(p.requeued) : "",
+        p.skipped ? ZYRA_RU.planNoteSkipped(p.skipped) : "",
+        p.unmapped ? ZYRA_RU.planNoteUnmapped(p.unmapped) : ""
+      ].join("");
+      if (p.remaining) return ZYRA_RU.planBatchMore(p.drafted, p.covered, p.totalCount, notesRu, p.remaining);
+      if (p.covered >= p.totalCount) return ZYRA_RU.planBatchFinalAll(p.drafted, p.totalCount);
+      return ZYRA_RU.planBatchFinalPartial(p.drafted, p.covered, p.totalCount, notesRu);
+    }
     const notes = [
       p.requeued ? ` ${p.requeued} scenario(s) in this batch came back without a test case and will be retried in a later batch.` : "",
       p.skipped ? ` ${p.skipped} scenario(s) still produced no test case after a retry and were skipped.` : "",
@@ -14912,6 +15041,8 @@ export class LegacyService implements OnModuleInit {
     trace?: TurnHandle;
     knowledgeConfidence?: RagRetrievalConfidence;
     contextRefs?: ZyraTurnContextRefs;
+    // The session's language, read by generateZyraChatCreateDecision.
+    language?: ExportLocale;
   }): Promise<ZyraChatDecision> {
     let scenarios: string[] = [];
     try {
@@ -14949,7 +15080,8 @@ export class LegacyService implements OnModuleInit {
         jira: params.jira,
         bugs: params.bugs,
         trace: params.trace,
-        knowledgeConfidence: params.knowledgeConfidence
+        knowledgeConfidence: params.knowledgeConfidence,
+        language: params.language
       });
     }
 
@@ -14971,7 +15103,8 @@ export class LegacyService implements OnModuleInit {
       jira: params.jira,
       bugs: params.bugs,
       trace: params.trace,
-      knowledgeConfidence: params.knowledgeConfidence
+      knowledgeConfidence: params.knowledgeConfidence,
+      language: params.language
     });
 
     // A first-batch scenario that came back without a draft goes to the end of the queue for one retry.
@@ -15004,6 +15137,14 @@ export class LegacyService implements OnModuleInit {
     );
     void this.continueZyraChatPlan(params.projectId, params.userId, params.sessionId, planId).catch(() => undefined);
 
+    if (zyraReplyLanguage() === "ru") {
+      const intro = first.requeue.length
+        ? ZYRA_RU.planFirstIntroRequeued(decision.testcases.length, firstBatch.length, first.requeue.length)
+        : first.unmapped
+          ? ZYRA_RU.planFirstIntroUnmapped(decision.testcases.length, firstBatch.length, first.unmapped)
+          : ZYRA_RU.planFirstIntro(firstBatch.length);
+      return { ...decision, reply: ZYRA_RU.planStarted(scenarios.length, intro, remaining.length, decision.reply) };
+    }
     const firstIntro = first.requeue.length
       ? `Here are ${decision.testcases.length} test case(s) for the first ${firstBatch.length} — ${first.requeue.length} scenario(s) came back without a test case and will be retried in a later batch.`
       : first.unmapped
@@ -15039,7 +15180,7 @@ export class LegacyService implements OnModuleInit {
       `INSERT INTO zyra_chat_messages
        (session_id, project_id, user_id, role, content, reasoning_summary, action_type, status, testcases, activity, trace, review_request_id)
        VALUES ($1,$2,$3,'assistant',$4,$5,$6,'completed',$7::jsonb,$8::jsonb,$9::jsonb,$10)`,
-      [sessionId, projectId, userId, reply, "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity), trace ? JSON.stringify(trace) : null, reviewRequestId]
+      [sessionId, projectId, userId, reply, zyraReplyLanguage() === "ru" ? ZYRA_RU.planMessageReasoning : "Continuing a batched 'all possible cases' generation plan.", actionType, JSON.stringify(testcases), JSON.stringify(activity), trace ? JSON.stringify(trace) : null, reviewRequestId]
     );
     await client.query("UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = $1", [sessionId]);
   }
@@ -15130,11 +15271,23 @@ export class LegacyService implements OnModuleInit {
    * "stop, don't guess" by default rather than needing this line updated in lockstep with wherever
    * that status gets introduced.
    */
+  // The background loop has no turn around it — it runs after the request returned, or on boot with
+  // no request at all — so it sets the session's language itself for the plan messages it posts. A
+  // new message would supersede the plan, so the language read here holds for the plan's lifetime.
   private async continueZyraChatPlan(projectId: string, userId: string | null, sessionId: string, planId: string): Promise<void> {
+    const language = await this.zyraSessionLanguage(projectId, sessionId);
+    return runInZyraLanguage(language, () => this.continueZyraChatPlanInLanguage(projectId, userId, sessionId, planId));
+  }
+
+  private async continueZyraChatPlanInLanguage(projectId: string, userId: string | null, sessionId: string, planId: string): Promise<void> {
     for (;;) {
-      const sessionRes = await this.db.query("SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
+      // language is re-read with the plan on every batch, so a message sent from a Russian browser
+      // mid-plan switches the remaining batches too — and a plan resumed on boot, with no request
+      // at all, still writes in the language its session was last spoken in.
+      const sessionRes = await this.db.query("SELECT active_plan, language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2", [sessionId, projectId]);
       const plan = sessionRes.rows[0]?.active_plan as Body | undefined;
       if (!plan || plan.planId !== planId || plan.status !== "running") return;
+      const language = LegacyService.zyraStoredLanguage(sessionRes.rows[0]?.language);
 
       const remainingScenarios = normalizeJsonArray(plan.remainingScenarios).map(String);
       const batchSize = Number(plan.batchSize) || LegacyService.ZYRA_PLAN_BATCH_SIZE;
@@ -15173,7 +15326,7 @@ export class LegacyService implements OnModuleInit {
         if (!allocation.key) {
           stage("plan:batch", { status: "blocked", reason: allocation.reason }, "update");
           await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
-            await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I couldn't continue generating more test cases — ${allocation.reason}`, [], [], "answer", recorder.finish());
+            await this.postZyraPlanMessage(client, projectId, sessionId, userId, zyraReplyLanguage() === "ru" ? ZYRA_RU.planNoKey(allocation.reason) : `I couldn't continue generating more test cases — ${allocation.reason}`, [], [], "answer", recorder.finish());
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           });
           return;
@@ -15182,7 +15335,7 @@ export class LegacyService implements OnModuleInit {
         if (!capabilities.generation) {
           stage("plan:batch", { status: "blocked", reason: "Test case generation is off for this project" }, "update");
           await this.zyraPlanTransition(sessionId, planId, doneCount, async (client) => {
-            await this.postZyraPlanMessage(client, projectId, sessionId, userId, "Test case generation was disabled for Zyra in this project, so I stopped generating the remaining scenarios. Enable it under Zyra → Settings → Capabilities to continue.", [], [], "answer", recorder.finish());
+            await this.postZyraPlanMessage(client, projectId, sessionId, userId, zyraReplyLanguage() === "ru" ? ZYRA_RU.planGenerationDisabled : "Test case generation was disabled for Zyra in this project, so I stopped generating the remaining scenarios. Enable it under Zyra → Settings → Capabilities to continue.", [], [], "answer", recorder.finish());
             await client.query("UPDATE zyra_chat_sessions SET active_plan = NULL WHERE id = $1", [sessionId]);
           });
           return;
@@ -15225,7 +15378,8 @@ export class LegacyService implements OnModuleInit {
           suites,
           // Carried in the plan so every batch files into the suite the user asked for, not just
           // the first — a routed suite id is not recoverable from the original message text.
-          routedSuite: (plan.routedSuite as { id?: string; name?: string } | null) || null
+          routedSuite: (plan.routedSuite as { id?: string; name?: string } | null) || null,
+          language
         });
         stage("generating", { draftedCount: LegacyService.zyraDraftedCount(decision) }, "update");
         const gated = this.applyStorageGateToGenerated(decision, capabilities);
@@ -15253,7 +15407,13 @@ export class LegacyService implements OnModuleInit {
         const remaining = [...remainingScenarios.slice(batch.length), ...outcome.requeue];
         const newCovered = LegacyService.zyraPlanCovered(plan) + outcome.covered;
         // Never announce a batch that wrote nothing — the same false-success trap the chat path had.
-        const reply = !testcases.length
+        const reply = !testcases.length && zyraReplyLanguage() === "ru"
+          ? [
+              ZYRA_RU.planBatchSavedNothing(batch.length),
+              outcome.requeue.length ? ZYRA_RU.planBatchRetryLater(outcome.requeue.length) : "",
+              remaining.length ? ZYRA_RU.planContinuingRemaining(remaining.length) : ZYRA_RU.planLastBatch
+            ].filter(Boolean).join(" ")
+          : !testcases.length
           ? [
               `⚠️ This batch saved nothing — none of the ${batch.length} scenario(s) produced a stored test case.`,
               outcome.requeue.length ? `${outcome.requeue.length} of them will be retried in a later batch.` : "",
@@ -15297,7 +15457,7 @@ export class LegacyService implements OnModuleInit {
         // `detail` is already what the pause message itself tells the user.
         const failedTrace = recorder.fail(detail || "This batch did not complete.");
         await this.zyraPlanTransition(sessionId, planId, doneCount, async (client, current) => {
-          await this.postZyraPlanMessage(client, projectId, sessionId, userId, `I ran into an issue generating more test cases (${detail}). Pausing here — ${LegacyService.zyraPlanCovered(plan)}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], [], "answer", failedTrace);
+          await this.postZyraPlanMessage(client, projectId, sessionId, userId, zyraReplyLanguage() === "ru" ? ZYRA_RU.planPausedOnError(detail, LegacyService.zyraPlanCovered(plan), totalCount) : `I ran into an issue generating more test cases (${detail}). Pausing here — ${LegacyService.zyraPlanCovered(plan)}/${totalCount} scenarios covered. Say "continue" and I'll retry the rest.`, [], [], "answer", failedTrace);
           // Spread the locked read, not the outer closure's `plan` — same reasoning as the
           // success-path commit above.
           await client.query(
@@ -15406,8 +15566,8 @@ export class LegacyService implements OnModuleInit {
       `INSERT INTO ai_generation_requests
        (project_id, requested_by, provider, model, user_story, acceptance_criteria, custom_prompt, requested_count,
         generated_count, generated_payload, agent_name, task_status, feedback, context, jira_issue_keys, linear_issue_keys,
-        token_input, token_output, token_total, source_summary, activity_log)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,'[]'::jsonb,$9,'todo',$10,$11,$12::jsonb,$13::jsonb,0,0,0,$14::jsonb,$15::jsonb)
+        token_input, token_output, token_total, source_summary, activity_log, language)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,'[]'::jsonb,$9,'todo',$10,$11,$12::jsonb,$13::jsonb,0,0,0,$14::jsonb,$15::jsonb,$16)
        RETURNING *`,
       [
         projectId,
@@ -15424,7 +15584,10 @@ export class LegacyService implements OnModuleInit {
         JSON.stringify(jiraIssueKeys),
         JSON.stringify(linearIssueKeys),
         JSON.stringify(sourceSummary),
-        JSON.stringify(activityLog)
+        JSON.stringify(activityLog),
+        // The language the task's own text is written in (detectScriptLanguage), stored because
+        // processZyraTask runs after this request has returned. No signal is English.
+        detectScriptLanguage([story, acceptanceCriteria, context].join("\n")) ?? "en"
       ]
     );
     void this.processZyraTask(projectId, res.rows[0].id, { userId: uid, knowledgeItemIds }).catch(() => undefined);
@@ -15533,7 +15696,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.rows[0].auth_header_name,
         authScheme: allocation.rows[0].auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: LegacyService.zyraStoredLanguage(task.language) }
       });
       const drafts = aiResult.drafts;
       // Stamped into generated_payload together with the drafts themselves, so the save reads the
@@ -15732,9 +15895,12 @@ export class LegacyService implements OnModuleInit {
       createdAt: new Date().toISOString()
     }];
     const claimRes = await this.db.query(
-      `UPDATE ai_generation_requests SET task_status = 'todo', feedback = $3, activity_log = activity_log || $4::jsonb, updated_at = now()
+      // language follows the feedback's own text: Russian feedback on an English task regenerates in
+      // Russian; feedback with no signal ("ok", a ticket key) keeps the task's language.
+      `UPDATE ai_generation_requests SET task_status = 'todo', feedback = $3, activity_log = activity_log || $4::jsonb, updated_at = now(),
+              language = COALESCE($6, language)
        WHERE id = $1 AND project_id = $2 AND task_status = $5 RETURNING *`,
-      [taskId, projectId, feedback, JSON.stringify(feedbackActivity), statusBeforeFeedback]
+      [taskId, projectId, feedback, JSON.stringify(feedbackActivity), statusBeforeFeedback, detectScriptLanguage(feedbackText)]
     );
     if (claimRes.rowCount === 0) {
       // Lost the race: something else (another feedback submission, a close, a save) changed the
@@ -15779,7 +15945,8 @@ export class LegacyService implements OnModuleInit {
       provider,
       model,
       allocation: allocation.rows[0],
-      previousSourceSummary: existing.rows[0].source_summary
+      previousSourceSummary: existing.rows[0].source_summary,
+      language: LegacyService.zyraStoredLanguage(claimRes.rows[0].language)
     }).catch(() => undefined);
     return {
       generationRequestId: taskId,
@@ -15815,6 +15982,7 @@ export class LegacyService implements OnModuleInit {
       model: string;
       allocation: Body;
       previousSourceSummary: unknown;
+      language?: ExportLocale;
     }
   ): Promise<void> {
     const {
@@ -15848,7 +16016,7 @@ export class LegacyService implements OnModuleInit {
         authHeaderName: allocation.auth_header_name,
         authScheme: allocation.auth_scheme,
         projectId,
-        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence }
+        input: { story, context, acceptanceCriteria, feedback, knowledge, jira, linear, existingTestcases, requestedCount, testcaseRange, knowledgeConfidence, language: options.language }
       });
       // Logged regardless of whether the UPDATE below actually applies (see the !responseRow
       // branch) — the provider call happened and was billed either way.
@@ -18017,8 +18185,76 @@ export class LegacyService implements OnModuleInit {
       input.feedback ? `Reviewer feedback to apply to this same task:\n${input.feedback}` : "",
       "For every draft, use the selected knowledge, Jira context, Zyra memory, and existing testcase repository context.",
       "Make sure every draft is specific, detailed, testable, and not a duplicate of existing testcases or another generated draft.",
-      groundingNote
+      groundingNote,
+      LegacyService.zyraLanguageInstruction(input.language)
     ].filter(Boolean).join("\n\n");
+  }
+
+  /*
+   * Asks for the drafts' prose in the user's language (see V132_zyra_generation_language.sql for
+   * where it comes from). It goes here, in the per-request dynamic prompt, not in zyraSystemPrompt:
+   * the system prompt and the static source block are prompt-cached per project, and a per-language
+   * line there would split that cache by language for no gain. Placed last so it is the final word,
+   * the same reason groundingNote sits where it does.
+   *
+   * Everything machine-read stays English: the JSON keys, priority and severity (normalizeAiDrafts /
+   * normalizeZyraSeverity accept only the English values and would drop "Высокая" to null), the
+   * technique names, and the source labels that sanitizeZyraSourceRefs matches verbatim.
+   */
+  /** A stored `language` column read back as a supported locale; anything else (NULL, a typo) is English. */
+  private static zyraStoredLanguage(value: unknown): ExportLocale {
+    return (EXPORT_LOCALES as readonly string[]).includes(String(value)) ? (value as ExportLocale) : "en";
+  }
+
+  private async zyraSessionLanguage(projectId: string, sessionId: string): Promise<ExportLocale> {
+    const res = await this.db.query<{ language: string }>(
+      "SELECT language FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2",
+      [sessionId, projectId]
+    );
+    return LegacyService.zyraStoredLanguage(res.rows[0]?.language);
+  }
+
+  /*
+   * Records the language of the message that is about to start chat work on this session, before
+   * that work is detached. Called only after the caller's own access check. Null — a message that
+   * carries no language signal — leaves the stored language as it is.
+   */
+  private async rememberZyraSessionLanguage(projectId: string, sessionId: string, language: ExportLocale | null): Promise<void> {
+    if (!language) return;
+    await this.db.query(
+      "UPDATE zyra_chat_sessions SET language = $3 WHERE id = $1 AND project_id = $2 AND language IS DISTINCT FROM $3",
+      [sessionId, projectId, language]
+    );
+  }
+
+  /*
+   * The chat router's counterpart to zyraLanguageInstruction: the `reply` (and reasoningSummary) the
+   * user reads, in the session's language. The router decides actions, so every machine-read field
+   * of its envelope stays as specified. Empty for English, so an English turn's prompt is unchanged.
+   *
+   * The wording rule matters as much as the language: the English prompt forbids past-tense
+   * "created/saved" claims about staged work, and reconcileZyraReply polices it with
+   * ZYRA_COMPLETION_CLAIM — which only knows English verbs. ZYRA_COMPLETION_CLAIM_RU is the Russian
+   * counterpart; this instruction tells the model the same rule in Russian terms so it rarely fires.
+   */
+  private static zyraReplyLanguageInstruction(language: ExportLocale | undefined): string {
+    if (language !== "ru") return "";
+    return [
+      "",
+      "LANGUAGE: the user is writing in Russian. Write the reply and reasoningSummary fields in Russian.",
+      "Keep everything else exactly as specified above, in English: the JSON keys, action, actionType, operation types, and any suite name, external id or other value copied from the context.",
+      "The staged-work rule applies in Russian too: describe drafts as 'подготовлены'/'предложены' and staged for review ('ожидают проверки'), never as 'созданы', 'сохранены', 'добавлены', 'обновлены' or 'архивированы'."
+    ].join("\n");
+  }
+
+  private static zyraLanguageInstruction(language: ExportLocale | undefined): string {
+    if (language !== "ru") return "";
+    return [
+      "Write every draft in Russian: title, preconditions, each step's action and expectedResult inside stepsJson, testData, and expectedSummary.",
+      "For component, reuse an existing component name exactly as written when the draft belongs to that area; only a new component name is written in Russian.",
+      "Keep these exactly as specified, in English, whatever the language: the JSON keys, priority (P1/P2/P3), severity (Critical/High/Medium/Low), the technique names, and the sourceRefs labels.",
+      "Values the sources state — names, error messages, codes, URLs, field labels as they appear in the product — are copied as written, not translated."
+    ].join("\n");
   }
 
   /**
@@ -18827,12 +19063,19 @@ export class LegacyService implements OnModuleInit {
     reason: string
   ): ZyraChatDecision {
     const intent = this.detectZyraChatIntent(message);
-    const note = `⚠️ Zyra's AI provider is unavailable right now (${reason}), so this is a best-effort answer from the test repository only — no test cases were generated or changed.`;
+    const ru = zyraReplyLanguage() === "ru";
+    const note = ru
+      ? ZYRA_RU.degradedNote(reason)
+      : `⚠️ Zyra's AI provider is unavailable right now (${reason}), so this is a best-effort answer from the test repository only — no test cases were generated or changed.`;
     // Generation genuinely cannot happen without the provider — say so rather than pretending.
     if (intent === "create" || intent === "update" || intent === "archive" || intent === "suite") {
       return {
-        reply: `${note}\n\nI can't ${intent === "create" ? "generate test cases" : "change the test repository"} until the provider is reachable. Check Settings → AI Providers, then ask me again.`,
-        reasoningSummary: `Degraded mode (${reason}). Refused a ${intent} request rather than mutating the repository without AI context.`,
+        reply: ru
+          ? ZYRA_RU.degradedRefuse(note, intent === "create")
+          : `${note}\n\nI can't ${intent === "create" ? "generate test cases" : "change the test repository"} until the provider is reachable. Check Settings → AI Providers, then ask me again.`,
+        reasoningSummary: ru
+          ? `Режим без ИИ (${reason}). Запрос «${intent}» отклонён, чтобы не изменять репозиторий без контекста ИИ.`
+          : `Degraded mode (${reason}). Refused a ${intent} request rather than mutating the repository without AI context.`,
         actionType: "answer",
         operations: [],
         testcases: []
@@ -18841,8 +19084,10 @@ export class LegacyService implements OnModuleInit {
     // Read-only requests can still be served from the repository snapshot, as a table.
     if (intent === "list" && existingTestcases.length) {
       return {
-        reply: `${note}\n\nHere is the nearest existing coverage I could match.`,
-        reasoningSummary: `Degraded mode (${reason}). Listed ${existingTestcases.length} existing testcase(s) from repository context.`,
+        reply: ru ? ZYRA_RU.degradedList(note) : `${note}\n\nHere is the nearest existing coverage I could match.`,
+        reasoningSummary: ru
+          ? `Режим без ИИ (${reason}). Показаны существующие тест-кейсы из репозитория: ${existingTestcases.length}.`
+          : `Degraded mode (${reason}). Listed ${existingTestcases.length} existing testcase(s) from repository context.`,
         actionType: "answer",
         operations: [],
         testcases: existingTestcases.slice(0, 25).map((tc) => this.chatDraftRow(tc, "covered", "Existing coverage matched without AI."))
@@ -18850,7 +19095,9 @@ export class LegacyService implements OnModuleInit {
     }
     return {
       reply: `${note}\n\n${this.defaultZyraReply(message, existingTestcases)}`,
-      reasoningSummary: `Degraded mode (${reason}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
+      reasoningSummary: ru
+        ? `Режим без ИИ (${reason}). ${this.defaultReasoningSummary(existingTestcases.length)}`
+        : `Degraded mode (${reason}). ${this.defaultReasoningSummary(existingTestcases.length)}`,
       actionType: "answer",
       operations: [],
       testcases: []
@@ -18987,7 +19234,12 @@ export class LegacyService implements OnModuleInit {
     if (actionType === "create" || actionType === "archive" || actionType === "update") {
       return { kind: "proposal", actionType, content };
     }
-    if (LegacyService.ZYRA_OFFER_PATTERN.test(content) || LegacyService.ZYRA_STAGED_AWAITING_PATTERN.test(content)) {
+    if (
+      LegacyService.ZYRA_OFFER_PATTERN.test(content) ||
+      LegacyService.ZYRA_STAGED_AWAITING_PATTERN.test(content) ||
+      ZYRA_RU_OFFER.test(foldRu(content)) ||
+      ZYRA_RU_STAGED_AWAITING.test(foldRu(content))
+    ) {
       return { kind: "offer", content };
     }
     return null;
@@ -19017,8 +19269,10 @@ export class LegacyService implements OnModuleInit {
   private static readonly ZYRA_AFFIRMATIVE_PATTERN =
     /^(yes please|yes|yeah|yep|yup|sure|ok|okay|confirmed?|correct|go ahead|do it|please do it|please do|do that|please proceed|proceed|sounds good|go for it)[\s.!]*$/i;
 
+  // The Russian alternatives are OR-ed in for every session: a Russian word cannot occur in an
+  // English message, so English confirmations behave exactly as before.
   private zyraIsConfirmation(message: string): boolean {
-    return LegacyService.ZYRA_AFFIRMATIVE_PATTERN.test(message.trim());
+    return LegacyService.ZYRA_AFFIRMATIVE_PATTERN.test(message.trim()) || ZYRA_RU_AFFIRMATIVE.test(foldRu(message.trim()));
   }
 
   // Resolve the router's suite against reality: an id only counts if the suite exists, a name is
@@ -19088,10 +19342,14 @@ export class LegacyService implements OnModuleInit {
       testcaseStorage: "Test case storage operations (create, update, delete, bulk)",
       suiteOperations: "Suite operations (create, move/assign)"
     };
-    const reason = `${label[capability]} is currently disabled for Zyra in this project. Enable it under Zyra → Settings → Capabilities, then try again.`;
+    const reason = zyraReplyLanguage() === "ru"
+      ? ZYRA_RU.capabilityDisabled(ZYRA_RU.capabilityLabel[capability])
+      : `${label[capability]} is currently disabled for Zyra in this project. Enable it under Zyra → Settings → Capabilities, then try again.`;
     return {
       reply: reason,
-      reasoningSummary: `Requested a disabled Zyra capability (${capability}). ${existingCount} nearby testcase(s) available for context.`,
+      reasoningSummary: zyraReplyLanguage() === "ru"
+        ? `Запрошена отключённая возможность Zyra (${capability}). Ближайших тест-кейсов для контекста: ${existingCount}.`
+        : `Requested a disabled Zyra capability (${capability}). ${existingCount} nearby testcase(s) available for context.`,
       actionType: "answer",
       operations: [],
       testcases: []
@@ -19105,7 +19363,9 @@ export class LegacyService implements OnModuleInit {
       ...decision,
       operations: [],
       actionType: "answer",
-      reply: `Test case storage is disabled for Zyra in this project, so these are suggestions only — I did not save them. Enable "Test case storage operations" under Zyra → Settings → Capabilities to let me save generated testcases.\n\n${decision.reply}`
+      reply: zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.storageGate(decision.reply)
+        : `Test case storage is disabled for Zyra in this project, so these are suggestions only — I did not save them. Enable "Test case storage operations" under Zyra → Settings → Capabilities to let me save generated testcases.\n\n${decision.reply}`
     };
   }
 
@@ -19142,7 +19402,9 @@ export class LegacyService implements OnModuleInit {
     return [
       cleaned,
       "",
-      "_Those test cases were only described in chat — they were not saved to the repository. Ask me to generate them and they'll be created and shown in the table above._"
+      zyraReplyLanguage() === "ru"
+        ? ZYRA_RU.strippedTable
+        : "_Those test cases were only described in chat — they were not saved to the repository. Ask me to generate them and they'll be created and shown in the table above._"
     ].join("\n").trim();
   }
 
@@ -19221,12 +19483,18 @@ export class LegacyService implements OnModuleInit {
    * staged, and says how to file them, so the state on screen and the state in the sentence agree.
    */
   private static zyraDraftFilingHint(suiteName: string | null): string {
+    if (zyraReplyLanguage() === "ru") {
+      return suiteName === LegacyService.ZYRA_DRAFT_SUITE_NAME
+        ? ZYRA_RU.draftFilingHintDraftSuite(LegacyService.ZYRA_DRAFT_SUITE_NAME)
+        : ZYRA_RU.draftFilingHintSuite(suiteName);
+    }
     return suiteName === LegacyService.ZYRA_DRAFT_SUITE_NAME
       ? `They're staged as drafts in **${LegacyService.ZYRA_DRAFT_SUITE_NAME}** — say "save them to <suite>" and I'll file them where they belong.`
       : `They're drafts in **${suiteName}** — review them there, or say "save them to <suite>" to move them.`;
   }
 
   private static zyraUngroundedNote(count: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.ungroundedNote(count);
     return [
       "ℹ️ I don't have anything about this in the project's knowledge base, and no Jira ticket matched it either.",
       "",
@@ -19237,6 +19505,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private static zyraKnowledgeBaseOffNote(count: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.knowledgeBaseOffNote(count);
     return [
       "ℹ️ I don't have access to the Knowledge Base — Access to Knowledge Base is turned off for Zyra in this project.",
       "",
@@ -19251,6 +19520,7 @@ export class LegacyService implements OnModuleInit {
   // "I found nothing", and collapsing the two into one message would either overstate a weak match
   // as real coverage or understate a genuine (if imperfect) one as nothing at all.
   private static zyraWeakGroundingNote(count: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.weakGroundingNote(count);
     return [
       "⚠️ What I found in the project's knowledge base only loosely matches this request — not a strong enough match to call this real coverage.",
       "",
@@ -19334,7 +19604,23 @@ export class LegacyService implements OnModuleInit {
     return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
   }
 
+  // The English classification decides; a Russian session gets the same entry from ZYRA_RU.failure.
   private static zyraFailureCause(detail: string): { cause: string; advice: string } {
+    const english = LegacyService.zyraFailureCauseEn(detail);
+    if (zyraReplyLanguage() !== "ru") return english;
+    const key = (
+      {
+        "the AI's answer came back incomplete, so I couldn't read the test cases out of it": "truncated",
+        "the AI provider is rate-limiting this workspace right now": "rateLimited",
+        "the AI provider rejected the workspace's key": "badKey",
+        "the AI provider didn't answer in time": "timeout",
+        "no AI provider is configured for this workspace": "noProvider"
+      } as Record<string, keyof typeof ZYRA_RU.failure>
+    )[english.cause] ?? "generic";
+    return ZYRA_RU.failure[key];
+  }
+
+  private static zyraFailureCauseEn(detail: string): { cause: string; advice: string } {
     const text = String(detail || "").toLowerCase();
     if (/json|parse|truncat|unterminated|unexpected token|no testcase drafts|no drafts/.test(text)) {
       return {
@@ -19379,6 +19665,18 @@ export class LegacyService implements OnModuleInit {
     jiraCount: number;
     suiteName?: string | null;
   }): string {
+    if (zyraReplyLanguage() === "ru") {
+      const targetRu = input.requestedCount && input.requestedCount > 0 ? ZYRA_RU.attemptCount(input.requestedCount) : ZYRA_RU.attemptCountGeneric;
+      const sourcesRu = [
+        input.knowledgeCount ? ZYRA_RU.attemptKnowledge(input.knowledgeCount) : null,
+        input.jiraCount ? ZYRA_RU.attemptJira(input.jiraCount) : null
+      ].filter((s): s is string => Boolean(s));
+      return [
+        ZYRA_RU.attemptGenerate(targetRu),
+        input.suiteName ? ZYRA_RU.attemptForSuite(input.suiteName) : null,
+        sourcesRu.length ? ZYRA_RU.attemptFrom(sourcesRu) : ZYRA_RU.attemptFromRequestOnly
+      ].filter(Boolean).join(" ");
+    }
     const target = input.requestedCount && input.requestedCount > 0 ? `${input.requestedCount} test case(s)` : "test cases";
     const sources = [
       input.knowledgeCount ? `${input.knowledgeCount} knowledge-base item(s)` : null,
@@ -19399,6 +19697,7 @@ export class LegacyService implements OnModuleInit {
    */
   private static zyraFailureReply(attempt: string, detail: string, retried: boolean): string {
     const { cause, advice } = LegacyService.zyraFailureCause(detail);
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.failureReply(attempt, retried, cause, advice);
     return [
       "⚠️ I ran into a problem and couldn't finish this — **nothing was created or saved.**",
       "",
@@ -19506,6 +19805,13 @@ export class LegacyService implements OnModuleInit {
   private zyraMoveBreakdownSuffix(moveBreakdown: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }> | undefined): string {
     if (!moveBreakdown || !moveBreakdown.length) return "";
     const total = moveBreakdown.reduce((sum, entry) => sum + entry.count, 0);
+    if (zyraReplyLanguage() === "ru") {
+      const partsRu = moveBreakdown.map((entry) => {
+        const label = entry.created ? ZYRA_RU.moveSuiteCreated(entry.suiteName) : entry.suiteName;
+        return entry.count > 0 ? `${label}: ${entry.count}` : ZYRA_RU.moveNoneMatched(label);
+      });
+      return ZYRA_RU.movedToSuites(partsRu, total);
+    }
     const parts = moveBreakdown.map((entry) => {
       const label = entry.created ? `${entry.suiteName} (created)` : entry.suiteName;
       return entry.count > 0 ? `${label}: ${entry.count}` : `${label}: 0 (none matched)`;
@@ -19532,6 +19838,7 @@ export class LegacyService implements OnModuleInit {
   // success ("Created the Regression suite") never trips this on the word "suite" itself, while an
   // unrelated hallucinated testcase claim in the same reply still does.
   private zyraFalseCompletionBanner(reply: string, salvaged = false, claimPattern: RegExp = LegacyService.ZYRA_COMPLETION_CLAIM): string {
+    if (zyraReplyLanguage() === "ru") return this.zyraFalseCompletionBannerRu(reply, salvaged, claimPattern);
     if (!claimPattern.test(reply)) return "";
     if (!salvaged && LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
     return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
@@ -19555,7 +19862,25 @@ export class LegacyService implements OnModuleInit {
   private static readonly ZYRA_PERSISTED_CLAIM =
     /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|saved|archived|updated|deleted|removed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|saved|archived|updated|removed)\b|\b(test\s?cases?|suite)\b[^.!?\n,;]{0,10}\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s\w{1,12}\s)(created|added|saved|archived|updated|deleted|removed)\b/i;
 
+  /*
+   * A Russian session's reply is checked against BOTH languages: the Russian claim pattern for the
+   * Russian prose it was asked to write, and the English one in case the model answered in English
+   * anyway. Either language's disclosure phrases exempt it, exactly as in English.
+   */
+  private zyraFalseCompletionBannerRu(reply: string, salvaged: boolean, englishPattern: RegExp): string {
+    const folded = foldRu(reply);
+    if (!englishPattern.test(reply) && !ZYRA_RU_COMPLETION_CLAIM.test(folded)) return "";
+    if (!salvaged && (LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply) || ZYRA_RU_ALREADY_DISCLOSED.test(folded))) return "";
+    return ZYRA_RU.falseClaimBanner;
+  }
+
   private zyraPersistedClaimBanner(reply: string): string {
+    if (zyraReplyLanguage() === "ru") {
+      const folded = foldRu(reply);
+      const claims = LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || ZYRA_RU_COMPLETION_CLAIM.test(folded);
+      const disclosed = LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply) || ZYRA_RU_ALREADY_DISCLOSED.test(folded);
+      return claims && !disclosed ? ZYRA_RU.falseClaimBanner : "";
+    }
     if (!LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
     return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
   }
@@ -19593,6 +19918,11 @@ export class LegacyService implements OnModuleInit {
     const requested = decision.operations.filter((op) => op.type !== "create_suite").length;
     const appliedCount = applied.testcases.length;
 
+    const ru = zyraReplyLanguage() === "ru";
+    if (!appliedCount && ru) {
+      const detailRu = decision.operations.length ? ZYRA_RU.nothingSavedMissing : ZYRA_RU.nothingSavedNoOps;
+      return [ZYRA_RU.nothingSaved(detailRu), "", decision.reply].join("\n") + moveSuffix;
+    }
     if (!appliedCount) {
       const detail = decision.operations.length
         ? "The test cases it referred to do not exist in this project, so there was nothing to change."
@@ -19609,7 +19939,9 @@ export class LegacyService implements OnModuleInit {
     // no longer accurate even when every requested operation produced a row. Appended after the
     // model's own prose rather than replacing it, so the reply keeps whatever specifics it named.
     const proposedCount = applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length;
-    const reviewHint = proposedCount > 0
+    const reviewHint = proposedCount > 0 && ru
+      ? ZYRA_RU.reviewHint(proposedCount)
+      : proposedCount > 0
       ? `\n\n📝 ${proposedCount} of them ${proposedCount === 1 ? "is" : "are"} staged for your review — open the review panel to select, edit, or discard, then Save to add ${proposedCount === 1 ? "it" : "them"} to the repository. Nothing has been written to the repository yet.`
       : "";
 
@@ -19637,6 +19969,19 @@ export class LegacyService implements OnModuleInit {
       // The two shortfalls are independent and can both be true in the same turn (an update that
       // never resolved to a row, and a move that only partially matched its named ids) — state
       // whichever applies rather than picking one wording and silently dropping the other.
+      if (ru) {
+        // The activity reasons are English sentences from the activity log — not pasted into a
+        // Russian reply; the headline still states both shortfalls.
+        const headlineRu = [
+          appliedCount < requested ? ZYRA_RU.partialHeadline(appliedCount, requested) : "",
+          unresolvedMoves > 0 ? ZYRA_RU.partialUnresolvedMoves(unresolvedMoves) : ""
+        ].filter(Boolean).join(" ");
+        return bannerPrefix + [
+          `⚠️ ${headlineRu}` + (appliedCount < requested ? ZYRA_RU.partialRestNotDrafted : ""),
+          "",
+          decision.reply + reviewHint
+        ].join("\n") + moveSuffix;
+      }
       const headline = [
         appliedCount < requested ? `${appliedCount} of ${requested} test case operation(s) were drafted for review.` : "",
         unresolvedMoves > 0 ? `${unresolvedMoves} named test case(s) could not be moved.` : ""
@@ -19786,6 +20131,9 @@ export class LegacyService implements OnModuleInit {
     contextRefs?: ZyraTurnContextRefs;
   }): Promise<ZyraChatDecision> {
     const plan = this.chatTestcasePlan(params.message, params.projectTestcaseRange, params.routedCount);
+    // Read here rather than threaded down from the turn: this is the one function every interactive
+    // chat create (first try and the smaller retry) goes through, and it already has the session.
+    const language = await this.zyraSessionLanguage(params.projectId, params.sessionId);
     if (plan.testcaseRange === "all") {
       return this.startZyraChatPlan({
         projectId: params.projectId,
@@ -19805,7 +20153,8 @@ export class LegacyService implements OnModuleInit {
         bugs: params.bugs,
         trace: params.trace,
         knowledgeConfidence: params.knowledgeConfidence,
-        contextRefs: params.contextRefs
+        contextRefs: params.contextRefs,
+        language
       });
     }
     return this.generateZyraChatTestcasesWithAi({
@@ -19825,6 +20174,7 @@ export class LegacyService implements OnModuleInit {
       bugs: params.bugs,
       trace: params.trace,
       knowledgeConfidence: params.knowledgeConfidence,
+      language,
       ...plan
     });
   }
@@ -20007,7 +20357,13 @@ export class LegacyService implements OnModuleInit {
       reason: "No active testcase is linked to this Jira issue key."
     }));
     const coveragePct = totalTickets ? Math.round((coveredTickets / totalTickets) * 100) : 0;
-    const reply = totalTickets
+    const reply = zyraReplyLanguage() === "ru"
+      ? totalTickets
+        ? ZYRA_RU.jiraCoverage(totalTickets, coveredTickets, pendingTickets, linkedTestcases, coveragePct, Boolean(pendingTickets))
+        : connected
+          ? ZYRA_RU.jiraNotSynced
+          : ZYRA_RU.jiraNotConnected
+      : totalTickets
       ? [
           `I checked the Jira ticket cache and testcase links for this project.`,
           `Total Jira tickets: ${totalTickets}.`,
@@ -20032,6 +20388,11 @@ export class LegacyService implements OnModuleInit {
   }
 
   private defaultZyraReply(message: string, existingTestcases: ZyraGenerationInput["existingTestcases"]): string {
+    if (zyraReplyLanguage() === "ru") {
+      if (existingTestcases.length) return ZYRA_RU.defaultRelated(existingTestcases.length);
+      if (/\b(example|sample|for example|how would|how to)\b/i.test(message) || /(пример|как бы|как сделать)/i.test(message)) return ZYRA_RU.defaultExample;
+      return ZYRA_RU.defaultGeneric;
+    }
     if (existingTestcases.length) {
       return `I found ${existingTestcases.length} related testcase(s) in the repository context. At a high level, I would use them as reference coverage, then look for gaps around negative flows, boundaries, permissions, data state, and audit behavior. Ask me to show the related testcases if you want the table.`;
     }
@@ -20042,6 +20403,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private defaultReasoningSummary(existingCount: number): string {
+    if (zyraReplyLanguage() === "ru") return ZYRA_RU.defaultReasoning(existingCount);
     return `Reviewed available knowledge-base notes, recent chat context, and ${existingCount} nearby testcase(s). Focused on coverage gaps, duplicate avoidance, edge cases, boundary values, permissions, data integrity, state transitions, and auditability.`;
   }
 
@@ -20201,6 +20563,12 @@ export class LegacyService implements OnModuleInit {
     item.linearIssueKeys = normalizeJsonArray(row.linear_issue_keys);
     item.sources = normalizeJsonArray(row.source_summary);
     item.activities = normalizeJsonArray(row.activity_log);
+    // A Russian task's timeline and sources are rendered in Russian; the stored English is untouched
+    // (see zyra-task-activity-ru.ts). Every other task is returned exactly as before.
+    if (row.language === "ru") {
+      item.sources = item.sources.map((entry: Body) => localizeZyraTaskEntry(entry));
+      item.activities = item.activities.map((entry: Body) => localizeZyraTaskEntry(entry));
+    }
     item.tokenUsage = {
       input: Number(row.token_input || 0),
       output: Number(row.token_output || 0),

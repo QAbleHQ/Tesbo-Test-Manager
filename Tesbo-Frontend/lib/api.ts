@@ -983,6 +983,8 @@ export interface ZyraTask {
   tokenUsage: { input: number; output: number; total: number };
   createdAt: string;
   updatedAt: string;
+  /** "en" | "ru", set server-side from the script of what the user typed; drives the task view's UI language (lib/zyra-i18n.ts). Missing/unknown renders as English. */
+  language?: string;
 }
 
 export interface ZyraCapabilities {
@@ -1153,6 +1155,8 @@ export interface ZyraChatSession {
   activePlan?: ZyraChatActivePlan | null;
   /** Only present on list responses; absent (falsy) on a session just returned from create/get. */
   hasMessages?: boolean;
+  /** Set server-side from the script of what the user typed; drives the chat UI language (lib/zyra-i18n.ts). Missing/unknown renders as English. */
+  language?: "en" | "ru" | string;
 }
 
 export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
@@ -1838,6 +1842,13 @@ export interface TestCaseExportFilters {
   customFieldFilters?: string;
   /** Custom tag ids — a case matches when it carries any one of them. */
   customTagIds?: string[];
+  /**
+   * Explicit test case ids — the repository's row checkboxes. When present, the export is scoped
+   * to exactly these ids and every other filter field above (suiteId, status, search, ...) is
+   * ignored: "export the N I selected" means exactly those rows, not those rows intersected with
+   * whatever the filter panel currently shows. See getExportUrl.
+   */
+  ids?: string[];
   /** Repository table column sort. Omitted keeps the server's default (ID sequence) order. */
   sortBy?: "id" | "title" | "priority";
   sortDir?: "asc" | "desc";
@@ -1847,19 +1858,27 @@ export interface TestCaseExportFilters {
 // listTestCases call and suiteCasesSort) so "Export" produces exactly what's currently
 // selected/filtered/sorted on screen, not the whole project in an unrelated order — an unfiltered,
 // unsorted export is still the default when `filters` is omitted.
+//
+// A non-empty `ids` short-circuits every other filter field: a user who ticked specific rows and
+// hit Export means exactly those rows, regardless of the suite/status/search filters still active
+// in the panel behind them. The column sort still applies, matching the on-screen row order.
 export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?: TestCaseExportFilters): string {
   const sp = new URLSearchParams();
-  if (filters?.suiteId) sp.set("suiteId", filters.suiteId);
-  if (filters?.includeDescendants) sp.set("includeDescendants", "true");
-  if (filters?.status) sp.set("status", filters.status);
-  if (filters?.priority) sp.set("priority", filters.priority);
-  if (filters?.type) sp.set("type", filters.type);
-  if (filters?.automationStatus) sp.set("automationStatus", filters.automationStatus);
-  if (filters?.jiraIssueKey) sp.set("jiraIssueKey", filters.jiraIssueKey);
-  if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
-  if (filters?.search) sp.set("search", filters.search);
-  if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
-  if (filters?.customTagIds?.length) sp.set("customTagIds", filters.customTagIds.join(","));
+  if (filters?.ids?.length) {
+    sp.set("ids", filters.ids.join(","));
+  } else {
+    if (filters?.suiteId) sp.set("suiteId", filters.suiteId);
+    if (filters?.includeDescendants) sp.set("includeDescendants", "true");
+    if (filters?.status) sp.set("status", filters.status);
+    if (filters?.priority) sp.set("priority", filters.priority);
+    if (filters?.type) sp.set("type", filters.type);
+    if (filters?.automationStatus) sp.set("automationStatus", filters.automationStatus);
+    if (filters?.jiraIssueKey) sp.set("jiraIssueKey", filters.jiraIssueKey);
+    if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
+    if (filters?.search) sp.set("search", filters.search);
+    if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
+    if (filters?.customTagIds?.length) sp.set("customTagIds", filters.customTagIds.join(","));
+  }
   if (filters?.sortBy) sp.set("sortBy", filters.sortBy);
   if (filters?.sortDir) sp.set("sortDir", filters.sortDir);
   const qs = sp.toString();

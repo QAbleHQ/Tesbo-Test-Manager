@@ -824,7 +824,8 @@ export default function BugsPage() {
                           <th>Reporter</th>
                           <th>Assignee</th>
                           <th>Reported</th>
-                          <th className="w-8"></th>
+                          {/* Labelled so the row's edit/delete read as a column, as on every other list. */}
+                          <th>Actions</th>
                         </tr>
                       </thead>
                       <tbody>

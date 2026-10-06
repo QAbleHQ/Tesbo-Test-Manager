@@ -6500,3 +6500,425 @@ test.describe("zyra chat — request trace and turn lifecycle (fake provider)", 
     expect(messages.find((m) => m.role === "assistant")?.status).toBe("timed_out");
   });
 });
+
+test.describe("zyra — writes in the language the user writes in (fake provider)", () => {
+  /*
+   * Zyra's language is the Unicode script of what the user typed (common/script-language.ts), never
+   * the browser: Cyrillic in → Russian test cases, Russian replies and Russian fixed messages out.
+   * It is stored — zyra_chat_sessions.language / ai_generation_requests.language (V132) — because
+   * most of the work outlives its request, and because a message with no signal ("ok", "да", a
+   * ticket key) must keep the language the conversation already had.
+   *
+   * What a scripted provider can prove is the contract: which prompts carry the Russian
+   * instruction, what the backend itself writes into the chat, what is stored. Whether a real model
+   * then writes good Russian is outside what these tests can show.
+   *
+   * English is the default and must be untouched — every existing Zyra suite asserts the English
+   * wording verbatim, and runs in the same impacted selection as this block.
+   */
+  const RU_BROWSER = { "Accept-Language": "ru-RU,ru;q=0.9" };
+  const EN_BROWSER = { "Accept-Language": "en-US,en;q=0.9" };
+  const DRAFTS_IN_RUSSIAN = "Write every draft in Russian";
+  const REPLY_IN_RUSSIAN = "LANGUAGE: the user is writing in Russian";
+  const GENERATOR = "You are Zyra the Test Generator";
+
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let asGuest: APIRequestContext;
+  let ai: FakeAiServer;
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("zyra-language");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    asGuest = await loginAs(tenant.guest);
+    ai = await startFakeAiServer();
+  });
+
+  test.afterAll(async () => {
+    await asOwner?.dispose();
+    await asGuest?.dispose();
+    await ai?.close();
+  });
+
+  test.beforeEach(() => {
+    ai?.reset();
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+    if (tenant) purge();
+  });
+
+  test.afterEach(() => {
+    if (tenant) purge();
+  });
+
+  function purge(): void {
+    const project = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(`DELETE FROM zyra_chat_messages WHERE project_id = ${project};`);
+    // ai_generation_requests.chat_session_id is ON DELETE RESTRICT (V116) — before sessions.
+    exec(`DELETE FROM ai_generation_requests WHERE project_id = ${project};`);
+    exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
+    exec(`DELETE FROM testcases WHERE project_id = ${project};`);
+    exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    exec(`DELETE FROM project_ai_key_allocations WHERE project_id = ${project};`);
+    exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${org};`);
+  }
+
+  function url(suffix: string): string {
+    return `/api/projects/${tenant!.mainProjectId}/agents/zyra${suffix}`;
+  }
+
+  // A custom-gateway provider: OpenAI-wire but not embeddings-capable, so no background embedding
+  // job ever eats a queued reply — see the "zyra chat — citations" block's identical helper.
+  async function allocateFakeAiKey(): Promise<void> {
+    const keyRes = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: `E2E language fake ai ${Date.now()}${Math.floor(Math.random() * 1000)}`, provider: "e2e-fake-gateway", apiKey: "sk-e2e-fake", baseUrl: ai.baseUrl, defaultModel: "gpt-4o-mini" },
+      failOnStatusCode: false,
+    });
+    expect(keyRes.status(), `creating the fake-provider AI key — ${await keyRes.text()}`).toBe(201);
+    const key = await keyRes.json();
+    const allocRes = await asOwner.post("/api/workspace/ai-keys/allocations", {
+      data: { projectId: tenant!.mainProjectId, workspaceAiKeyId: key.id },
+      failOnStatusCode: false,
+    });
+    expect(allocRes.status(), `allocating the fake-provider key — ${await allocRes.text()}`).toBe(201);
+  }
+
+  async function newSession(title: string): Promise<string> {
+    const res = await asOwner.post(url("/chat/sessions"), { data: { title }, failOnStatusCode: false });
+    expect(res.status(), `creating a chat session — ${await res.text()}`).toBeLessThan(300);
+    return (await res.json()).id;
+  }
+
+  const sessionLanguage = (sessionId: string) =>
+    scalar(`SELECT language FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`);
+
+  const generationRequests = () => ai.requests.filter((r) => JSON.stringify(r.messages ?? []).includes(GENERATOR));
+  const routerRequests = () => ai.requests.filter((r) => JSON.stringify(r.messages ?? []).includes("You are Zyra, an expert test engineer and edge-case designer"));
+  const systemMessage = (request: { messages?: Array<{ role: string; content: unknown }> }) =>
+    JSON.stringify((request.messages ?? []).find((m) => m.role === "system")?.content ?? "");
+
+  const draft = (title: string) => ({
+    title,
+    preconditions: "Пользователь находится на странице входа.",
+    stepsJson: JSON.stringify([{ stepNumber: 1, action: "Ввести неверный пароль", expectedResult: "Отображается сообщение об ошибке" }]),
+    testData: "user@example.com",
+    expectedSummary: "Вход отклонён.",
+    priority: "P1",
+    severity: "High",
+    tags: ["zyra"],
+    sourceRefs: [],
+  });
+
+  function queueCreateTurn(title: string): void {
+    ai.queueReply({ reply: "", reasoningSummary: "Creating one case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+    ai.queueReply({ drafts: [draft(title)] });
+    ai.queueReply("Noted."); // rememberZyraTurn's summarization call — see ZYR-A-63
+  }
+
+  const send = (sessionId: string, message: string, headers: Record<string, string> = {}) =>
+    asOwner.post(url(`/chat/sessions/${sessionId}/messages`), { data: { message }, headers, failOnStatusCode: false });
+
+  async function lastAssistant(sessionId: string): Promise<Record<string, any>> {
+    const res = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    const messages = (await res.json()).messages as Array<Record<string, any>>;
+    return [...messages].reverse().find((m) => m.role === "assistant")!;
+  }
+
+  /** One full create turn; returns the generation and router prompts it sent. */
+  async function createTurn(sessionId: string, message: string, headers: Record<string, string> = {}) {
+    ai.reset();
+    queueCreateTurn("Черновик");
+    const res = await send(sessionId, message, headers);
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    const generation = generationRequests();
+    expect(generation, "exactly one draft-writing call").toHaveLength(1);
+    return { generation: JSON.stringify(generation[0].messages), router: JSON.stringify(routerRequests()[0]?.messages ?? []), request: generation[0] };
+  }
+
+  test("ZYR-L-01 a Russian message gets Russian drafts and a Russian reply; the cached system prompt does not change", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language basic");
+
+    const english = await createTurn(sessionId, "Create a test case for the login page.");
+    expect(english.generation).not.toContain(DRAFTS_IN_RUSSIAN);
+    expect(english.router).not.toContain(REPLY_IN_RUSSIAN);
+    expect(sessionLanguage(sessionId)).toBe("en");
+    expect(String((await lastAssistant(sessionId)).content)).toMatch(/^I drafted 1 test case\(s\) after reading/);
+
+    ai.reset();
+    queueCreateTurn("Вход с неверным паролем отклонён");
+    const res = await send(sessionId, "Создай тест-кейс для неверного пароля на странице входа.");
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    expect(sessionLanguage(sessionId)).toBe("ru");
+
+    const generation = generationRequests();
+    expect(generation).toHaveLength(1);
+    const prompt = JSON.stringify(generation[0].messages);
+    expect(prompt).toContain(DRAFTS_IN_RUSSIAN);
+    // Machine-read fields are pinned to English in the same instruction.
+    expect(prompt).toContain("severity (Critical/High/Medium/Low)");
+    expect(JSON.stringify(routerRequests()[0].messages), "the router is asked for a Russian reply").toContain(REPLY_IN_RUSSIAN);
+    // The instruction sits in the per-request prompt: the prompt-cached system message is byte-identical.
+    expect(systemMessage(generation[0])).toBe(systemMessage(english.request));
+
+    // The backend's own reply text is Russian; the draft suite keeps its real (English) name.
+    const reply = await lastAssistant(sessionId);
+    expect(String(reply.content)).toMatch(/^Я подготовил\(а\) 1 тест-кейс\(ов\), изучив:/);
+    expect(String(reply.content)).toContain("**Zyra generated test cases**");
+    expect(String(reply.content)).not.toContain("I drafted");
+    expect(String(reply.reasoningSummary ?? reply.reasoning_summary ?? "")).toContain("Генерация через");
+
+    // The Russian draft is what got staged, with the stored vocabulary still English.
+    const staged = JSON.parse(
+      scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`),
+    );
+    expect(staged[0].draft.title).toBe("Вход с неверным паролем отклонён");
+    expect(staged[0].draft.severity).toBe("High");
+  });
+
+  test("ZYR-L-02 the browser's language is ignored — the text decides, in both directions", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language browser ignored");
+
+    const englishFromRussianBrowser = await createTurn(sessionId, "Create a test case for the password reset email.", RU_BROWSER);
+    expect(englishFromRussianBrowser.generation).not.toContain(DRAFTS_IN_RUSSIAN);
+    expect(sessionLanguage(sessionId)).toBe("en");
+
+    const russianFromEnglishBrowser = await createTurn(sessionId, "Создай тест-кейс для письма сброса пароля.", EN_BROWSER);
+    expect(russianFromEnglishBrowser.generation).toContain(DRAFTS_IN_RUSSIAN);
+    expect(sessionLanguage(sessionId)).toBe("ru");
+  });
+
+  test("ZYR-L-03 a message with no language signal keeps the session's language, in both directions", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language no signal");
+
+    await createTurn(sessionId, "Создай тест-кейс для страницы входа.");
+    expect(sessionLanguage(sessionId)).toBe("ru");
+    for (const noSignal of ["ok", "yes", "5", "👍", "HBP-14"]) {
+      const turn = await createTurn(sessionId, noSignal);
+      expect(sessionLanguage(sessionId), `"${noSignal}" must not flip a Russian session`).toBe("ru");
+      expect(turn.generation, `"${noSignal}" still generates in Russian`).toContain(DRAFTS_IN_RUSSIAN);
+    }
+
+    // A real English message switches it back…
+    await createTurn(sessionId, "Now create a test case for the logout button.");
+    expect(sessionLanguage(sessionId)).toBe("en");
+    // …and a bare Russian "да" does not switch an English session to Russian.
+    const da = await createTurn(sessionId, "да");
+    expect(sessionLanguage(sessionId)).toBe("en");
+    expect(da.generation).not.toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-04 mixed text goes with the majority; URLs, ticket keys and code don't count; other Cyrillic languages fall back to English", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language mixed");
+    const cases: [string, "ru" | "en"][] = [
+      ["Создай тест-кейсы для login page на мобильном", "ru"],
+      ["Create test cases for the экран входа on mobile", "en"],
+      ["Проверь страницу https://example.com/login/very/long/path HBP-14 и `validateEmailFormat()`", "ru"],
+      ["Verify the city field accepts «Москва» and saves it", "en"],
+      // Ukrainian: Cyrillic, but not Russian — English, never Russian.
+      ["Створи тест-кейси для сторінки входу", "en"],
+      // Transliterated Russian is Latin script.
+      ["sozdai test dlya stranitsy vhoda", "en"],
+    ];
+    for (const [message, expected] of cases) {
+      const turn = await createTurn(sessionId, message);
+      expect(sessionLanguage(sessionId), message).toBe(expected);
+      if (expected === "ru") expect(turn.generation, message).toContain(DRAFTS_IN_RUSSIAN);
+      else expect(turn.generation, message).not.toContain(DRAFTS_IN_RUSSIAN);
+    }
+  });
+
+  test("ZYR-L-05 an exhaustive plan's background batches, and its plan messages, are Russian", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language plan");
+    const scenarioDraft = (title: string) => ({ ...draft(title), severity: undefined });
+
+    // Same seven-scenario, two-batch shape as ZCC-B-08 (api/zyra-chat-consistency.spec.ts).
+    ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
+    ai.queueReply({ scenarios: Array.from({ length: 7 }, (_, i) => `Scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] });
+    ai.queueReply({ drafts: Array.from({ length: 5 }, (_, i) => scenarioDraft(`Scenario ${i + 1}`)) });
+    ai.queueReply("Noted."); // the first batch's rememberZyraTurn — see ZCC-B-08
+    ai.queueReply({ drafts: Array.from({ length: 2 }, (_, i) => scenarioDraft(`Scenario ${i + 6}`)) });
+
+    const turn = await send(sessionId, "Сгенерируй все возможные тест-кейсы для входа в систему.");
+    expect(turn.status(), await turn.text()).toBeLessThan(300);
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), {
+        message: "the plan must run its background batch to completion",
+        timeout: 30_000,
+      })
+      .toBeNull();
+
+    const generations = generationRequests();
+    expect(generations.length, "the inline batch and the background batch").toBe(2);
+    for (const [index, request] of generations.entries()) {
+      expect(JSON.stringify(request.messages), `batch ${index + 1}`).toContain(DRAFTS_IN_RUSSIAN);
+    }
+    const session = await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json();
+    const assistant = (session.messages as Array<Record<string, any>>).filter((m) => m.role === "assistant");
+    expect(assistant).toHaveLength(2);
+    expect(String(assistant[0].content)).toContain("Я выделил(а) 7 отдельных сценариев");
+    expect(String(assistant[1].content)).toContain("все 7 сценариев покрыты");
+    expect(JSON.stringify(session.messages)).not.toContain("all 7 scenarios are now covered");
+  });
+
+  test("ZYR-L-06 'продолжить' resumes a paused plan, and the resume message is Russian", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language resume");
+    exec(`UPDATE zyra_chat_sessions SET language = 'ru' WHERE id = ${literal(sessionId)};`);
+    const plan = JSON.stringify({ planId: `e2e-plan-${Date.now()}`, status: "paused", remainingScenarios: ["Лимит мест", "Освобождение мест"], batchSize: 5, doneCount: 3, totalCount: 5, originalMessage: "Сгенерируй все возможные кейсы" });
+    exec(`UPDATE zyra_chat_sessions SET active_plan = ${literal(plan)}::jsonb WHERE id = ${literal(sessionId)};`);
+    ai.queueReply({ drafts: [draft("Лимит мест"), draft("Освобождение мест")] });
+    ai.queueReply("Noted.");
+
+    const res = await send(sessionId, "продолжить");
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    await expect
+      .poll(() => scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), { timeout: 30_000 })
+      .toBeNull();
+
+    const session = await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json();
+    const contents = (session.messages as Array<Record<string, any>>).filter((m) => m.role === "assistant").map((m) => String(m.content));
+    expect(contents.some((c) => c.startsWith("Продолжаю — покрыто сценариев:")), JSON.stringify(contents)).toBe(true);
+    expect(contents.some((c) => c.startsWith("Вот последние")), JSON.stringify(contents)).toBe(true);
+    expect(JSON.stringify(generationRequests()[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-07 a Russian reply that claims unsaved work as saved gets the Russian correction banner", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E language claim guard");
+    // An answer turn — nothing staged, nothing written — whose Russian prose says otherwise.
+    ai.queueReply({ reply: "Готово! Тест-кейсы созданы и сохранены в набор Login.", reasoningSummary: "Ответ.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const res = await send(sessionId, "Сохрани эти тест-кейсы в набор Login, пожалуйста.");
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    const reply = String((await lastAssistant(sessionId)).content);
+    expect(reply.startsWith("⚠️ **Извините! Ничего не сохранено.**"), reply).toBe(true);
+    expect(reply).toContain("Тест-кейсы созданы и сохранены в набор Login.");
+
+    // A truthful Russian reply passes untouched.
+    ai.reset();
+    ai.queueReply({ reply: "Я подготовил(а) 3 тест-кейса — они ожидают вашей проверки.", reasoningSummary: "Ответ.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    await send(sessionId, "Что ты подготовил для страницы входа?");
+    expect(String((await lastAssistant(sessionId)).content)).toBe("Я подготовил(а) 3 тест-кейса — они ожидают вашей проверки.");
+  });
+
+  test("ZYR-L-08 a capability that is off is explained in Russian", async () => {
+    await allocateFakeAiKey();
+    const settings = await asOwner.patch(url("/settings"), { data: { capabilities: { generation: false } }, failOnStatusCode: false });
+    expect(settings.status(), await settings.text()).toBeLessThan(300);
+    try {
+      const sessionId = await newSession("E2E language capability");
+      ai.queueReply({ reply: "", reasoningSummary: "Создание.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false });
+      const res = await send(sessionId, "Создай тест-кейс для страницы входа.");
+      expect(res.status(), await res.text()).toBeLessThan(300);
+      const reply = String((await lastAssistant(sessionId)).content);
+      expect(reply).toBe("Для Zyra в этом проекте сейчас отключено: Генерация тест-кейсов. Включите это в Zyra → Настройки → Возможности и попробуйте снова.");
+    } finally {
+      await asOwner.patch(url("/settings"), { data: { capabilities: { generation: true } }, failOnStatusCode: false });
+    }
+  });
+
+  async function waitForTask(taskId: string): Promise<void> {
+    await expect
+      .poll(() => scalar(`SELECT task_status FROM ai_generation_requests WHERE id = ${literal(taskId)};`), { timeout: 30_000 })
+      .toBe("in_review");
+  }
+
+  test("ZYR-L-09 a task with a Russian story is generated in Russian and its timeline reads in Russian; feedback re-detects", async () => {
+    await allocateFakeAiKey();
+    ai.queueReply({ drafts: [draft("Проверка входа")] });
+    ai.queueReply("- Noted.");
+    const taskRes = await asOwner.post(url("/tasks"), {
+      data: { userStory: "Пользователь входит в систему по email и паролю." },
+      headers: EN_BROWSER,
+      failOnStatusCode: false,
+    });
+    expect(taskRes.status(), await taskRes.text()).toBe(201);
+    const taskId = (await taskRes.json()).generationRequestId;
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("ru");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+
+    const task = await (await asOwner.get(url(`/tasks/${taskId}`))).json();
+    const body = task.task ?? task;
+    expect(body.language).toBe("ru");
+    const titles = (body.activities as Array<{ title: string }>).map((a) => a.title);
+    expect(titles).toEqual(expect.arrayContaining(["Задача создана", "Задача взята в работу", "Сгенерированы черновики тест-кейсов"]));
+    expect(titles).not.toContain("Task created");
+    // The stored log is still English — translation happens on the way out.
+    expect(scalar(`SELECT activity_log::text FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toContain("Task created");
+    // The story itself is the user's text and is never rewritten.
+    expect((body.activities as Array<{ title: string; detail: string }>).find((a) => a.title === "Задача создана")!.detail).toBe("Пользователь входит в систему по email и паролю.");
+
+    // Feedback with no signal keeps Russian.
+    await expect.poll(() => ai.requests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    ai.reset();
+    ai.queueReply({ drafts: [draft("Проверка входа 2")] });
+    ai.queueReply("- Noted.");
+    const okRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), { data: { feedback: "ok" }, failOnStatusCode: false });
+    expect(okRes.status(), await okRes.text()).toBe(201);
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("ru");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+
+    // English feedback switches the task to English.
+    await expect.poll(() => ai.requests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    ai.reset();
+    ai.queueReply({ drafts: [draft("Sign-in check")] });
+    ai.queueReply("- Noted.");
+    const enRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Please also cover the locked account case." },
+      headers: RU_BROWSER,
+      failOnStatusCode: false,
+    });
+    expect(enRes.status(), await enRes.text()).toBe(201);
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("en");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).not.toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-10 Russian feedback on an English task switches it to Russian", async () => {
+    await allocateFakeAiKey();
+    ai.queueReply({ drafts: [draft("Login check")] });
+    ai.queueReply("- Noted.");
+    const taskRes = await asOwner.post(url("/tasks"), { data: { userStory: "Users sign in with email and password." }, failOnStatusCode: false });
+    const taskId = (await taskRes.json()).generationRequestId;
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("en");
+    await waitForTask(taskId);
+    const englishTask = await (await asOwner.get(url(`/tasks/${taskId}`))).json();
+    expect(((englishTask.task ?? englishTask).activities as Array<{ title: string }>).map((a) => a.title)).toContain("Task created");
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).not.toContain(DRAFTS_IN_RUSSIAN);
+
+    await expect.poll(() => ai.requests.length, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
+    ai.reset();
+    ai.queueReply({ drafts: [draft("Заблокированная учётная запись")] });
+    ai.queueReply("- Noted.");
+    const fbRes = await asOwner.post(url(`/tasks/${taskId}/feedback`), {
+      data: { feedback: "Добавь сценарий с заблокированной учётной записью." },
+      failOnStatusCode: false,
+    });
+    expect(fbRes.status(), await fbRes.text()).toBe(201);
+    expect(scalar(`SELECT language FROM ai_generation_requests WHERE id = ${literal(taskId)};`)).toBe("ru");
+    await waitForTask(taskId);
+    expect(JSON.stringify(ai.requests[0]?.messages ?? [])).toContain(DRAFTS_IN_RUSSIAN);
+  });
+
+  test("ZYR-L-11 a caller without access to the project cannot change a session's language", async () => {
+    const sessionId = await newSession("E2E language access");
+    expect(sessionLanguage(sessionId)).toBe("en");
+    // The guest is in the workspace but not a member of this project.
+    const res = await asGuest.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Создай тест-кейс для страницы входа." },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(404);
+    expect(sessionLanguage(sessionId), "a refused request writes nothing").toBe("en");
+  });
+});

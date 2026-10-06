@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Button, Field, FieldLabel, Input, Select, Textarea } from "@/components/ui";
 import type { ZyraChatTestcaseRow } from "@/lib/api";
+import { useZyraText } from "@/lib/zyra-i18n";
 
 type Step = { action: string; expectedResult: string };
 
@@ -68,6 +69,7 @@ export function ZyraDraftEditor({
   const [testData, setTestData] = useState(initialTestData);
   const [severity, setSeverity] = useState(row.severity || "");
   const [component, setComponent] = useState(row.component || "");
+  const t = useZyraText();
 
   function addStep() {
     setSteps((prev) => [...prev, { action: "", expectedResult: "" }]);
@@ -98,11 +100,11 @@ export function ZyraDraftEditor({
   return (
     <div className="space-y-3 rounded-lg border border-[var(--brand-border)] bg-[var(--surface)] p-3">
       <Field>
-        <FieldLabel>Title</FieldLabel>
+        <FieldLabel>{t("col.title")}</FieldLabel>
         <Input value={title} onChange={(event) => setTitle(event.target.value)} />
       </Field>
       <Field>
-        <FieldLabel>Priority</FieldLabel>
+        <FieldLabel>{t("col.priority")}</FieldLabel>
         <Select value={priority} onChange={(event) => setPriority(event.target.value)}>
           {PRIORITIES.map((p) => (
             <option key={p} value={p}>{p}</option>
@@ -110,34 +112,35 @@ export function ZyraDraftEditor({
         </Select>
       </Field>
       <Field>
-        <FieldLabel>Severity</FieldLabel>
+        <FieldLabel>{t("col.severity")}</FieldLabel>
         <Select value={severity} onChange={(event) => setSeverity(event.target.value)}>
-          <option value="">Select</option>
+          <option value="">{t("editor.select")}</option>
+          {/* The option value stays the English severity the API stores; only the label is localized. */}
           {SEVERITIES.map((s) => (
-            <option key={s} value={s}>{s}</option>
+            <option key={s} value={s}>{t.value("severity", s)}</option>
           ))}
         </Select>
       </Field>
       <Field>
-        <FieldLabel>Component</FieldLabel>
-        <Input value={component} onChange={(event) => setComponent(event.target.value)} placeholder="e.g. Checkout" />
+        <FieldLabel>{t("col.component")}</FieldLabel>
+        <Input value={component} onChange={(event) => setComponent(event.target.value)} placeholder={t("editor.componentPlaceholder")} />
       </Field>
       <Field>
-        <FieldLabel>Preconditions</FieldLabel>
+        <FieldLabel>{t("col.preconditions")}</FieldLabel>
         <Textarea value={preconditions} onChange={(event) => setPreconditions(event.target.value)} rows={2} />
       </Field>
       {/* Bound to the draft's description — what zyraSave writes to the test case's Description
           column, and what the repository's edit form shows under that same label. */}
       <Field>
-        <FieldLabel>Description</FieldLabel>
+        <FieldLabel>{t("col.description")}</FieldLabel>
         <Textarea value={description} onChange={(event) => setDescription(event.target.value)} rows={2} />
       </Field>
       <Field>
-        <FieldLabel>Test Data</FieldLabel>
-        <Textarea value={testData} onChange={(event) => setTestData(event.target.value)} rows={2} placeholder="Input data, sample values, or setup-specific data" />
+        <FieldLabel>{t("col.testData")}</FieldLabel>
+        <Textarea value={testData} onChange={(event) => setTestData(event.target.value)} rows={2} placeholder={t("editor.testDataPlaceholder")} />
       </Field>
       <div>
-        <FieldLabel>Steps</FieldLabel>
+        <FieldLabel>{t("col.steps")}</FieldLabel>
         <div className="mt-1.5 space-y-2">
           {steps.map((step, index) => (
             <div key={index} className="flex gap-2">
@@ -145,25 +148,25 @@ export function ZyraDraftEditor({
                 value={step.action}
                 onChange={(event) => updateStep(index, "action", event.target.value)}
                 rows={1}
-                placeholder={`Step ${index + 1} action`}
+                placeholder={t("editor.stepAction", { n: index + 1 })}
                 className="flex-1"
               />
               <Textarea
                 value={step.expectedResult}
                 onChange={(event) => updateStep(index, "expectedResult", event.target.value)}
                 rows={1}
-                placeholder="Expected result"
+                placeholder={t("col.expectedResult")}
                 className="flex-1"
               />
-              <Button variant="secondary" size="sm" onClick={() => removeStep(index)} disabled={steps.length <= 1}>Remove</Button>
+              <Button variant="secondary" size="sm" onClick={() => removeStep(index)} disabled={steps.length <= 1}>{t("editor.remove")}</Button>
             </div>
           ))}
         </div>
-        <Button variant="secondary" size="sm" className="mt-2" onClick={addStep}>+ Add step</Button>
+        <Button variant="secondary" size="sm" className="mt-2" onClick={addStep}>{t("editor.addStep")}</Button>
       </div>
       <div className="flex justify-end gap-2">
-        <Button variant="secondary" size="sm" onClick={onCancel} disabled={saving}>Cancel</Button>
-        <Button size="sm" onClick={handleSave} disabled={saving || !title.trim()}>{saving ? "Saving..." : "Save edit"}</Button>
+        <Button variant="secondary" size="sm" onClick={onCancel} disabled={saving}>{t("cancel")}</Button>
+        <Button size="sm" onClick={handleSave} disabled={saving || !title.trim()}>{saving ? t("savingDots") : t("editor.saveEdit")}</Button>
       </div>
     </div>
   );

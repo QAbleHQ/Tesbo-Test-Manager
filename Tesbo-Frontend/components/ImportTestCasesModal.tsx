@@ -141,32 +141,40 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
       .catch(() => setCustomFieldDefinitions([]));
   }, [open, projectId, reset]);
 
-  const normalizeHeader = useCallback((value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, ""), []);
+  // Letters and digits in any script survive, not just a-z0-9: the old ASCII-only rule folded every
+  // Cyrillic header to "", so a Russian export (or a custom field named in Russian) never auto-mapped.
+  // ё/е are folded together because everyday Russian typing uses them interchangeably.
+  const normalizeHeader = useCallback(
+    (value: string) => value.toLowerCase().replace(/ё/g, "е").replace(/[^\p{L}\p{N}]+/gu, ""),
+    []
+  );
 
   const autoMap = useCallback((headers: string[]) => {
     const map: Record<string, number> = {};
     const lowerHeaders = headers.map(normalizeHeader);
     const aliases: Record<string, string[]> = {
-      title: ["title", "testcasetitle", "testcase", "name", "summary", "scenario"],
-      description: ["description", "desc", "details"],
-      preconditions: ["preconditions", "precondition", "prerequisites", "prerequisite"],
-      postconditions: ["postconditions", "postcondition"],
+      // The last alias of each field is its header in a Russian export or template — the labels in
+      // RU_HEADERS (Tesbo-Backend-Nest/src/common/export-i18n.ts), already normalized.
+      title: ["title", "testcasetitle", "testcase", "name", "summary", "scenario", "название"],
+      description: ["description", "desc", "details", "описание"],
+      preconditions: ["preconditions", "precondition", "prerequisites", "prerequisite", "предусловия"],
+      postconditions: ["postconditions", "postcondition", "постусловия"],
       // "action"/"actions" moved off Steps and onto the dedicated Action field below — a header
       // literally named "Action" is far more likely to be one plain single-step column than the
       // multi-step "action => expected result" DSL Steps expects.
-      steps: ["steps", "teststeps"],
-      action: ["action", "actions", "step", "teststep"],
-      expectedResult: ["expectedresult", "expected", "expectedoutcome"],
-      testData: ["testdata", "data", "inputdata"],
-      priority: ["priority", "prio"],
-      severity: ["severity"],
-      type: ["type", "testtype", "casetype"],
-      status: ["status", "state"],
-      automationStatus: ["automationstatus", "automationtype", "automation", "automated"],
-      suite: ["suite", "suitename", "folder", "foldername", "module", "modulename"],
-      component: ["component", "componentname", "subfolder", "subfoldername", "feature", "area"],
-      estimatedDuration: ["estimatedduration", "duration", "estimate"],
-      attachments: ["notes", "attachment", "attachments", "comments"],
+      steps: ["steps", "teststeps", "шаги"],
+      action: ["action", "actions", "step", "teststep", "действие"],
+      expectedResult: ["expectedresult", "expected", "expectedoutcome", "ожидаемыйрезультат"],
+      testData: ["testdata", "data", "inputdata", "тестовыеданные"],
+      priority: ["priority", "prio", "приоритет"],
+      severity: ["severity", "серьезность"],
+      type: ["type", "testtype", "casetype", "тип"],
+      status: ["status", "state", "статус"],
+      automationStatus: ["automationstatus", "automationtype", "automation", "automated", "типавтоматизации"],
+      suite: ["suite", "suitename", "folder", "foldername", "module", "modulename", "набор"],
+      component: ["component", "componentname", "subfolder", "subfoldername", "feature", "area", "компонент"],
+      estimatedDuration: ["estimatedduration", "duration", "estimate", "оценкавремени"],
+      attachments: ["notes", "attachment", "attachments", "comments", "примечания"],
     };
     for (const field of IMPORTABLE_FIELDS) {
       const normalized = normalizeHeader(field.key);
