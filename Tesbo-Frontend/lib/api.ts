@@ -784,6 +784,10 @@ export async function listNotifications(): Promise<AppNotification[]> {
   return api<AppNotification[]>("/api/notifications");
 }
 
+export async function markAllNotificationsRead(): Promise<void> {
+  await api<unknown>("/api/notifications/read-all", { method: "POST" });
+}
+
 export async function markNotificationRead(id: string): Promise<void> {
   return api<void>(`/api/notifications/${id}/read`, { method: "POST" });
 }

@@ -2,6 +2,8 @@ import { InjectQueue } from "@nestjs/bullmq";
 import { Injectable, Logger } from "@nestjs/common";
 import { Queue } from "bullmq";
 import { DatabaseService } from "../database/database.service";
+import { notificationLinks, notificationMessages, type IntegrationProvider } from "../legacy/notification-events";
+import { writeNotifications } from "../legacy/notification-writer";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { ChangedField } from "../common/text-diff.util";
 import {
@@ -192,12 +194,53 @@ export class IntegrationSyncService {
   }
 
   async failRun(runId: string, error: string): Promise<void> {
-    await this.db.query(
+    const res = await this.db.query(
       `UPDATE integration_sync_runs
        SET status = 'failed', stage = 'failed', error = $2, finished_at = now(), updated_at = now()
-       WHERE id = $1 AND status IN ('queued', 'running')`,
+       WHERE id = $1 AND status IN ('queued', 'running')
+       RETURNING id, provider, organization_id, project_id, triggered_by, trigger_source`,
       [runId, error.slice(0, 2000)]
     );
+    // Only the call that actually ended the run announces it (a run already settled matched nothing).
+    if (res.rows[0]) await this.notifyRunOutcome(res.rows[0], "failed");
+  }
+
+  /**
+   * "[Jira / Linear / Notion] sync failed. Please review the connection." / "…sync completed
+   * successfully." for a run that has just ended. A run someone started by hand is reported to them;
+   * a nightly run has no one waiting on it, so a failure goes to the workspace owners and a success
+   * is not announced at all (it would be one notification per mapped project, every night). A run
+   * that finished `partial` — some tickets failed — is not announced either way: it is neither of
+   * the two matrix messages. Uses writeNotifications, not LegacyService (see notification-writer.ts).
+   */
+  private async notifyRunOutcome(run: Row, outcome: "completed" | "failed"): Promise<void> {
+    try {
+      const manual = run.trigger_source === "manual" && run.triggered_by;
+      let recipients: Array<string | null> = [];
+      if (manual) {
+        recipients = [run.triggered_by];
+      } else if (outcome === "failed") {
+        const owners = await this.db.query<{ user_id: string }>(
+          "SELECT user_id FROM organization_members WHERE organization_id = $1 AND role = 'owner'",
+          [run.organization_id]
+        );
+        recipients = owners.rows.map((r) => r.user_id);
+      }
+      if (!recipients.length) return;
+      const provider = run.provider as IntegrationProvider;
+      const project = await this.db.query<{ name: string }>("SELECT name FROM projects WHERE id = $1", [run.project_id]);
+      const projectName = project.rows[0]?.name || "your project";
+      await writeNotifications(this.db, recipients, {
+        type: outcome === "completed" ? "integration_sync_completed" : "integration_sync_failed",
+        title: outcome === "completed" ? notificationMessages.integrationSyncCompleted(provider, projectName) : notificationMessages.integrationSyncFailed(provider, projectName),
+        // That project's own integration page, where the run and its result are shown.
+        link: notificationLinks.projectIntegration(String(run.project_id), provider),
+        dedupeKey: `sync_${outcome}:${run.id}`,
+        memberOf: { organizationId: String(run.organization_id) }
+      }, this.logger);
+    } catch (err) {
+      this.logger.warn(`Sync notification failed for run ${run.id} — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -219,16 +262,18 @@ export class IntegrationSyncService {
   }
 
   async finishRun(runId: string, note: string | null): Promise<void> {
-    await this.db.query(
+    const res = await this.db.query(
       `UPDATE integration_sync_runs
        SET status = CASE WHEN failed_tickets > 0 THEN 'partial' ELSE 'succeeded' END,
            stage = 'done',
            error = COALESCE(error, $2),
            finished_at = now(),
            updated_at = now()
-       WHERE id = $1 AND status IN ('queued', 'running')`,
+       WHERE id = $1 AND status IN ('queued', 'running')
+       RETURNING id, status, provider, organization_id, project_id, triggered_by, trigger_source`,
       [runId, note]
     );
+    if (res.rows[0]?.status === "succeeded") await this.notifyRunOutcome(res.rows[0], "completed");
   }
 
   /**

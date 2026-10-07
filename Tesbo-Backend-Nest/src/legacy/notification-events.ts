@@ -26,7 +26,21 @@ export type NotificationType =
   | "bug_reassigned"
   | "bug_status_changed"
   | "bug_mentioned"
-  | "comment_reply";
+  | "comment_reply"
+  | "zyra_generation_ready"
+  | "zyra_generation_failed"
+  | "zyra_task_failed"
+  | "zyra_review_completed"
+  | "kb_document_ready"
+  | "kb_document_failed"
+  | "kb_document_updated"
+  | "kb_document_deleted"
+  | "integration_connected"
+  | "integration_disconnected"
+  | "integration_auth_expired"
+  | "integration_sync_completed"
+  | "integration_sync_failed"
+  | "integration_issue_linked";
 
 /**
  * Not implemented — the extension point for the integration notifications (connected, disconnected,
@@ -59,7 +73,27 @@ export const NOTIFICATION_PRIORITY: Record<NotificationType, NotificationPriorit
   bug_status_changed: "Medium",
   bug_mentioned: "High",
   // The matrix's Collaboration "Reply to comment" row.
-  comment_reply: "Medium"
+  comment_reply: "Medium",
+  // Phase 2 — Zyra. "Generation completed" (Medium) and "Review required" (High) are one event in
+  // this product (a generated batch lands in `in_review`; there is no separate "complete" state), so
+  // they send a single notification, with the higher priority and the more actionable wording.
+  zyra_generation_ready: "High",
+  // Likewise "Generation failed" and "Task failed" for the task-board generator. `zyra_task_failed`
+  // is the chat plan that pauses on an error, the one other unattended Zyra job.
+  zyra_generation_failed: "High",
+  zyra_task_failed: "High",
+  zyra_review_completed: "Medium",
+  // Phase 2 — Knowledge Base and integrations (Jira / Linear / Notion share every integration type).
+  kb_document_ready: "Medium",
+  kb_document_failed: "High",
+  kb_document_updated: "Low",
+  kb_document_deleted: "Medium",
+  integration_connected: "Medium",
+  integration_disconnected: "High",
+  integration_auth_expired: "High",
+  integration_sync_completed: "Low",
+  integration_sync_failed: "High",
+  integration_issue_linked: "Low"
 };
 
 /** `notifications.title` is VARCHAR(255). */
@@ -105,8 +139,31 @@ export const notificationMessages = {
   bugReassigned: (bugId: string) => `Bug ${bugId} has been reassigned to you.`,
   bugStatusChanged: (bugId: string, status: string) => `Bug ${bugId} status changed to ${status}.`,
   bugMentioned: (userName: string, bugId: string) => `${userName} mentioned you on bug ${bugId}.`,
-  commentReplied: (userName: string) => `${userName} replied to your comment.`
+  commentReplied: (userName: string) => `${userName} replied to your comment.`,
+  zyraGenerationReady: () => "Zyra-generated test cases are ready for your review.",
+  zyraGenerationFailed: () => "Zyra could not generate the requested test cases.",
+  zyraTaskFailed: () => "Zyra task failed. Please retry or review the details.",
+  zyraReviewCompleted: () => "Review completed for Zyra-generated test cases.",
+  kbDocumentReady: (name: string) => `${name} is ready to use with Zyra.`,
+  kbDocumentFailed: (name: string) => `We couldn't process ${name}.`,
+  kbDocumentUpdated: (name: string) => `${name} has been updated.`,
+  kbDocumentDeleted: (name: string) => `${name} has been deleted from the Knowledge Base.`,
+  integrationConnected: (provider: IntegrationProvider) => `${integrationLabel(provider)} has been connected successfully.`,
+  integrationDisconnected: (provider: IntegrationProvider) => `${integrationLabel(provider)} has been disconnected.`,
+  integrationAuthExpired: (provider: IntegrationProvider) => `Your ${integrationLabel(provider)} connection needs to be reconnected.`,
+  // A sync belongs to one project (each project maps its own Jira project / Linear team / Notion
+  // database), so the message names it.
+  integrationSyncCompleted: (provider: IntegrationProvider, projectName: string) => `${integrationLabel(provider)} sync completed successfully for ${projectName}.`,
+  integrationSyncFailed: (provider: IntegrationProvider, projectName: string) => `${integrationLabel(provider)} sync failed for ${projectName}. Please review the connection.`,
+  integrationIssueLinked: (issueId: string) => `${issueId} has been linked successfully.`
 };
+
+const INTEGRATION_LABELS: Record<IntegrationProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
+
+/** "Jira" / "Linear" / "Notion" for a provider id; anything unrecognised is shown as given. */
+export function integrationLabel(provider: string): string {
+  return INTEGRATION_LABELS[provider as IntegrationProvider] ?? provider;
+}
 
 /**
  * What a notification points at. `link_entity_id` is a single VARCHAR(255) column, so entities that
@@ -131,6 +188,16 @@ export const notificationLinks = {
   project: (projectId: string): NotificationLink => ({ linkEntityType: "project", linkEntityId: projectId }),
   projectMembers: (projectId: string): NotificationLink => ({ linkEntityType: "project_members", linkEntityId: projectId }),
   testRun: (projectId: string, cycleId: string): NotificationLink => ({ linkEntityType: "test_run", linkEntityId: `${projectId}:${cycleId}` }),
+  zyraTask: (projectId: string, taskId: string): NotificationLink => ({ linkEntityType: "zyra_task", linkEntityId: `${projectId}:${taskId}` }),
+  /** The task board (the id is the project's) — what the archive sweep's notification already uses. */
+  zyraTaskBoard: (projectId: string): NotificationLink => ({ linkEntityType: "zyra_task_board", linkEntityId: projectId }),
+  /** The project's Knowledge Base list — where a deleted or unprocessable item's notification lands. */
+  knowledgeBase: (projectId: string): NotificationLink => ({ linkEntityType: "knowledge_base", linkEntityId: projectId }),
+  /** Workspace-level integration settings (a connection belongs to the workspace, not a project). */
+  integrations: (organizationId: string): NotificationLink => ({ linkEntityType: "integrations_settings", linkEntityId: organizationId }),
+  /** A project's own page for one integration (Settings → Jira / Linear / Notion), where its sync runs. */
+  projectIntegration: (projectId: string, provider: IntegrationProvider): NotificationLink => ({ linkEntityType: "project_integration", linkEntityId: `${projectId}:${provider}` }),
+  testCase: (projectId: string, testCaseId: string): NotificationLink => ({ linkEntityType: "testcase", linkEntityId: `${projectId}:${testCaseId}` }),
   knowledgeDocument: (projectId: string, documentId: string): NotificationLink => ({ linkEntityType: "knowledge_document", linkEntityId: `${projectId}:${documentId}` }),
   bug: (projectId: string, bugId: string): NotificationLink => ({ linkEntityType: "bug", linkEntityId: `${projectId}:${bugId}` })
 };

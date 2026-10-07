@@ -18,7 +18,8 @@ import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util"
 import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
-import { clipNotificationTitle, notificationLinks, notificationMessages, runLabel, type NotificationLink, type NotificationType } from "./notification-events";
+import { writeNotifications } from "./notification-writer";
+import { notificationLinks, notificationMessages, runLabel, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
 import {
@@ -5302,6 +5303,40 @@ export class LegacyService implements OnModuleInit {
     // insertTestCaseWithClient's comment. updateTestCaseWithClient is also called nested inside
     // zyraSave's shared transaction, which enqueues for its own touched rows separately below.
     if (after?.id) this.enqueueTestcaseEmbedding(projectId, after.id, "updated");
+    await this.notifyIssueLinked(projectId, uid, before.rows[0], after);
+  }
+
+  /**
+   * "[Issue ID] has been linked successfully." when an external issue or page is attached to a test
+   * case (or swapped for a different one). A link is just three columns on `testcases` — there is no
+   * link record or event — so it is detected here by comparing the row before and after an edit, which
+   * means only that path is covered: the bulk, import and Zyra writers set the same columns without
+   * going through updateTestCase. Told: the case's owner and creator (the people responsible for it),
+   * never the person who linked it.
+   */
+  private async notifyIssueLinked(projectId: string, actorId: string, before: Body, after: Body | undefined): Promise<void> {
+    try {
+      if (!after?.id) return;
+      const links: Array<{ provider: IntegrationProvider; was: unknown; now: unknown; label: (v: string) => string }> = [
+        { provider: "jira", was: before.jira_issue_key, now: after.jira_issue_key, label: (v) => v },
+        { provider: "linear", was: before.linear_issue_key, now: after.linear_issue_key, label: (v) => v },
+        { provider: "notion", was: before.notion_page_id, now: after.notion_page_id, label: (v) => notionPageKey(v) }
+      ];
+      for (const link of links) {
+        const now = String(link.now ?? "").trim();
+        if (!now || now === String(link.was ?? "").trim()) continue;
+        await this.notifyUsers([after.owner_id, after.created_by], {
+          type: "integration_issue_linked",
+          title: notificationMessages.integrationIssueLinked(link.label(now)),
+          link: notificationLinks.testCase(projectId, String(after.id)),
+          dedupeKey: `issue_linked:${after.id}:${link.provider}:${now}`,
+          actorId,
+          memberOf: { projectId }
+        });
+      }
+    } catch (err) {
+      this.logger.error(`Issue-link notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // No duplicate/clone endpoint existed before this feature. Added so "custom field
@@ -10036,6 +10071,49 @@ export class LegacyService implements OnModuleInit {
     return res.rows[0]?.name || null;
   }
 
+  /**
+   * "[Document Name] has been updated." / "…has been deleted from the Knowledge Base." for the
+   * people with a stake in a KB item: its creator (or uploader) and, for a document, everyone who
+   * has commented on it. There is no sharing or watcher concept on KB items (every project member
+   * sees every item), so "relevant project users" means those two groups — and a future watcher
+   * list is one more source unioned in here. The actor is never told about their own edit.
+   *
+   * An update notification is limited to one per document per recipient per hour: the editor saves
+   * as people type, and a notification per save would bury the bell.
+   */
+  private async notifyKnowledgeItem(opts: {
+    kind: "updated" | "deleted";
+    projectId: string;
+    actorId: string;
+    itemId: string;
+    name: string;
+    ownerId: string | null;
+    isDocument: boolean;
+  }): Promise<void> {
+    try {
+      const recipients: Array<string | null> = [opts.ownerId];
+      if (opts.isDocument) {
+        const commenters = await this.db.query<{ author_id: string | null }>(
+          "SELECT DISTINCT author_id FROM knowledge_document_comments WHERE document_id = $1 AND is_deleted = false",
+          [opts.itemId]
+        );
+        recipients.push(...commenters.rows.map((r) => r.author_id));
+      }
+      const hour = new Date().toISOString().slice(0, 13);
+      await this.notifyUsers(recipients, {
+        type: opts.kind === "updated" ? "kb_document_updated" : "kb_document_deleted",
+        title: opts.kind === "updated" ? notificationMessages.kbDocumentUpdated(opts.name) : notificationMessages.kbDocumentDeleted(opts.name),
+        // A deleted item has no page to open; its recipients land on the Knowledge Base list.
+        link: opts.kind === "updated" ? notificationLinks.knowledgeDocument(opts.projectId, opts.itemId) : notificationLinks.knowledgeBase(opts.projectId),
+        dedupeKey: opts.kind === "updated" ? `kb_updated:${opts.itemId}:${hour}` : `kb_deleted:${opts.itemId}`,
+        actorId: opts.actorId,
+        memberOf: { projectId: opts.projectId }
+      });
+    } catch (err) {
+      this.logger.error(`Knowledge base notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   async updateKnowledgeDocument(projectId: string, userId: string | null | undefined, documentId: string, body: Body) {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
@@ -10157,6 +10235,11 @@ export class LegacyService implements OnModuleInit {
     );
     await this.logProjectActivity(projectId, uid, "updated", "knowledge_document", documentId, nextTitle, {});
     if (contentChanged) this.enqueueEmbedding(res.rows[0].organization_id, projectId, "document", documentId, "updated");
+    // A real edit of a person's document: its title or its content. Zyra's own memory document and
+    // read-only provider mirrors are rewritten by the system, not by people, and are not announced.
+    if ((contentChanged || nextTitle !== doc.title) && !this.isZyraMemoryDocument(doc)) {
+      await this.notifyKnowledgeItem({ kind: "updated", projectId, actorId: uid, itemId: documentId, name: nextTitle || doc.title, ownerId: doc.created_by ?? null, isDocument: true });
+    }
     return toCamel(res.rows[0]);
   }
 
@@ -10224,6 +10307,7 @@ export class LegacyService implements OnModuleInit {
       [documentId, uid]
     );
     await this.logProjectActivity(projectId, uid, "deleted", "knowledge_document", documentId, doc.title, {});
+    await this.notifyKnowledgeItem({ kind: "deleted", projectId, actorId: uid, itemId: documentId, name: doc.title, ownerId: doc.created_by ?? null, isDocument: true });
     return { success: true };
   }
 
@@ -10734,6 +10818,7 @@ export class LegacyService implements OnModuleInit {
       .delete(file.storage_key)
       .catch((error) => this.logger.warn(`Failed to delete storage object ${file.storage_key}: ${error}`));
     await this.logProjectActivity(projectId, uid, "deleted", "knowledge_file", fileId, file.original_file_name, {});
+    await this.notifyKnowledgeItem({ kind: "deleted", projectId, actorId: uid, itemId: fileId, name: String(file.original_file_name ?? "File"), ownerId: file.uploaded_by ?? null, isDocument: false });
     return { success: true };
   }
 
@@ -11192,6 +11277,52 @@ export class LegacyService implements OnModuleInit {
   }
 
   async integrationCallback(userId: string | null | undefined, provider: string, body: Body) {
+    const result = await this.connectIntegration(userId, provider, body);
+    await this.notifyIntegrationConnection(userId, provider, "connected");
+    return result;
+  }
+
+  /**
+   * "[Jira / Linear / Notion] has been connected successfully." / "…has been disconnected." Connections
+   * belong to the workspace and only its owner can make or remove one, so the people told are the
+   * owners — minus the one who did it. The three providers share the one set of types.
+   */
+  private async notifyIntegrationConnection(userId: string | null | undefined, provider: string, kind: "connected" | "disconnected"): Promise<void> {
+    try {
+      const p = assertIntegrationProvider(provider);
+      const workspace = await this.workspace(userId);
+      await this.notifyUsers(await this.workspaceOwnerIds(workspace.id), {
+        type: kind === "connected" ? "integration_connected" : "integration_disconnected",
+        title: kind === "connected" ? notificationMessages.integrationConnected(p) : notificationMessages.integrationDisconnected(p),
+        link: notificationLinks.integrations(workspace.id),
+        actorId: userId ?? null,
+        memberOf: { organizationId: workspace.id }
+      });
+    } catch (err) {
+      this.logger.error(`Integration notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** "Your [Integration] connection needs to be reconnected." — the connecting user and the owners. */
+  private async notifyIntegrationAuthExpired(connection: Body): Promise<void> {
+    try {
+      const organizationId = String(connection.organization_id ?? "");
+      if (!organizationId) return;
+      await this.notifyUsers([connection.connected_by ? String(connection.connected_by) : null, ...(await this.workspaceOwnerIds(organizationId))], {
+        type: "integration_auth_expired",
+        title: notificationMessages.integrationAuthExpired(String(connection.provider) as IntegrationProvider),
+        link: notificationLinks.integrations(organizationId),
+        // Once a day per connection: every request that finds the token refused would otherwise re-announce it.
+        // (Same key the sync worker uses, so the two paths that can discover the same expiry agree.)
+        dedupeKey: `integration_auth:${organizationId}:${String(connection.provider)}:${new Date().toISOString().slice(0, 10)}`,
+        memberOf: { organizationId }
+      });
+    } catch (err) {
+      this.logger.error(`Integration notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async connectIntegration(userId: string | null | undefined, provider: string, body: Body) {
     const p = assertIntegrationProvider(provider);
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
@@ -11388,6 +11519,7 @@ export class LegacyService implements OnModuleInit {
     // (ensureProviderFolder looks it up by source_provider, not by name) rather than creating a
     // second one.
 
+    await this.notifyIntegrationConnection(userId, provider, "disconnected");
     return { disconnected: true };
   }
 
@@ -11935,11 +12067,14 @@ export class LegacyService implements OnModuleInit {
   // Keyed on the refresh token that was refused: if the row has moved on since (a reconnect, or
   // another deployment renewed it), the WHERE matches nothing and the fresh token is left alone.
   private async recordRefusedRefresh(connection: Body, reason: string): Promise<void> {
-    await this.db.query(
+    const recorded = await this.db.query(
       `UPDATE integration_connections SET auth_error = $2, auth_error_at = now(), auth_error_refresh_fingerprint = $3
        WHERE id = $1 AND refresh_token = $4`,
       [connection.id, reason, this.refreshTokenFingerprint(connection.refresh_token), connection.refresh_token]
     ).catch((err) => this.logger.warn(`Failed to record refused token refresh for connection ${connection.id}: ${err instanceof Error ? err.message : err}`));
+    // Only when this call is what recorded the refusal — a row that has since moved on (a reconnect)
+    // matched nothing and is not expired.
+    if (recorded && recorded.rowCount) await this.notifyIntegrationAuthExpired(connection);
   }
 
   // Atlassian access tokens are JWTs naming the OAuth app they were issued to (`client_id`). A
@@ -16275,6 +16410,14 @@ export class LegacyService implements OnModuleInit {
             [sessionId, JSON.stringify({ ...current, status: "paused" })]
           );
         });
+        // A multi-batch plan runs unattended, so its owner may not be watching the chat when it
+        // pauses. No actor: nobody did this, the job did.
+        await this.notifyUsers([userId], {
+          type: "zyra_task_failed",
+          title: notificationMessages.zyraTaskFailed(),
+          link: notificationLinks.zyraTaskBoard(projectId),
+          memberOf: { projectId }
+        });
         return;
       }
     }
@@ -16420,6 +16563,29 @@ export class LegacyService implements OnModuleInit {
   // user already closed/saved/resubmitted the task in the meantime, that action already moved
   // task_status past this point and must win — we only append a note to the activity log so the
   // failure isn't lost, without resurrecting or overwriting whatever the user set.
+  /**
+   * Tells the person who requested a task-board generation about it: the batch is ready for review,
+   * the generation failed, or a review of it was completed by someone else. `requested_by` is the
+   * only user on the row — NULL for the archive sweep, whose own project-wide notification already
+   * exists — so a task with no requester notifies nobody. Never throws.
+   */
+  private async notifyZyraTask(projectId: string, taskId: string, kind: "ready" | "failed" | "reviewed", actorId: string | null = null): Promise<void> {
+    try {
+      const res = await this.db.query<{ requested_by: string | null }>("SELECT requested_by FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
+      const requester = res.rows[0]?.requested_by;
+      if (!requester) return;
+      const [type, title] =
+        kind === "ready"
+          ? (["zyra_generation_ready", notificationMessages.zyraGenerationReady()] as const)
+          : kind === "failed"
+            ? (["zyra_generation_failed", notificationMessages.zyraGenerationFailed()] as const)
+            : (["zyra_review_completed", notificationMessages.zyraReviewCompleted()] as const);
+      await this.notifyUsers([requester], { type, title, link: notificationLinks.zyraTask(projectId, taskId), actorId, memberOf: { projectId } });
+    } catch (err) {
+      this.logger.error(`Zyra notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private async markZyraTaskFailed(projectId: string, taskId: string, detail: string) {
     const failedAt = new Date().toISOString();
     const activity = [{ actor: "agent", stage: "failed", title: "Generation failed", detail, createdAt: failedAt }];
@@ -16440,6 +16606,10 @@ export class LegacyService implements OnModuleInit {
         "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb, updated_at = now() WHERE id = $1 AND project_id = $2",
         [taskId, projectId, JSON.stringify(note)]
       );
+    } else {
+      // Only when this call is what moved the task to 'failed'. A task the user already closed or
+      // saved (the rowCount === 0 branch above) did not fail from their point of view.
+      await this.notifyZyraTask(projectId, taskId, "failed");
     }
   }
 
@@ -16580,6 +16750,7 @@ export class LegacyService implements OnModuleInit {
         );
         return;
       }
+      await this.notifyZyraTask(projectId, taskId, "ready");
       await this.rememberZyraTurn({
         projectId,
         userId: options.userId,
@@ -16909,6 +17080,7 @@ export class LegacyService implements OnModuleInit {
         );
         return;
       }
+      await this.notifyZyraTask(projectId, taskId, "ready");
       await this.rememberZyraTurn({
         projectId,
         userId,
@@ -17061,6 +17233,8 @@ export class LegacyService implements OnModuleInit {
       const fresh = await this.db.query("SELECT * FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
       return await this.formatAiTask(fresh.rows[0]);
     }
+    // A review finished without saving: the requester hears about it unless they are the reviewer.
+    await this.notifyZyraTask(projectId, taskId, "reviewed", this.requireUser(userId));
     return await this.formatAiTask(res.rows[0]);
   }
 
@@ -17720,6 +17894,8 @@ export class LegacyService implements OnModuleInit {
         // update/archive, or feature #1's similarity-redirect create->update). Never throws.
         const saveEventId = (result as Body)?.saveEventId;
         if (saveEventId) await this.queueZyraTicketComments(projectId, uid, taskId, String(saveEventId), testcases, touchedActions);
+        // The reviewer saved part or all of the batch. The requester is told unless they are the reviewer.
+        if (testcases.length) await this.notifyZyraTask(projectId, taskId, "reviewed", uid);
         delete (result as Body).touchedActions;
         delete (result as Body).saveEventId;
         return result;
@@ -18841,38 +19017,7 @@ export class LegacyService implements OnModuleInit {
       memberOf?: { organizationId?: string; projectId?: string };
     }
   ): Promise<number> {
-    try {
-      const recipients = [...new Set(recipientIds.filter((id): id is string => !!id && isUuid(id) && id !== opts.actorId))];
-      if (!recipients.length) return 0;
-      const params: unknown[] = [
-        recipients,
-        opts.type,
-        clipNotificationTitle(opts.title),
-        opts.link?.linkEntityType ?? null,
-        opts.link?.linkEntityId ?? null,
-        opts.dedupeKey ?? null
-      ];
-      let scope = "";
-      if (opts.memberOf?.organizationId) {
-        params.push(opts.memberOf.organizationId);
-        scope += ` AND EXISTS (SELECT 1 FROM organization_members om WHERE om.user_id = u.id AND om.organization_id = $${params.length}::uuid)`;
-      }
-      if (opts.memberOf?.projectId) {
-        params.push(opts.memberOf.projectId);
-        scope += ` AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.user_id = u.id AND pm.project_id = $${params.length}::uuid)`;
-      }
-      const res = await this.db.query(
-        `INSERT INTO notifications (user_id, type, title, link_entity_type, link_entity_id, dedupe_key)
-         SELECT u.id, $2, $3, $4, $5, $6 FROM users u WHERE u.id = ANY($1::uuid[])${scope}
-         ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
-         RETURNING id`,
-        params
-      );
-      return res.rows.length;
-    } catch (err) {
-      this.logger.error(`Notification "${opts.type}" failed — ${err instanceof Error ? err.message : String(err)}`);
-      return 0;
-    }
+    return writeNotifications(this.db, recipientIds, opts, this.logger);
   }
 
   private async displayNameOf(userId: string): Promise<string> {
@@ -19061,6 +19206,17 @@ export class LegacyService implements OnModuleInit {
       [uid]
     );
     return res.rows;
+  }
+
+  /**
+   * Marks every unread notification of the caller read, in one statement. Only the caller's own rows,
+   * and only the unread ones — `read_at IS NULL` keeps an already-read row's timestamp where it was,
+   * the same rule markNotificationRead's COALESCE applies one at a time, so repeating this is a no-op.
+   */
+  async markAllNotificationsRead(userId: string | null | undefined): Promise<{ ok: true; updated: number }> {
+    const uid = this.requireSession(userId);
+    const res = await this.db.query("UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL RETURNING id", [uid]);
+    return { ok: true, updated: res.rows.length };
   }
 
   /** Scoped to the caller's own id (user_id = $2) — the gap the removed stub's own comment called

@@ -3,6 +3,8 @@ import { Logger } from "@nestjs/common";
 import { createHash } from "crypto";
 import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
+import { notificationLinks, notificationMessages } from "../legacy/notification-events";
+import { writeNotifications } from "../legacy/notification-writer";
 import { tracedEmbeddingCall } from "../observability/embedding-trace";
 import { embedTexts, resolveEmbeddingAllocation } from "./rag-ai-allocation";
 import { RagChunkingService } from "./rag-chunking.service";
@@ -152,6 +154,42 @@ export class RagEmbeddingProcessor extends WorkerHost {
       sourceId,
       contentHash
     ]);
+    await this.notifyKnowledgeOutcome(projectId, sourceType, sourceId, "ready");
+  }
+
+  /**
+   * "[Name] is ready to use with Zyra." / "We couldn't process [Name]." for whoever created or
+   * uploaded the item. Only for items a person put there: documents mirrored from Jira / Linear /
+   * Notion and Zyra's own memory document are indexed by the system, usually in bulk, and would
+   * bury the bell. "Ready" is announced once per item, the first time it is indexed (the dedupe key
+   * has no content hash), not on every later re-index after an edit. Never throws.
+   * Uses writeNotifications, not LegacyService, for the circular-import reason at the top of the file.
+   */
+  private async notifyKnowledgeOutcome(projectId: string, sourceType: "document" | "file", sourceId: string, outcome: "ready" | "failed"): Promise<void> {
+    try {
+      const res =
+        sourceType === "document"
+          ? await this.db.query<{ name: string; owner: string | null; source_provider: string | null; document_type: string | null }>(
+              "SELECT title AS name, created_by AS owner, source_provider, document_type FROM knowledge_documents WHERE id = $1",
+              [sourceId]
+            )
+          : await this.db.query<{ name: string; owner: string | null; source_provider: string | null; document_type: string | null }>(
+              "SELECT original_file_name AS name, uploaded_by AS owner, NULL::text AS source_provider, NULL::text AS document_type FROM knowledge_files WHERE id = $1",
+              [sourceId]
+            );
+      const item = res.rows[0];
+      if (!item?.owner || item.source_provider || item.document_type === "ai_memory") return;
+      const name = item.name || (sourceType === "document" ? "Document" : "File");
+      await writeNotifications(this.db, [item.owner], {
+        type: outcome === "ready" ? "kb_document_ready" : "kb_document_failed",
+        title: outcome === "ready" ? notificationMessages.kbDocumentReady(name) : notificationMessages.kbDocumentFailed(name),
+        link: sourceType === "document" ? notificationLinks.knowledgeDocument(projectId, sourceId) : notificationLinks.knowledgeBase(projectId),
+        dedupeKey: outcome === "ready" ? `kb_ready:${sourceId}` : `kb_failed:${sourceId}:${new Date().toISOString().slice(0, 10)}`,
+        memberOf: { projectId }
+      }, this.logger);
+    } catch (err) {
+      this.logger.warn(`Knowledge notification failed for ${sourceType}:${sourceId} — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // Test-case counterpart of processKnowledgeSource above. One vector per test case (no
@@ -251,6 +289,7 @@ export class RagEmbeddingProcessor extends WorkerHost {
     const table = data.sourceType === "document" ? "knowledge_documents" : "knowledge_files";
     await this.setStatus(table, data.sourceId, "failed").catch(() => undefined);
     this.logger.warn(`Embedding job permanently failed for ${data.sourceType}:${data.sourceId}`);
+    await this.notifyKnowledgeOutcome(data.projectId, data.sourceType, data.sourceId, "failed");
   }
 
   private async setStatus(table: string, sourceId: string, status: string): Promise<void> {

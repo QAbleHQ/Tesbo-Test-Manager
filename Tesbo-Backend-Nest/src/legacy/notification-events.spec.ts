@@ -124,3 +124,60 @@ describe("notifyUsers", () => {
     await expect(svc.notifyUsers([OTHER], { type: "bug_assigned", title: "t" })).resolves.toBe(0);
   });
 });
+
+describe("Phase 2 wording (Zyra, Knowledge Base, integrations)", () => {
+  it("renders the matrix messages", () => {
+    expect(notificationMessages.zyraGenerationReady()).toBe("Zyra-generated test cases are ready for your review.");
+    expect(notificationMessages.zyraGenerationFailed()).toBe("Zyra could not generate the requested test cases.");
+    expect(notificationMessages.zyraTaskFailed()).toBe("Zyra task failed. Please retry or review the details.");
+    expect(notificationMessages.zyraReviewCompleted()).toBe("Review completed for Zyra-generated test cases.");
+    expect(notificationMessages.kbDocumentReady("Spec.pdf")).toBe("Spec.pdf is ready to use with Zyra.");
+    expect(notificationMessages.kbDocumentFailed("Spec.pdf")).toBe("We couldn't process Spec.pdf.");
+    expect(notificationMessages.kbDocumentUpdated("Spec")).toBe("Spec has been updated.");
+    expect(notificationMessages.kbDocumentDeleted("Spec")).toBe("Spec has been deleted from the Knowledge Base.");
+    expect(notificationMessages.integrationConnected("jira")).toBe("Jira has been connected successfully.");
+    expect(notificationMessages.integrationDisconnected("linear")).toBe("Linear has been disconnected.");
+    expect(notificationMessages.integrationAuthExpired("notion")).toBe("Your Notion connection needs to be reconnected.");
+    expect(notificationMessages.integrationSyncCompleted("jira", "Project 1")).toBe("Jira sync completed successfully for Project 1.");
+    expect(notificationMessages.integrationSyncFailed("linear", "Project 1")).toBe("Linear sync failed for Project 1. Please review the connection.");
+    expect(notificationMessages.integrationIssueLinked("PRJ-12")).toBe("PRJ-12 has been linked successfully.");
+  });
+
+  it("keeps the matrix priorities for the new types", () => {
+    expect(NOTIFICATION_PRIORITY.kb_document_updated).toBe("Low");
+    expect(NOTIFICATION_PRIORITY.integration_sync_completed).toBe("Low");
+    expect(NOTIFICATION_PRIORITY.integration_sync_failed).toBe("High");
+    expect(NOTIFICATION_PRIORITY.zyra_generation_ready).toBe("High");
+    expect(NOTIFICATION_PRIORITY.integration_connected).toBe("Medium");
+  });
+});
+
+describe("notifyZyraTask", () => {
+  const notifyZyraTask = (svc: LegacyService, ...args: unknown[]) =>
+    (svc as unknown as { notifyZyraTask: (...a: unknown[]) => Promise<void> }).notifyZyraTask(...args);
+
+  it("tells the requester, with the matching type and a link to the task", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    dbQuery.mockResolvedValueOnce({ rows: [{ requested_by: OTHER }] }).mockResolvedValueOnce({ rows: [{ id: "n1" }] });
+    await notifyZyraTask(svc, PROJECT_ID, "task-1", "failed");
+    const [, params] = dbQuery.mock.calls[1];
+    expect(params[0]).toEqual([OTHER]);
+    expect(params[1]).toBe("zyra_generation_failed");
+    expect(params[2]).toBe("Zyra could not generate the requested test cases.");
+    expect(params[4]).toBe(`${PROJECT_ID}:task-1`);
+  });
+
+  it("notifies nobody for a task with no requester (the archive sweep's rows)", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    dbQuery.mockResolvedValueOnce({ rows: [{ requested_by: null }] });
+    await notifyZyraTask(svc, PROJECT_ID, "task-1", "ready");
+    expect(dbQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not tell the reviewer about their own review", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    dbQuery.mockResolvedValueOnce({ rows: [{ requested_by: ACTOR }] });
+    await notifyZyraTask(svc, PROJECT_ID, "task-1", "reviewed", ACTOR);
+    expect(dbQuery).toHaveBeenCalledTimes(1); // the requester lookup only; the insert is skipped
+  });
+});

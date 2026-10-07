@@ -10,6 +10,7 @@ import {
   rbacSuiteSkipReason,
   resetRbacMembership,
   seedFixtureUser,
+  setOrgRole,
   type RbacTenant,
 } from "../utils/rbac-tenant";
 
@@ -171,6 +172,45 @@ test.describe("notifications — real rows", () => {
       expect(rowAfterSecond.read_at, "a second mark-read moved read_at instead of leaving it alone").toBe(readAt);
     } finally {
       deleteNotification(id);
+    }
+  });
+
+  test("NOTIF-A-09 mark all as read clears every unread row of the caller — and only the caller's", async () => {
+    const mine = [seedNotification(tenant!.owner.userId, tenant!.mainProjectId), seedNotification(tenant!.owner.userId, tenant!.mainProjectId)];
+    const theirs = seedNotification(tenant!.manager.userId, tenant!.mainProjectId);
+    try {
+      // One already read before the call: its timestamp must stay where it was.
+      expect((await asOwner.post(`/api/notifications/${mine[0]}/read`)).status()).toBe(201);
+      const readAt = (await (await asOwner.get("/api/notifications")).json()).find((n: { id: string }) => n.id === mine[0]).read_at;
+
+      const res = await asOwner.post("/api/notifications/read-all", { failOnStatusCode: false });
+      expect(res.status(), await res.text()).toBe(201);
+      expect(await res.json()).toMatchObject({ ok: true });
+
+      const owner = await (await asOwner.get("/api/notifications")).json();
+      for (const id of mine) expect(owner.find((n: { id: string }) => n.id === id).read_at, `${id} should be read`).toBeTruthy();
+      expect(owner.find((n: { id: string }) => n.id === mine[0]).read_at, "an already-read row keeps its timestamp").toBe(readAt);
+
+      // A teammate's unread row is not the caller's to clear.
+      const manager = await (await asManager.get("/api/notifications")).json();
+      expect(manager.find((n: { id: string }) => n.id === theirs).read_at).toBeNull();
+
+      // Nothing left to mark: a repeat is a harmless no-op.
+      const again = await asOwner.post("/api/notifications/read-all", { failOnStatusCode: false });
+      expect(again.status()).toBe(201);
+      expect((await again.json()).updated).toBe(0);
+    } finally {
+      [...mine, theirs].forEach(deleteNotification);
+    }
+  });
+
+  test("NOTIF-A-10 an unauthenticated caller cannot mark all as read", async () => {
+    const anon = await request.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    try {
+      const res = await anon.post("/api/notifications/read-all", { failOnStatusCode: false });
+      expect(res.status(), await res.text()).toBe(400);
+    } finally {
+      await anon.dispose();
     }
   });
 
@@ -678,6 +718,121 @@ test.describe("notifications — Phase 1 matrix", () => {
     expect(again.ok()).toBeTruthy();
     expect(await titles(asQa)).toHaveLength(1);
     expect(await titles(asManager)).toHaveLength(1);
+  });
+
+  // ─── Phase 2: Knowledge Base, Zyra, integrations ───────────────────────────
+
+  test("NOTIF-P2-01 editing or deleting a KB document tells its creator and commenters — not the actor — and edits are limited to one an hour", async () => {
+    const title = stamp("kb");
+    const created = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { title, contentText: "v1", contentHtml: "<p>v1</p>", documentType: "general" },
+      failOnStatusCode: false,
+    });
+    expect(created.ok(), `creating a document — ${await created.text()}`).toBeTruthy();
+    const docId = (await created.json()).id;
+    const doc = `/api/projects/${tenant!.mainProjectId}/knowledge-base/documents/${docId}`;
+    try {
+      // qa joins the people with a stake in it by commenting.
+      expect((await asQa.post(`${doc}/comments`, { data: { body: "Looks right" } })).ok()).toBeTruthy();
+      exec(`DELETE FROM notifications WHERE user_id IN (${literal(tenant!.owner.userId)}, ${literal(tenant!.qa.userId)});`);
+
+      const edit = (text: string) => asManager.patch(doc, { data: { contentText: text, contentHtml: `<p>${text}</p>` } });
+      expect((await edit("v2")).ok()).toBeTruthy();
+      expect(await titles(asOwner)).toEqual([`${title} has been updated.`]); // the creator
+      expect(await titles(asQa)).toEqual([`${title} has been updated.`]); // a commenter
+      expect(await titles(asManager)).toEqual([]); // the editor
+      expect((await inbox(asOwner))[0]).toMatchObject({ type: "kb_document_updated", link_entity_type: "knowledge_document", link_entity_id: `${tenant!.mainProjectId}:${docId}` });
+
+      // Another edit in the same hour does not add to the bell.
+      expect((await edit("v3")).ok()).toBeTruthy();
+      expect(await titles(asOwner)).toHaveLength(1);
+      // Saving without changing anything is no edit at all.
+      expect((await edit("v3")).ok()).toBeTruthy();
+      expect(await titles(asQa)).toHaveLength(1);
+
+      const removed = await asManager.delete(doc, { failOnStatusCode: false });
+      expect(removed.ok(), await removed.text()).toBeTruthy();
+      expect((await titles(asOwner))[0]).toBe(`${title} has been deleted from the Knowledge Base.`);
+      expect((await inbox(asOwner))[0]).toMatchObject({ type: "kb_document_deleted", link_entity_type: "knowledge_base", link_entity_id: tenant!.mainProjectId });
+      expect((await titles(asQa))[0]).toBe(`${title} has been deleted from the Knowledge Base.`);
+    } finally {
+      await asOwner.delete(doc, { failOnStatusCode: false });
+    }
+  });
+
+  test("NOTIF-P2-02 closing a Zyra review tells whoever requested the generation — unless they closed it themselves", async () => {
+    const seedTask = (): string => {
+      const id = crypto.randomUUID();
+      exec(
+        "INSERT INTO ai_generation_requests (id, project_id, requested_by, provider, user_story, requested_count, generated_count, " +
+          `generated_payload, agent_name, task_status) VALUES (${literal(id)}, ${literal(tenant!.mainProjectId)}, ${literal(tenant!.qa.userId)}, ` +
+          "'openai', 'E2E Notif zyra story', 1, 1, '[]'::jsonb, 'Zyra the Test Generator', 'in_review');",
+      );
+      return id;
+    };
+    const ids = [seedTask(), seedTask()];
+    try {
+      const close = (api: APIRequestContext, id: string) =>
+        api.post(`/api/projects/${tenant!.mainProjectId}/agents/zyra/tasks/${id}/close`, { data: {}, failOnStatusCode: false });
+
+      expect((await close(asManager, ids[0])).ok()).toBeTruthy();
+      const [row] = await inbox(asQa);
+      expect(row.title).toBe("Review completed for Zyra-generated test cases.");
+      expect(row).toMatchObject({ type: "zyra_review_completed", link_entity_type: "zyra_task", link_entity_id: `${tenant!.mainProjectId}:${ids[0]}` });
+      expect(await titles(asManager)).toEqual([]);
+
+      // Closing it again is a no-op, not a second notification.
+      expect((await close(asManager, ids[0])).ok()).toBeTruthy();
+      expect(await titles(asQa)).toHaveLength(1);
+
+      // The requester closing their own review is their own action.
+      expect((await close(asQa, ids[1])).ok()).toBeTruthy();
+      expect(await titles(asQa)).toHaveLength(1);
+    } finally {
+      exec(`DELETE FROM ai_generation_requests WHERE id IN (${ids.map(literal).join(", ")});`);
+    }
+  });
+
+  test("NOTIF-P2-03 disconnecting an integration tells the other workspace owners, not the owner who did it", async () => {
+    // A second owner: promotion to owner is refused through the API, so it is written directly.
+    setOrgRole(tenant!.organizationId, tenant!.manager.userId, "owner");
+    exec(
+      "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at, connected_by) VALUES (" +
+        `${literal(tenant!.organizationId)}, 'jira', 'e2e-jira-site', 'https://e2e.invalid', 'e2e-not-a-real-token', '', now() + interval '1 hour', ${literal(tenant!.owner.userId)}) ` +
+        "ON CONFLICT (organization_id, provider) DO UPDATE SET disconnected_at = NULL;",
+    );
+    try {
+      const res = await asOwner.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
+      expect(res.ok(), await res.text()).toBeTruthy();
+      const [row] = await inbox(asManager);
+      expect(row.title).toBe("Jira has been disconnected.");
+      expect(row).toMatchObject({ type: "integration_disconnected", link_entity_type: "integrations_settings", link_entity_id: tenant!.organizationId });
+      expect(await titles(asOwner)).toEqual([]);
+      expect(await titles(asQa)).toEqual([]); // not an owner
+    } finally {
+      exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+    }
+  });
+
+  test("NOTIF-P2-04 linking an issue to a test case tells its creator, not the person who linked it, and not twice", async () => {
+    const tc = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, { data: { title: stamp("link case") } });
+    expect(tc.status(), await tc.text()).toBe(201);
+    const tcId = (await tc.json()).id;
+    const put = (api: APIRequestContext, jiraIssueKey: string) =>
+      api.put(`/api/projects/${tenant!.mainProjectId}/testcases/${tcId}`, { data: { jiraIssueKey }, failOnStatusCode: false });
+
+    expect((await put(asManager, "E2E-123")).ok()).toBeTruthy();
+    const [row] = await inbox(asOwner);
+    expect(row.title).toBe("E2E-123 has been linked successfully.");
+    expect(row).toMatchObject({ type: "integration_issue_linked", link_entity_type: "testcase", link_entity_id: `${tenant!.mainProjectId}:${tcId}` });
+    expect(await titles(asManager)).toEqual([]);
+
+    // The same key again is not a new link.
+    expect((await put(asManager, "E2E-123")).ok()).toBeTruthy();
+    expect(await titles(asOwner)).toHaveLength(1);
+    // The creator linking their own case's issue is their own action.
+    expect((await put(asOwner, "E2E-456")).ok()).toBeTruthy();
+    expect(await titles(asOwner)).toHaveLength(1);
   });
 
   // ─── Isolation ─────────────────────────────────────────────────────────────

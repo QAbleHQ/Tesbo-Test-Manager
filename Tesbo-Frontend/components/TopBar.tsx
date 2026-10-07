@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { IconBell, IconLogout, IconSearch, IconUserCircle, IconX } from "@tabler/icons-react";
 import type { AppNotification, ProjectSummary } from "@/lib/api";
-import { listNotifications, markNotificationRead } from "@/lib/api";
+import { listNotifications, markAllNotificationsRead, markNotificationRead } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useLogout } from "@/lib/useLogout";
@@ -49,6 +49,19 @@ function resolveNotificationHref(n: AppNotification): string | null {
       return `/projects/${id}/members`;
     case "test_run":
       return projectId && entityId ? `/projects/${projectId}/cycles/${entityId}` : null;
+    case "project_integration":
+      // "<projectId>:<provider>" — the provider is one of the three integration pages that exist.
+      return projectId && (entityId === "jira" || entityId === "linear" || entityId === "notion")
+        ? `/projects/${projectId}/settings/integrations/${entityId}`
+        : null;
+    case "knowledge_base":
+      return `/projects/${id}/knowledge-base`;
+    case "integrations_settings":
+      return "/settings/integrations";
+    case "testcase":
+      return projectId && entityId ? `/projects/${projectId}/testcases/${entityId}` : null;
+    case "zyra_task":
+      return projectId && entityId ? `/projects/${projectId}/agents/tasks/${entityId}` : null;
     case "knowledge_document":
       return projectId && entityId ? `/projects/${projectId}/knowledge-base/documents/${entityId}` : null;
     case "bug":
@@ -186,6 +199,17 @@ export default function TopBar() {
   }, []);
 
   const unreadCount = notifItems.filter((n) => !n.read_at).length;
+
+  /**
+   * Optimistic, like a single click: the badge clears at once. If the request fails the list is
+   * fetched again, so the screen goes back to what the server actually holds rather than showing
+   * everything read when it is not.
+   */
+  function handleMarkAllRead() {
+    const now = new Date().toISOString();
+    setNotifItems((prev) => prev.map((item) => (item.read_at ? item : { ...item, read_at: now })));
+    void markAllNotificationsRead().catch(() => void refreshNotifications());
+  }
 
   function toggleNotifications() {
     const opening = !notifOpen;
@@ -384,7 +408,20 @@ export default function TopBar() {
               ) : notifItems.length === 0 ? (
                 <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No notifications</p>
               ) : (
-                notifItems.map((n) => {
+                <>
+                  {unreadCount > 0 && (
+                    <div className="flex items-center justify-between border-b border-[var(--border)] px-3 pb-1.5 pt-1">
+                      <span className="text-[12px] text-[var(--muted-soft)]">{unreadCount} unread</span>
+                      <button
+                        type="button"
+                        onClick={handleMarkAllRead}
+                        className="text-[12px] font-medium text-[var(--brand-primary)] hover:underline"
+                      >
+                        Mark all as read
+                      </button>
+                    </div>
+                  )}
+                {notifItems.map((n) => {
                   const href = resolveNotificationHref(n);
                   const body = (
                     <>
@@ -419,7 +456,8 @@ export default function TopBar() {
                       <span className="min-w-0 flex-1">{body}</span>
                     </button>
                   );
-                })
+                })}
+                </>
               )}
             </div>
           )}

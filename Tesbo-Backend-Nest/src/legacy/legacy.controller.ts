@@ -2172,6 +2172,13 @@ export class LegacyController {
     return this.legacy.notificationsForUser(req.userId);
   }
 
+  // Declared before the `:id/read` route below; the two never overlap (this one is a single fixed
+  // segment, that one needs an id in the middle) but keeping the literal first reads unambiguously.
+  @Post("/api/notifications/read-all")
+  async readAllNotifications(@Req() req: AuthenticatedRequest) {
+    return this.legacy.markAllNotificationsRead(req.userId);
+  }
+
   @Post("/api/notifications/:id/read")
   async readNotification(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
     await this.legacy.markNotificationRead(req.userId, id);
