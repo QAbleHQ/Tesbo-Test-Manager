@@ -194,19 +194,23 @@ test.describe("integrations — Jira and Linear", () => {
       remoteProjectKey?: string;
       remoteProjectName?: string;
       projectId?: string;
+      /** The per-run ticket cap cut this run off (V134): the pass is unfinished and the next Sync continues it. */
+      truncated?: boolean;
+      /** SQL expression for when the pass began; defaults to the run's own start. */
+      windowStart?: string;
     } = {},
   ): string {
     const status = fields.status ?? "failed";
     const projectId = fields.projectId ?? tenant!.mainProjectId;
     const triggerSource = fields.triggerSource ?? "nightly";
     exec(
-      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date, error, remote_project_key, remote_project_name, started_at, finished_at) VALUES (" +
+      "INSERT INTO integration_sync_runs (organization_id, project_id, provider, status, stage, trigger_source, nightly_cycle_date, error, remote_project_key, remote_project_name, started_at, finished_at, truncated, window_start) VALUES (" +
         `${literal(tenant!.organizationId)}, ${literal(projectId)}, ${literal(provider)}, ${literal(status)}, ` +
         `${literal(status === "failed" ? "failed" : "done")}, ${literal(triggerSource)}, ` +
         `${triggerSource === "nightly" ? "(now() + interval '5.5 hours')::date" : "NULL"}, ` +
         `${fields.error === undefined ? "NULL" : literal(fields.error)}, ${fields.remoteProjectKey ? literal(fields.remoteProjectKey) : "NULL"}, ` +
         `${fields.remoteProjectName ? literal(fields.remoteProjectName) : "NULL"}, ` +
-        "now(), now());",
+        `now(), now(), ${fields.truncated ? "true" : "false"}, ${fields.windowStart ?? "now()"});`,
     );
     return scalar(
       `SELECT id FROM integration_sync_runs WHERE project_id = ${literal(projectId)} AND provider = ${literal(provider)} ` +
@@ -1205,6 +1209,98 @@ test.describe("integrations — Jira and Linear", () => {
     const { run } = await status.json();
     expect(run?.remoteProjectName).toBeNull();
     expect(run?.remoteProjectKey).toBe("KAN");
+  });
+
+  // ─── A backlog over the per-run ticket cap is continued, not restarted (V134) ───
+  //
+  // Every provider fetch is newest-updated first, so a run cut off at the cap used to be followed by a
+  // Sync that fetched the same newest tickets again and never reached the rest. A run now records
+  // that its pass is unfinished (truncated, window_start) and the next Sync joins that pass. Reaching
+  // Jira for real is not possible here (see the top of this file), so the cap itself and the skipping of
+  // already-synced tickets are pinned in integration-sync.processor.spec.ts; these pin the part that
+  // lives behind the HTTP route: which pass a Sync click joins. The queued run fails against the
+  // unreachable site right after it is created, which does not matter to the row it was inserted with.
+
+  /** Clicks Sync and returns the new run's id. */
+  async function clickSync(): Promise<string> {
+    const res = await asOwner.post(url("/jira/sync"), { data: {}, failOnStatusCode: false });
+    expect(res.status(), await res.text()).toBeLessThan(300);
+    const body = await res.json();
+    expect(body.alreadyRunning, "the seeded runs are all finished, so a click must start a new one").toBe(false);
+    return String(body.run.id);
+  }
+
+  /** True when both runs belong to the same pass. */
+  const samePass = (a: string, b: string) =>
+    scalar(
+      `SELECT (SELECT window_start FROM integration_sync_runs WHERE id = ${literal(a)}) = ` +
+        `(SELECT window_start FROM integration_sync_runs WHERE id = ${literal(b)});`,
+    ) === "t";
+
+  const cutOffRun = (remoteProjectKey = "E2E") =>
+    seedSyncRun("jira", { status: "succeeded", error: null, triggerSource: "manual", remoteProjectKey, truncated: true, windowStart: "now() - interval '3 days'" });
+
+  test("INT-A-86 Sync after a run the cap cut off joins that run's pass instead of starting over", async () => {
+    seedJiraMapping(seedConnection("jira"), "E2E");
+    const cutOff = cutOffRun();
+
+    const next = await clickSync();
+    expect(samePass(next, cutOff), "the next Sync started a fresh pass, so it would re-sync the same newest tickets").toBe(true);
+    // The continuation is a new row, not a rewrite of the earlier run.
+    expect(next).not.toBe(cutOff);
+    expect(scalar(`SELECT truncated FROM integration_sync_runs WHERE id = ${literal(cutOff)};`)).toBe("t");
+  });
+
+  test("INT-A-87 Sync after a run that reached the end of the backlog starts a fresh pass", async () => {
+    seedJiraMapping(seedConnection("jira"), "E2E");
+    const finished = seedSyncRun("jira", { status: "succeeded", error: null, triggerSource: "manual", remoteProjectKey: "E2E", truncated: false, windowStart: "now() - interval '3 days'" });
+
+    const next = await clickSync();
+    expect(samePass(next, finished), "a finished pass must not be continued").toBe(false);
+    expect(scalar(`SELECT window_start > now() - interval '1 hour' FROM integration_sync_runs WHERE id = ${literal(next)};`)).toBe("t");
+  });
+
+  test("INT-A-88 a project with no earlier run starts a fresh pass that is not marked unfinished", async () => {
+    seedJiraMapping(seedConnection("jira"), "E2E");
+    const first = await clickSync();
+    expect(scalar(`SELECT window_start > now() - interval '1 hour' FROM integration_sync_runs WHERE id = ${literal(first)};`)).toBe("t");
+    expect(scalar(`SELECT truncated FROM integration_sync_runs WHERE id = ${literal(first)};`)).toBe("f");
+  });
+
+  test("INT-A-89 remapping to another Jira project abandons the old project's unfinished pass", async () => {
+    seedJiraMapping(seedConnection("jira"), "NEWKEY");
+    const oldProject = cutOffRun("OLDKEY");
+
+    const next = await clickSync();
+    expect(samePass(next, oldProject), "tickets already synced from OLDKEY must not be skipped for NEWKEY").toBe(false);
+  });
+
+  test("INT-A-90 a failed run after a cut-off one does not discard the pass's progress", async () => {
+    seedJiraMapping(seedConnection("jira"), "E2E");
+    const cutOff = cutOffRun();
+    // An outage during the continuation fails the run before it syncs anything.
+    seedSyncRun("jira", { status: "failed", error: "Jira is unreachable", triggerSource: "manual", remoteProjectKey: "E2E" });
+
+    const next = await clickSync();
+    expect(samePass(next, cutOff), "a failed attempt threw away the pass, so the user would re-sync from the top").toBe(true);
+  });
+
+  test("INT-A-91 an unfinished pass does not count as the nightly incremental cursor; the run that finishes it does, from the pass's start", async () => {
+    seedJiraMapping(seedConnection("jira"), "E2E");
+    cutOffRun();
+    // Same predicate as IntegrationSyncService.getLastSuccessfulRunStart.
+    const cursorOlderThan = (interval: string) =>
+      scalar(
+        "SELECT COALESCE(MAX(COALESCE(window_start, started_at)) < now() - " +
+          `interval ${literal(interval)}, false) FROM integration_sync_runs ` +
+          `WHERE project_id = ${literal(tenant!.mainProjectId)} AND provider = 'jira' AND status IN ('succeeded', 'partial') AND truncated = false;`,
+      );
+    // No finished pass yet: tickets older than where the cut-off run stopped were never seen.
+    expect(cursorOlderThan("2 days"), "an unfinished pass counted as a successful sync").toBe("f");
+
+    // The run that finishes the pass counts, and carries the pass's start rather than its own.
+    seedSyncRun("jira", { status: "succeeded", error: null, triggerSource: "manual", remoteProjectKey: "E2E", truncated: false, windowStart: "now() - interval '3 days'" });
+    expect(cursorOlderThan("2 days")).toBe("t");
   });
 
   // ─── Linear Project mapping (V95) ─────────────────────────────────────────

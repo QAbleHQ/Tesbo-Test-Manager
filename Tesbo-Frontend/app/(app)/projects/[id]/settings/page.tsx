@@ -131,6 +131,7 @@ export default function ProjectSettingsPage() {
   const [deleteProjectError, setDeleteProjectError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [messageIsError, setMessageIsError] = useState(false);
   const [jiraStatus, setJiraStatus] = useState<JiraConnection | null>(null);
   const [linearStatus, setLinearStatus] = useState<LinearConnection | null>(null);
   // Notion is on every plan, so unlike Linear there is no Pro lock state to track here.
@@ -293,25 +294,15 @@ export default function ProjectSettingsPage() {
     }
     setSaving(true);
     try {
-      const draftName = newEnvironmentName.trim();
-      const draftUrl = newEnvironmentUrl.trim();
-      // Only blocks the save (and only looks at these two fields) while the Test Environments tab
-      // is active — leftover text left in an unrelated, hidden tab's inputs shouldn't stop someone
-      // from saving a name/description change on the General tab.
-      const hasDraftEnvironment = activeTab === "testRuns" && Boolean(draftName || draftUrl);
-      if (hasDraftEnvironment) {
-        const draftNameError = validateEnvironmentName(newEnvironmentName, testRunEnvironments);
-        const draftUrlError = validateEnvironmentUrl(newEnvironmentUrl, testRunEnvironments);
-        if (draftNameError || draftUrlError) {
-          setNewEnvironmentNameError(draftNameError);
-          setNewEnvironmentUrlError(draftUrlError);
-          return;
-        }
+      // Text still sitting in the name/URL inputs was never added, so Save must not silently add it
+      // (or silently drop it). Only checked on the Test Environments tab — leftover text in that
+      // hidden tab's inputs shouldn't stop a name/description change saved from the General tab.
+      if (activeTab === "testRuns" && (newEnvironmentName.trim() || newEnvironmentUrl.trim())) {
+        setMessageIsError(true);
+        setMessage("Click Add to include the environment you typed, or clear the fields, before saving.");
+        return;
       }
-      const environmentsToSave = [...testRunEnvironments];
-      if (hasDraftEnvironment) {
-        environmentsToSave.push({ name: draftName, url: draftUrl });
-      }
+      const environmentsToSave = testRunEnvironments;
       const currentSettings = parseProjectSettings(project.settings);
       const nextSettings: ProjectSettingsPayload = {
         ...currentSettings,
@@ -336,11 +327,11 @@ export default function ProjectSettingsPage() {
       setTestRunEnvironments(normalizeTestRunEnvironments(refreshedSettings.testRunEnvironments));
       const savedIcon = extractProjectIcon(refreshedSettings);
       setIcon({ color: savedIcon?.color ?? null, glyph: savedIcon?.glyph ?? null });
-      setNewEnvironmentName("");
-      setNewEnvironmentUrl("");
+      setMessageIsError(false);
       setMessage("Project settings saved.");
     } catch (error) {
       const text = error instanceof Error ? error.message : "Failed to save project settings.";
+      setMessageIsError(true);
       setMessage(text);
     } finally {
       setSaving(false);
@@ -382,6 +373,7 @@ export default function ProjectSettingsPage() {
     setNewEnvironmentNameError(nameValidationError);
     setNewEnvironmentUrlError(urlValidationError);
     if (nameValidationError || urlValidationError) return;
+    setMessage(null);
     setTestRunEnvironments((prev) => [...prev, { name: newEnvironmentName.trim(), url: newEnvironmentUrl.trim() }]);
     setNewEnvironmentName("");
     setNewEnvironmentUrl("");
@@ -390,6 +382,7 @@ export default function ProjectSettingsPage() {
   }
 
   function handleRemoveEnvironment(index: number) {
+    setMessage(null);
     setTestRunEnvironments((prev) => prev.filter((_, i) => i !== index));
   }
 
@@ -398,6 +391,10 @@ export default function ProjectSettingsPage() {
     router.replace(`/projects/${projectId}/settings?tab=${tab}`, { scroll: false });
   }
 
+  // Rows staged with Add but not yet persisted by Save — marked so a draft can't be mistaken for a saved one.
+  const savedEnvironmentKeys = new Set(
+    normalizeTestRunEnvironments(parseProjectSettings(project.settings).testRunEnvironments).map((e) => `${e.name}\n${e.url}`)
+  );
   const memberIds = new Set(projectMembers.map((member) => member.userId));
   const availableToAdd = workspaceMembers.filter((member) => !memberIds.has(member.userId));
 
@@ -650,7 +647,12 @@ export default function ProjectSettingsPage() {
                       <tbody>
                         {testRunEnvironments.map((env, index) => (
                           <tr key={`${env.name}-${index}`}>
-                            <td className="px-3 py-2.5 text-[var(--foreground)]">{env.name}</td>
+                            <td className="px-3 py-2.5 text-[var(--foreground)]">
+                              {env.name}
+                              {!savedEnvironmentKeys.has(`${env.name}\n${env.url}`) && (
+                                <span className="ml-2 text-xs text-[var(--muted)]">(unsaved)</span>
+                              )}
+                            </td>
                             <td className="px-3 py-2.5 text-[var(--muted)] break-all">{env.url}</td>
                             <td className="px-3 py-2.5 text-right">
                               <Button
@@ -715,7 +717,14 @@ export default function ProjectSettingsPage() {
           )}
 
           {message && (
-            <p className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm text-[var(--foreground)]">
+            <p
+              role={messageIsError ? "alert" : "status"}
+              className={`rounded-lg border px-3 py-2 text-sm ${
+                messageIsError
+                  ? "border-[var(--error-border)] bg-[var(--error-soft)] text-[var(--error-foreground)]"
+                  : "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success-foreground)]"
+              }`}
+            >
               {message}
             </p>
           )}

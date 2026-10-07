@@ -189,6 +189,7 @@ export class SignupService {
     for (const projectId of inv.project_ids ?? []) {
       await this.legacy.logProjectActivity(projectId, userId, "project_member_added", "project_member", userId, inv.email, { role: inv.role, via: "invitation_registered" });
     }
+    await this.legacy.notifyInvitationAccepted(inv.id, userId);
 
     return userId;
   }

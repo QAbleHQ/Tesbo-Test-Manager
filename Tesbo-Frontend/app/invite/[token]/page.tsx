@@ -3,9 +3,11 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
+import { IconX } from "@tabler/icons-react";
 import {
   acceptInvitation,
   authMe,
+  declineInvitation,
   getInvitationByToken,
   type InviteDetails,
 } from "@/lib/api";
@@ -20,7 +22,7 @@ function roleLabel(role: string): string {
   return "QA Engineer";
 }
 
-type PageState = "loading" | "valid" | "expired" | "cancelled" | "accepted" | "invalid";
+type PageState = "loading" | "valid" | "expired" | "cancelled" | "declined" | "accepted" | "invalid";
 
 export default function InviteAcceptancePage() {
   const params = useParams();
@@ -32,6 +34,9 @@ export default function InviteAcceptancePage() {
   const [loggedInEmail, setLoggedInEmail] = useState<string | null>(null);
   const [state, setState] = useState<PageState>("loading");
   const [accepting, setAccepting] = useState(false);
+  const [declining, setDeclining] = useState(false);
+  // Declining is one-way (the sender has to invite again), so it takes a second click.
+  const [confirmingDecline, setConfirmingDecline] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
 
   useEffect(() => {
@@ -50,6 +55,7 @@ export default function InviteAcceptancePage() {
         }
         if (inv.status === "expired") setState("expired");
         else if (inv.status === "cancelled") setState("cancelled");
+        else if (inv.status === "declined") setState("declined");
         else if (inv.status === "accepted") setState("accepted");
         else setState("valid");
       } catch {
@@ -75,6 +81,26 @@ export default function InviteAcceptancePage() {
     }
   }
 
+  async function handleDecline() {
+    setErrorMsg("");
+    setDeclining(true);
+    try {
+      await declineInvitation(token);
+      setConfirmingDecline(false);
+      setState("declined");
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Failed to decline invitation");
+    } finally {
+      setDeclining(false);
+    }
+  }
+
+  // "Not now": leaves the invitation exactly as it is (still pending, still acceptable from the
+  // link or the bell) and just takes the person somewhere useful.
+  function handleClose() {
+    router.push(loggedInUserId ? "/projects" : "/login");
+  }
+
   const invitePath = `/invite/${token}`;
   const loginUrl = `/login?redirect=${encodeURIComponent(invitePath)}&inviteEmail=${encodeURIComponent(invite?.email ?? "")}`;
   const registerUrl = `/invite/${token}/register`;
@@ -97,7 +123,19 @@ export default function InviteAcceptancePage() {
         <BrandLogo className="h-10 w-auto" />
       </div>
 
-      <Card className="w-full max-w-md p-8">
+      <Card className="relative w-full max-w-md p-8">
+        {state === "valid" && (
+          <button
+            type="button"
+            onClick={handleClose}
+            aria-label="Close"
+            title="Decide later"
+            className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-[6px] text-[var(--ink-400)] transition-colors hover:bg-[var(--ink-100)] hover:text-[var(--foreground)]"
+          >
+            <IconX size={18} stroke={1.75} />
+          </button>
+        )}
+
         {/* ── Invalid ── */}
         {state === "invalid" && (
           <>
@@ -136,6 +174,25 @@ export default function InviteAcceptancePage() {
               <p className="text-sm text-[var(--ink-400)]">
                 This invitation has been cancelled. Contact your team owner if you believe this is a mistake.
               </p>
+            </CardBody>
+          </>
+        )}
+
+        {/* ── Declined ── */}
+        {state === "declined" && (
+          <>
+            <CardHeader>
+              <CardTitle>Invitation declined</CardTitle>
+            </CardHeader>
+            <CardBody className="space-y-4">
+              <p className="text-sm text-[var(--ink-400)]">
+                This invitation was declined. If that was a mistake, ask the sender to invite you again.
+              </p>
+              {loggedInUserId && (
+                <Link href="/projects">
+                  <Button variant="secondary" className="w-full">Go to my workspace</Button>
+                </Link>
+              )}
             </CardBody>
           </>
         )}
@@ -237,13 +294,44 @@ export default function InviteAcceptancePage() {
 
               {/* ── Logged in, correct email ── */}
               {loggedInUserId && !emailMismatch && (
-                <Button
-                  className="w-full"
-                  onClick={handleAccept}
-                  disabled={accepting}
-                >
-                  {accepting ? "Joining…" : "Accept and join workspace"}
-                </Button>
+                <div className="space-y-3">
+                  <Button
+                    className="w-full"
+                    onClick={handleAccept}
+                    disabled={accepting || declining}
+                  >
+                    {accepting ? "Joining…" : "Accept and join workspace"}
+                  </Button>
+                  {confirmingDecline ? (
+                    <div className="space-y-2 rounded-[var(--radius-control)] border border-[var(--border)] px-4 py-3">
+                      <p className="text-sm text-[var(--foreground)]">
+                        Decline this invitation? The sender will need to invite you again.
+                      </p>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="secondary"
+                          className="flex-1"
+                          onClick={() => setConfirmingDecline(false)}
+                          disabled={declining}
+                        >
+                          Keep it
+                        </Button>
+                        <Button className="flex-1" onClick={handleDecline} disabled={declining}>
+                          {declining ? "Declining…" : "Yes, decline"}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <Button
+                      variant="secondary"
+                      className="w-full"
+                      onClick={() => setConfirmingDecline(true)}
+                      disabled={accepting}
+                    >
+                      Decline
+                    </Button>
+                  )}
+                </div>
               )}
             </CardBody>
           </>

@@ -18,6 +18,8 @@ import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util"
 import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
+import { writeNotifications } from "./notification-writer";
+import { notificationLinks, notificationMessages, runLabel, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
 import {
@@ -654,6 +656,59 @@ function validateProjectIcon(raw: unknown): ProjectIcon | undefined {
     }
   }
   return { color, glyph };
+}
+
+const ENVIRONMENT_NAME_MAX_LENGTH = 50;
+const ENVIRONMENT_URL_MAX_LENGTH = 500;
+
+/**
+ * `settings` arrives either as an object (API callers) or a pre-stringified object (the settings
+ * screen). Both are stored as a jsonb object; anything else is a 400 rather than a value that
+ * silently wipes the blob or lands as a scalar. Also mirrors the UI's testRunEnvironments rules.
+ */
+function parseProjectSettingsInput(raw: unknown): Body | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new BadRequestException({ error: "settings must be a JSON object" });
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BadRequestException({ error: "settings must be a JSON object" });
+  }
+  const settings = value as Body;
+  const envs = settings.testRunEnvironments;
+  if (envs !== undefined) {
+    if (!Array.isArray(envs)) throw new BadRequestException({ error: "testRunEnvironments must be an array" });
+    const names = new Set<string>();
+    const urls = new Set<string>();
+    for (const item of envs) {
+      const name = typeof item?.name === "string" ? item.name.trim() : "";
+      const url = typeof item?.url === "string" ? item.url.trim() : "";
+      if (!name) throw new BadRequestException({ error: "Environment name is required" });
+      if (name.length > ENVIRONMENT_NAME_MAX_LENGTH)
+        throw new BadRequestException({ error: `Environment name must be at most ${ENVIRONMENT_NAME_MAX_LENGTH} characters` });
+      if (!url) throw new BadRequestException({ error: "Environment URL is required" });
+      if (url.length > ENVIRONMENT_URL_MAX_LENGTH)
+        throw new BadRequestException({ error: `Environment URL must be at most ${ENVIRONMENT_URL_MAX_LENGTH} characters` });
+      let protocol = "";
+      try {
+        protocol = new URL(url).protocol;
+      } catch {
+        throw new BadRequestException({ error: "Enter a valid URL, e.g. https://staging.example.com" });
+      }
+      if (protocol !== "http:" && protocol !== "https:")
+        throw new BadRequestException({ error: "Environment URL must start with http:// or https://" });
+      if (names.has(name.toLowerCase())) throw new BadRequestException({ error: "An environment with this name already exists" });
+      if (urls.has(url.toLowerCase())) throw new BadRequestException({ error: "This URL is already added to another environment" });
+      names.add(name.toLowerCase());
+      urls.add(url.toLowerCase());
+    }
+  }
+  return settings;
 }
 
 /** Shared by createProject/updateProject. `name`/`description` undefined means "not being changed". */
@@ -2296,6 +2351,14 @@ export class LegacyService implements OnModuleInit {
       this.requestCache.invalidateWhere((key) => key.startsWith("access:") && key.endsWith(`:${targetUserId}`));
     });
     await this.logWorkspaceActivity(workspace.id, uid, "workspace_member_removed", "workspace_member", targetUserId, targetMember.rows[0].email, { role: targetMember.rows[0].role });
+    // No `memberOf`: they are, by definition, no longer in the workspace. The link only exists so
+    // the bell can mark it read (see notificationLinks).
+    await this.notifyUsers([targetUserId], {
+      type: "workspace_removed",
+      title: notificationMessages.workspaceRemoved(workspace.name),
+      link: notificationLinks.projectsList(workspace.id),
+      actorId: uid
+    });
   }
 
   // ─── Role helpers ────────────────────────────────────────────────────────────
@@ -2426,6 +2489,7 @@ export class LegacyService implements OnModuleInit {
     await this.email.sendInvite(email, inviterName, role, workspace.name, rawToken, projectNames, this.config.frontendUrl);
 
     await this.logWorkspaceActivity(workspace.id, uid, "invitation_sent", "invitation", result.rows[0].id, email, { role, projectIds });
+    await this.notifyInvitationCreated({ id: result.rows[0].id, organizationId: workspace.id, email, workspaceName: workspace.name, projectIds, actorId: uid, rawToken });
 
     return toCamel(result.rows[0]);
   }
@@ -2527,6 +2591,26 @@ export class LegacyService implements OnModuleInit {
       this.config.frontendUrl
     );
     await this.logWorkspaceActivity(workspace.id, uid, "invitation_resent", "invitation", inviteId, invite.rows[0].email, {});
+    // The token just rotated, so the invitee's notification(s) must point at the new one — the
+    // dedupe key stops a second notification, which is why the old row has to be repointed instead.
+    await this.db
+      .query(
+        `UPDATE notifications SET link_entity_type = 'invitation', link_entity_id = $1
+         WHERE dedupe_key = $2 OR dedupe_key LIKE $3`,
+        [rawToken, `ws_invite:${inviteId}`, `proj_invite:${inviteId}:%`]
+      )
+      .catch((err) => this.logger.error(`Could not refresh invitation notification link — ${err instanceof Error ? err.message : String(err)}`));
+    // And if the invitee has no notification for this invitation at all (the original send never
+    // wrote one), resending is the repair: same dedupe keys, so an existing one is left alone.
+    await this.notifyInvitationCreated({
+      id: inviteId,
+      organizationId: workspace.id,
+      email: invite.rows[0].email,
+      workspaceName: workspace.name,
+      projectIds,
+      actorId: uid,
+      rawToken
+    });
     return { resent: true };
   }
 
@@ -2586,6 +2670,7 @@ export class LegacyService implements OnModuleInit {
     const inv = invite.rows[0];
 
     if (inv.status === "cancelled") throw new BadRequestException({ error: "This invitation has been cancelled" });
+    if (inv.status === "declined") throw new BadRequestException({ error: "This invitation was declined. Ask the sender to send a new one." });
     if (inv.status === "accepted") throw new BadRequestException({ error: "This invitation has already been accepted" });
     if (inv.status === "expired" || new Date(inv.expires_at) < new Date())
       throw new BadRequestException({ error: "This invitation has expired. Ask the sender to resend it." });
@@ -2624,8 +2709,46 @@ export class LegacyService implements OnModuleInit {
     for (const projectId of inv.project_ids ?? []) {
       await this.logProjectActivity(projectId, uid, "project_member_added", "project_member", uid, inv.email, { role: inv.role, via: "invitation_accepted" });
     }
+    await this.notifyInvitationAccepted(inv.id, uid);
 
     return { accepted: true, organizationId: inv.organization_id };
+  }
+
+  /**
+   * The invitee turns an invitation down. Only the signed-in owner of the invited email can: the
+   * token alone must not be enough to burn someone else's invitation (same rule as accepting).
+   * `status` is a plain VARCHAR(20), so 'declined' needs no migration; it ends the invitation for
+   * good (accept/register refuse it, resend refuses a non-pending one) and the sender can simply
+   * invite again, since only a *pending* invite blocks a new one. It drops off the Members list
+   * (which shows pending and expired) and is recorded in the workspace activity feed.
+   */
+  async declineInvitation(userId: string | null | undefined, rawToken: string) {
+    const uid = this.requireUser(userId);
+    const invite = await this.db.query<{ id: string; organization_id: string; email: string; status: string; expires_at: string }>(
+      "SELECT id, organization_id, email, status, expires_at FROM invitations WHERE token = $1",
+      [this.hashToken(rawToken)]
+    );
+    if (!invite.rows[0]) throw new NotFoundException({ error: "Invitation not found or token is invalid" });
+    const inv = invite.rows[0];
+    if (inv.status === "declined") throw new BadRequestException({ error: "This invitation was already declined" });
+    if (inv.status === "cancelled") throw new BadRequestException({ error: "This invitation has been cancelled" });
+    if (inv.status === "accepted") throw new BadRequestException({ error: "This invitation has already been accepted" });
+    if (inv.status === "expired" || new Date(inv.expires_at) < new Date())
+      throw new BadRequestException({ error: "This invitation has expired. Ask the sender to resend it." });
+
+    const user = await this.db.query<{ email: string }>("SELECT email FROM users WHERE id = $1", [uid]);
+    if (!user.rows[0]) throw new NotFoundException({ error: "User not found" });
+    if (user.rows[0].email.toLowerCase() !== inv.email.toLowerCase())
+      throw new ForbiddenException({ error: "You must sign in with the invited email address to decline this invite" });
+
+    // `AND status = 'pending'` so two tabs (or an accept racing a decline) can't both win.
+    const res = await this.db.query(
+      "UPDATE invitations SET status = 'declined', updated_at = now() WHERE id = $1 AND status = 'pending' RETURNING id",
+      [inv.id]
+    );
+    if (!res.rows[0]) throw new BadRequestException({ error: "This invitation can no longer be declined" });
+    await this.logWorkspaceActivity(inv.organization_id, uid, "invitation_declined", "invitation", inv.id, inv.email, {});
+    return { declined: true };
   }
 
   async registerFromInvitation(rawToken: string, body: Body) {
@@ -2674,6 +2797,7 @@ export class LegacyService implements OnModuleInit {
     for (const projectId of inv.project_ids ?? []) {
       await this.logProjectActivity(projectId, newUser, "project_member_added", "project_member", newUser, inv.email, { role: inv.role, via: "invitation_registered" });
     }
+    await this.notifyInvitationAccepted(inv.id, newUser);
 
     return { userId: newUser, organizationId: inv.organization_id };
   }
@@ -2706,6 +2830,16 @@ export class LegacyService implements OnModuleInit {
       [normalized, workspace.id, targetUserId]
     );
     await this.logWorkspaceActivity(workspace.id, uid, "workspace_member_role_changed", "workspace_member", targetUserId, target.rows[0].email, { from: targetRole, to: normalized });
+    // Only a real change: re-submitting the role they already have tells them nothing.
+    if (normalized !== targetRole) {
+      await this.notifyUsers([targetUserId], {
+        type: "workspace_role_changed",
+        title: notificationMessages.workspaceRoleChanged(workspace.name, normalized),
+        link: notificationLinks.projectsList(workspace.id),
+        actorId: uid,
+        memberOf: { organizationId: workspace.id }
+      });
+    }
   }
 
   async aiKeys(userId: string | null | undefined) {
@@ -3281,25 +3415,34 @@ export class LegacyService implements OnModuleInit {
     const description = body.description !== undefined ? String(body.description) : undefined;
     validateProjectFields(name, description);
     const icon = validateProjectIcon(body.icon);
+    const settings = parseProjectSettingsInput(body.settings);
+    // One statement, so a failing icon write can no longer leave name/settings half-saved while the
+    // caller is told the save failed. The icon is a targeted jsonb_set rather than a read-modify-write
+    // of the whole blob, so it can't race a concurrent save of testcaseIdPrefix/testRunEnvironments
+    // and silently drop whichever one lost the race. `base` unwraps a settings value that an earlier
+    // build stored as a JSON *string* (the UI sent settings pre-stringified and this method
+    // stringified it again) — jsonb_set raises "cannot set path in scalar" on those rows.
     await this.db.query(
       `UPDATE projects SET
        name = COALESCE($2, name),
        description = COALESCE($3, description),
-       settings = COALESCE($4::jsonb, settings),
+       settings = CASE WHEN $5::jsonb IS NULL THEN COALESCE($4::jsonb, settings)
+         ELSE jsonb_set(
+           COALESCE($4::jsonb, CASE jsonb_typeof(settings)
+             WHEN 'object' THEN settings
+             WHEN 'string' THEN (settings #>> '{}')::jsonb
+             ELSE '{}'::jsonb END),
+           '{icon}', $5::jsonb, true) END,
        updated_at = now()
        WHERE id = $1`,
-      [id, name ?? null, description ?? null, body.settings ? JSON.stringify(body.settings) : null]
+      [
+        id,
+        name ?? null,
+        description ?? null,
+        settings ? JSON.stringify(settings) : null,
+        icon !== undefined ? JSON.stringify(icon) : null,
+      ]
     );
-    if (icon !== undefined) {
-      // A targeted jsonb_set rather than a read-modify-write of the whole settings blob, so an icon
-      // change can't race a concurrent save of testcaseIdPrefix/testRunEnvironments (or vice versa)
-      // and silently drop whichever one lost the race.
-      await this.db.query(
-        `UPDATE projects SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{icon}', $2::jsonb, true), updated_at = now()
-         WHERE id = $1`,
-        [id, JSON.stringify(icon)]
-      );
-    }
     // This request's own memoized project row (key/settings/organization_id) is now stale — drop it
     // so anything reading it later in this same request (externalIdPrefix after a testcaseIdPrefix
     // change, requireProjectAccess after a rename) sees the write that just happened.
@@ -3392,6 +3535,24 @@ export class LegacyService implements OnModuleInit {
       target.rows[0].email,
       existingRole ? { from: existingRole, to: requestedRole } : { role: requestedRole }
     );
+    const projectName = String(project.name ?? "");
+    if (!existingRole) {
+      await this.notifyUsers([targetUserId], {
+        type: "project_invitation",
+        title: notificationMessages.projectInvitation(projectName),
+        link: notificationLinks.project(projectId),
+        actorId: uid,
+        memberOf: { projectId }
+      });
+    } else if (existingRole !== requestedRole) {
+      await this.notifyUsers([targetUserId], {
+        type: "project_role_changed",
+        title: notificationMessages.projectRoleChanged(projectName, requestedRole),
+        link: notificationLinks.project(projectId),
+        actorId: uid,
+        memberOf: { projectId }
+      });
+    }
   }
 
   async removeProjectMember(userId: string | null | undefined, projectId: string, targetUserId: string) {
@@ -3440,6 +3601,12 @@ export class LegacyService implements OnModuleInit {
       ]);
     });
     await this.logProjectActivity(projectId, uid, "project_member_removed", "project_member", targetUserId, target.rows[0].email, { role: targetRole });
+    await this.notifyUsers([targetUserId], {
+      type: "project_removed",
+      title: notificationMessages.projectRemoved(String(project.name ?? "")),
+      link: notificationLinks.projectsList(projectId),
+      actorId: uid
+    });
   }
 
   /**
@@ -5201,6 +5368,40 @@ export class LegacyService implements OnModuleInit {
     // insertTestCaseWithClient's comment. updateTestCaseWithClient is also called nested inside
     // zyraSave's shared transaction, which enqueues for its own touched rows separately below.
     if (after?.id) this.enqueueTestcaseEmbedding(projectId, after.id, "updated");
+    await this.notifyIssueLinked(projectId, uid, before.rows[0], after);
+  }
+
+  /**
+   * "[Issue ID] has been linked successfully." when an external issue or page is attached to a test
+   * case (or swapped for a different one). A link is just three columns on `testcases` — there is no
+   * link record or event — so it is detected here by comparing the row before and after an edit, which
+   * means only that path is covered: the bulk, import and Zyra writers set the same columns without
+   * going through updateTestCase. Told: the case's owner and creator (the people responsible for it),
+   * never the person who linked it.
+   */
+  private async notifyIssueLinked(projectId: string, actorId: string, before: Body, after: Body | undefined): Promise<void> {
+    try {
+      if (!after?.id) return;
+      const links: Array<{ provider: IntegrationProvider; was: unknown; now: unknown; label: (v: string) => string }> = [
+        { provider: "jira", was: before.jira_issue_key, now: after.jira_issue_key, label: (v) => v },
+        { provider: "linear", was: before.linear_issue_key, now: after.linear_issue_key, label: (v) => v },
+        { provider: "notion", was: before.notion_page_id, now: after.notion_page_id, label: (v) => notionPageKey(v) }
+      ];
+      for (const link of links) {
+        const now = String(link.now ?? "").trim();
+        if (!now || now === String(link.was ?? "").trim()) continue;
+        await this.notifyUsers([after.owner_id, after.created_by], {
+          type: "integration_issue_linked",
+          title: notificationMessages.integrationIssueLinked(link.label(now)),
+          link: notificationLinks.testCase(projectId, String(after.id)),
+          dedupeKey: `issue_linked:${after.id}:${link.provider}:${now}`,
+          actorId,
+          memberOf: { projectId }
+        });
+      }
+    } catch (err) {
+      this.logger.error(`Issue-link notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // No duplicate/clone endpoint existed before this feature. Added so "custom field
@@ -6227,10 +6428,66 @@ export class LegacyService implements OnModuleInit {
       });
     }
     const executionIds = await this.resolveBulkExecutions(cycleId, body);
+    // Failed / Blocked keep their per-case matrix notifications. Any other status would otherwise be
+    // one notification per case, so for those the per-case notice is silenced and each assignee gets
+    // a single summary below. The "before" picture has to be read first — updateExecution overwrites it.
+    const summarise = status !== "Failed" && status !== "Blocked" && executionIds.length > 0;
+    const before = summarise ? await this.executionsBeforeBulkStatus(executionIds) : [];
     for (const executionId of executionIds) {
-      await this.updateExecution(executionId, uid, { status });
+      await this.updateExecution(executionId, uid, { status }, { quietStatus: summarise });
     }
+    if (summarise) await this.notifyBulkStatusChange(cycleId, uid, status, before);
     return { updated: executionIds.length, status };
+  }
+
+  private async executionsBeforeBulkStatus(executionIds: string[]): Promise<Array<{ status: string; assignee_id: string | null; tc_label: string }>> {
+    const res = await this.db.query<{ status: string; assignee_id: string | null; tc_label: string }>(
+      `SELECT e.status, e.assignee_id,
+              COALESCE(NULLIF(t.external_id, ''), NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Test case') AS tc_label
+       FROM executions e
+       JOIN cycle_items ci ON ci.id = e.cycle_item_id
+       LEFT JOIN testcases t ON t.id = ci.testcase_id
+       WHERE e.id = ANY($1::uuid[]) AND e.deleted_at IS NULL`,
+      [executionIds]
+    );
+    return res.rows;
+  }
+
+  /** One notification per assignee covering every case of theirs whose status actually changed. */
+  private async notifyBulkStatusChange(
+    cycleId: string,
+    actorId: string,
+    status: string,
+    before: Array<{ status: string; assignee_id: string | null; tc_label: string }>
+  ): Promise<void> {
+    try {
+      const byAssignee = new Map<string, string[]>();
+      for (const row of before) {
+        if (!row.assignee_id || row.status === status) continue;
+        byAssignee.set(row.assignee_id, [...(byAssignee.get(row.assignee_id) ?? []), row.tc_label]);
+      }
+      if (!byAssignee.size) return;
+      const run = await this.db.query<{ name: string; external_id: string | null; project_id: string }>(
+        "SELECT name, external_id, project_id FROM cycles WHERE id = $1",
+        [cycleId]
+      );
+      if (!run.rows[0]) return;
+      const label = runLabel(run.rows[0].name, run.rows[0].external_id);
+      for (const [assigneeId, cases] of byAssignee) {
+        await this.notifyUsers([assigneeId], {
+          type: "test_case_status_changed",
+          title:
+            cases.length === 1
+              ? notificationMessages.testCaseStatusChanged(cases[0], status, label)
+              : notificationMessages.testCasesStatusChangedBulk(cases.length, status, label),
+          link: notificationLinks.testRun(run.rows[0].project_id, cycleId),
+          actorId,
+          memberOf: { projectId: run.rows[0].project_id }
+        });
+      }
+    } catch (err) {
+      this.logger.error(`Bulk status notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -6292,7 +6549,7 @@ export class LegacyService implements OnModuleInit {
     return this.executions(cycleId);
   }
 
-  async updateExecution(executionId: string, actorId: string | null | undefined, body: Body) {
+  async updateExecution(executionId: string, actorId: string | null | undefined, body: Body, opts: { quietStatus?: boolean } = {}) {
     const uid = this.requireUser(actorId);
     /*
      * Basecamp 10189985971 (automation ingest scoping) surfaced this as a pre-existing defect.
@@ -6399,6 +6656,12 @@ export class LegacyService implements OnModuleInit {
       before.rows[0].testcase_title,
       { before: toCamel(before.rows[0]), after: toCamel(res.rows[0]) }
     );
+    // Only when something notifiable moved (a new assignee or a new status), so a save that changes
+    // neither does not pay for the extra lookups.
+    const after = res.rows[0];
+    if (after && (after.assignee_id !== before.rows[0].assignee_id || after.status !== before.rows[0].status)) {
+      await this.notifyExecutionChange(executionId, uid, { status: before.rows[0].status ?? null, assigneeId: before.rows[0].assignee_id ?? null }, opts);
+    }
   }
 
   private bugSelect(where: string): string {
@@ -6532,7 +6795,7 @@ export class LegacyService implements OnModuleInit {
     if (executionIds.length === 0) return;
 
     const affected = await this.db.query(
-      `SELECT e.id, e.status, COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title
+      `SELECT e.id, e.status, e.assignee_id, COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title
          FROM executions e
          JOIN cycle_items ci ON ci.id = e.cycle_item_id
          JOIN cycles c ON c.id = ci.cycle_id
@@ -6553,6 +6816,7 @@ export class LegacyService implements OnModuleInit {
         before: { status: row.status },
         after: { status: "Failed" }
       });
+      await this.notifyExecutionChange(String(row.id), actorId ?? null, { status: row.status ?? null, assigneeId: row.assignee_id ?? null });
     }
   }
 
@@ -6775,6 +7039,7 @@ export class LegacyService implements OnModuleInit {
       assigneeId: created.assigneeId ?? null,
       assigneeName: created.assigneeName ?? null
     });
+    await this.notifyBugChange(projectId, uid, null, created);
     return created;
   }
 
@@ -6785,6 +7050,103 @@ export class LegacyService implements OnModuleInit {
    * naming whichever other fields were edited. Compared against the row as it was before the
    * PATCH, so re-saving an unchanged form logs nothing.
    */
+  /**
+   * Bug assigned / reassigned / status changed. `before` is null for a freshly created bug (so a
+   * bug filed with an assignee is "assigned", and has no status *change*).
+   *
+   * Assigned vs reassigned follows the previous assignee: none before → assigned, someone else
+   * before → reassigned; either way it is the new assignee who is told. A status change goes to the
+   * reporter and the current assignee. Both lists are the "resolvers" a future watcher source would
+   * be added to.
+   */
+  private async notifyBugChange(projectId: string, actorId: string | null, before: Body | null, after: Body): Promise<void> {
+    try {
+      const bugId = String(after.id);
+      const label = String(after.externalId || after.title || "bug");
+      const link = notificationLinks.bug(projectId, bugId);
+      const memberOf = { projectId };
+      const assigneeId = after.assigneeId ? String(after.assigneeId) : null;
+      const beforeAssigneeId = before?.assigneeId ? String(before.assigneeId) : null;
+      if (assigneeId && assigneeId !== beforeAssigneeId) {
+        const reassigned = beforeAssigneeId !== null;
+        await this.notifyUsers([assigneeId], {
+          type: reassigned ? "bug_reassigned" : "bug_assigned",
+          title: reassigned ? notificationMessages.bugReassigned(label) : notificationMessages.bugAssigned(label),
+          link,
+          actorId,
+          memberOf
+        });
+      }
+      if (before && (before.status ?? null) !== (after.status ?? null) && after.status) {
+        await this.notifyUsers([after.reportedBy ? String(after.reportedBy) : null, assigneeId], {
+          type: "bug_status_changed",
+          title: notificationMessages.bugStatusChanged(label, String(after.status)),
+          link,
+          actorId,
+          memberOf
+        });
+      }
+    } catch (err) {
+      this.logger.error(`Bug notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * "[User Name] replied to your comment." Threads are one level deep, and the UI's Reply button —
+   * on the top comment or on any reply — always sends the thread's top comment as the parent. So the
+   * stored parent can't say who a reply was aimed at: a reply under Namrata's reply looks identical
+   * to a reply to the thread starter. Everyone who has commented in the thread (its top comment's
+   * author and every earlier replier) is therefore told, except the person replying. A reply that
+   * also @mentions someone is covered by the (stronger) mention notification, so `skipUserIds`
+   * leaves those people out. `table` is one of two fixed names, never caller input.
+   */
+  private async notifyCommentReply(opts: {
+    table: "bug_comments" | "knowledge_document_comments";
+    parentCommentId: string;
+    commentId: string;
+    projectId: string;
+    actorId: string;
+    link: NotificationLink;
+    skipUserIds?: string[];
+  }): Promise<void> {
+    try {
+      const thread = await this.db.query<{ author_id: string | null }>(
+        `SELECT DISTINCT author_id FROM ${opts.table} WHERE (id = $1 OR parent_comment_id = $1) AND is_deleted = false`,
+        [opts.parentCommentId]
+      );
+      const recipients = thread.rows.map((r) => r.author_id).filter((id): id is string => !!id && !opts.skipUserIds?.includes(id));
+      if (!recipients.length) return;
+      await this.notifyUsers(recipients, {
+        type: "comment_reply",
+        title: notificationMessages.commentReplied(await this.displayNameOf(opts.actorId)),
+        link: opts.link,
+        dedupeKey: `comment_reply:${opts.commentId}`,
+        actorId: opts.actorId,
+        memberOf: { projectId: opts.projectId }
+      });
+    } catch (err) {
+      this.logger.error(`Comment reply notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async notifyBugMentions(projectId: string, actorId: string, bugId: string, commentId: string, mentionedIds: string[]): Promise<void> {
+    try {
+      if (!mentionedIds.length) return;
+      const bug = await this.db.query<{ external_id: string | null; title: string }>("SELECT external_id, title FROM bugs WHERE id = $1", [bugId]);
+      const label = bug.rows[0]?.external_id || bug.rows[0]?.title || "bug";
+      await this.notifyUsers(mentionedIds, {
+        type: "bug_mentioned",
+        title: notificationMessages.bugMentioned(await this.displayNameOf(actorId), label),
+        link: notificationLinks.bug(projectId, bugId),
+        dedupeKey: `bug_mention:${commentId}`,
+        actorId,
+        memberOf: { projectId }
+      });
+    } catch (err) {
+      this.logger.error(`Bug mention notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private async logBugChanges(projectId: string, actorId: string, before: Body, after: Body) {
     const log = (action: string, diff: Body) =>
       this.logProjectActivity(projectId, actorId, action, "bug", String(after.id), String(after.title ?? ""), diff);
@@ -7150,11 +7512,24 @@ export class LegacyService implements OnModuleInit {
       commentId,
       ...(parentCommentId ? { parentCommentId } : {})
     });
-    for (const mentioned of await this.bugCommentMentions(projectId, text)) {
+    const mentions = await this.bugCommentMentions(projectId, text);
+    for (const mentioned of mentions) {
       await this.logProjectActivity(projectId, uid, "bug_mentioned", "bug", bugId, bug.title, {
         commentId,
         mentionedUserId: mentioned.id,
         mentionedName: mentioned.name
+      });
+    }
+    await this.notifyBugMentions(projectId, uid, bugId, commentId, mentions.map((m) => m.id));
+    if (parentCommentId) {
+      await this.notifyCommentReply({
+        table: "bug_comments",
+        parentCommentId,
+        commentId,
+        projectId,
+        actorId: uid,
+        link: notificationLinks.bug(projectId, bugId),
+        skipUserIds: mentions.map((m) => m.id)
       });
     }
     const attached = await this.bugCommentAttachments([commentId]);
@@ -7340,6 +7715,7 @@ export class LegacyService implements OnModuleInit {
     }
     const after = await this.getBug(bugId);
     await this.logBugChanges(projectId, uid, before, after);
+    await this.notifyBugChange(projectId, uid, before, after);
     return after;
   }
 
@@ -9760,6 +10136,49 @@ export class LegacyService implements OnModuleInit {
     return res.rows[0]?.name || null;
   }
 
+  /**
+   * "[Document Name] has been updated." / "…has been deleted from the Knowledge Base." for the
+   * people with a stake in a KB item: its creator (or uploader) and, for a document, everyone who
+   * has commented on it. There is no sharing or watcher concept on KB items (every project member
+   * sees every item), so "relevant project users" means those two groups — and a future watcher
+   * list is one more source unioned in here. The actor is never told about their own edit.
+   *
+   * An update notification is limited to one per document per recipient per hour: the editor saves
+   * as people type, and a notification per save would bury the bell.
+   */
+  private async notifyKnowledgeItem(opts: {
+    kind: "updated" | "deleted";
+    projectId: string;
+    actorId: string;
+    itemId: string;
+    name: string;
+    ownerId: string | null;
+    isDocument: boolean;
+  }): Promise<void> {
+    try {
+      const recipients: Array<string | null> = [opts.ownerId];
+      if (opts.isDocument) {
+        const commenters = await this.db.query<{ author_id: string | null }>(
+          "SELECT DISTINCT author_id FROM knowledge_document_comments WHERE document_id = $1 AND is_deleted = false",
+          [opts.itemId]
+        );
+        recipients.push(...commenters.rows.map((r) => r.author_id));
+      }
+      const hour = new Date().toISOString().slice(0, 13);
+      await this.notifyUsers(recipients, {
+        type: opts.kind === "updated" ? "kb_document_updated" : "kb_document_deleted",
+        title: opts.kind === "updated" ? notificationMessages.kbDocumentUpdated(opts.name) : notificationMessages.kbDocumentDeleted(opts.name),
+        // A deleted item has no page to open; its recipients land on the Knowledge Base list.
+        link: opts.kind === "updated" ? notificationLinks.knowledgeDocument(opts.projectId, opts.itemId) : notificationLinks.knowledgeBase(opts.projectId),
+        dedupeKey: opts.kind === "updated" ? `kb_updated:${opts.itemId}:${hour}` : `kb_deleted:${opts.itemId}`,
+        actorId: opts.actorId,
+        memberOf: { projectId: opts.projectId }
+      });
+    } catch (err) {
+      this.logger.error(`Knowledge base notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   async updateKnowledgeDocument(projectId: string, userId: string | null | undefined, documentId: string, body: Body) {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
@@ -9881,6 +10300,11 @@ export class LegacyService implements OnModuleInit {
     );
     await this.logProjectActivity(projectId, uid, "updated", "knowledge_document", documentId, nextTitle, {});
     if (contentChanged) this.enqueueEmbedding(res.rows[0].organization_id, projectId, "document", documentId, "updated");
+    // A real edit of a person's document: its title or its content. Zyra's own memory document and
+    // read-only provider mirrors are rewritten by the system, not by people, and are not announced.
+    if ((contentChanged || nextTitle !== doc.title) && !this.isZyraMemoryDocument(doc)) {
+      await this.notifyKnowledgeItem({ kind: "updated", projectId, actorId: uid, itemId: documentId, name: nextTitle || doc.title, ownerId: doc.created_by ?? null, isDocument: true });
+    }
     return toCamel(res.rows[0]);
   }
 
@@ -9948,6 +10372,7 @@ export class LegacyService implements OnModuleInit {
       [documentId, uid]
     );
     await this.logProjectActivity(projectId, uid, "deleted", "knowledge_document", documentId, doc.title, {});
+    await this.notifyKnowledgeItem({ kind: "deleted", projectId, actorId: uid, itemId: documentId, name: doc.title, ownerId: doc.created_by ?? null, isDocument: true });
     return { success: true };
   }
 
@@ -10074,6 +10499,16 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(projectId, uid, parentCommentId ? "replied" : "commented", "knowledge_document", documentId, doc.title, {
       commentId: res.rows[0].id
     });
+    if (parentCommentId) {
+      await this.notifyCommentReply({
+        table: "knowledge_document_comments",
+        parentCommentId,
+        commentId: String(res.rows[0].id),
+        projectId,
+        actorId: uid,
+        link: notificationLinks.knowledgeDocument(projectId, documentId)
+      });
+    }
     return this.getKnowledgeDocumentComment(projectId, res.rows[0].id);
   }
 
@@ -10448,6 +10883,7 @@ export class LegacyService implements OnModuleInit {
       .delete(file.storage_key)
       .catch((error) => this.logger.warn(`Failed to delete storage object ${file.storage_key}: ${error}`));
     await this.logProjectActivity(projectId, uid, "deleted", "knowledge_file", fileId, file.original_file_name, {});
+    await this.notifyKnowledgeItem({ kind: "deleted", projectId, actorId: uid, itemId: fileId, name: String(file.original_file_name ?? "File"), ownerId: file.uploaded_by ?? null, isDocument: false });
     return { success: true };
   }
 
@@ -10906,6 +11342,52 @@ export class LegacyService implements OnModuleInit {
   }
 
   async integrationCallback(userId: string | null | undefined, provider: string, body: Body) {
+    const result = await this.connectIntegration(userId, provider, body);
+    await this.notifyIntegrationConnection(userId, provider, "connected");
+    return result;
+  }
+
+  /**
+   * "[Jira / Linear / Notion] has been connected successfully." / "…has been disconnected." Connections
+   * belong to the workspace and only its owner can make or remove one, so the people told are the
+   * owners — minus the one who did it. The three providers share the one set of types.
+   */
+  private async notifyIntegrationConnection(userId: string | null | undefined, provider: string, kind: "connected" | "disconnected"): Promise<void> {
+    try {
+      const p = assertIntegrationProvider(provider);
+      const workspace = await this.workspace(userId);
+      await this.notifyUsers(await this.workspaceOwnerIds(workspace.id), {
+        type: kind === "connected" ? "integration_connected" : "integration_disconnected",
+        title: kind === "connected" ? notificationMessages.integrationConnected(p) : notificationMessages.integrationDisconnected(p),
+        link: notificationLinks.integrations(workspace.id),
+        actorId: userId ?? null,
+        memberOf: { organizationId: workspace.id }
+      });
+    } catch (err) {
+      this.logger.error(`Integration notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** "Your [Integration] connection needs to be reconnected." — the connecting user and the owners. */
+  private async notifyIntegrationAuthExpired(connection: Body): Promise<void> {
+    try {
+      const organizationId = String(connection.organization_id ?? "");
+      if (!organizationId) return;
+      await this.notifyUsers([connection.connected_by ? String(connection.connected_by) : null, ...(await this.workspaceOwnerIds(organizationId))], {
+        type: "integration_auth_expired",
+        title: notificationMessages.integrationAuthExpired(String(connection.provider) as IntegrationProvider),
+        link: notificationLinks.integrations(organizationId),
+        // Once a day per connection: every request that finds the token refused would otherwise re-announce it.
+        // (Same key the sync worker uses, so the two paths that can discover the same expiry agree.)
+        dedupeKey: `integration_auth:${organizationId}:${String(connection.provider)}:${new Date().toISOString().slice(0, 10)}`,
+        memberOf: { organizationId }
+      });
+    } catch (err) {
+      this.logger.error(`Integration notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async connectIntegration(userId: string | null | undefined, provider: string, body: Body) {
     const p = assertIntegrationProvider(provider);
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage integrations" });
@@ -11102,6 +11584,7 @@ export class LegacyService implements OnModuleInit {
     // (ensureProviderFolder looks it up by source_provider, not by name) rather than creating a
     // second one.
 
+    await this.notifyIntegrationConnection(userId, provider, "disconnected");
     return { disconnected: true };
   }
 
@@ -11649,11 +12132,14 @@ export class LegacyService implements OnModuleInit {
   // Keyed on the refresh token that was refused: if the row has moved on since (a reconnect, or
   // another deployment renewed it), the WHERE matches nothing and the fresh token is left alone.
   private async recordRefusedRefresh(connection: Body, reason: string): Promise<void> {
-    await this.db.query(
+    const recorded = await this.db.query(
       `UPDATE integration_connections SET auth_error = $2, auth_error_at = now(), auth_error_refresh_fingerprint = $3
        WHERE id = $1 AND refresh_token = $4`,
       [connection.id, reason, this.refreshTokenFingerprint(connection.refresh_token), connection.refresh_token]
     ).catch((err) => this.logger.warn(`Failed to record refused token refresh for connection ${connection.id}: ${err instanceof Error ? err.message : err}`));
+    // Only when this call is what recorded the refusal — a row that has since moved on (a reconnect)
+    // matched nothing and is not expired.
+    if (recorded && recorded.rowCount) await this.notifyIntegrationAuthExpired(connection);
   }
 
   // Atlassian access tokens are JWTs naming the OAuth app they were issued to (`client_id`). A
@@ -16077,6 +16563,14 @@ export class LegacyService implements OnModuleInit {
             [sessionId, JSON.stringify({ ...current, status: "paused" })]
           );
         });
+        // A multi-batch plan runs unattended, so its owner may not be watching the chat when it
+        // pauses. No actor: nobody did this, the job did.
+        await this.notifyUsers([userId], {
+          type: "zyra_task_failed",
+          title: notificationMessages.zyraTaskFailed(),
+          link: notificationLinks.zyraTaskBoard(projectId),
+          memberOf: { projectId }
+        });
         return;
       }
     }
@@ -16222,6 +16716,29 @@ export class LegacyService implements OnModuleInit {
   // user already closed/saved/resubmitted the task in the meantime, that action already moved
   // task_status past this point and must win — we only append a note to the activity log so the
   // failure isn't lost, without resurrecting or overwriting whatever the user set.
+  /**
+   * Tells the person who requested a task-board generation about it: the batch is ready for review,
+   * the generation failed, or a review of it was completed by someone else. `requested_by` is the
+   * only user on the row — NULL for the archive sweep, whose own project-wide notification already
+   * exists — so a task with no requester notifies nobody. Never throws.
+   */
+  private async notifyZyraTask(projectId: string, taskId: string, kind: "ready" | "failed" | "reviewed", actorId: string | null = null): Promise<void> {
+    try {
+      const res = await this.db.query<{ requested_by: string | null }>("SELECT requested_by FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
+      const requester = res.rows[0]?.requested_by;
+      if (!requester) return;
+      const [type, title] =
+        kind === "ready"
+          ? (["zyra_generation_ready", notificationMessages.zyraGenerationReady()] as const)
+          : kind === "failed"
+            ? (["zyra_generation_failed", notificationMessages.zyraGenerationFailed()] as const)
+            : (["zyra_review_completed", notificationMessages.zyraReviewCompleted()] as const);
+      await this.notifyUsers([requester], { type, title, link: notificationLinks.zyraTask(projectId, taskId), actorId, memberOf: { projectId } });
+    } catch (err) {
+      this.logger.error(`Zyra notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private async markZyraTaskFailed(projectId: string, taskId: string, detail: string) {
     const failedAt = new Date().toISOString();
     const activity = [{ actor: "agent", stage: "failed", title: "Generation failed", detail, createdAt: failedAt }];
@@ -16242,6 +16759,10 @@ export class LegacyService implements OnModuleInit {
         "UPDATE ai_generation_requests SET activity_log = activity_log || $3::jsonb, updated_at = now() WHERE id = $1 AND project_id = $2",
         [taskId, projectId, JSON.stringify(note)]
       );
+    } else {
+      // Only when this call is what moved the task to 'failed'. A task the user already closed or
+      // saved (the rowCount === 0 branch above) did not fail from their point of view.
+      await this.notifyZyraTask(projectId, taskId, "failed");
     }
   }
 
@@ -16382,6 +16903,7 @@ export class LegacyService implements OnModuleInit {
         );
         return;
       }
+      await this.notifyZyraTask(projectId, taskId, "ready");
       await this.rememberZyraTurn({
         projectId,
         userId: options.userId,
@@ -16711,6 +17233,7 @@ export class LegacyService implements OnModuleInit {
         );
         return;
       }
+      await this.notifyZyraTask(projectId, taskId, "ready");
       await this.rememberZyraTurn({
         projectId,
         userId,
@@ -16863,6 +17386,8 @@ export class LegacyService implements OnModuleInit {
       const fresh = await this.db.query("SELECT * FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
       return await this.formatAiTask(fresh.rows[0]);
     }
+    // A review finished without saving: the requester hears about it unless they are the reviewer.
+    await this.notifyZyraTask(projectId, taskId, "reviewed", this.requireUser(userId));
     return await this.formatAiTask(res.rows[0]);
   }
 
@@ -17522,6 +18047,8 @@ export class LegacyService implements OnModuleInit {
         // update/archive, or feature #1's similarity-redirect create->update). Never throws.
         const saveEventId = (result as Body)?.saveEventId;
         if (saveEventId) await this.queueZyraTicketComments(projectId, uid, taskId, String(saveEventId), testcases, touchedActions);
+        // The reviewer saved part or all of the batch. The requester is told unless they are the reviewer.
+        if (testcases.length) await this.notifyZyraTask(projectId, taskId, "reviewed", uid);
         delete (result as Body).touchedActions;
         delete (result as Body).saveEventId;
         return result;
@@ -18614,6 +19141,210 @@ export class LegacyService implements OnModuleInit {
     return res.rows.length;
   }
 
+  /**
+   * One notification row per named recipient — the Phase 1 matrix writer (see notification-events.ts).
+   *
+   * This is the single choke point every matrix scenario goes through, so the rules live here and
+   * nowhere else:
+   *  - the actor never hears about their own action (`actorId` is dropped from the recipients);
+   *  - recipients are de-duplicated and non-uuid / null entries ignored;
+   *  - `memberOf` keeps it inside the tenant: a recipient who is not a member of that workspace or
+   *    project at insert time gets nothing. Omitted only where the recipient is by definition no
+   *    longer (removal) or not yet (invitation) a member;
+   *  - `dedupeKey` rides the same ON CONFLICT (user_id, dedupe_key) index as notifyProjectMembers;
+   *  - it never throws: the action that triggered it has already succeeded, and a notification is
+   *    not worth failing that over — a failure is logged and reported as 0 rows.
+   *
+   * Recipient *resolution* is deliberately not in here. Each caller builds its list from a named
+   * resolver (assignee, reporter, inviter, owners…), so a future "watchers" source is one more list
+   * unioned in at those call sites — nothing in this writer changes.
+   */
+  async notifyUsers(
+    recipientIds: Array<string | null | undefined>,
+    opts: {
+      type: NotificationType;
+      title: string;
+      link?: NotificationLink | null;
+      dedupeKey?: string;
+      actorId?: string | null;
+      memberOf?: { organizationId?: string; projectId?: string };
+    }
+  ): Promise<number> {
+    return writeNotifications(this.db, recipientIds, opts, this.logger);
+  }
+
+  private async displayNameOf(userId: string): Promise<string> {
+    const res = await this.db.query<{ name: string | null; email: string }>("SELECT name, email FROM users WHERE id = $1", [userId]);
+    return res.rows[0]?.name?.trim() || res.rows[0]?.email || "A team member";
+  }
+
+  /** Workspace owners ("Workspace Admin" in the matrix — owner is the only workspace admin role). */
+  private async workspaceOwnerIds(organizationId: string): Promise<string[]> {
+    const res = await this.db.query<{ user_id: string }>(
+      "SELECT user_id FROM organization_members WHERE organization_id = $1 AND role = 'owner'",
+      [organizationId]
+    );
+    return res.rows.map((r) => r.user_id);
+  }
+
+  private async projectOwnerIds(projectId: string): Promise<string[]> {
+    const res = await this.db.query<{ user_id: string }>("SELECT user_id FROM project_members WHERE project_id = $1 AND role = 'owner'", [projectId]);
+    return res.rows.map((r) => r.user_id);
+  }
+
+  /**
+   * "Workspace invitation" / "Project invitation" for someone who already has an account. An email
+   * with no account yet has no inbox to notify; they get the emailed invite and, once registered,
+   * the accepted-invitation notification goes to the inviter instead.
+   */
+  private async notifyInvitationCreated(inv: { id: string; organizationId: string; email: string; workspaceName: string; projectIds: string[]; actorId: string; rawToken: string }) {
+    try {
+      const user = await this.db.query<{ id: string }>("SELECT id FROM users WHERE lower(email) = $1", [inv.email.toLowerCase()]);
+      const inviteeId = user.rows[0]?.id;
+      if (!inviteeId) return;
+      await this.notifyUsers([inviteeId], {
+        type: "workspace_invitation",
+        title: notificationMessages.workspaceInvitation(inv.workspaceName),
+        link: notificationLinks.invitation(inv.rawToken),
+        dedupeKey: `ws_invite:${inv.id}`,
+        actorId: inv.actorId
+      });
+      if (!inv.projectIds.length) return;
+      const projects = await this.db.query<{ id: string; name: string }>("SELECT id, name FROM projects WHERE id = ANY($1::uuid[])", [inv.projectIds]);
+      for (const p of projects.rows) {
+        await this.notifyUsers([inviteeId], {
+          type: "project_invitation",
+          title: notificationMessages.projectInvitation(p.name),
+          link: notificationLinks.invitation(inv.rawToken),
+          dedupeKey: `proj_invite:${inv.id}:${p.id}`,
+          actorId: inv.actorId
+        });
+      }
+    } catch (err) {
+      this.logger.error(`Invitation notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * "Invitation accepted", called from each of the three places an invitation is accepted
+   * (sign-in accept, register-from-link, OTP register). Recipients: the inviter plus the workspace
+   * owners (workspace) or project owners (each project the invite included).
+   */
+  async notifyInvitationAccepted(invitationId: string, acceptedUserId: string): Promise<void> {
+    try {
+      const res = await this.db.query<{ invited_by: string | null; organization_id: string; project_ids: string[] | null; workspace_name: string }>(
+        `SELECT i.invited_by, i.organization_id, i.project_ids, o.name AS workspace_name
+         FROM invitations i JOIN organizations o ON o.id = i.organization_id WHERE i.id = $1`,
+        [invitationId]
+      );
+      const inv = res.rows[0];
+      if (!inv) return;
+      const userName = await this.displayNameOf(acceptedUserId);
+      await this.notifyUsers([inv.invited_by, ...(await this.workspaceOwnerIds(inv.organization_id))], {
+        type: "workspace_invitation_accepted",
+        title: notificationMessages.workspaceInvitationAccepted(userName, inv.workspace_name),
+        link: notificationLinks.workspaceMembers(inv.organization_id),
+        dedupeKey: `ws_invite_accepted:${invitationId}`,
+        actorId: acceptedUserId,
+        memberOf: { organizationId: inv.organization_id }
+      });
+      const projectIds = inv.project_ids ?? [];
+      if (!projectIds.length) return;
+      const projects = await this.db.query<{ id: string; name: string }>(
+        "SELECT id, name FROM projects WHERE id = ANY($1::uuid[]) AND organization_id = $2",
+        [projectIds, inv.organization_id]
+      );
+      for (const p of projects.rows) {
+        await this.notifyUsers([inv.invited_by, ...(await this.projectOwnerIds(p.id))], {
+          type: "project_invitation_accepted",
+          title: notificationMessages.projectInvitationAccepted(userName, p.name),
+          link: notificationLinks.projectMembers(p.id),
+          dedupeKey: `proj_invite_accepted:${invitationId}:${p.id}`,
+          actorId: acceptedUserId,
+          memberOf: { projectId: p.id }
+        });
+      }
+    } catch (err) {
+      this.logger.error(`Invitation-accepted notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * "Test run assigned" / "Test case failed" / "Test case blocked" for one execution. Run after the
+   * execution row has been written; `before` is the status / assignee it had.
+   *
+   * Assigned: one notification per run per assignee per day, however many of its executions were
+   * assigned — a bulk assign of 200 cases is one "you've been assigned to run X", not 200.
+   * Failed / blocked: only on the transition into that status (re-saving a Failed case is not a new
+   * failure). Recipients are the run owner and the case's assignee — the people who care.
+   */
+  private async notifyExecutionChange(
+    executionId: string,
+    actorId: string | null,
+    before: { status: string | null; assigneeId: string | null },
+    opts: { quietStatus?: boolean } = {}
+  ): Promise<void> {
+    try {
+      const res = await this.db.query<{
+        status: string;
+        assignee_id: string | null;
+        cycle_id: string;
+        cycle_name: string;
+        cycle_external_id: string | null;
+        cycle_owner_id: string | null;
+        project_id: string;
+        tc_label: string;
+      }>(
+        `SELECT e.status, e.assignee_id, c.id AS cycle_id, c.name AS cycle_name, c.external_id AS cycle_external_id, c.owner_id AS cycle_owner_id, c.project_id,
+                COALESCE(NULLIF(t.external_id, ''), NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Test case') AS tc_label
+         FROM executions e
+         JOIN cycle_items ci ON ci.id = e.cycle_item_id
+         JOIN cycles c ON c.id = ci.cycle_id
+         LEFT JOIN testcases t ON t.id = ci.testcase_id
+         WHERE e.id = $1`,
+        [executionId]
+      );
+      const row = res.rows[0];
+      if (!row) return;
+      const link = notificationLinks.testRun(row.project_id, row.cycle_id);
+      const memberOf = { projectId: row.project_id };
+      const run = runLabel(row.cycle_name, row.cycle_external_id);
+
+      if (row.assignee_id && row.assignee_id !== before.assigneeId) {
+        await this.notifyUsers([row.assignee_id], {
+          type: "test_run_assigned",
+          title: notificationMessages.testRunAssigned(run),
+          link,
+          dedupeKey: `run_assigned:${row.cycle_id}:${new Date().toISOString().slice(0, 10)}`,
+          actorId,
+          memberOf
+        });
+      }
+      if (row.status !== before.status && (row.status === "Failed" || row.status === "Blocked")) {
+        const failed = row.status === "Failed";
+        await this.notifyUsers([row.cycle_owner_id, row.assignee_id], {
+          type: failed ? "test_case_failed" : "test_case_blocked",
+          title: failed ? notificationMessages.testCaseFailed(row.tc_label, run) : notificationMessages.testCaseBlocked(row.tc_label, run),
+          link,
+          actorId,
+          memberOf
+        });
+      } else if (row.status !== before.status && row.assignee_id && !opts.quietStatus) {
+        // Any other status change (Passed, Skipped, back to Untested…): the case's assignee hears
+        // about it. Failed / Blocked are the branch above, which already includes the assignee.
+        await this.notifyUsers([row.assignee_id], {
+          type: "test_case_status_changed",
+          title: notificationMessages.testCaseStatusChanged(row.tc_label, row.status, run),
+          link,
+          actorId,
+          memberOf
+        });
+      }
+    } catch (err) {
+      this.logger.error(`Execution notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /** Newest first, capped at 50 — this list has never had real volume to page through, and the
    *  dropdown it feeds (TopBar.tsx) has no pagination UI to hand a cursor to. Deliberately NOT run
    *  through toCamel: the frontend's AppNotification type already expects the raw column names
@@ -18628,6 +19359,17 @@ export class LegacyService implements OnModuleInit {
       [uid]
     );
     return res.rows;
+  }
+
+  /**
+   * Marks every unread notification of the caller read, in one statement. Only the caller's own rows,
+   * and only the unread ones — `read_at IS NULL` keeps an already-read row's timestamp where it was,
+   * the same rule markNotificationRead's COALESCE applies one at a time, so repeating this is a no-op.
+   */
+  async markAllNotificationsRead(userId: string | null | undefined): Promise<{ ok: true; updated: number }> {
+    const uid = this.requireSession(userId);
+    const res = await this.db.query("UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL RETURNING id", [uid]);
+    return { ok: true, updated: res.rows.length };
   }
 
   /** Scoped to the caller's own id (user_id = $2) — the gap the removed stub's own comment called
