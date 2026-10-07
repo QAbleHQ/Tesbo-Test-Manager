@@ -60,7 +60,7 @@ test.describe("auto bug-filing on Failed", () => {
       await expect(severitySelect).toHaveValue("");
       await severitySelect.selectOption("Critical");
 
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -115,7 +115,7 @@ test.describe("auto bug-filing on Failed", () => {
       expect(optionValues).toEqual(["Not selected", "Critical", "High", "Medium", "Low"]);
 
       await severitySelect.selectOption("Low");
-      await page.getByRole("button", { name: "Skip", exact: true }).click();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       // Fail the second case — its dialog must reset to Not selected, not inherit "Low". Severity is not
@@ -123,8 +123,8 @@ test.describe("auto bug-filing on Failed", () => {
       await page.getByRole("combobox").nth(1).selectOption("Failed");
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
       await expect(page.getByRole("combobox", { name: "Severity" })).toHaveValue("");
-      await expect(page.getByRole("button", { name: "File Bug" })).toBeEnabled();
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await expect(page.getByRole("button", { name: "Report Bug", exact: true })).toBeEnabled();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       const verifyApi = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -167,7 +167,7 @@ test.describe("auto bug-filing on Failed", () => {
       await page.getByRole("combobox").first().selectOption("Failed");
 
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
-      await page.getByRole("button", { name: "Skip", exact: true }).click();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -228,7 +228,7 @@ test.describe("auto bug-filing on Failed", () => {
         })),
       );
 
-      const submit = page.getByRole("button", { name: "File Bug" });
+      const submit = page.getByRole("button", { name: "Report Bug", exact: true });
       await submit.click();
       await expect(page.getByTestId("log-bug-error")).toBeVisible();
       // The dialog stays open with the same staged files — exactly what invited the original defect.
@@ -360,7 +360,7 @@ test.describe("auto bug-filing on Failed", () => {
       await expect(page.getByPlaceholder("https://example.com/browse/BUG-123")).toBeHidden();
       await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
 
-      const submit = page.getByRole("button", { name: "File Bug" });
+      const submit = page.getByRole("button", { name: "Report Bug", exact: true });
       await expect(submit).toBeDisabled();
       await expect(page.getByText("Select a Jira ticket before saving.", { exact: true })).toBeVisible();
 
@@ -1932,7 +1932,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
       const bugTitle = `E2E No-Save Log Bug ${Date.now()}`;
       await page.getByPlaceholder("Brief summary of the bug…").fill(bugTitle);
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       // The panel must reopen on this same test case, as Failed, with the bug it just filed —
@@ -2026,7 +2026,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
 
       await page.getByLabel("Assign to").selectOption(me.userId);
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
 
       const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
@@ -2054,7 +2054,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
 
       await page.getByLabel("Assign to").selectOption(me.userId);
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
 
       const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
