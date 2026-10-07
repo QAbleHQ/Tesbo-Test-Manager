@@ -419,9 +419,10 @@ const EN = {
   "task.feedbackPlaceholder":
     "Ask Zyra to improve coverage, add edge cases, remove duplicates, or focus on a missed rule.",
   "task.refsLabel": "Docs or ticket references for knowledge base",
-  "task.refsPlaceholder": "Mention docs, Jira or Linear tickets, release notes, or policy links Zyra should consider.",
+  "task.refsPlaceholder": "Mention docs, Jira or Linear tickets, Notion pages, release notes, or policy links Zyra should consider.",
   "task.attachJira": "Attach Jira tickets",
   "task.attachLinear": "Attach Linear tickets",
+  "task.attachNotion": "Attach Notion pages",
   "task.selectTicket": "Select ticket...",
   "task.feedbackLocked": "Feedback opens up once Zyra finishes generating drafts for this task.",
   "task.feedbackClosed": "Feedback isn't available once a task is closed.",
@@ -809,9 +810,10 @@ const RU: Record<ZyraTextKey, Entry> = {
   "task.feedbackPlaceholder":
     "Попросите Zyra улучшить покрытие, добавить граничные случаи, убрать дубликаты или учесть пропущенное правило.",
   "task.refsLabel": "Ссылки на документы или задачи для базы знаний",
-  "task.refsPlaceholder": "Укажите документы, задачи Jira или Linear, заметки о релизе или ссылки на правила, которые Zyra должна учесть.",
+  "task.refsPlaceholder": "Укажите документы, задачи Jira или Linear, страницы Notion, заметки о релизе или ссылки на правила, которые Zyra должна учесть.",
   "task.attachJira": "Прикрепить задачи Jira",
   "task.attachLinear": "Прикрепить задачи Linear",
+  "task.attachNotion": "Прикрепить страницы Notion",
   "task.selectTicket": "Выберите задачу...",
   "task.feedbackLocked": "Отзыв можно будет оставить, когда Zyra закончит генерацию черновиков для этой задачи.",
   "task.feedbackClosed": "Для закрытой задачи отзыв недоступен.",

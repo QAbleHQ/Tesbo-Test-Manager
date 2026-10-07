@@ -12,6 +12,8 @@ import { env } from "../utils/env";
  * into the app — the opposite of what it promised. The fix opens the flow in its own tab; the
  * original tab never navigates away and picks up the result on its own.
  *
+ * Notion (INT-U-09 and up) is covered by the blocks at the end of this file, against mocked Notion routes.
+ *
  * ProjectIntegrationMapping.tsx (a project's Settings → Integrations tab) drives the identical
  * flow through the same shared hook and is not re-tested here.
  *
@@ -357,6 +359,714 @@ test.describe("Jira/Linear + AI Generation project settings", () => {
       await page.goto(`/projects/${projectId}/settings/integrations/linear`);
       await expect(page.getByRole("checkbox", { name: /Auto-comment on Linear ticket/ })).not.toBeChecked();
 
+      await page.goto(`/projects/${projectId}/settings/integrations/jira`);
+      await expect(page.getByRole("checkbox", { name: /Auto-comment on Jira ticket/ })).toBeChecked();
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});
+
+/*
+ * Notion: the same screens as Jira and Linear, driven the same way. Notion's workspace-level
+ * `/api/workspace/integrations/notion/*` and project-level `/api/projects/:id/notion/*` responses are
+ * mocked, because a real Notion consent screen and a real database picker cannot be driven from
+ * Playwright (api.notion.com is compiled in; see docs/e2e-coverage-waves.md). What is under test is
+ * Tesbo's own logic: which card shows what, the popup lifecycle, error surfacing, the exact body the
+ * picker saves, and settings persistence, which goes to the real backend where it can.
+ *
+ * Locators come from the final screens: IntegrationsTab.tsx (`integration-card-*`, `integration-
+ * configure-*`, `integration-manage-*`, `integration-disconnect-*`, `integration-upgrade-*`),
+ * WorkspaceIntegrationConfig.tsx, ProjectIntegrationMapping.tsx (`remote-item`, `remote-items-empty`),
+ * the project settings Integrations tab (`notion-project-card`, `notion-project-cta`,
+ * `notion-project-settings-link`) and app/integrations/callback/page.tsx.
+ *
+ * What the screens do NOT have, and so is not asserted: a confirmation step before Disconnect (both
+ * the Integrations tab and the Notion page call disconnect on the first click), exactly like Jira.
+ */
+
+const NOTION_SETTINGS_URL = "/settings/integrations/notion";
+const NOTION_CALLBACK_URL = "/integrations/callback?code=e2e-code&state=notion.e2e.sig";
+
+interface NotionWorkspaceMock {
+  callbackCalls: number;
+  callbackBodies: Array<{ code?: string; state?: string }>;
+  disconnectCalls: number;
+  otherProviderDisconnectCalls: number;
+  connected: boolean;
+}
+
+/** Mocks the five workspace endpoints for Notion, in memory only: no real Notion, no DB writes. */
+async function mockNotionWorkspaceRoutes(
+  context: BrowserContext,
+  opts: {
+    configured?: boolean;
+    connectedInitially?: boolean;
+    failCallback?: string;
+    disconnectDelayMs?: number;
+    /** Merged over the connected status body, e.g. needsReconnect. */
+    statusExtra?: Record<string, unknown>;
+  } = {}
+): Promise<NotionWorkspaceMock> {
+  const state: NotionWorkspaceMock = {
+    callbackCalls: 0,
+    callbackBodies: [],
+    disconnectCalls: 0,
+    otherProviderDisconnectCalls: 0,
+    connected: opts.connectedInitially ?? false,
+  };
+
+  await context.route("**/api/workspace/integrations/notion/disconnect", async (route) => {
+    state.disconnectCalls += 1;
+    if (opts.disconnectDelayMs) await new Promise((resolve) => setTimeout(resolve, opts.disconnectDelayMs));
+    state.connected = false;
+    await route.fulfill({ json: { disconnected: true } });
+  });
+  // Any other provider's disconnect during a Notion test is a defect: counted, never expected.
+  for (const other of ["jira", "linear"]) {
+    await context.route(`**/api/workspace/integrations/${other}/disconnect`, async (route) => {
+      state.otherProviderDisconnectCalls += 1;
+      await route.fulfill({ json: { disconnected: true } });
+    });
+  }
+
+  await context.route("**/api/workspace/integrations/notion/config", (route) =>
+    route.fulfill({
+      json: { configured: opts.configured ?? true, clientId: "e2e-notion-client-id", redirectUri: "http://localhost/integrations/callback" },
+    })
+  );
+
+  await context.route("**/api/workspace/integrations/notion/status", (route) =>
+    route.fulfill({
+      json: state.connected
+        ? {
+            connected: true,
+            siteUrl: "https://www.notion.so",
+            needsReconnect: false,
+            authError: null,
+            connectedProjects: [{ projectId: "e2e-project", projectName: "E2E Project", projectKey: "E2EK" }],
+            ...(opts.statusExtra ?? {}),
+          }
+        : { connected: false, connectedProjects: [] },
+    })
+  );
+
+  await context.route("**/api/workspace/integrations/notion/auth-url", (route) =>
+    route.fulfill({ json: { url: `${MOCK_AUTHORIZE_URL}?state=notion.e2e.sig` } })
+  );
+
+  await context.route("**/api/workspace/integrations/notion/callback", async (route) => {
+    state.callbackCalls += 1;
+    state.callbackBodies.push(route.request().postDataJSON());
+    if (opts.failCallback) {
+      await route.fulfill({ status: 400, json: { error: opts.failCallback } });
+      return;
+    }
+    state.connected = true;
+    await route.fulfill({ json: { connectionId: "e2e-connection", siteUrl: "https://www.notion.so", workspaceName: "E2E Workspace" } });
+  });
+
+  await context.route(`${MOCK_AUTHORIZE_URL}**`, (route) =>
+    route.fulfill({ contentType: "text/html", body: "<html><body><h1>Mock OAuth Consent</h1></body></html>" })
+  );
+
+  return state;
+}
+
+async function clickConnectNotionAndGetPopup(context: BrowserContext, page: Page): Promise<Page> {
+  const [popup] = await Promise.all([
+    context.waitForEvent("page"),
+    page.getByRole("button", { name: "Connect Notion" }).click(),
+  ]);
+  return popup;
+}
+
+test.describe("Notion integration: workspace Integrations tab (UI)", () => {
+  const TAB_URL = "/settings?tab=integrations";
+
+  /** Mocks all three providers' workspace status plus the plan, so the card states are deterministic. */
+  async function mockTab(
+    context: BrowserContext,
+    opts: {
+      plan?: "launch" | "pro";
+      notion?: Record<string, unknown>;
+      jira?: Record<string, unknown>;
+      linear?: Record<string, unknown>;
+    } = {}
+  ) {
+    const calls = { disconnect: [] as string[] };
+    await context.route("**/api/billing", (route) =>
+      route.fulfill({
+        json: {
+          plan: opts.plan ?? "pro",
+          billingInterval: null,
+          status: null,
+          currentPeriodEnd: null,
+          cancelAtPeriodEnd: false,
+          paymentFailedAt: null,
+          graceEndsAt: null,
+          inGracePeriod: false,
+          limitsEnforced: false,
+        },
+      })
+    );
+    const bodies = { jira: opts.jira ?? { connected: false }, linear: opts.linear ?? { connected: false }, notion: opts.notion ?? { connected: false } };
+    for (const provider of ["jira", "linear", "notion"] as const) {
+      await context.route(`**/api/workspace/integrations/${provider}/status`, (route) => route.fulfill({ json: bodies[provider] }));
+      await context.route(`**/api/workspace/integrations/${provider}/disconnect`, async (route) => {
+        calls.disconnect.push(provider);
+        bodies[provider] = { connected: false };
+        await route.fulfill({ json: { disconnected: true } });
+      });
+    }
+    return calls;
+  }
+
+  test("INT-U-09 the Notion card is open to a Launch workspace with no Pro lock, while Linear shows its lock", async ({ page, context }) => {
+    await mockTab(context, { plan: "launch" });
+    await page.goto(TAB_URL);
+
+    const notion = page.getByTestId("integration-card-notion");
+    await expect(notion).toBeVisible();
+    await expect(notion.getByRole("heading", { name: "Notion" })).toBeVisible();
+    // The plan allow-list is {jira, notion}: no badge, no upgrade button, a normal Configure entry.
+    await expect(notion.getByText("Requires Pro")).toHaveCount(0);
+    await expect(page.getByTestId("integration-upgrade-notion")).toHaveCount(0);
+    const configure = page.getByTestId("integration-configure-notion");
+    await expect(configure).toBeVisible();
+    await expect(configure).toHaveAttribute("href", "/settings/integrations/notion");
+    // Not connected: nothing claims it is.
+    await expect(notion.getByText("Connected", { exact: true })).toHaveCount(0);
+
+    // Regression: Jira stays open and Linear stays locked on the same plan.
+    await expect(page.getByTestId("integration-card-jira").getByText("Requires Pro")).toHaveCount(0);
+    await expect(page.getByTestId("integration-configure-jira")).toBeVisible();
+    await expect(page.getByTestId("integration-card-linear").getByText("Requires Pro")).toBeVisible();
+    await expect(page.getByTestId("integration-upgrade-linear")).toBeVisible();
+
+    await configure.click();
+    await expect(page).toHaveURL(/\/settings\/integrations\/notion$/);
+    await expect(page.getByRole("heading", { name: "Notion Integration" })).toBeVisible();
+  });
+
+  test("INT-U-10 a connected Notion card shows its site, how many projects use it, and Manage, without touching Jira or Linear", async ({ page, context }) => {
+    await mockTab(context, {
+      plan: "launch",
+      notion: {
+        connected: true,
+        siteUrl: "https://www.notion.so",
+        connectedProjects: [{ projectId: "p1", projectName: "Checkout", projectKey: "CHK" }],
+      },
+    });
+    await page.goto(TAB_URL);
+
+    const notion = page.getByTestId("integration-card-notion");
+    await expect(notion.getByText("Connected", { exact: true })).toBeVisible();
+    await expect(notion.getByRole("link", { name: "https://www.notion.so" })).toHaveAttribute("href", "https://www.notion.so");
+    await expect(notion.getByText("Used by 1 project: CHK")).toBeVisible();
+    await expect(page.getByTestId("integration-manage-notion")).toHaveAttribute("href", "/settings/integrations/notion");
+    await expect(page.getByTestId("integration-disconnect-notion")).toBeEnabled();
+    // Connected replaces Configure; it does not sit beside it.
+    await expect(page.getByTestId("integration-configure-notion")).toHaveCount(0);
+
+    // Jira's card is unaffected by Notion being connected.
+    const jira = page.getByTestId("integration-card-jira");
+    await expect(jira.getByText("Connected", { exact: true })).toHaveCount(0);
+    await expect(page.getByTestId("integration-configure-jira")).toBeVisible();
+  });
+
+  test("INT-U-11 disconnecting Notion from the tab calls only Notion's route, then offers Configure again", async ({ page, context }) => {
+    const calls = await mockTab(context, {
+      notion: { connected: true, siteUrl: "https://www.notion.so", connectedProjects: [] },
+      jira: { connected: true, siteUrl: "https://e2e.atlassian.invalid", connectedProjects: [] },
+    });
+    await page.goto(TAB_URL);
+    await expect(page.getByTestId("integration-card-notion").getByText("Connected", { exact: true })).toBeVisible();
+
+    await page.getByTestId("integration-disconnect-notion").click();
+
+    await expect(page.getByText("Notion disconnected.")).toBeVisible();
+    await expect(page.getByTestId("integration-configure-notion")).toBeVisible();
+    await expect(page.getByTestId("integration-disconnect-notion")).toHaveCount(0);
+    expect(calls.disconnect, "only the Notion disconnect route may be called").toEqual(["notion"]);
+    // Jira is still connected, untouched.
+    await expect(page.getByTestId("integration-card-jira").getByText("Connected", { exact: true })).toBeVisible();
+  });
+});
+
+test.describe("Notion integration: workspace connect flow (UI)", () => {
+  test("INT-U-12 Connect Notion opens the authorize URL in a new tab and disables the button while waiting", async ({ page, context }) => {
+    await mockNotionWorkspaceRoutes(context);
+    await page.goto(NOTION_SETTINGS_URL);
+    await expect(page.getByRole("heading", { name: "Notion Integration" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Connect Notion" })).toBeVisible();
+
+    const originalUrl = page.url();
+    const popup = await clickConnectNotionAndGetPopup(context, page);
+    await popup.waitForURL(/example-oauth\.invalid/);
+
+    // The authorize URL the popup lands on is the one the backend's auth-url answered (with its state).
+    expect(popup.url()).toContain("state=notion.e2e.sig");
+    expect(page.url()).toBe(originalUrl);
+    const waiting = page.getByRole("button", { name: /Waiting for you to finish in the new tab/ });
+    await expect(waiting).toBeVisible();
+    await expect(waiting).toBeDisabled();
+
+    await popup.close();
+    // Closing without finishing is a silent cancel, not an error.
+    await expect(page.getByRole("button", { name: "Connect Notion" })).toBeEnabled({ timeout: 10_000 });
+    await expect(page.getByText(/failed|error/i)).toHaveCount(0);
+  });
+
+  test("INT-U-13 a deployment with no Notion OAuth app says which variables to set and offers no Connect button", async ({ page, context }) => {
+    await mockNotionWorkspaceRoutes(context, { configured: false });
+    await page.goto(NOTION_SETTINGS_URL);
+
+    await expect(page.getByText("Notion isn't set up on this deployment yet.")).toBeVisible();
+    await expect(page.getByText("NOTION_CLIENT_ID", { exact: true })).toBeVisible();
+    await expect(page.getByText("NOTION_CLIENT_SECRET", { exact: true })).toBeVisible();
+    await expect(page.getByText("http://localhost/integrations/callback")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Connect Notion" })).toHaveCount(0);
+  });
+
+  test("INT-U-14 a connected Notion page shows its site and projects, and a rapid double-click on Disconnect fires one request", async ({ page, context }) => {
+    const mock = await mockNotionWorkspaceRoutes(context, { connectedInitially: true, disconnectDelayMs: 300 });
+    await page.goto(NOTION_SETTINGS_URL);
+
+    await expect(page.getByRole("heading", { name: "Connected" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "https://www.notion.so" })).toBeVisible();
+    await expect(page.getByText("1 project(s) currently map to this Notion connection.")).toBeVisible();
+    await expect(page.getByText("E2EK")).toBeVisible();
+    await expect(page.getByText(/Notion database feeds a Tesbo project/)).toBeVisible();
+
+    const button = page.getByRole("button", { name: "Disconnect Notion" });
+    await expect(button).toBeEnabled();
+    // Two native clicks in the page's own JS, before React can disable the button (see INT-U-07).
+    await button.evaluate((el) => {
+      (el as HTMLButtonElement).click();
+      (el as HTMLButtonElement).click();
+    });
+
+    await expect(page.getByRole("heading", { name: "Connect Notion" })).toBeVisible({ timeout: 10_000 });
+    expect(mock.disconnectCalls).toBe(1);
+    expect(mock.otherProviderDisconnectCalls).toBe(0);
+    await expect(page.getByText("Notion disconnected.")).toBeVisible();
+  });
+
+  test("INT-U-15 a connection that needs reconnecting shows a warning with the reason, on the workspace page", async ({ page, context }) => {
+    await mockNotionWorkspaceRoutes(context, {
+      connectedInitially: true,
+      statusExtra: { needsReconnect: true, authError: "Notion rejected this workspace's token." },
+    });
+    await page.goto(NOTION_SETTINGS_URL);
+
+    const alert = page.getByRole("alert").filter({ hasText: "needs to be reconnected" });
+    await expect(alert).toBeVisible();
+    await expect(alert.getByText("Notion needs to be reconnected")).toBeVisible();
+    await expect(alert.getByText("Notion rejected this workspace's token.")).toBeVisible();
+    // The way out is on the same page.
+    await expect(page.getByRole("button", { name: "Disconnect Notion" })).toBeEnabled();
+  });
+});
+
+test.describe("Notion integration: OAuth callback page (UI)", () => {
+  test("INT-U-16 a successful Notion callback posts the code and signed state to Notion's route and says Notion connected", async ({ page, context }) => {
+    const mock = await mockNotionWorkspaceRoutes(context);
+    await page.goto(NOTION_CALLBACK_URL);
+
+    await expect(page.getByRole("heading", { name: "Notion connected to Tesbo" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Return to Tesbo" })).toBeVisible();
+    expect(mock.callbackCalls).toBe(1);
+    // The state goes back verbatim: the backend verifies it, the page must not rewrite it.
+    expect(mock.callbackBodies[0]).toEqual({ code: "e2e-code", state: "notion.e2e.sig" });
+  });
+
+  test("INT-U-17 a denied consent screen (error param, no code) is reported without calling the backend", async ({ page, context }) => {
+    const mock = await mockNotionWorkspaceRoutes(context);
+    // What Notion redirects to when the user cancels: ?error=access_denied, no code.
+    await page.goto("/integrations/callback?error=access_denied&state=notion.e2e.sig");
+
+    await expect(page.getByRole("heading", { name: "Connection Failed" })).toBeVisible();
+    await expect(page.getByText("Notion authorization was denied or failed.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Try Again" })).toBeVisible();
+    await expect(page.getByRole("button", { name: /go back/i })).toHaveCount(0);
+    expect(mock.callbackCalls, "a denied authorization must not burn a token exchange").toBe(0);
+  });
+
+  test("INT-U-18 a server-side rejection of the Notion callback shows the server's message", async ({ page, context }) => {
+    const mock = await mockNotionWorkspaceRoutes(context, {
+      failCallback: "Notion did not accept the authorization code. Start the connection again.",
+    });
+    await page.goto(NOTION_CALLBACK_URL);
+
+    await expect(page.getByRole("heading", { name: "Connection Failed" })).toBeVisible();
+    await expect(page.getByText("Notion did not accept the authorization code. Start the connection again.")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Try Again" })).toBeVisible();
+    expect(mock.callbackCalls).toBe(1);
+  });
+
+  test("INT-U-19 a callback with no code, or a state naming no known provider, never calls the backend", async ({ page, context }) => {
+    const mock = await mockNotionWorkspaceRoutes(context);
+
+    await page.goto("/integrations/callback?state=notion.e2e.sig");
+    await expect(page.getByText("Missing authorization code or integration context.")).toBeVisible();
+
+    await page.goto("/integrations/callback?code=e2e-code&state=bogus.e2e.sig");
+    await expect(page.getByText("Missing authorization code or integration context.")).toBeVisible();
+    // No provider means no Try Again: there is nothing to restart.
+    await expect(page.getByRole("button", { name: "Try Again" })).toHaveCount(0);
+    expect(mock.callbackCalls).toBe(0);
+  });
+});
+
+test.describe("Notion integration: project screens (UI)", () => {
+  function apiContext() {
+    return pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: path.join(__dirname, "../.auth/state.json") });
+  }
+
+  async function createProject(api: Awaited<ReturnType<typeof apiContext>>, label: string): Promise<string> {
+    const suffix = Date.now().toString().slice(-8);
+    const created = await (
+      await api.post("/api/projects", { data: { name: `${label} ${suffix}`, key: `E2E${label.replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 5)}${suffix}` } })
+    ).json();
+    return created.id;
+  }
+
+  const DB_PRODUCT = { id: "11111111-1111-1111-1111-111111111111", name: "Product Specs", url: "https://www.notion.so/product", connected: false };
+  const DB_ROADMAP = { id: "22222222-2222-2222-2222-222222222222", name: "Roadmap", url: "https://www.notion.so/roadmap", connected: false };
+
+  interface ProjectMock {
+    saves: Array<Record<string, unknown>>;
+    syncCalls: number;
+  }
+
+  /** Mocks the project-level Notion endpoints. GET and POST share the databases URL, split by method. */
+  async function mockNotionProject(
+    context: BrowserContext,
+    projectId: string,
+    opts: {
+      status?: Record<string, unknown>;
+      databases?: Array<typeof DB_PRODUCT>;
+      saveError?: { status: number; error: string };
+      syncError?: { status: number; error: string };
+    } = {}
+  ): Promise<ProjectMock> {
+    const state: ProjectMock = { saves: [], syncCalls: 0 };
+    await context.route(`**/api/projects/${projectId}/notion/status`, (route) =>
+      route.fulfill({
+        json: opts.status ?? { connected: true, siteUrl: "https://www.notion.so", needsReconnect: false, authError: null, connectedProjects: [], history: [] },
+      })
+    );
+    await context.route(`**/api/projects/${projectId}/notion/databases`, async (route) => {
+      if (route.request().method() === "POST") {
+        state.saves.push(route.request().postDataJSON());
+        if (opts.saveError) {
+          await route.fulfill({ status: opts.saveError.status, json: { error: opts.saveError.error } });
+          return;
+        }
+        await route.fulfill({ json: { linked: 1 } });
+        return;
+      }
+      await route.fulfill({ json: opts.databases ?? [] });
+    });
+    await context.route(`**/api/projects/${projectId}/notion/sync`, async (route) => {
+      state.syncCalls += 1;
+      if (opts.syncError) {
+        await route.fulfill({ status: opts.syncError.status, json: { error: opts.syncError.error } });
+        return;
+      }
+      await route.fulfill({ json: { run: null, alreadyRunning: false } });
+    });
+    await context.route(`**/api/projects/${projectId}/integrations/notion/sync-status`, (route) => route.fulfill({ json: { run: null } }));
+    return state;
+  }
+
+  test("INT-U-20 the project's Integrations tab shows Notion connected with its gear link, or a Connect-in-Workspace-Settings CTA", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion Card");
+      await mockNotionProject(context, projectId, {
+        status: {
+          connected: true,
+          siteUrl: "https://www.notion.so",
+          needsReconnect: false,
+          connectedProjects: [{ id: "m1", notionDatabaseId: DB_ROADMAP.id, notionDatabaseName: "Roadmap", createdAt: new Date().toISOString() }],
+          history: [],
+        },
+      });
+      // Pin the neighbours' state so the regression half does not depend on what account A has connected.
+      for (const provider of ["jira", "linear"]) {
+        await context.route(`**/api/projects/${projectId}/${provider}/status`, (route) =>
+          route.fulfill({ json: { connected: false, connectedProjects: [], history: [] } })
+        );
+      }
+      await page.goto(`/projects/${projectId}/settings?tab=integrations`);
+
+      const card = page.getByTestId("notion-project-card");
+      await expect(card).toBeVisible();
+      await expect(card.getByText("Workspace connected")).toBeVisible();
+      await expect(card.getByText("Notion database linked to this project: Roadmap")).toBeVisible();
+      const gear = page.getByTestId("notion-project-settings-link");
+      await expect(gear).toHaveAttribute("href", `/projects/${projectId}/settings/integrations/notion`);
+      await expect(page.getByTestId("notion-project-cta")).toHaveCount(0);
+
+      // Regression: Jira and Linear cards are still on the page, each with their own entry.
+      await expect(page.getByRole("heading", { name: "Jira", exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Linear", exact: true })).toBeVisible();
+      await expect(page.getByTestId("linear-project-cta")).toBeVisible();
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-21 with Notion not connected the project card sends the user to Workspace Settings, and a reconnect warning shows when needed", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion Disc");
+      await mockNotionProject(context, projectId, { status: { connected: false, connectedProjects: [], history: [] } });
+      await page.goto(`/projects/${projectId}/settings?tab=integrations`);
+
+      const card = page.getByTestId("notion-project-card");
+      await expect(card.getByText("Not connected for this workspace yet.")).toBeVisible();
+      const cta = page.getByTestId("notion-project-cta");
+      await expect(cta).toHaveText("Connect in Workspace Settings");
+      await expect(cta).toHaveAttribute("href", "/settings/integrations/notion");
+      await expect(page.getByTestId("notion-project-settings-link")).toHaveCount(0);
+      // Never an upgrade prompt: Notion is on every plan.
+      await expect(card.getByText(/Upgrade to Pro|Pro plan/)).toHaveCount(0);
+
+      // Connected but needing a reconnect: the card says so.
+      await context.unroute(`**/api/projects/${projectId}/notion/status`);
+      await context.route(`**/api/projects/${projectId}/notion/status`, (route) =>
+        route.fulfill({ json: { connected: true, needsReconnect: true, authError: "revoked", connectedProjects: [], history: [] } })
+      );
+      await page.reload();
+      await expect(page.getByTestId("notion-project-card").getByText("Needs to be reconnected in Workspace Settings.")).toBeVisible();
+      await expect(page.getByTestId("notion-project-card").getByText("No Notion database linked to this project yet.")).toBeVisible();
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-22 a workspace with nothing shared with Tesbo shows the share-with-integration guidance and cannot save", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion Empty");
+      const mock = await mockNotionProject(context, projectId, { databases: [] });
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+
+      await expect(page.getByRole("heading", { name: "Notion Integration" })).toBeVisible();
+      await expect(page.getByRole("heading", { name: "Select a Notion database" })).toBeVisible();
+      const empty = page.getByTestId("remote-items-empty");
+      await expect(empty.getByText("No databases are shared with Tesbo yet.")).toBeVisible();
+      await expect(empty.getByText(/Connections/)).toBeVisible();
+      await expect(empty.getByRole("link", { name: "Workspace Settings" })).toHaveAttribute("href", "/settings/integrations/notion");
+      await expect(page.getByTestId("remote-item")).toHaveCount(0);
+      // Nothing to select, so nothing to save, and nothing was sent.
+      await expect(page.getByRole("button", { name: "Link Notion database" })).toBeDisabled();
+      expect(mock.saves).toEqual([]);
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-23 picking a shared database saves exactly { databaseId, databaseName } and reports it linked", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion Pick");
+      const mock = await mockNotionProject(context, projectId, { databases: [DB_PRODUCT, DB_ROADMAP] });
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+
+      await expect(page.getByTestId("remote-item")).toHaveCount(2);
+      const save = page.getByRole("button", { name: "Link Notion database" });
+      await expect(save).toBeDisabled();
+
+      await page.getByRole("radio", { name: /Roadmap/ }).check();
+      await expect(save).toBeEnabled();
+      await save.click();
+
+      await expect(page.getByText("Roadmap linked to this project.")).toBeVisible();
+      // The request body is the whole contract with POST /notion/databases: no key, no extras.
+      expect(mock.saves).toEqual([{ databaseId: DB_ROADMAP.id, databaseName: "Roadmap" }]);
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-24 an already-linked database is preselected, and the sync card appears only once a database is linked", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion Linked");
+      const mock = await mockNotionProject(context, projectId, {
+        databases: [DB_PRODUCT, { ...DB_ROADMAP, connected: true }],
+        status: {
+          connected: true,
+          siteUrl: "https://www.notion.so",
+          connectedProjects: [{ id: "m1", notionDatabaseId: DB_ROADMAP.id, notionDatabaseName: "Roadmap", createdAt: new Date().toISOString() }],
+          history: [],
+        },
+        syncError: { status: 400, error: "Notion could not be reached. Try again in a moment." },
+      });
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+
+      await expect(page.getByRole("radio", { name: /Roadmap/ })).toBeChecked();
+      await expect(page.getByRole("radio", { name: /Product Specs/ })).not.toBeChecked();
+      await expect(page.getByRole("heading", { name: "Sync Pages" })).toBeVisible();
+
+      // A failed sync start shows the server's reason and leaves Sync Now usable.
+      await page.getByRole("button", { name: "Sync Now" }).click();
+      await expect(page.getByText("Notion could not be reached. Try again in a moment.")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Sync Now" })).toBeEnabled();
+      expect(mock.syncCalls).toBe(1);
+
+      // Clearing the selection turns Link into a no-op: it cannot be saved with nothing chosen.
+      await page.getByRole("button", { name: "Clear selection" }).click();
+      await expect(page.getByRole("button", { name: "Link Notion database" })).toBeDisabled();
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-25 a 'not shared' error from saving surfaces the server's message and leaves the page usable", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion Err");
+      const message = "Notion could not find that database. Share it with the Tesbo integration in Notion, then try again.";
+      const mock = await mockNotionProject(context, projectId, { databases: [DB_PRODUCT], saveError: { status: 400, error: message } });
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+
+      await page.getByRole("radio", { name: /Product Specs/ }).check();
+      await page.getByRole("button", { name: "Link Notion database" }).click();
+
+      await expect(page.getByText(message)).toBeVisible();
+      // Not reported as linked, and not stuck on "Saving…".
+      await expect(page.getByText("linked to this project.")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Link Notion database" })).toBeEnabled();
+      await expect(page.getByRole("radio", { name: /Product Specs/ })).toBeChecked();
+      expect(mock.saves).toHaveLength(1);
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-26 the project mapping page warns when the connection needs reconnecting and links to Workspace Settings", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion Reco");
+      await mockNotionProject(context, projectId, {
+        databases: [DB_PRODUCT],
+        status: { connected: true, siteUrl: "https://www.notion.so", needsReconnect: true, authError: "Notion rejected this token.", connectedProjects: [], history: [] },
+      });
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+
+      const alert = page.getByRole("alert").filter({ hasText: "needs to be reconnected" });
+      await expect(alert.getByText("Notion needs to be reconnected")).toBeVisible();
+      await expect(alert.getByText("Notion rejected this token.")).toBeVisible();
+      await expect(alert.getByRole("link", { name: "Reconnect Notion in workspace settings" })).toHaveAttribute(
+        "href",
+        `/settings/integrations/notion?returnProjectId=${projectId}`
+      );
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-27 a project whose workspace has not connected Notion is sent to Workspace Settings with a way back", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion NoConn");
+      await mockNotionProject(context, projectId, { status: { connected: false, connectedProjects: [], history: [] } });
+      // Not configured on the deployment: the page cannot offer an inline Connect, so it links out.
+      await context.route("**/api/workspace/integrations/notion/config", (route) =>
+        route.fulfill({ json: { configured: false, clientId: "", redirectUri: "http://localhost/integrations/callback" } })
+      );
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+
+      await expect(page.getByRole("heading", { name: "Notion is not connected for this workspace" })).toBeVisible();
+      await expect(page.getByRole("link", { name: "Go to Workspace Settings → Integrations" })).toHaveAttribute(
+        "href",
+        `/settings/integrations/notion?returnProjectId=${projectId}`
+      );
+      await expect(page.getByTestId("remote-item")).toHaveCount(0);
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("INT-U-28 Notion's Auto-comment setting persists independently of Jira's and Linear's on the same project", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      projectId = await createProject(api, "UI Notion AI Gen");
+      // Notion: connected, nothing shared (the settings panel renders below the mapping card either way).
+      await mockNotionProject(context, projectId, { databases: [] });
+      // Same stand-in the Jira/Linear block uses, so their pages get past "not connected".
+      for (const [provider, remote] of [["jira", "projects"], ["linear", "teams"]] as const) {
+        await context.route(`**/api/projects/${projectId}/${provider}/status`, (route) =>
+          route.fulfill({ json: { connected: true, siteUrl: `https://e2e.${provider}.invalid` } })
+        );
+        await context.route(`**/api/projects/${projectId}/${provider}/${remote}`, (route) => route.fulfill({ json: [] }));
+      }
+      const readSettings = async () => {
+        const fetched = await (await api.get(`/api/projects/${projectId}`)).json();
+        return typeof fetched.settings === "string" ? JSON.parse(fetched.settings) : fetched.settings || {};
+      };
+
+      // Notion: turn Auto-comment ON.
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+      await expect(page.getByRole("heading", { name: "Notion + AI Generation" })).toBeVisible();
+      const notionBox = page.getByRole("checkbox", { name: /Auto-comment on Notion ticket/ });
+      await expect(notionBox).not.toBeChecked();
+      await notionBox.check();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByText("Notion settings saved.")).toBeVisible();
+
+      let settings = await readSettings();
+      expect(settings.notionAutoComment).toBe(true);
+      expect(settings.jiraAutoComment).toBeFalsy();
+      expect(settings.linearAutoComment).toBeFalsy();
+
+      // The other two providers' panels read their own (off) state, not Notion's.
+      await page.goto(`/projects/${projectId}/settings/integrations/linear`);
+      await expect(page.getByRole("checkbox", { name: /Auto-comment on Linear ticket/ })).not.toBeChecked();
+      await page.goto(`/projects/${projectId}/settings/integrations/jira`);
+      await expect(page.getByRole("checkbox", { name: /Auto-comment on Jira ticket/ })).not.toBeChecked();
+
+      // Turn Jira ON: saving it must not clobber Notion's half of the settings blob.
+      await page.getByRole("checkbox", { name: /Auto-comment on Jira ticket/ }).check();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByText("Jira settings saved.")).toBeVisible();
+      settings = await readSettings();
+      expect(settings.jiraAutoComment).toBe(true);
+      expect(settings.notionAutoComment).toBe(true);
+      expect(settings.linearAutoComment).toBeFalsy();
+
+      // And turning Notion OFF leaves Jira's ON: reload and read both back.
+      await page.goto(`/projects/${projectId}/settings/integrations/notion`);
+      await expect(page.getByRole("checkbox", { name: /Auto-comment on Notion ticket/ })).toBeChecked();
+      await page.getByRole("checkbox", { name: /Auto-comment on Notion ticket/ }).uncheck();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByText("Notion settings saved.")).toBeVisible();
+      settings = await readSettings();
+      expect(settings.notionAutoComment).toBe(false);
+      expect(settings.jiraAutoComment).toBe(true);
       await page.goto(`/projects/${projectId}/settings/integrations/jira`);
       await expect(page.getByRole("checkbox", { name: /Auto-comment on Jira ticket/ })).toBeChecked();
     } finally {

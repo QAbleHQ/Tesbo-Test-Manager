@@ -29,8 +29,8 @@ const STORAGE_LIMITS_BYTES: Record<Plan, number> = {
   pro: 5 * 1024 * 1024 * 1024
 };
 
-// Launch includes Jira only; every other integration (Linear, and anything added later) is Pro-only.
-const LAUNCH_ALLOWED_INTEGRATIONS = new Set(["jira"]);
+// Launch includes Jira and Notion; every other integration (Linear, and anything added later) is Pro-only.
+const LAUNCH_ALLOWED_INTEGRATIONS = new Set(["jira", "notion"]);
 
 // Storage percentages the workspace owner is emailed about, highest first.
 const STORAGE_WARN_THRESHOLDS = [100, 95, 80];
@@ -400,7 +400,7 @@ export class PlanLimitsService {
     const { effectivePlan } = await this.getEntitlement(organizationId);
     if (effectivePlan === "pro" || LAUNCH_ALLOWED_INTEGRATIONS.has(provider)) return;
     throw new ForbiddenException({
-      error: `${provider[0].toUpperCase()}${provider.slice(1)} is a Pro plan integration. The Launch plan includes Jira only — upgrade to Pro to connect it.`
+      error: `${provider[0].toUpperCase()}${provider.slice(1)} is a Pro plan integration. The Launch plan includes Jira and Notion only. Upgrade to Pro to connect it.`
     });
   }
 

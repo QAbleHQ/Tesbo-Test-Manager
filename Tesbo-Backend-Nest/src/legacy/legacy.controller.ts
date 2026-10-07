@@ -537,6 +537,11 @@ export class LegacyController {
     return this.legacy.linkedLinearKeys(projectId, req.userId);
   }
 
+  @Get("/api/projects/:projectId/testcases/linked-notion-pages")
+  linkedNotionPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.linkedNotionPages(projectId, req.userId);
+  }
+
   @Get("/api/projects/:projectId/testcases/:testcaseId")
   getTestCase(
     @Req() req: AuthenticatedRequest,
@@ -1964,7 +1969,7 @@ export class LegacyController {
     return this.legacy.knowledgeItemFile(projectId, req.userId, itemId);
   }
 
-  // ── Workspace-scoped app integrations (Jira, Linear) ──
+  // ── Workspace-scoped app integrations (Jira, Linear, Notion) ──
   // Connecting/configuring an app is workspace-wide; see the project-scoped mapping/sync/ticket
   // routes further below for picking which remote project/team feeds a given Tesbo project.
 
@@ -2084,7 +2089,45 @@ export class LegacyController {
     return this.legacy.linearSearchIssues(projectId, req.userId, query);
   }
 
-  // ── Requirements page: cross-source (Jira + Linear) aggregates ──
+  // ── Project-scoped Notion mapping/sync/pages ──
+  // One Notion database per Tesbo project; its pages are the tickets. Same shape as the Linear routes.
+
+  @Get("/api/projects/:projectId/notion/status")
+  notionStatus(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.notionStatus(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/notion/databases")
+  notionDatabases(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.notionDatabases(projectId, req.userId);
+  }
+
+  @Post("/api/projects/:projectId/notion/databases")
+  connectNotionDatabase(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.connectNotionDatabase(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/notion/sync")
+  syncNotion(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.syncNotion(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/notion/pages")
+  notionPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.notionPages(projectId, req.userId, query);
+  }
+
+  @Post("/api/projects/:projectId/notion/comment")
+  notionComment(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.notionComment(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/notion/search-pages")
+  notionSearchPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.notionSearchPages(projectId, req.userId, query);
+  }
+
+  // ── Requirements page: cross-source (Jira + Linear + Notion) aggregates ──
 
   @Get("/api/projects/:projectId/tickets/summary")
   requirementsSummary(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {

@@ -64,6 +64,7 @@ services:
       # Optional: derived from FRONTEND_URL + /integrations/callback when left unset.
       JIRA_REDIRECT_URI: ${JIRA_REDIRECT_URI:-}
       LINEAR_REDIRECT_URI: ${LINEAR_REDIRECT_URI:-}
+      NOTION_REDIRECT_URI: ${NOTION_REDIRECT_URI:-}
       POSTMARK_API_TOKEN: ${POSTMARK_API_TOKEN:-}
       POSTMARK_FROM_EMAIL: ${POSTMARK_FROM_EMAIL:-noreply@example.com}
       # "live" = real delivery, and only production should say it. Left at "log" here, which never
@@ -78,6 +79,8 @@ services:
       JIRA_CLIENT_SECRET: ${JIRA_CLIENT_SECRET:-}
       LINEAR_CLIENT_ID: ${LINEAR_CLIENT_ID:-}
       LINEAR_CLIENT_SECRET: ${LINEAR_CLIENT_SECRET:-}
+      NOTION_CLIENT_ID: ${NOTION_CLIENT_ID:-}
+      NOTION_CLIENT_SECRET: ${NOTION_CLIENT_SECRET:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID_PRO_MONTHLY: ${STRIPE_PRICE_ID_PRO_MONTHLY:-}

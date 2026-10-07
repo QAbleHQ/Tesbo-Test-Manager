@@ -295,6 +295,46 @@ test.describe("test case creation", () => {
       await api.dispose();
     }
   });
+
+  // Regression coverage for: the Bulk actions modal let you update Status, Priority and Automation
+  // Type across many test cases at once, but had no Severity field at all — so clearing a wave of
+  // false-positive "Critical" severities, for example, required opening each case individually.
+  test("Bulk actions updates Severity (alongside Priority) across every selected test case", async ({ page }) => {
+    const titleA = `UI bulk severity A ${Date.now()}`;
+    const titleB = `UI bulk severity B ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let idA = "";
+    let idB = "";
+    try {
+      idA = (await (await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: titleA, severity: "Low", priority: "P3" } })).json()).id;
+      idB = (await (await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: titleB, severity: "Low", priority: "P3" } })).json()).id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("row", { name: titleA }).getByLabel(`Select ${titleA}`).check();
+      await page.getByRole("row", { name: titleB }).getByLabel(`Select ${titleB}`).check();
+
+      // Modal (components/ui/Modal.tsx) renders its title as a plain <h2>, with no role="dialog" —
+      // so this is identified by its heading, not a dialog role, matching the rest of this file's
+      // modal-locator pattern (see the "Rename suite" modal tests below).
+      await page.getByRole("button", { name: "Bulk actions" }).click();
+      await expect(page.getByRole("heading", { name: "Bulk actions" })).toBeVisible();
+      await fieldControl(page, "Action").selectOption({ label: "Update status / priority / severity / automation type" });
+      await fieldControl(page, "Severity").selectOption("Critical");
+      await fieldControl(page, "Priority").selectOption("P0");
+      await page.getByRole("button", { name: "Confirm" }).click();
+      await expect(page.getByRole("heading", { name: "Bulk actions" })).toBeHidden();
+
+      for (const id of [idA, idB]) {
+        const after = await (await api.get(`/api/projects/${ctx.projectId}/testcases/${id}`)).json();
+        expect(after.severity).toBe("Critical");
+        expect(after.priority).toBe("P0");
+      }
+    } finally {
+      if (idA) await api.delete(`/api/projects/${ctx.projectId}/testcases/${idA}`, { failOnStatusCode: false });
+      if (idB) await api.delete(`/api/projects/${ctx.projectId}/testcases/${idB}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
 });
 
 /*

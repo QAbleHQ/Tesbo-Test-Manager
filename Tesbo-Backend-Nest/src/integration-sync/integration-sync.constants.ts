@@ -11,6 +11,8 @@ export const INTEGRATION_SYNC_TICKET_JOB = "sync-ticket";
 // 100 keeps response bodies manageable.
 export const JIRA_PAGE_SIZE = 100;
 export const LINEAR_PAGE_SIZE = 100;
+// Notion caps database queries, block children and search at 100 per page.
+export const NOTION_PAGE_SIZE = 100;
 
 // Hard ceiling on tickets pulled in a single run, so a first sync against a 50k-issue Jira
 // project can't run for hours or blow up the queue. Ordered by most-recently-updated, so the
@@ -30,7 +32,7 @@ export const INTEGRATION_SYNC_CONCURRENCY = 3;
 export const DECISION_PROMPT_CHAR_BUDGET = 12000;
 
 // Folder created (lazily, on first successful sync) to hold everything a provider owns.
-export const PROVIDER_FOLDER_NAMES: Record<string, string> = { jira: "Jira", linear: "Linear" };
+export const PROVIDER_FOLDER_NAMES: Record<string, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
 
 // ── Nightly cron ──
 
@@ -38,8 +40,10 @@ export const PROVIDER_FOLDER_NAMES: Record<string, string> = { jira: "Jira", lin
 // (or vice versa) and each has its own independent BullMQ Job Scheduler.
 export const INTEGRATION_SYNC_NIGHTLY_JIRA_JOB = "nightly-sync-jira";
 export const INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB = "nightly-sync-linear";
+export const INTEGRATION_SYNC_NIGHTLY_NOTION_JOB = "nightly-sync-notion";
 export const INTEGRATION_SYNC_NIGHTLY_JIRA_SCHEDULER_ID = "integration-sync-nightly-jira";
 export const INTEGRATION_SYNC_NIGHTLY_LINEAR_SCHEDULER_ID = "integration-sync-nightly-linear";
+export const INTEGRATION_SYNC_NIGHTLY_NOTION_SCHEDULER_ID = "integration-sync-nightly-notion";
 
 // Midnight IST, every night. No per-organization timezone exists anywhere in this schema, so this
 // is a single global fire time rather than one derived per workspace.
@@ -87,3 +91,27 @@ export const SYNC_RUN_STALE_MINUTES = 20;
 
 export const INTEGRATION_SYNC_WATCHDOG_JOB = "sync-watchdog";
 export const INTEGRATION_SYNC_WATCHDOG_SCHEDULER_ID = "integration-sync-watchdog";
+
+// ── Notion ──
+
+// The one Notion-Version every Tesbo request sends (sync client, OAuth token exchange and comment
+// posting). 2022-06-28 is the last version in which a database is queried directly
+// (POST /v1/databases/{id}/query) and listed through /v1/search with filter value "database". Later
+// versions (2025-09-03 onward) split a database into data sources and move querying to
+// /v1/data_sources/{id}/query, so bumping this means reworking those two calls, not just the header.
+export const NOTION_API_VERSION = "2022-06-28";
+export const NOTION_API_BASE = "https://api.notion.com/v1";
+
+// Page bodies are read block by block, one request per container block, so a deeply nested or huge
+// page is bounded two ways: nesting depth and total blocks read per page. Hitting either cap
+// truncates the body (with a visible marker) rather than failing the ticket.
+export const NOTION_MAX_BLOCK_DEPTH = 5;
+export const NOTION_MAX_BLOCKS_PER_PAGE = 500;
+
+// A rate-limited (429) Notion request waits Retry-After seconds, up to this many retries, with each
+// wait capped so one odd header cannot stall a worker for minutes.
+export const NOTION_MAX_RETRIES = 3;
+export const NOTION_MAX_RETRY_WAIT_MS = 10_000;
+
+// Notion rejects a rich_text content segment longer than this when creating a comment.
+export const NOTION_RICH_TEXT_LIMIT = 2000;

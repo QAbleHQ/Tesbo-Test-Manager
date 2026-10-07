@@ -10,11 +10,12 @@ interface ArchiveSweepCandidate {
   projectId: string;
   jiraIssueKey: string | null;
   linearIssueKey: string | null;
+  notionPageId: string | null;
 }
 
 export interface ArchiveSweepFailure {
   testcaseId: string;
-  provider: "jira" | "linear";
+  provider: "jira" | "linear" | "notion";
   issueKey: string;
   reason: string;
   detail?: string;
@@ -143,8 +144,11 @@ export class ZyraArchiveSweepService {
     const jiraCandidates = pending.filter((candidate): candidate is ArchiveSweepCandidate & { jiraIssueKey: string } => Boolean(candidate.jiraIssueKey));
     const linearCandidates = pending.filter((candidate): candidate is ArchiveSweepCandidate & { linearIssueKey: string } => Boolean(candidate.linearIssueKey));
 
+    const notionCandidates = pending.filter((candidate): candidate is ArchiveSweepCandidate & { notionPageId: string } => Boolean(candidate.notionPageId));
+
     await this.processJira(jiraCandidates, summary, stagedByProject);
     await this.processLinear(linearCandidates, summary, stagedByProject);
+    await this.processNotion(notionCandidates, summary, stagedByProject);
 
     await this.notifyStagedProjects(stagedByProject, summary);
 
@@ -216,9 +220,9 @@ export class ZyraArchiveSweepService {
     // archive an already-archived test case is pure waste, both of API budget and of a proposal a
     // human would never need to act on.
     const res = await this.db.query<Body>(
-      `SELECT id, project_id AS "projectId", jira_issue_key AS "jiraIssueKey", linear_issue_key AS "linearIssueKey"
+      `SELECT id, project_id AS "projectId", jira_issue_key AS "jiraIssueKey", linear_issue_key AS "linearIssueKey", notion_page_id AS "notionPageId"
        FROM testcases_active
-       WHERE status <> 'Archived' AND (jira_issue_key IS NOT NULL OR linear_issue_key IS NOT NULL)`,
+       WHERE status <> 'Archived' AND (jira_issue_key IS NOT NULL OR linear_issue_key IS NOT NULL OR notion_page_id IS NOT NULL)`,
       []
     );
     return res.rows as unknown as ArchiveSweepCandidate[];
@@ -288,9 +292,33 @@ export class ZyraArchiveSweepService {
     });
   }
 
+  // A Notion page has no status category, so the live lookup answers "done" only when Notion reports
+  // the page archived or in the trash (see LegacyService.fetchLiveNotionPageCategory). Per page, with
+  // the same bounded concurrency as Linear: there is no batch-by-id call.
+  private async processNotion(
+    candidates: Array<ArchiveSweepCandidate & { notionPageId: string }>,
+    summary: ArchiveSweepSummary,
+    stagedByProject: Map<string, number>
+  ): Promise<void> {
+    if (!candidates.length) return;
+    await mapWithConcurrency(candidates, ZYRA_ARCHIVE_SWEEP_LINEAR_CONCURRENCY, async (candidate) => {
+      let result: { found: boolean; doneness: "done" | "not_done" | null; rawCategory: string | null; reason: string; detail?: string };
+      try {
+        result = await this.legacy.fetchLiveTicketCategory(candidate.projectId, "notion", candidate.notionPageId);
+      } catch (err) {
+        const detail = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+        this.logger.error(`Archive sweep: Notion lookup crashed for testcase ${candidate.id} - ${detail}`);
+        summary.failed++;
+        summary.failures.push({ testcaseId: candidate.id, provider: "notion", issueKey: candidate.notionPageId, reason: "error", detail });
+        return;
+      }
+      await this.handleResult(candidate, "notion", candidate.notionPageId, result, summary, stagedByProject);
+    });
+  }
+
   private async handleResult(
     candidate: ArchiveSweepCandidate,
-    provider: "jira" | "linear",
+    provider: "jira" | "linear" | "notion",
     issueKey: string,
     result: { found: boolean; doneness: "done" | "not_done" | null; rawCategory: string | null; reason: string; detail?: string },
     summary: ArchiveSweepSummary,
@@ -316,8 +344,11 @@ export class ZyraArchiveSweepService {
       return;
     }
 
-    const providerLabel = provider === "jira" ? "Jira" : "Linear";
-    const reason = `Zyra's archive sweep found the linked ${providerLabel} ticket ${issueKey}'s status category is "${result.rawCategory}" (done) — this test case may no longer be needed. Review before archiving.`;
+    const providerLabel = { jira: "Jira", linear: "Linear", notion: "Notion" }[provider];
+    const reason =
+      provider === "notion"
+        ? `Zyra's archive sweep found the linked Notion page ${issueKey} is archived or in the trash, so this test case may no longer be needed. Review before archiving.`
+        : `Zyra's archive sweep found the linked ${providerLabel} ticket ${issueKey}'s status category is "${result.rawCategory}" (done), so this test case may no longer be needed. Review before archiving.`;
     const outcome = await this.legacy.stageArchiveSweepProposal(candidate.projectId, candidate.id, reason);
     if (outcome === "staged") {
       summary.staged++;

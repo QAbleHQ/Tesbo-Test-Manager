@@ -27,6 +27,7 @@ import {
   type KnowledgeDocument,
   type KnowledgeDocumentHistoryEntry,
   type KnowledgeBreadcrumbEntry,
+  integrationProviderLabel,
 } from "@/lib/api";
 import { Button, Input, Modal, PageLoader, StatusChip } from "@/components/ui";
 import RichTextEditor from "@/components/knowledge-base/RichTextEditor";
@@ -531,7 +532,7 @@ export default function KnowledgeDocumentPage() {
   // Provider mirrors are rewritten wholesale by each sync, so the editor is locked and the API
   // rejects updates. Comments are the writable channel — they're stored apart from the body.
   const isSyncedMirror = doc.isReadOnly && doc.sourceRole === "mirror";
-  const providerLabel = doc.sourceProvider === "linear" ? "Linear" : "Jira";
+  const providerLabel = integrationProviderLabel(doc.sourceProvider);
 
   // Update History is the same data and component everywhere — the Knowledge Base list's
   // info-icon popover and this modal never drift into showing different things for the same

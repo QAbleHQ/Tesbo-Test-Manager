@@ -53,6 +53,7 @@ import {
   type BugItem,
   type CustomTag,
   type ZyraSourceRef,
+  notionPageKey,
 } from "@/lib/api";
 import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
 
@@ -363,6 +364,8 @@ export default function TestCasesPage() {
   const formSuiteId = isUnfiledView ? null : activeSuiteId;
   const activeJiraIssueKey = searchParams.get("jiraIssueKey") || "";
   const activeLinearIssueKey = searchParams.get("linearIssueKey") || "";
+  // A Notion test case links by full page id; the chip below shows the short `notion:xxxxxxxx` label.
+  const activeNotionPageId = searchParams.get("notionPageId") || "";
 
   // Take over the shared TopBar with this page's breadcrumb + actions (portaled below),
   // and hide the default global "Search projects" search while this page is mounted.
@@ -495,6 +498,7 @@ export default function TestCasesPage() {
   const [bulkStatus, setBulkStatus] = useState("Draft");
   const [bulkPriority, setBulkPriority] = useState("P2");
   const [bulkAutomationStatus, setBulkAutomationStatus] = useState("Not Automated");
+  const [bulkSeverity, setBulkSeverity] = useState("Medium");
   const [bulkTargetSuiteId, setBulkTargetSuiteId] = useState("");
 
   const [deleteSuiteId, setDeleteSuiteId] = useState<string | null>(null);
@@ -840,6 +844,7 @@ export default function TestCasesPage() {
         automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
         jiraIssueKey: activeJiraIssueKey || undefined,
         linearIssueKey: activeLinearIssueKey || undefined,
+        notionPageId: activeNotionPageId || undefined,
         search: debouncedSuiteSearch || undefined,
         customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
         customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -865,6 +870,7 @@ export default function TestCasesPage() {
     suiteAutomationFilter,
     activeJiraIssueKey,
     activeLinearIssueKey,
+    activeNotionPageId,
     customFieldFilters,
     suiteTagFilter,
   ]);
@@ -891,6 +897,7 @@ export default function TestCasesPage() {
       automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
       jiraIssueKey: activeJiraIssueKey || undefined,
       linearIssueKey: activeLinearIssueKey || undefined,
+      notionPageId: activeNotionPageId || undefined,
       search: debouncedSuiteSearch || undefined,
       customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
       customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -906,6 +913,7 @@ export default function TestCasesPage() {
       suiteAutomationFilter,
       activeJiraIssueKey,
       activeLinearIssueKey,
+      activeNotionPageId,
       debouncedSuiteSearch,
       customFieldFilters,
       suiteTagFilter,
@@ -1154,6 +1162,7 @@ export default function TestCasesPage() {
           automationStatus: suiteAutomationFilter === "all" ? undefined : suiteAutomationFilter,
           jiraIssueKey: activeJiraIssueKey || undefined,
           linearIssueKey: activeLinearIssueKey || undefined,
+          notionPageId: activeNotionPageId || undefined,
           search: debouncedSuiteSearch || undefined,
           customFieldFilters: buildCustomFieldFiltersQueryParam(customFieldFilters),
           customTagIds: suiteTagFilter.length ? suiteTagFilter : undefined,
@@ -1189,6 +1198,7 @@ export default function TestCasesPage() {
     setBulkStatus(BULK_NO_CHANGE);
     setBulkPriority(BULK_NO_CHANGE);
     setBulkAutomationStatus(BULK_NO_CHANGE);
+    setBulkSeverity(BULK_NO_CHANGE);
     setIsBulkActionModalOpen(true);
   }
 
@@ -1217,6 +1227,7 @@ export default function TestCasesPage() {
           ...(bulkStatus !== BULK_NO_CHANGE ? { status: bulkStatus } : {}),
           ...(bulkPriority !== BULK_NO_CHANGE ? { priority: bulkPriority } : {}),
           ...(bulkAutomationStatus !== BULK_NO_CHANGE ? { automationStatus: bulkAutomationStatus } : {}),
+          ...(bulkSeverity !== BULK_NO_CHANGE ? { severity: bulkSeverity } : {}),
         });
       } else if (bulkAction === "move") {
         // An empty target used to become `undefined`, which the API COALESCE'd back to each case's
@@ -2084,6 +2095,16 @@ export default function TestCasesPage() {
                         className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
                       >
                         <span className="opacity-70">Linear:</span> {activeLinearIssueKey}
+                        <IconX size={11} stroke={2.5} />
+                      </button>
+                    )}
+                    {activeNotionPageId && (
+                      <button
+                        type="button"
+                        onClick={() => router.replace(`/projects/${projectId}/testcases`)}
+                        className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
+                      >
+                        <span className="opacity-70">Notion:</span> {notionPageKey(activeNotionPageId)}
                         <IconX size={11} stroke={2.5} />
                       </button>
                     )}
@@ -2974,7 +2995,7 @@ export default function TestCasesPage() {
           >
             <option value="">Select an action…</option>
             <option value="move">Move to suite</option>
-            <option value="update">Update status / priority / automation type</option>
+            <option value="update">Update status / priority / severity / automation type</option>
             <option value="archive">Archive</option>
             <option value="delete">Delete</option>
           </Select>
@@ -3017,6 +3038,13 @@ export default function TestCasesPage() {
               <Select value={bulkAutomationStatus} onChange={(e) => setBulkAutomationStatus(e.target.value)}>
                 <option value={BULK_NO_CHANGE}>Leave unchanged</option>
                 {TESTCASE_AUTOMATION_TYPES.map((a) => <option key={a} value={a}>{a}</option>)}
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Severity</FieldLabel>
+              <Select value={bulkSeverity} onChange={(e) => setBulkSeverity(e.target.value)}>
+                <option value={BULK_NO_CHANGE}>Leave unchanged</option>
+                {TESTCASE_SEVERITIES.map((s) => <option key={s} value={s}>{s}</option>)}
               </Select>
             </Field>
           </div>

@@ -526,7 +526,8 @@ test.describe("payment lifecycle", () => {
         failOnStatusCode: false,
       });
       expect(linear.status()).toBe(403);
-      expect((await linear.json()).error).toContain("Pro plan integration");
+      expect((await linear.json()).error).toContain("Pro plan integration");      // The refusal names what Launch does include, which is Jira and Notion.
+      expect((await linear.json()).error).toContain("Jira and Notion");
 
       // Jira is included on Launch, so the plan gate lets this through and it fails later on the
       // missing OAuth code instead — which is how we can tell the gate opened without connecting
@@ -537,6 +538,34 @@ test.describe("payment lifecycle", () => {
       });
       expect(jira.status()).toBe(400);
       expect((await jira.json()).error).toContain("Authorization code");
+      // Notion is the second integration on Launch's allow-list ({jira, notion}). Same proof as Jira:
+      // the gate opens, so the request fails later, on the missing code (400), not at the plan (403).
+      const notion = await asBilling.post("/api/workspace/integrations/notion/callback", {
+        data: {},
+        failOnStatusCode: false,
+      });
+      expect(notion.status(), `Notion was plan-gated on Launch: ${await notion.text()}`).toBe(400);
+      expect((await notion.json()).error).toContain("Authorization code");
+
+      // A denied consent screen reaches its own message through the same open gate.
+      const denied = await asBilling.post("/api/workspace/integrations/notion/callback", {
+        data: { error: "access_denied" },
+        failOnStatusCode: false,
+      });
+      expect(denied.status()).toBe(400);
+      expect((await denied.json()).error).toContain("cancelled or denied");
+
+      // A forged state is refused as a bad state, still not as a plan limit.
+      const forged = await asBilling.post("/api/workspace/integrations/notion/callback", {
+        data: { code: "e2e-not-a-real-code", state: "notion.forged.state" },
+        failOnStatusCode: false,
+      });
+      expect(forged.status()).toBe(400);
+      expect((await forged.json()).error).toContain("Invalid authorization state");
+
+      // Reading a Notion connection is never plan-gated.
+      const status = await asBilling.get("/api/workspace/integrations/notion/status", { failOnStatusCode: false });
+      expect(status.status()).toBe(200);
     });
 
     test("POST /api/billing/portal-session refuses a workspace with no billing account", { tag: '@tesbo.testId("TES-TC-64")' }, async () => {
@@ -595,6 +624,13 @@ test.describe("payment lifecycle", () => {
         });
         expect(linear.status()).toBe(400);
         expect((await linear.json()).error).toContain("Authorization code");
+        // And Notion, which Launch already had, is of course still open on Pro.
+        const notion = await asBilling.post("/api/workspace/integrations/notion/callback", {
+          data: {},
+          failOnStatusCode: false,
+        });
+        expect(notion.status()).toBe(400);
+        expect((await notion.json()).error).toContain("Authorization code");
       } finally {
         await asBilling.delete(
           `/api/projects/${projectIds[0]}/custom-fields/definitions/${definition.id}`,
@@ -678,6 +714,49 @@ test.describe("payment lifecycle", () => {
         failOnStatusCode: false,
       });
       expect(nested.status()).toBe(403);
+    });
+
+    test("Notion writes on a read-only project are refused while its reads and a writable project's routes are untouched", async () => {
+      // The write lock is a global guard over every non-GET route under /api/projects/:id, so the
+      // Notion routes are covered by construction. Nothing here needs a Notion connection: the guard
+      // answers before the handler, which is itself what is being pinned.
+      setGraceWindow(orgId, -1);
+      const oldest = activeProjectIdsOldestFirst(orgId);
+      const writable = oldest[1];
+      const locked = oldest[2];
+
+      const writes: Array<[string, () => Promise<import("@playwright/test").APIResponse>]> = [
+        ["unlink", () => asBilling.post(`/api/projects/${locked}/notion/databases`, { data: { databaseId: null }, failOnStatusCode: false })],
+        ["sync", () => asBilling.post(`/api/projects/${locked}/notion/sync`, { data: {}, failOnStatusCode: false })],
+        [
+          "comment",
+          () =>
+            asBilling.post(`/api/projects/${locked}/notion/comment`, {
+              data: { pageId: "11111111-1111-1111-1111-111111111111", comment: "refused" },
+              failOnStatusCode: false,
+            }),
+        ],
+      ];
+      for (const [what, attempt] of writes) {
+        const refused = await attempt();
+        expect(refused.status(), `Notion ${what} on a locked project answered ${refused.status()}: ${await refused.text()}`).toBe(403);
+        expect((await refused.json()).error).toContain("read-only");
+      }
+
+      // Reads on the locked project keep working.
+      for (const path of ["/notion/status", "/notion/pages", "/testcases/linked-notion-pages"]) {
+        const read = await asBilling.get(`/api/projects/${locked}${path}`, { failOnStatusCode: false });
+        expect(read.status(), `GET ${path} on a locked project answered ${read.status()}`).toBe(200);
+      }
+
+      // The same write on a writable project is past the lock: it reaches the handler, which answers
+      // that this workspace has no Notion connection (the tenant never connected one).
+      const open = await asBilling.post(`/api/projects/${writable}/notion/databases`, {
+        data: { databaseId: null },
+        failOnStatusCode: false,
+      });
+      expect(open.status(), await open.text()).toBe(404);
+      expect(JSON.stringify(await open.json()).toLowerCase()).toContain("not connected");
     });
 
     test("BUGC-A-10 a locked project's bug comments stay readable, but a new comment, a reply, an edit or a delete is refused", async () => {
