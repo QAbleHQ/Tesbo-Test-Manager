@@ -308,6 +308,7 @@ export default function BugComments({
 
   // The top-level comment whose reply box is open; one at a time.
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
+  const [composerOpen, setComposerOpen] = useState(false);
 
   const [editing, setEditing] = useState<EditState | null>(null);
   const [savingEdit, setSavingEdit] = useState(false);
@@ -635,7 +636,31 @@ export default function BugComments({
       )}
 
       <div className="mt-4">
-        <CommentComposer projectId={projectId} bugId={bugId} members={members} labels={COMMENT_COMPOSER_LABELS} onPosted={posted} />
+        {composerOpen ? (
+          <CommentComposer
+            projectId={projectId}
+            bugId={bugId}
+            members={members}
+            labels={COMMENT_COMPOSER_LABELS}
+            autoFocus
+            onPosted={(created) => {
+              setComposerOpen(false);
+              posted(created);
+            }}
+            onCancel={() => setComposerOpen(false)}
+          />
+        ) : (
+          // Collapsed until clicked, so an idle bug isn't dominated by an empty editor.
+          <button
+            type="button"
+            data-testid="bug-comment-open"
+            onClick={() => setComposerOpen(true)}
+            className="flex w-full items-center gap-3 rounded-[10px] border border-[var(--border)] px-3 py-3 text-left text-sm text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
+          >
+            <MemberAvatar name={currentUser?.name ?? "You"} seed={currentUserId ?? "me"} size={28} />
+            Add a comment…
+          </button>
+        )}
       </div>
 
       <ConfirmModal
