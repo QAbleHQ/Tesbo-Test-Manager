@@ -1331,6 +1331,117 @@ test.describe("zyra / agents (UI)", () => {
     expect(await page.evaluate(() => (window as unknown as { __zyraTaskXss?: number }).__zyraTaskXss)).toBeUndefined();
   });
 
+  // ─── The full task page's description: View more / View less (fix for "[Tasks] Full Task Details
+  // Are Too Long — Add View More/Expand Behavior") ────────────────────────────
+  //
+  // A task built from several synced tickets stacks every ticket's document into task.context, so the
+  // description could run for pages and push the testcase tabs far below the fold. It is now capped at
+  // a collapsed height (CSS max-height, never a cut of the text) with a toggle that appears only when
+  // the content actually overflows.
+
+  const COLLAPSED_MAX_PX = 256;
+  const LONG_DESCRIPTION_END = "END-OF-DESCRIPTION marker line";
+
+  /** Several stacked ticket documents, the shape a multi-ticket Jira/Linear task carries — far taller than the cap. */
+  function longTicketMarkdown(prefix: string): string {
+    const tickets = Array.from({ length: 6 }, (_, i) =>
+      [
+        `### ${prefix}-${i + 1}: Ticket number ${i + 1}`,
+        "",
+        "- **Status:** Todo",
+        "- **Type:** Issue",
+        "- **Priority:** No priority",
+        `- **Link:** [ticket ${i + 1}](https://example.com/${prefix}-${i + 1})`,
+        "",
+        `Description paragraph for ticket ${i + 1}, long enough to take a full line of the card on its own.`,
+      ].join("\n"),
+    );
+    return [...tickets, "", LONG_DESCRIPTION_END].join("\n");
+  }
+
+  /** clientHeight is what is shown; scrollHeight is the full rendered content, clipped or not. */
+  async function descriptionHeights(page: Page): Promise<{ client: number; scroll: number }> {
+    return page.locator("#task-description-content").evaluate((el) => ({ client: el.clientHeight, scroll: el.scrollHeight }));
+  }
+
+  for (const provider of ["Jira", "Linear"] as const) {
+    const keys = (key: string) => (provider === "Jira" ? { jiraIssueKeys: [key] } : { linearIssueKeys: [key] });
+
+    test(`ZYU-137 a long ${provider} description starts collapsed and View more / View less toggle it`, async ({ browser }) => {
+      const prefix = provider === "Jira" ? "ZYL" : "LIN-L";
+      const taskId = seedTask({ userStory: stamp(`${provider} long description story`), context: longTicketMarkdown(prefix), ...keys(`${prefix}-1`) });
+      const page = await open(browser, `/agents/tasks/${taskId}`);
+
+      const description = page.getByTestId("task-description");
+      const toggle = description.getByRole("button", { name: "View more" });
+      await expect(toggle).toBeVisible();
+      await expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+      // Collapsed: capped, with more content below the cap — but nothing removed from the page.
+      let heights = await descriptionHeights(page);
+      expect(heights.client).toBeLessThanOrEqual(COLLAPSED_MAX_PX);
+      expect(heights.scroll).toBeGreaterThan(heights.client);
+      await expect(description).toContainText(LONG_DESCRIPTION_END);
+      await expect(description.locator("h3")).toHaveCount(6);
+
+      // Expanded: the whole description is shown, last line included.
+      await toggle.click();
+      const collapse = description.getByRole("button", { name: "View less" });
+      await expect(collapse).toHaveAttribute("aria-expanded", "true");
+      heights = await descriptionHeights(page);
+      expect(heights.client).toBeGreaterThan(COLLAPSED_MAX_PX);
+      expect(heights.client).toBe(heights.scroll);
+      const end = description.getByText(LONG_DESCRIPTION_END);
+      await end.scrollIntoViewIfNeeded();
+      await expect(end).toBeInViewport();
+      // Links inside the expanded part still render and point where the ticket said.
+      await expect(description.getByRole("link", { name: "ticket 6" })).toHaveAttribute("href", `https://example.com/${prefix}-6`);
+
+      // Collapsing returns to the short view.
+      await collapse.click();
+      await expect(description.getByRole("button", { name: "View more" })).toHaveAttribute("aria-expanded", "false");
+      heights = await descriptionHeights(page);
+      expect(heights.client).toBeLessThanOrEqual(COLLAPSED_MAX_PX);
+      // The rest of the page is unaffected by the toggle.
+      await expect(page.getByRole("button", { name: "Generated Testcases (2)" })).toBeVisible();
+    });
+  }
+
+  test("ZYU-138 a short task description shows in full with no View more toggle", async ({ browser }) => {
+    const taskId = seedTask({ userStory: stamp("Short description story"), context: TICKET_MARKDOWN, linearIssueKeys: ["LIN-S1"] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    const description = page.getByTestId("task-description");
+    await expect(description.locator("h3")).toHaveText("LIN-05: Submit an Expense Claim");
+    await expect(description.getByRole("button", { name: /View (more|less)/ })).toHaveCount(0);
+    const heights = await descriptionHeights(page);
+    expect(heights.client, "a description under the cap is not clipped").toBe(heights.scroll);
+    // No fade either — the mask is applied only while there is hidden content.
+    const mask = await page.locator("#task-description-content").evaluate((el) => getComputedStyle(el).maskImage || getComputedStyle(el).webkitMaskImage);
+    expect(mask === "" || mask === "none").toBe(true);
+  });
+
+  test("ZYU-139 an empty task description keeps its empty state and shows no toggle", async ({ browser }) => {
+    const taskId = seedTask({ userStory: stamp("Empty description toggle story"), context: "   ", jiraIssueKeys: ["ZYD-E1"] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    const description = page.getByTestId("task-description");
+    await expect(description).toContainText("No description available");
+    await expect(description.getByRole("button", { name: /View (more|less)/ })).toHaveCount(0);
+  });
+
+  test("ZYU-140 raw HTML in a long description stays escaped once expanded", async ({ browser }) => {
+    const context = [longTicketMarkdown("XSS"), `<img src=x onerror="window.__zyraLongXss=1"> <b>not bold</b>`].join("\n");
+    const taskId = seedTask({ userStory: stamp("Long XSS description story"), context, linearIssueKeys: ["LIN-X1"] });
+    const page = await open(browser, `/agents/tasks/${taskId}`);
+
+    const description = page.getByTestId("task-description");
+    await description.getByRole("button", { name: "View more" }).click();
+    await expect(description).toContainText("<b>not bold</b>");
+    await expect(description.locator("img, b")).toHaveCount(0);
+    expect(await page.evaluate(() => (window as unknown as { __zyraLongXss?: number }).__zyraLongXss)).toBeUndefined();
+  });
+
   // ─── The review table, which is where the writes happen ────────────────────
 
   test("ZYU-12 the task detail lists every generated draft with its priority", { tag: '@tesbo.testId("TES-TC-1097")' }, async ({ browser }) => {

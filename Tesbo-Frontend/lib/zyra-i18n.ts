@@ -395,6 +395,8 @@ const EN = {
   "task.summary": (p) =>
     `${p.generated} testcase${s(p.generated)} generated, ${p.saved} saved, ${p.tokens} tokens, updated ${p.date}`,
   "task.noDescription": "No description available",
+  "task.viewMore": "View more",
+  "task.viewLess": "View less",
   "task.ticketComments": "Ticket comments",
   "task.ticketCommentsHint":
     "What was posted to the linked ticket after each save. A failed comment can be sent again once the cause is fixed.",
@@ -784,6 +786,8 @@ const RU: Record<ZyraTextKey, Entry> = {
   "task.summary": (p) =>
     `Сгенерировано тест-кейсов: ${p.generated}, сохранено: ${p.saved}, токенов: ${p.tokens}, обновлено ${p.date}`,
   "task.noDescription": "Описание отсутствует",
+  "task.viewMore": "Показать больше",
+  "task.viewLess": "Показать меньше",
   "task.ticketComments": "Комментарии в задачах трекера",
   "task.ticketCommentsHint":
     "Что публиковалось в связанной задаче после каждого сохранения. Неудавшийся комментарий можно отправить повторно, когда причина будет устранена.",
