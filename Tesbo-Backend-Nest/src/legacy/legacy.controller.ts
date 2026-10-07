@@ -420,6 +420,11 @@ export class LegacyController {
     return this.legacy.acceptInvitation(req.userId, token);
   }
 
+  @Post("/api/invitations/:token/decline")
+  declineInvitation(@Req() req: AuthenticatedRequest, @Param("token") token: string) {
+    return this.legacy.declineInvitation(req.userId, token);
+  }
+
   @Post("/api/invitations/:token/register")
   async registerFromInvitation(@Param("token") token: string, @Body() body: Record<string, any>) {
     const result = await this.legacy.registerFromInvitation(token, body);
@@ -2165,6 +2170,13 @@ export class LegacyController {
   @Get("/api/notifications")
   async notifications(@Req() req: AuthenticatedRequest) {
     return this.legacy.notificationsForUser(req.userId);
+  }
+
+  // Declared before the `:id/read` route below; the two never overlap (this one is a single fixed
+  // segment, that one needs an id in the middle) but keeping the literal first reads unambiguously.
+  @Post("/api/notifications/read-all")
+  async readAllNotifications(@Req() req: AuthenticatedRequest) {
+    return this.legacy.markAllNotificationsRead(req.userId);
   }
 
   @Post("/api/notifications/:id/read")

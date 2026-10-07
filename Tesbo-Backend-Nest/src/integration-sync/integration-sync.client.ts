@@ -8,7 +8,6 @@ import {
   JIRA_PAGE_SIZE,
   JIRA_TOKEN_REFRESH_RETRY_DELAY_MS,
   LINEAR_PAGE_SIZE,
-  MAX_TICKETS_PER_RUN,
   NOTION_MAX_BLOCKS_PER_PAGE,
   NOTION_MAX_BLOCK_DEPTH,
   NOTION_PAGE_SIZE,
@@ -33,6 +32,13 @@ type Queryable = { query: (text: string, values?: unknown[]) => Promise<{ rows: 
 function asArray(value: unknown): Row[] {
   return Array.isArray(value) ? (value as Row[]) : [];
 }
+
+/**
+ * Receives one page of fetched tickets. Resolving `true` stops the fetch there (the caller hit its
+ * per-run cap) and the fetch reports `truncated`; the cap itself lives in the caller, which alone
+ * knows which of the fetched tickets still need syncing.
+ */
+type OnTicketPage = (tickets: RemoteTicket[]) => Promise<boolean | void>;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -281,7 +287,7 @@ export class IntegrationSyncClient {
   /**
    * Pages through every issue in a Jira project, newest-updated first, invoking `onPage` per
    * page so the caller can upsert incrementally and report progress before the whole backlog
-   * is in memory. Stops at MAX_TICKETS_PER_RUN.
+   * is in memory. Stops early when `onPage` resolves true.
    *
    * `sinceIso`, when given, narrows the JQL to `updated >= sinceIso` — the nightly scheduler's
    * incremental fetch. Manual Sync never passes it, so its full-resync behavior is unchanged.
@@ -289,7 +295,7 @@ export class IntegrationSyncClient {
   async fetchJiraTickets(
     connection: Row,
     projectKey: string,
-    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    onPage: OnTicketPage,
     sinceIso?: string | null
   ): Promise<{ total: number; truncated: boolean }> {
     const { baseUrl, headers } = this.jiraAuth(connection);
@@ -319,9 +325,7 @@ export class IntegrationSyncClient {
       const issues = asArray(data.issues);
       if (!issues.length) return { total, truncated: false };
 
-      const remaining = MAX_TICKETS_PER_RUN - total;
-      const truncated = issues.length > remaining;
-      const page = (truncated ? issues.slice(0, remaining) : issues).map((issue) => {
+      const page = issues.map((issue) => {
         const fields = (issue.fields || {}) as Row;
         return {
           issueId: String(issue.id || ""),
@@ -340,9 +344,9 @@ export class IntegrationSyncClient {
         } satisfies RemoteTicket;
       });
 
-      await onPage(page);
+      const stop = await onPage(page);
       total += page.length;
-      if (truncated) return { total, truncated: true };
+      if (stop) return { total, truncated: true };
 
       nextPageToken = data.nextPageToken ? String(data.nextPageToken) : undefined;
       if (!nextPageToken || data.isLast === true) return { total, truncated: false };
@@ -431,7 +435,7 @@ export class IntegrationSyncClient {
   async fetchLinearTickets(
     connection: Row,
     entityId: string,
-    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    onPage: OnTicketPage,
     sinceIso?: string | null,
     entityType: "team" | "project" = "team"
   ): Promise<{ total: number; truncated: boolean }> {
@@ -486,9 +490,7 @@ export class IntegrationSyncClient {
       const issues = asArray(data?.entity?.issues?.nodes);
       if (!issues.length) return { total, truncated: false };
 
-      const remaining = MAX_TICKETS_PER_RUN - total;
-      const truncated = issues.length > remaining;
-      const page = (truncated ? issues.slice(0, remaining) : issues).map((issue) => ({
+      const page = issues.map((issue) => ({
         issueId: String(issue.id || ""),
         issueKey: String(issue.identifier || ""),
         summary: String(issue.title || ""),
@@ -504,9 +506,9 @@ export class IntegrationSyncClient {
         url: String(issue.url || "")
       } satisfies RemoteTicket));
 
-      await onPage(page);
+      const stop = await onPage(page);
       total += page.length;
-      if (truncated) return { total, truncated: true };
+      if (stop) return { total, truncated: true };
 
       const pageInfo = (data?.entity?.issues?.pageInfo || {}) as Row;
       if (!pageInfo.hasNextPage || !pageInfo.endCursor) return { total, truncated: false };
@@ -573,7 +575,7 @@ export class IntegrationSyncClient {
   async fetchNotionPages(
     connection: Row,
     databaseId: string,
-    onPage: (tickets: RemoteTicket[]) => Promise<void>,
+    onPage: OnTicketPage,
     sinceIso?: string | null
   ): Promise<{ total: number; truncated: boolean }> {
     let cursor: string | undefined;
@@ -585,9 +587,7 @@ export class IntegrationSyncClient {
       const data = await this.notion<Row>(connection, "POST", `/databases/${encodeURIComponent(databaseId)}/query`, body, "database");
 
       const pages = asArray(data.results).filter((page) => page.object === undefined || page.object === "page");
-      const remaining = MAX_TICKETS_PER_RUN - total;
-      const truncated = pages.length > remaining;
-      const batch = (truncated ? pages.slice(0, remaining) : pages).map((page) => {
+      const batch = pages.map((page) => {
         const properties = (page.properties || {}) as Row;
         return {
           issueId: String(page.id || ""),
@@ -603,9 +603,9 @@ export class IntegrationSyncClient {
         } satisfies RemoteTicket;
       });
 
-      if (batch.length) await onPage(batch);
+      const stop = batch.length ? await onPage(batch) : false;
       total += batch.length;
-      if (truncated) return { total, truncated: true };
+      if (stop) return { total, truncated: true };
 
       if (!data.has_more || !data.next_cursor) return { total, truncated: false };
       cursor = String(data.next_cursor);

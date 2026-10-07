@@ -394,3 +394,80 @@ describe("IntegrationSyncService#startRun, notion", () => {
     expect(insertSql).toContain("SELECT notion_database_name FROM notion_project_mappings");
   });
 });
+
+/**
+ * A run the per-run ticket cap cut off leaves its pass unfinished (V134); the next run must continue it
+ * rather than start over, or the same newest tickets are re-synced forever. startRun decides that
+ * from the latest completed run, so the fake answers exactly that lookup and records what the INSERT and
+ * the queued payload were given.
+ */
+describe("IntegrationSyncService#startRun — continuing a pass the cap cut off", () => {
+  const WINDOW = new Date("2026-10-01T08:00:00.000Z");
+  const SINCE = new Date("2026-09-30T00:00:00.000Z");
+  type Prior = { truncated: boolean; remote_project_key: string | null; window_start: Date | null; sync_since: Date | null };
+
+  function setup(prior?: Partial<Prior>, opts: { nightly?: boolean; since?: string | null } = {}) {
+    const query = jest.fn((sql: string, _params: unknown[] = []) => {
+      if (sql.includes("FROM integration_connections")) return Promise.resolve({ rows: [] });
+      if (sql.includes("SELECT truncated, remote_project_key, window_start, sync_since")) {
+        return Promise.resolve({ rows: prior ? [{ truncated: true, remote_project_key: "KAN", window_start: WINDOW, sync_since: null, ...prior }] : [] });
+      }
+      if (sql.includes("INSERT INTO integration_sync_runs")) return Promise.resolve({ rows: [{ id: "run-new" }] });
+      return Promise.resolve({ rows: [] });
+    });
+    const queue = { add: jest.fn().mockResolvedValue(undefined) };
+    const service = new IntegrationSyncService(queue as unknown as Queue, { query } as unknown as DatabaseService, {} as unknown as PlanLimitsService);
+    const start = () =>
+      service.startRun("org-1", "proj-1", "jira", opts.nightly ? null : "user-1", "KAN", { triggerSource: opts.nightly ? "nightly" : "manual", since: opts.since ?? null });
+    const insertParams = () => query.mock.calls.find(([sql]) => String(sql).includes("INSERT INTO integration_sync_runs"))![1] as unknown[];
+    return { start, insertParams, queue, query };
+  }
+
+  it("inherits the pass's window and since when the latest completed run was truncated", async () => {
+    const { start, insertParams, queue } = setup({ sync_since: SINCE });
+    await start();
+    // $10 window_start, $11 sync_since
+    expect(insertParams()[9]).toBe(WINDOW);
+    expect(insertParams()[10]).toBe(SINCE.toISOString());
+    expect(queue.add.mock.calls[0][1].since).toBe(SINCE.toISOString());
+  });
+
+  it("starts a fresh pass when the latest completed run reached the end of the backlog", async () => {
+    const { start, insertParams } = setup({ truncated: false });
+    await start();
+    expect(insertParams()[9]).toBeNull();
+  });
+
+  it("starts a fresh pass when there is no earlier run", async () => {
+    const { start, insertParams } = setup(undefined);
+    await start();
+    expect(insertParams()[9]).toBeNull();
+  });
+
+  it("starts a fresh pass when the project is now mapped to a different remote project", async () => {
+    const { start, insertParams } = setup({ remote_project_key: "OTHER" });
+    await start();
+    expect(insertParams()[9]).toBeNull();
+  });
+
+  it("a manual run continuing an incremental pass keeps that pass's since, not a full resync", async () => {
+    const { start, queue } = setup({ sync_since: SINCE });
+    await start();
+    expect(queue.add.mock.calls[0][1].since).toBe(SINCE.toISOString());
+  });
+
+  it("a nightly run's own since applies only when it is not continuing a pass", async () => {
+    const fresh = setup({ truncated: false }, { nightly: true, since: "2026-10-06T00:00:00.000Z" });
+    await fresh.start();
+    expect(fresh.queue.add.mock.calls[0][1].since).toBe("2026-10-06T00:00:00.000Z");
+  });
+
+  it("looks only at completed runs, so a failed run mid-pass does not discard the progress", async () => {
+    const { start, query } = setup({});
+    await start();
+    // The filter lives in the SQL (the fake cannot model it), so assert the statement carries it.
+    const lookup = String(query.mock.calls.find(([sql]) => String(sql).includes("SELECT truncated, remote_project_key"))![0]);
+    expect(lookup).toContain("status IN ('succeeded', 'partial')");
+    expect(lookup).toContain("ORDER BY created_at DESC LIMIT 1");
+  });
+});
