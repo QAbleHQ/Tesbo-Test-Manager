@@ -63,6 +63,10 @@ export type RbacTenantKind =
   | "ai-keys"
   // Wave 10 — the tail: notifications, activity, API keys, external report ingest
   | "notifications"
+  // The Phase 1 notification matrix (workspace/project membership, runs, bugs). Separate from
+  // "notifications" because these tests change roles, remove members and accept invitations, which
+  // would move the membership the seeded-row tests above rely on.
+  | "notification-events"
   | "api-keys"
   | "tesbo-reports"
   // Email delivery gating: needs an owner who can send an invite, in a workspace whose pending
