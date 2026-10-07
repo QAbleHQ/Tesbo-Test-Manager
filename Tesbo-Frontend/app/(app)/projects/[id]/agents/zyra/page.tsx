@@ -55,6 +55,7 @@ import { renderMarkdown } from "@/lib/markdown";
 import { formatDateTime } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { refreshPageCachesAfterZyraSave } from "@/lib/zyraCacheSync";
 import { ZyraLanguageContext, useZyraText, zyraLanguage, zyraText, type ZyraT } from "@/lib/zyra-i18n";
 
 // ─── Zyra icon badge — gradient sparkle mark used in the header and per-message ──
@@ -993,7 +994,7 @@ export default function ZyraChatPage() {
   const params = useParams();
   const router = useRouter();
   const projectId = params.id as string;
-  const { currentUser } = useAppData();
+  const { currentUser, workspace } = useAppData();
   const { project } = useProjectData();
   const projectName = String(project.name || "");
 
@@ -1355,6 +1356,12 @@ export default function ZyraChatPage() {
       if (settled) setActiveSession((prev) => prev && prev.id === sessionId ? settled : prev);
       void refreshSessions();
       const userMessage = settled?.messages?.find((m) => m.id === started.userMessageId);
+      // A confirmed archive is applied in the chat turn itself, with no review-panel Save to refresh
+      // the repository's cached pages — so do the same refresh here when this turn archived anything.
+      const reply = settled?.messages?.slice((settled.messages ?? []).findIndex((m) => m.id === started.userMessageId) + 1) ?? [];
+      if (userMessage && reply.some((m) => m.role === "assistant" && (m.testcases || []).some((row) => row.action === "archived"))) {
+        refreshPageCachesAfterZyraSave(projectId, workspace?.id);
+      }
       if (!settled || !userMessage) {
         setError(tNow()("err.slow"));
       } else if (userMessage.status === ZYRA_MESSAGE_FAILED) {

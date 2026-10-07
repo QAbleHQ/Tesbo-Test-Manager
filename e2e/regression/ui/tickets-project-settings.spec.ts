@@ -9,8 +9,11 @@ import { accountA, apiContext, ticket, unique } from "../fixtures";
  * real green assertion rather than an expected-red one. handleAddEnvironment() validates both of the
  * cases the card is about:
  *
- *   !name || !url                 -> "Environment name and URL are required."
- *   name already in the list      -> "Environment name already exists."   (case-insensitive)
+ *   no name / no URL              -> "Environment name is required" / "Environment URL is required"
+ *   name already in the list      -> "An environment with this name already exists"   (case-insensitive)
+ *
+ * (The wording above follows lib/validation.ts's validateEnvironmentName/Url; the original card text
+ * was "Environment name and URL are required." / "Environment name already exists.")
  *
  * The screen has TWO steps, which is the thing to get right when reading these tests: **Add** stages
  * an environment into local component state and clears the two inputs; **Save** is what PATCHes the
@@ -42,14 +45,14 @@ test.describe("project settings — test environments", () => {
    * it", and the restore would be skipped exactly where it is needed. The environments this file adds
    * would then be left behind in a shared project.
    */
-  let originalSettings: string | null = null;
+  let originalSettings: unknown = null;
   let captured = false;
 
   test.beforeEach(async () => {
     const api = await apiContext();
     try {
       const project = await (await api.get(`/api/projects/${accountA().projectId}`)).json();
-      originalSettings = typeof project.settings === "string" ? project.settings : null;
+      originalSettings = project.settings ?? null;
       captured = true;
     } finally {
       await api.dispose();
@@ -63,7 +66,7 @@ test.describe("project settings — test environments", () => {
       await api.patch(`/api/projects/${accountA().projectId}`, {
         // An empty settings object where there was none: this screen's own save path would write one
         // anyway, and it leaves no environment behind, which is the property that matters.
-        data: { settings: originalSettings ?? "{}" },
+        data: { settings: originalSettings ?? {} },
         failOnStatusCode: false,
       });
     } finally {
@@ -76,7 +79,9 @@ test.describe("project settings — test environments", () => {
     const api = await apiContext();
     try {
       const project = await (await api.get(`/api/projects/${accountA().projectId}`)).json();
-      const settings = JSON.parse(String(project.settings ?? "{}"));
+      // The API returns the jsonb object. (This helper used to JSON.parse a string, which only worked
+      // because the double-encoding bug stored settings as a jsonb string.)
+      const settings = typeof project.settings === "string" ? JSON.parse(project.settings) : (project.settings ?? {});
       return Array.isArray(settings.testRunEnvironments) ? settings.testRunEnvironments : [];
     } finally {
       await api.dispose();
@@ -93,7 +98,7 @@ test.describe("project settings — test environments", () => {
       await page.getByPlaceholder(nameInput).fill(name);
       await page.getByRole("button", { name: "Add", exact: true }).click();
 
-      await expect(page.getByText("Environment name and URL are required.")).toBeVisible();
+      await expect(page.getByText("Environment URL is required")).toBeVisible();
       // Refused means not staged: the name is still in the box, waiting to be completed.
       await expect(page.getByPlaceholder(nameInput)).toHaveValue(name);
     },
@@ -108,7 +113,7 @@ test.describe("project settings — test environments", () => {
       await page.getByPlaceholder(urlInput).fill("https://reg-no-name.example.com");
       await page.getByRole("button", { name: "Add", exact: true }).click();
 
-      await expect(page.getByText("Environment name and URL are required.")).toBeVisible();
+      await expect(page.getByText("Environment name is required")).toBeVisible();
       await expect(page.getByPlaceholder(urlInput)).toHaveValue("https://reg-no-name.example.com");
     },
   );
@@ -164,7 +169,7 @@ test.describe("project settings — test environments", () => {
       await page.getByPlaceholder(urlInput).fill(`https://second-${Date.now()}.example.com`);
       await page.getByRole("button", { name: "Add", exact: true }).click();
 
-      await expect(page.getByText("Environment name already exists.")).toBeVisible();
+      await expect(page.getByText("An environment with this name already exists")).toBeVisible();
 
       // And it really was not staged — saving now must persist exactly one entry for that name.
       await page.getByRole("button", { name: "Save", exact: true }).click();
@@ -174,6 +179,118 @@ test.describe("project settings — test environments", () => {
         (e) => e.name.toLowerCase() === name.toLowerCase(),
       );
       expect(matching, "the duplicate must not have been added alongside the original").toHaveLength(1);
+    },
+  );
+
+  test(
+    ticket("REG-ENV-05", "settings-save-500", "an added environment is a draft until Save persists it"),
+    { tag: '@tesbo.testId("TES-TC-3027")' },
+    async ({ page }) => {
+      await page.goto(settingsUrl());
+      const before = await storedEnvironments();
+
+      const name = unique("Draft");
+      const url = `https://draft-${Date.now()}.example.com`;
+      await page.getByPlaceholder(nameInput).fill(name);
+      await page.getByPlaceholder(urlInput).fill(url);
+      await page.getByRole("button", { name: "Add", exact: true }).click();
+
+      await expect(page.getByText(name)).toBeVisible();
+      await expect(page.getByText("(unsaved)")).toBeVisible();
+      expect(await storedEnvironments(), "Add alone must not persist anything").toEqual(before);
+
+      // Leaving without Save discards the draft.
+      await page.reload();
+      await expect(page.getByText(name)).toHaveCount(0);
+      expect(await storedEnvironments()).toEqual(before);
+
+      await page.getByPlaceholder(nameInput).fill(name);
+      await page.getByPlaceholder(urlInput).fill(url);
+      await page.getByRole("button", { name: "Add", exact: true }).click();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+
+      // The inline success message, green and announced as a status, not an alert.
+      const ok = page.getByRole("status").filter({ hasText: "Project settings saved." });
+      await expect(ok).toBeVisible();
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      await expect(page.getByText("(unsaved)")).toHaveCount(0);
+      expect(await storedEnvironments()).toEqual(expect.arrayContaining([expect.objectContaining({ name, url })]));
+
+      await page.reload();
+      await expect(page.getByText(name)).toBeVisible();
+    },
+  );
+
+  test(
+    ticket("REG-ENV-06", "settings-save-500", "text typed but never added is not saved, and Save says so"),
+    { tag: '@tesbo.testId("TES-TC-3028")' },
+    async ({ page }) => {
+      await page.goto(settingsUrl());
+      const before = await storedEnvironments();
+
+      await page.getByPlaceholder(nameInput).fill(unique("Typed"));
+      await page.getByPlaceholder(urlInput).fill(`https://typed-${Date.now()}.example.com`);
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+
+      await expect(page.getByRole("alert").filter({ hasText: "Click Add" })).toBeVisible();
+      await expect(page.getByText("Project settings saved.")).toHaveCount(0);
+      expect(await storedEnvironments(), "nothing may be saved while input is pending").toEqual(before);
+
+      // Whitespace-only input is not pending input.
+      await page.getByPlaceholder(nameInput).fill("   ");
+      await page.getByPlaceholder(urlInput).fill("");
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByRole("status").filter({ hasText: "Project settings saved." })).toBeVisible();
+    },
+  );
+
+  test(
+    ticket("REG-ENV-07", "settings-save-500", "a failed save shows the server error inline and keeps the drafts"),
+    { tag: '@tesbo.testId("TES-TC-3029")' },
+    async ({ page }) => {
+      await page.route("**/api/projects/*", async (route) => {
+        if (route.request().method() !== "PATCH") return route.fallback();
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Internal server error" }) });
+      });
+      await page.goto(settingsUrl());
+      const before = await storedEnvironments();
+
+      const name = unique("Fail");
+      await page.getByPlaceholder(nameInput).fill(name);
+      await page.getByPlaceholder(urlInput).fill(`https://fail-${Date.now()}.example.com`);
+      await page.getByRole("button", { name: "Add", exact: true }).click();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+
+      await expect(page.getByRole("alert").filter({ hasText: "Internal server error" })).toBeVisible();
+      await expect(page.getByText("Project settings saved.")).toHaveCount(0);
+      // Draft survives so the user can retry, and is still flagged unsaved.
+      await expect(page.getByText(name)).toBeVisible();
+      await expect(page.getByText("(unsaved)")).toBeVisible();
+      expect(await storedEnvironments()).toEqual(before);
+    },
+  );
+
+  test(
+    ticket("REG-ENV-08", "settings-save-500", "removing an environment only takes effect on Save"),
+    { tag: '@tesbo.testId("TES-TC-3030")' },
+    async ({ page }) => {
+      const api = await apiContext();
+      const keep = { name: unique("Keep"), url: `https://keep-${Date.now()}.example.com` };
+      const drop = { name: unique("Drop"), url: `https://drop-${Date.now()}.example.com` };
+      try {
+        await api.patch(`/api/projects/${accountA().projectId}`, { data: { settings: { testRunEnvironments: [keep, drop] } } });
+        await page.goto(settingsUrl());
+
+        await page.getByRole("row", { name: new RegExp(drop.name) }).getByRole("button", { name: "Remove" }).click();
+        await expect(page.getByText(drop.name)).toHaveCount(0);
+        expect(await storedEnvironments(), "Remove alone must not persist").toHaveLength(2);
+
+        await page.getByRole("button", { name: "Save", exact: true }).click();
+        await expect(page.getByRole("status").filter({ hasText: "Project settings saved." })).toBeVisible();
+        expect(await storedEnvironments()).toEqual([keep]);
+      } finally {
+        await api.dispose();
+      }
     },
   );
 });

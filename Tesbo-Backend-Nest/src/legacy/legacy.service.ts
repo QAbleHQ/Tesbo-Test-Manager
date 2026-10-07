@@ -419,6 +419,9 @@ type ZyraAppliedOperations = {
   // see applyZyraChatOperations' own comment. 0 when every move fully resolved, or when the turn
   // had no move_to_suite operations naming explicit ids at all.
   unresolvedMoveTargetCount?: number;
+  // Archives a confirming message applied immediately (see applyZyraChatOperations' archiveConfirmed),
+  // so reconcileZyraReply can state what actually happened instead of the model's "staged" wording.
+  archivedNowCount?: number;
 };
 
 // Structurally satisfied by both DatabaseService and a transaction's PoolClient (both expose this
@@ -653,6 +656,59 @@ function validateProjectIcon(raw: unknown): ProjectIcon | undefined {
     }
   }
   return { color, glyph };
+}
+
+const ENVIRONMENT_NAME_MAX_LENGTH = 50;
+const ENVIRONMENT_URL_MAX_LENGTH = 500;
+
+/**
+ * `settings` arrives either as an object (API callers) or a pre-stringified object (the settings
+ * screen). Both are stored as a jsonb object; anything else is a 400 rather than a value that
+ * silently wipes the blob or lands as a scalar. Also mirrors the UI's testRunEnvironments rules.
+ */
+function parseProjectSettingsInput(raw: unknown): Body | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new BadRequestException({ error: "settings must be a JSON object" });
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BadRequestException({ error: "settings must be a JSON object" });
+  }
+  const settings = value as Body;
+  const envs = settings.testRunEnvironments;
+  if (envs !== undefined) {
+    if (!Array.isArray(envs)) throw new BadRequestException({ error: "testRunEnvironments must be an array" });
+    const names = new Set<string>();
+    const urls = new Set<string>();
+    for (const item of envs) {
+      const name = typeof item?.name === "string" ? item.name.trim() : "";
+      const url = typeof item?.url === "string" ? item.url.trim() : "";
+      if (!name) throw new BadRequestException({ error: "Environment name is required" });
+      if (name.length > ENVIRONMENT_NAME_MAX_LENGTH)
+        throw new BadRequestException({ error: `Environment name must be at most ${ENVIRONMENT_NAME_MAX_LENGTH} characters` });
+      if (!url) throw new BadRequestException({ error: "Environment URL is required" });
+      if (url.length > ENVIRONMENT_URL_MAX_LENGTH)
+        throw new BadRequestException({ error: `Environment URL must be at most ${ENVIRONMENT_URL_MAX_LENGTH} characters` });
+      let protocol = "";
+      try {
+        protocol = new URL(url).protocol;
+      } catch {
+        throw new BadRequestException({ error: "Enter a valid URL, e.g. https://staging.example.com" });
+      }
+      if (protocol !== "http:" && protocol !== "https:")
+        throw new BadRequestException({ error: "Environment URL must start with http:// or https://" });
+      if (names.has(name.toLowerCase())) throw new BadRequestException({ error: "An environment with this name already exists" });
+      if (urls.has(url.toLowerCase())) throw new BadRequestException({ error: "This URL is already added to another environment" });
+      names.add(name.toLowerCase());
+      urls.add(url.toLowerCase());
+    }
+  }
+  return settings;
 }
 
 /** Shared by createProject/updateProject. `name`/`description` undefined means "not being changed". */
@@ -3359,25 +3415,34 @@ export class LegacyService implements OnModuleInit {
     const description = body.description !== undefined ? String(body.description) : undefined;
     validateProjectFields(name, description);
     const icon = validateProjectIcon(body.icon);
+    const settings = parseProjectSettingsInput(body.settings);
+    // One statement, so a failing icon write can no longer leave name/settings half-saved while the
+    // caller is told the save failed. The icon is a targeted jsonb_set rather than a read-modify-write
+    // of the whole blob, so it can't race a concurrent save of testcaseIdPrefix/testRunEnvironments
+    // and silently drop whichever one lost the race. `base` unwraps a settings value that an earlier
+    // build stored as a JSON *string* (the UI sent settings pre-stringified and this method
+    // stringified it again) — jsonb_set raises "cannot set path in scalar" on those rows.
     await this.db.query(
       `UPDATE projects SET
        name = COALESCE($2, name),
        description = COALESCE($3, description),
-       settings = COALESCE($4::jsonb, settings),
+       settings = CASE WHEN $5::jsonb IS NULL THEN COALESCE($4::jsonb, settings)
+         ELSE jsonb_set(
+           COALESCE($4::jsonb, CASE jsonb_typeof(settings)
+             WHEN 'object' THEN settings
+             WHEN 'string' THEN (settings #>> '{}')::jsonb
+             ELSE '{}'::jsonb END),
+           '{icon}', $5::jsonb, true) END,
        updated_at = now()
        WHERE id = $1`,
-      [id, name ?? null, description ?? null, body.settings ? JSON.stringify(body.settings) : null]
+      [
+        id,
+        name ?? null,
+        description ?? null,
+        settings ? JSON.stringify(settings) : null,
+        icon !== undefined ? JSON.stringify(icon) : null,
+      ]
     );
-    if (icon !== undefined) {
-      // A targeted jsonb_set rather than a read-modify-write of the whole settings blob, so an icon
-      // change can't race a concurrent save of testcaseIdPrefix/testRunEnvironments (or vice versa)
-      // and silently drop whichever one lost the race.
-      await this.db.query(
-        `UPDATE projects SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{icon}', $2::jsonb, true), updated_at = now()
-         WHERE id = $1`,
-        [id, JSON.stringify(icon)]
-      );
-    }
     // This request's own memoized project row (key/settings/organization_id) is now stale — drop it
     // so anything reading it later in this same request (externalIdPrefix after a testcaseIdPrefix
     // change, requireProjectAccess after a rename) sees the write that just happened.
@@ -13637,7 +13702,9 @@ export class LegacyService implements OnModuleInit {
       // Only a turn that has operations to apply stages anything — an answer turn never reaches
       // this step, so its trace doesn't claim a staging pass that did nothing.
       if (decision.operations.length) onStage?.("staging", { operationCounts: LegacyService.tallyZyraOperationTypes(decision.operations) });
-      const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations);
+      // A confirmed archive is applied now rather than staged — but only when THIS message really is
+      // the user's confirmation (zyraIsArchiveConfirmation), never on the model's word alone.
+      const applied = await this.applyZyraChatOperations(projectId, uid, sessionId, decision.operations, { archiveConfirmed: this.zyraIsArchiveConfirmation(message) });
       const activity = [
         { actor: "user", title: "Asked Zyra", detail: message.slice(0, 320), createdAt: new Date().toISOString() },
         ...applied.activity
@@ -14382,7 +14449,7 @@ export class LegacyService implements OnModuleInit {
       "- create: create new testcase drafts/saved cases only when the user clearly asks to create/generate/add/write testcases. If the user names an existing suite for these new testcases (or a prior turn already established one, e.g. confirming 'yes' to save into the suite you just discussed), set operation.suiteId (preferred, from 'Existing suites' below) or operation.suiteName directly on the create operation so the testcase lands in that suite immediately — do not require a separate move_to_suite step for testcases you are creating in this same turn.",
       "CRITICAL for a create op: do NOT author the actual testcase content. Leave operation.draft unset and the top-level testcases array empty — a separate authoring step writes the real title/steps/preconditions/etc. immediately after this routing decision, using its own dedicated response budget, and never reads operation.draft or testcases for a create op. Only set operation.suiteId/operation.suiteName (when known) and operation.reason. Writing out full draft content here produces nothing useful (it is always discarded and re-generated from scratch) and for a large or 'exhaustive' request can consume your entire response before you finish the JSON envelope, corrupting this turn's routing decision — reply/reasoningSummary/action all become unrecoverable, not just the drafts.",
       "- update: update an existing testcase only when the user clearly asks to update/edit/mark/revise a testcase.",
-      "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage. IMPORTANT: before archiving, always describe which testcases will be archived and explicitly ask the user to confirm (e.g. 'I found TC-5 Login Test. Should I archive it? Reply yes to confirm.'). Only include archive operations if the user's current message is a clear confirmation (yes, confirm, go ahead, proceed) after you already proposed what would be archived in the prior assistant turn.",
+      "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage. IMPORTANT: before archiving, always describe which testcases will be archived and explicitly ask the user to confirm (e.g. 'I found TC-5 Login Test. Should I archive it? Reply yes to confirm.'). Only include archive operations if the user's current message is a clear confirmation (yes, confirm, go ahead, proceed) after you already proposed what would be archived in the prior assistant turn. To archive a SET in one operation — every existing testcase, or several named ones — emit a single archive operation with operation.allExisting=true or operation.externalIds; the same confirmation rule applies. An archive emitted on the user's clear confirmation is APPLIED IMMEDIATELY (not staged for review): describe it as archived, never as staged or pending review.",
       "- create_suite: create a new test suite (a folder/group for testcases) when the user asks to create/add a suite, folder, or group. Put the suite name in operation.suiteName.",
       "- move_to_suite: move/assign EXISTING testcases into a suite when the user asks to move/assign/organize/group/put existing testcases into a suite. The target suite goes in operation.suiteName (it is created automatically if it does not already exist, so you do not need a separate create_suite op for the same suite). List the testcases to move in operation.externalIds (use the external IDs shown under 'Existing suites' / 'Existing testcases'), set operation.allExisting=true when the user means every existing testcase, or set operation.fromLastPlan=true when the user refers to 'all'/'the N cases' from a recent generation batch (see 'Most recently generated batch' below) — fromLastPlan is exact and does not depend on you correctly recalling every external ID from earlier in the conversation, so prefer it over externalIds whenever the user is clearly referring to a just-generated batch rather than naming specific unrelated testcases.",
       "CRITICAL: 'create'/'update'/'archive' operations are STAGED for review, not applied immediately — nothing is inserted, changed, or removed in the repository until the user separately reviews and saves the staged batch. Still emit the operation as soon as you are confident the user wants it — do not add an extra 'would you like me to save these?' round-trip of your own in the chat, the review step already exists downstream and is not yours to gate. But your WORDING must match reality: describe what you produce as DRAFTED/PROPOSED and staged for review — never as 'created', 'saved', 'updated', or 'archived' (all past tense, all claims about work this turn did not do), however many testcases your reply text lists. If the user wants testcases, choose 'create' now; otherwise do not enumerate any as if they existed.",
@@ -14890,7 +14957,13 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
-  private async applyZyraChatOperations(projectId: string, userId: string | null, sessionId: string, operations: ZyraChatDecision["operations"]) {
+  private async applyZyraChatOperations(
+    projectId: string,
+    userId: string | null,
+    sessionId: string,
+    operations: ZyraChatDecision["operations"],
+    options: { archiveConfirmed?: boolean } = {}
+  ) {
     const testcases: Body[] = [];
     const activity: Body[] = [];
     // create/update/archive no longer write straight to `testcases` — they're staged here and only
@@ -15013,6 +15086,44 @@ export class LegacyService implements OnModuleInit {
           draftIndex: proposals.length - 1
         });
         activity.push({ actor: "agent", title: "Drafted testcase for review", detail: draftPayload.title || "Untitled test case", createdAt: new Date().toISOString() });
+      } else if (op.type === "archive" && (op.allExisting || op.externalIds?.length || op.testcaseIds?.length)) {
+        // A set-wide archive ("delete all the test cases", or several named ids): resolved against
+        // the live repository the same way move_to_suite resolves its targets, then staged as one
+        // proposed-archive per test case — exactly the proposal shape the single-case branch below
+        // stages, so the review panel lists every case and nothing changes until zyraSave.
+        const { targets, requestedCount } = await this.resolveZyraMoveTargets(projectId, sessionId, op, null);
+        const rows = targets.length
+          ? (await this.db.query(
+              "SELECT * FROM testcases WHERE project_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL ORDER BY created_at ASC",
+              [projectId, targets.map((target) => target.id)]
+            )).rows.map((row) => toCamel(row))
+          : [];
+        const toArchive = rows.filter((row) => row.status !== "Archived");
+        const alreadyArchived = rows.length - toArchive.length;
+        const missing = requestedCount === null ? 0 : Math.max(0, requestedCount - rows.length);
+        const fields = { status: "Archived" };
+        for (const row of toArchive) {
+          proposals.push({ opType: "archive", testcaseId: row.id, externalId: row.externalId, fields, reason: op.reason || "" });
+          testcases.push({ ...this.chatTestcaseRow({ ...row, ...fields }, "proposed-archive", op.reason), draftIndex: proposals.length - 1 });
+        }
+        if (toArchive.length) {
+          activity.push({ actor: "agent", title: "Drafted archive for review", detail: `${toArchive.length} test case(s) staged for archiving.`, createdAt: new Date().toISOString() });
+        }
+        // Same "Could not …" shape the single-case branch uses, so reconcileZyraReply reports it
+        // instead of letting the reply claim everything was staged.
+        if (!toArchive.length || missing) {
+          activity.push({
+            actor: "agent",
+            title: "Could not archive testcases",
+            detail: !toArchive.length
+              ? (op.allExisting ? "There are no active test cases in this project to archive." : "None of the named test cases exist in this project or are still active, so there was nothing to archive.")
+              : `${missing} of the named test case(s) do not exist in this project, so they were not staged.`,
+            createdAt: new Date().toISOString()
+          });
+        }
+        if (alreadyArchived) {
+          activity.push({ actor: "agent", title: "Skipped archived testcases", detail: `${alreadyArchived} named test case(s) were already archived.`, createdAt: new Date().toISOString() });
+        }
       } else if ((op.type === "update" || op.type === "archive") && (op.testcaseId || op.externalId)) {
         const found = await this.findProjectTestcase(projectId, op.testcaseId, op.externalId);
         if (!found) {
@@ -15193,8 +15304,47 @@ export class LegacyService implements OnModuleInit {
         await this.recordZyraPendingReviewRequest(sessionId, reviewRequestId);
       }
     }
+    // An archive the user has explicitly confirmed (the router only emits one after asking — see the
+    // archive rule in the router prompt — and archiveConfirmed is the server's own check of the
+    // confirming message) is applied now instead of waiting in the review panel: committed through
+    // zyraSave itself, so it gets exactly what the panel's Save would — one transaction, the target
+    // lock and stale-target check, audit entries, cache refresh, embeddings and the ticket
+    // auto-comment. Any create/update staged in the same turn stays staged for review. Archive only
+    // ever sets status to Archived, which the repository can restore.
+    let archivedNowCount = 0;
+    const archiveIndexes = proposals.map((p, index) => ((p as Body).opType === "archive" ? index : -1)).filter((index) => index >= 0);
+    if (options.archiveConfirmed && reviewRequestId && archiveIndexes.length) {
+      try {
+        const saved = (await this.zyraSave(projectId, userId, reviewRequestId, { selectedDraftIndexes: archiveIndexes })) as Body;
+        archivedNowCount = Number(saved.savedCount) || 0;
+        const archivedSet = new Set(archiveIndexes);
+        // Positions the unsaved proposals now hold — zyraSave keeps them in their original order.
+        const remainingIndex = new Map<number, number>();
+        proposals.forEach((_, index) => {
+          if (!archivedSet.has(index)) remainingIndex.set(index, remainingIndex.size);
+        });
+        for (const tc of testcases) {
+          if (tc.reviewRequestId !== reviewRequestId || typeof tc.draftIndex !== "number") continue;
+          if (archivedSet.has(tc.draftIndex)) {
+            tc.action = "archived";
+            delete tc.draftIndex;
+            delete tc.reviewRequestId;
+          } else {
+            tc.draftIndex = remainingIndex.get(tc.draftIndex);
+          }
+        }
+        if (!remainingIndex.size) reviewRequestId = null;
+        activity.push({ actor: "agent", title: "Archived testcases", detail: `Archived ${archivedNowCount} test case(s) as confirmed.`, createdAt: new Date().toISOString() });
+      } catch (err) {
+        // Nothing was archived (zyraSave is one transaction) and the batch is still in review, so
+        // the user can still Save it from the panel — say so instead of claiming it happened.
+        const reason = this.extractAiErrorMessage(err) || (err instanceof Error ? err.message : String(err));
+        this.logger.warn(`Confirmed Zyra archive failed for project ${projectId}: ${reason}`);
+        activity.push({ actor: "agent", title: "Could not archive testcases", detail: `The confirmed archive failed and nothing was archived: ${reason}. The cases are still listed for review.`, createdAt: new Date().toISOString() });
+      }
+    }
     const moveBreakdown = await this.zyraMoveBreakdown(projectId, moveSuites, moveTargetIds);
-    return { testcases, activity, reviewRequestId, moveBreakdown, unresolvedMoveTargetCount };
+    return { testcases, activity, reviewRequestId, moveBreakdown, unresolvedMoveTargetCount, archivedNowCount };
   }
 
   // Ground truth for how many testcases actually ended up in each suite a move_to_suite operation
@@ -15351,10 +15501,13 @@ export class LegacyService implements OnModuleInit {
   // fall short of. Only the explicit external-id/internal-id branch names a concrete set, which is
   // exactly the shape that can partially fail (some ids real, some not) — see F4's fix in
   // applyZyraChatOperations' move_to_suite branch, which uses requestedCount to detect that.
-  private async resolveZyraMoveTargets(projectId: string, sessionId: string, op: ZyraChatDecision["operations"][number], targetSuiteId: string, createdThisTurn: string[] = []): Promise<{ targets: Array<{ id: string }>; requestedCount: number | null }> {
+  //
+  // Also resolves a set-wide archive op (applyZyraChatOperations), which passes targetSuiteId null:
+  // there is no destination suite to exclude, so allExisting means every non-archived testcase.
+  private async resolveZyraMoveTargets(projectId: string, sessionId: string, op: ZyraChatDecision["operations"][number], targetSuiteId: string | null, createdThisTurn: string[] = []): Promise<{ targets: Array<{ id: string }>; requestedCount: number | null }> {
     if (op.allExisting) {
       const res = await this.db.query(
-        "SELECT id FROM testcases WHERE project_id = $1 AND COALESCE(status,'') <> 'Archived' AND suite_id IS DISTINCT FROM $2::uuid AND deleted_at IS NULL",
+        "SELECT id FROM testcases WHERE project_id = $1 AND COALESCE(status,'') <> 'Archived' AND ($2::uuid IS NULL OR suite_id IS DISTINCT FROM $2::uuid) AND deleted_at IS NULL",
         [projectId, targetSuiteId]
       ).catch(() => ({ rows: [] as Body[] }));
       return { targets: res.rows.map((row) => ({ id: String(row.id) })), requestedCount: null };
@@ -20282,7 +20435,11 @@ export class LegacyService implements OnModuleInit {
         if (op.type === "create") return !!op.draft;
         if (op.type === "create_suite") return !!op.suiteName;
         if (op.type === "move_to_suite") return (!!op.suiteName || !!op.suiteId) && (op.allExisting || op.fromLastPlan || !!op.externalIds?.length || !!op.testcaseIds?.length);
-        return op.testcaseId || op.externalId; // update / archive
+        // An archive may name a SET (every existing testcase, or several ids) as well as one case —
+        // a confirmed "delete all the test cases" arrives as allExisting:true, and dropping it here
+        // is what left the confirmation with nothing to stage. applyZyraChatOperations expands it.
+        if (op.type === "archive") return op.testcaseId || op.externalId || op.allExisting || !!op.externalIds?.length || !!op.testcaseIds?.length;
+        return op.testcaseId || op.externalId; // update
       })
       .slice(0, LegacyService.ZYRA_CHAT_MAX_OPERATIONS);
     const testcases = tableIntent ? normalizeJsonArray(raw.testcases).slice(0, 25) : [];
@@ -20517,6 +20674,20 @@ export class LegacyService implements OnModuleInit {
   // English message, so English confirmations behave exactly as before.
   private zyraIsConfirmation(message: string): boolean {
     return LegacyService.ZYRA_AFFIRMATIVE_PATTERN.test(message.trim()) || ZYRA_RU_AFFIRMATIVE.test(foldRu(message.trim()));
+  }
+
+  // Whether this message may make a confirmed archive happen NOW (applyZyraChatOperations). Wider
+  // than zyraIsConfirmation — "yes all", "yes, archive those three" are confirmations too — but it
+  // must START affirmative and carry no hedge: "yes but keep TC-5", "no", "wait" never qualify, and
+  // an archive the model emits on such a message is only staged for review, as before.
+  private static readonly ZYRA_ARCHIVE_CONFIRM_START =
+    /^(yes|yeah|yep|yup|sure|ok|okay|confirm(ed)?|go ahead|proceed|do it|please (do|proceed|go ahead))\b/i;
+  private static readonly ZYRA_ARCHIVE_CONFIRM_HEDGE =
+    /\b(no|not|don'?t|cancel|stop|except|but|keep|wait|unless|only if|instead)\b/i;
+  private zyraIsArchiveConfirmation(message: string): boolean {
+    const text = message.trim();
+    if (this.zyraIsConfirmation(text)) return true;
+    return LegacyService.ZYRA_ARCHIVE_CONFIRM_START.test(text) && !LegacyService.ZYRA_ARCHIVE_CONFIRM_HEDGE.test(text);
   }
 
   // Resolve the router's suite against reality: an id only counts if the suite exists, a name is
@@ -21130,7 +21301,16 @@ export class LegacyService implements OnModuleInit {
   }
 
   private reconcileZyraReply(decision: ZyraChatDecision, applied: ZyraAppliedOperations): string {
-    const moveSuffix = this.zyraMoveBreakdownSuffix(applied.moveBreakdown);
+    // Ground truth for a confirmed archive applied this turn — the model may still word it as
+    // staged, so the reply states what actually happened. Carried on the same suffix every return
+    // path below already appends.
+    const archiveFailure = applied.activity.find((entry) => String(entry.detail || "").startsWith("The confirmed archive failed"));
+    const archivedSuffix = applied.archivedNowCount
+      ? `\n\n🗄️ Archived ${applied.archivedNowCount} test case${applied.archivedNowCount === 1 ? "" : "s"} — they now show under the Archived filter in the repository and can be restored from there.`
+      : archiveFailure
+        ? `\n\n⚠️ ${String(archiveFailure.detail)}`
+        : "";
+    const moveSuffix = this.zyraMoveBreakdownSuffix(applied.moveBreakdown) + archivedSuffix;
     /*
      * An `answer` turn used to return its reply unchecked, on the reasoning that an answer changes
      * nothing so there is nothing to reconcile. That is exactly backwards: an answer changes nothing,

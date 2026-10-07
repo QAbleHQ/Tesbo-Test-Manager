@@ -29,7 +29,7 @@ import {
   notionPageKey,
   zyraTaskTicketKeys,
 } from "@/lib/api";
-import { IconSparkles, IconUser } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronUp, IconSparkles, IconUser } from "@tabler/icons-react";
 import { Button, Card, CopyButton, Field, FieldError, FieldHint, FieldLabel, Input, Modal, PageLoader, Select, StatusChip, Textarea, type Severity } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { toTsv } from "@/lib/tsv";
@@ -82,6 +82,71 @@ function latestFailureDetail(activities: ZyraTask["activities"], fallback: strin
 // Rows written before `kind` existed fall back to matching the fixed title zyraFeedback writes.
 function isFeedbackActivity(activity: ZyraTask["activities"][number]): boolean {
   return activity.kind === "feedback" || activity.title === "Review feedback submitted";
+}
+
+// Collapsed height of the task description, in px (16rem). A ticket synced from Jira/Linear — or
+// several of them in one task — can run to pages, which pushed the testcase tabs far below the fold.
+const DESCRIPTION_COLLAPSED_PX = 256;
+
+/**
+ * The rendered description, height-capped with a View more / View less toggle. The cap is a CSS
+ * max-height on the full HTML, never a cut of the text: slicing Markdown/HTML by characters would
+ * break tables, lists and links mid-element, and line-clamp doesn't apply to headings and lists.
+ * Whether the toggle shows at all is measured, not guessed — re-measured on resize and whenever the
+ * content changes — so a short description renders exactly as before, with no toggle and no fade.
+ */
+function CollapsibleDescription({ html, moreLabel, lessLabel }: { html: string; moreLabel: string; lessLabel: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [overflows, setOverflows] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // scrollHeight is the full content height whether or not the max-height is applied.
+    const measure = () => setOverflows(el.scrollHeight > DESCRIPTION_COLLAPSED_PX + 1);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [html]);
+
+  const collapsed = overflows && !expanded;
+  return (
+    <>
+      <div
+        ref={ref}
+        id="task-description-content"
+        className="zyra-prose mt-1.5 break-words text-sm text-[var(--muted)]"
+        // Starts capped (overflow unknown until measured) so a long description never flashes in full.
+        // The fade is a mask on the content itself rather than an overlay, because the card behind it
+        // is a translucent glass surface that no solid gradient colour would match.
+        style={
+          expanded
+            ? undefined
+            : {
+                maxHeight: DESCRIPTION_COLLAPSED_PX,
+                overflow: "hidden",
+                ...(collapsed ? { maskImage: "linear-gradient(to bottom, black 75%, transparent)", WebkitMaskImage: "linear-gradient(to bottom, black 75%, transparent)" } : {}),
+              }
+        }
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+      {overflows && (
+        <Button
+          variant="secondary"
+          size="sm"
+          aria-expanded={expanded}
+          aria-controls="task-description-content"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-3"
+        >
+          {expanded ? lessLabel : moreLabel}
+          {expanded ? <IconChevronUp size={14} stroke={1.75} /> : <IconChevronDown size={14} stroke={1.75} />}
+        </Button>
+      )}
+    </>
+  );
 }
 
 // Status labels are "taskStatus.<status>" in lib/zyra-i18n.ts; an unknown status reads as its own words.
@@ -535,9 +600,10 @@ export default function ZyraTaskDetailPage() {
             <div data-testid="task-description" className="mt-4 border-t border-[var(--border-subtle)] pt-3">
               <p className="text-xs font-medium uppercase tracking-wide text-[var(--muted)]">{t("drawer.description")}</p>
               {task.context?.trim() ? (
-                <div
-                  className="zyra-prose mt-1.5 break-words text-sm text-[var(--muted)]"
-                  dangerouslySetInnerHTML={{ __html: renderMarkdown(task.context) }}
+                <CollapsibleDescription
+                  html={renderMarkdown(task.context)}
+                  moreLabel={t("task.viewMore")}
+                  lessLabel={t("task.viewLess")}
                 />
               ) : (
                 <p className="mt-1.5 text-sm text-[var(--muted-soft)]">{t("task.noDescription")}</p>
