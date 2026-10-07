@@ -192,8 +192,23 @@ export class IntegrationSyncProcessor extends WorkerHost {
       await this.runs.setStage(runId, "fetching_tickets");
       const queued: SyncTicketJobPayload[] = [];
       let skipped = 0;
-      const onPage = async (tickets: RemoteTicket[]) => {
+      let alreadySynced = 0;
+      let capped = false;
+      const onPage = async (tickets: RemoteTicket[]): Promise<boolean> => {
+        // A run continuing a pass the cap cut off (V134) skips what the earlier runs already synced, so
+        // the cap below is spent on the tickets that are left rather than on the same newest tickets again.
+        const done = await this.syncedInPass(runId, projectId, String(connection.id), provider, tickets);
         for (const ticket of tickets) {
+          if (done.has(ticket.issueId)) {
+            alreadySynced++;
+            continue;
+          }
+          // Checked only when another ticket still needs syncing, so a backlog of exactly the cap
+          // finishes the pass instead of reporting a limit that was never exceeded.
+          if (queued.length + skipped >= MAX_TICKETS_PER_RUN) {
+            capped = true;
+            break;
+          }
           try {
             const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket, remote.remote_id);
             queued.push({ runId, organizationId, projectId, provider, ticketId, issueId: ticket.issueId, issueKey: ticket.issueKey, folderId, triggeredBy });
@@ -211,6 +226,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
         // Published per page so the UI's "found N tickets" climbs while a large backlog is still
         // being pulled, instead of sitting at zero for a minute.
         await this.runs.setTotals(runId, queued.length);
+        return capped;
       };
 
       const { truncated } =
@@ -221,6 +237,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
             : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since, remote.entity_type === "project" ? "project" : "team");
 
       await this.runs.setTotals(runId, queued.length);
+      // Marks the pass unfinished so the next Sync for this project continues it (see startRun).
+      if (truncated) await this.db.query("UPDATE integration_sync_runs SET truncated = true, updated_at = now() WHERE id = $1", [runId]);
 
       if (!queued.length) {
         // An incremental (nightly) run finding nothing means "nothing changed since last time",
@@ -230,6 +248,8 @@ export class IntegrationSyncProcessor extends WorkerHost {
         let emptyNote: string;
         if (skipped) {
           emptyNote = `All ${skipped} updated ticket${skipped === 1 ? "" : "s"} in ${remoteLabel} had invalid data and were skipped — see server logs.`;
+        } else if (alreadySynced) {
+          emptyNote = `Every ticket in ${remoteLabel} is already synced.`;
         } else if (since) {
           emptyNote = `No changes in ${remoteLabel} since the last sync.`;
         } else {
@@ -248,8 +268,9 @@ export class IntegrationSyncProcessor extends WorkerHost {
       // building documents — finishRun's own COALESCE keeps whatever is written here.
       const notes: string[] = [];
       if (truncated) {
+        const syncedSoFar = await this.countSyncedInPass(runId, projectId, provider);
         notes.push(
-          `Stopped at the ${MAX_TICKETS_PER_RUN}-ticket limit for one sync. The most recently updated ${MAX_TICKETS_PER_RUN} tickets were synced; run Sync again to continue.`
+          `Stopped at the ${MAX_TICKETS_PER_RUN}-ticket limit for one sync. ${syncedSoFar} tickets are synced so far; run Sync again to continue with the rest.`
         );
       }
       if (skipped) {
@@ -274,6 +295,40 @@ export class IntegrationSyncProcessor extends WorkerHost {
       );
       await this.runs.failRun(runId, message);
     }
+  }
+
+  /**
+   * The ids in `tickets` that an earlier run of this run's pass (synced at/after its window_start)
+   * already stored in the state Jira/Linear/Notion has now — matched on the upstream updated time, so a
+   * ticket edited after it was synced is not skipped. Empty for the first run of a pass, since nothing
+   * has been synced at/after its own window_start yet.
+   */
+  private async syncedInPass(runId: string, projectId: string, connectionId: string, provider: SyncProvider, tickets: RemoteTicket[]): Promise<Set<string>> {
+    if (!tickets.length) return new Set();
+    const c = TICKET_TABLES[provider];
+    const res = await this.db.query<Row>(
+      `SELECT t.${c.issueIdCol} AS issue_id, t.${c.updatedCol} AS updated_at
+       FROM ${c.table} t
+       JOIN integration_sync_runs r ON r.id = $1
+       WHERE t.project_id = $2 AND t.${c.connectionCol} = $3 AND t.${c.issueIdCol} = ANY($4::text[]) AND t.synced_at >= r.window_start`,
+      [runId, projectId, connectionId, tickets.map((ticket) => ticket.issueId)]
+    );
+    const stored = new Map(res.rows.map((row) => [String(row.issue_id), row.updated_at ? new Date(row.updated_at).getTime() : null]));
+    return new Set(
+      tickets
+        .filter((ticket) => ticket.updatedAt && stored.get(ticket.issueId) === new Date(ticket.updatedAt).getTime())
+        .map((ticket) => ticket.issueId)
+    );
+  }
+
+  private async countSyncedInPass(runId: string, projectId: string, provider: SyncProvider): Promise<number> {
+    const c = TICKET_TABLES[provider];
+    const res = await this.db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM ${c.table} t JOIN integration_sync_runs r ON r.id = $1
+       WHERE t.project_id = $2 AND t.synced_at >= r.window_start`,
+      [runId, projectId]
+    );
+    return res.rows[0]?.n ?? 0;
   }
 
   private async upsertTicket(

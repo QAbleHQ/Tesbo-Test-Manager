@@ -89,11 +89,25 @@ export class IntegrationSyncService {
     options?: { triggerSource?: SyncTriggerSource; since?: string | null }
   ): Promise<{ run: SyncRunView; alreadyRunning: boolean }> {
     const triggerSource: SyncTriggerSource = options?.triggerSource || "manual";
-    const since = options?.since ?? null;
     const connection = await this.db.query<{ id: string }>(
       "SELECT id FROM integration_connections WHERE organization_id = $1 AND provider = $2",
       [organizationId, provider]
     );
+
+    // A run the cap cut off leaves its pass unfinished (V134). This run picks that pass up — same window,
+    // same incremental `since` — so the processor skips what the earlier runs already synced and the cap
+    // is spent on the tickets that are left. Only the latest completed run counts: if it reached the end
+    // of the backlog, this run starts a fresh pass. A failed run is ignored, so an outage mid-pass does
+    // not throw away the progress already made. A different mapped project/team/database is a new pass.
+    const prior = await this.db.query<{ truncated: boolean; remote_project_key: string | null; window_start: Date | null; sync_since: Date | null }>(
+      `SELECT truncated, remote_project_key, window_start, sync_since FROM integration_sync_runs
+       WHERE project_id = $1 AND provider = $2 AND status IN ('succeeded', 'partial')
+       ORDER BY created_at DESC LIMIT 1`,
+      [projectId, provider]
+    );
+    const resumed = prior.rows[0]?.truncated && prior.rows[0].window_start && prior.rows[0].remote_project_key === remoteProjectKey ? prior.rows[0] : null;
+    let since = options?.since ?? null;
+    if (resumed) since = resumed.sync_since ? new Date(resumed.sync_since).toISOString() : null;
 
     // NULL for a manual run — idx_integration_sync_runs_nightly_cycle (V90) only covers
     // trigger_source = 'nightly', and a unique index never treats two NULLs as colliding, so manual
@@ -109,10 +123,10 @@ export class IntegrationSyncService {
         notion: "SELECT notion_database_name FROM notion_project_mappings WHERE project_id = $9 AND enabled = true LIMIT 1"
       }[provider];
       const inserted = await this.db.query<{ id: string }>(
-        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, remote_project_name, triggered_by, trigger_source, nightly_cycle_date, status, stage)
-         VALUES ($1, $2, $3, $4, $5, (${remoteNameSql}), $6, $7, $8, 'queued', 'queued')
+        `INSERT INTO integration_sync_runs (organization_id, project_id, provider, connection_id, remote_project_key, remote_project_name, triggered_by, trigger_source, nightly_cycle_date, status, stage, window_start, sync_since)
+         VALUES ($1, $2, $3, $4, $5, (${remoteNameSql}), $6, $7, $8, 'queued', 'queued', COALESCE($10::timestamptz, now()), $11::timestamptz)
          RETURNING id`,
-        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource, cycleDate, projectId]
+        [organizationId, projectId, provider, connection.rows[0]?.id || null, remoteProjectKey, triggeredBy, triggerSource, cycleDate, projectId, resumed?.window_start ?? null, since]
       );
       const runId = inserted.rows[0].id;
 
@@ -460,9 +474,11 @@ export class IntegrationSyncService {
    * Returns null when there is no prior successful run (first-ever sync for this project+provider).
    */
   async getLastSuccessfulRunStart(projectId: string, provider: SyncProvider): Promise<Date | null> {
+    // A run the cap cut off is not a finished pass, so it is no cursor: tickets older than where it
+    // stopped were never seen. The pass's start (window_start, inherited by every continuation) is.
     const res = await this.db.query<{ started_at: string | null }>(
-      `SELECT MAX(started_at) AS started_at FROM integration_sync_runs
-       WHERE project_id = $1 AND provider = $2 AND status IN ('succeeded', 'partial')`,
+      `SELECT MAX(COALESCE(window_start, started_at)) AS started_at FROM integration_sync_runs
+       WHERE project_id = $1 AND provider = $2 AND status IN ('succeeded', 'partial') AND truncated = false`,
       [projectId, provider]
     );
     const startedAt = res.rows[0]?.started_at;

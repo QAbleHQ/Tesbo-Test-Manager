@@ -6,7 +6,7 @@ import type { RagIngestionService } from "../rag/rag-ingestion.service";
 import { IntegrationConnectionInvalidError, IntegrationSyncClient, NotionNotSharedError } from "./integration-sync.client";
 import { IntegrationSyncDecisions } from "./integration-sync-decisions";
 import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.builder";
-import { INTEGRATION_SYNC_NIGHTLY_JIRA_JOB, INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, INTEGRATION_SYNC_RUN_JOB } from "./integration-sync.constants";
+import { INTEGRATION_SYNC_NIGHTLY_JIRA_JOB, INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, INTEGRATION_SYNC_RUN_JOB, MAX_TICKETS_PER_RUN } from "./integration-sync.constants";
 import { IntegrationSyncProcessor } from "./integration-sync.processor";
 import { IntegrationSyncService } from "./integration-sync.service";
 import { RemoteTicket, SyncProvider, SyncRunJobPayload } from "./integration-sync.types";
@@ -517,5 +517,116 @@ describe("IntegrationSyncProcessor, notion provider", () => {
     await processor.process(job("sync-ticket", ticketJob));
     expect(updates).toHaveLength(1);
     expect(build.mock.calls[1][0].description).toBe("- **Status:** Open\n\ncached body");
+  });
+});
+
+/**
+ * A backlog bigger than MAX_TICKETS_PER_RUN used to re-sync the same newest tickets on every Sync,
+ * because every fetch starts at the newest ticket and nothing remembered how far the last run got. A
+ * run now stops after MAX_TICKETS_PER_RUN tickets that still need syncing, marks its pass unfinished, and the next run
+ * of the same pass skips what is already done. This drives three runs over a 5000-ticket backlog with a
+ * stateful fake of the ticket table — a canned response could not show a ticket being skipped *because*
+ * an earlier run stored it.
+ */
+describe.each<SyncProvider>(["jira", "linear", "notion"])("IntegrationSyncProcessor#process — a backlog over the cap is continued, not restarted (%s)", (provider) => {
+  const PAGE = 100;
+  const stamp = (n: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, 0) + n * 60_000).toISOString();
+  const backlog = (size: number, edited: Record<number, string> = {}) =>
+    // Newest first, as every provider fetch returns them.
+    Array.from({ length: size }, (_, i) => remoteTicket({ issueId: `id-${i}`, issueKey: `T-${i}`, updatedAt: edited[i] ?? stamp(size - i) }));
+
+  function harness(tickets: RemoteTicket[]) {
+    // issue id -> upstream updated time as stored, and whether the current pass already synced it.
+    const stored = new Map<string, { updated: number; inPass: boolean }>();
+    let truncatedMarks = 0;
+    const dbQuery = jest.fn((sql: string, params: unknown[] = []) => {
+      if (sql.includes("_project_mappings")) return Promise.resolve({ rows: [{ remote_id: "r-1", remote_key: "ENG", remote_name: "Engineering" }] });
+      if (sql.includes("INSERT INTO ")) {
+        const [issueId, updatedAt] = [params[2], params[13]];
+        stored.set(String(issueId), { updated: new Date(String(updatedAt)).getTime(), inPass: true });
+        return Promise.resolve({ rows: [{ id: `row-${issueId}` }] });
+      }
+      if (sql.includes("t.synced_at >= r.window_start") && sql.includes("ANY(")) {
+        const ids = params[3] as string[];
+        return Promise.resolve({
+          rows: ids.filter((id) => stored.get(id)?.inPass).map((id) => ({ issue_id: id, updated_at: new Date(stored.get(id)!.updated).toISOString() }))
+        });
+      }
+      if (sql.includes("count(*)")) return Promise.resolve({ rows: [{ n: [...stored.values()].filter((s) => s.inPass).length }] });
+      if (sql.includes("SET truncated = true")) truncatedMarks++;
+      return Promise.resolve({ rows: [] });
+    });
+    const fetch = jest.fn(async (_conn: unknown, _key: string, onPage: (page: RemoteTicket[]) => Promise<boolean | void>) => {
+      let total = 0;
+      for (let i = 0; i < tickets.length; i += PAGE) {
+        const page = tickets.slice(i, i + PAGE);
+        const stop = await onPage(page);
+        total += page.length;
+        if (stop) return { total, truncated: true };
+      }
+      return { total, truncated: false };
+    });
+    const made = makeProcessor({
+      db: { query: dbQuery },
+      client: { loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }), fetchJiraTickets: fetch, fetchLinearTickets: fetch, fetchNotionPages: fetch } as never
+    });
+    const payload: SyncRunJobPayload = { runId: "run-1", organizationId: "org-1", projectId: "proj-1", provider, triggeredBy: "user-1" };
+    const run = async () => {
+      (made.runs.enqueueTicketJobs as jest.Mock).mockClear();
+      await made.processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+      const calls = (made.runs.enqueueTicketJobs as jest.Mock).mock.calls;
+      return { queued: (calls[0]?.[0] ?? []) as Array<{ issueKey: string }>, truncatedMarks, finish: (made.runs.finishRun as jest.Mock).mock.calls.at(-1)?.[1] as string | null | undefined };
+    };
+    return { run, stored, db: dbQuery, runs: made.runs };
+  }
+
+  it("syncs a cap's worth per run until the backlog is done — never the same ticket twice", async () => {
+    const CAP = MAX_TICKETS_PER_RUN;
+    const h = harness(backlog(CAP * 2 + 1000));
+
+    const first = await h.run();
+    expect(first.queued).toHaveLength(CAP);
+    expect(first.queued[0].issueKey).toBe("T-0");
+    expect(first.truncatedMarks).toBe(1);
+    expect(String(h.db.mock.calls.find(([sql]) => String(sql).includes("SET error"))?.[1]?.[1])).toMatch(new RegExp(`${CAP}-ticket limit.*${CAP} tickets are synced so far.*run Sync again`));
+
+    const second = await h.run();
+    expect(second.queued).toHaveLength(CAP);
+    expect(second.queued[0].issueKey).toBe(`T-${CAP}`);
+    expect(second.truncatedMarks).toBe(2);
+
+    const third = await h.run();
+    expect(third.queued).toHaveLength(1000);
+    expect(third.queued[0].issueKey).toBe(`T-${CAP * 2}`);
+    // The pass reached the end: no further truncation mark, so the next Sync starts fresh.
+    expect(third.truncatedMarks).toBe(2);
+    expect(h.stored.size).toBe(CAP * 2 + 1000);
+  });
+
+  it("re-syncs a ticket that was edited upstream after the earlier run stored it", async () => {
+    const tickets = backlog(MAX_TICKETS_PER_RUN + 500);
+    const h = harness(tickets);
+    await h.run();
+    // T-5 changes in the provider between the two runs; its stored copy is now stale.
+    tickets[5] = { ...tickets[5], updatedAt: stamp(999_999) };
+
+    const second = await h.run();
+    expect(second.queued.map((t) => t.issueKey)).toContain("T-5");
+    expect(second.queued).toHaveLength(501);
+  });
+
+  it("does not report a limit when the backlog is exactly the cap", async () => {
+    const h = harness(backlog(MAX_TICKETS_PER_RUN));
+    const only = await h.run();
+    expect(only.queued).toHaveLength(MAX_TICKETS_PER_RUN);
+    expect(only.truncatedMarks).toBe(0);
+  });
+
+  it("finishes with a clear note when everything left was already synced in the pass", async () => {
+    const h = harness(backlog(150));
+    await h.run();
+    const again = await h.run();
+    expect(again.queued).toHaveLength(0);
+    expect(again.finish).toBe("Every ticket in Engineering is already synced.");
   });
 });
