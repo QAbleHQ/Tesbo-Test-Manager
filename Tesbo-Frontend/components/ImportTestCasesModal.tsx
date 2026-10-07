@@ -278,7 +278,22 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
   const parseWorkbook = useCallback(async (inputFile: File): Promise<ParsedSheet[]> => {
     const XLSX = await import("xlsx");
     const buffer = await inputFile.arrayBuffer();
-    const workbook = XLSX.read(buffer, { type: "array", cellDates: false });
+    // SheetJS decodes a CSV handed over as bytes with a legacy codepage unless it carries a UTF-8 BOM,
+    // so a BOM-less UTF-8 file (Cyrillic, accents, CJK) arrives as mojibake ("Ð¿Ñ…"). A CSV is decoded
+    // here instead and handed over as a string, which SheetJS leaves alone. Invalid UTF-8 means a
+    // legacy Windows export — Russian Excel writes windows-1251 — so fall back to that.
+    let workbook: import("xlsx").WorkBook;
+    if (/\.csv$/i.test(inputFile.name)) {
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+      } catch {
+        text = new TextDecoder("windows-1251").decode(buffer);
+      }
+      workbook = XLSX.read(text, { type: "string", cellDates: false });
+    } else {
+      workbook = XLSX.read(buffer, { type: "array", cellDates: false });
+    }
     const sheets = workbook.SheetNames.map((name) => {
       const worksheet = workbook.Sheets[name];
       const rawRows = XLSX.utils.sheet_to_json<string[]>(worksheet, {
