@@ -656,6 +656,59 @@ function validateProjectIcon(raw: unknown): ProjectIcon | undefined {
   return { color, glyph };
 }
 
+const ENVIRONMENT_NAME_MAX_LENGTH = 50;
+const ENVIRONMENT_URL_MAX_LENGTH = 500;
+
+/**
+ * `settings` arrives either as an object (API callers) or a pre-stringified object (the settings
+ * screen). Both are stored as a jsonb object; anything else is a 400 rather than a value that
+ * silently wipes the blob or lands as a scalar. Also mirrors the UI's testRunEnvironments rules.
+ */
+function parseProjectSettingsInput(raw: unknown): Body | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new BadRequestException({ error: "settings must be a JSON object" });
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BadRequestException({ error: "settings must be a JSON object" });
+  }
+  const settings = value as Body;
+  const envs = settings.testRunEnvironments;
+  if (envs !== undefined) {
+    if (!Array.isArray(envs)) throw new BadRequestException({ error: "testRunEnvironments must be an array" });
+    const names = new Set<string>();
+    const urls = new Set<string>();
+    for (const item of envs) {
+      const name = typeof item?.name === "string" ? item.name.trim() : "";
+      const url = typeof item?.url === "string" ? item.url.trim() : "";
+      if (!name) throw new BadRequestException({ error: "Environment name is required" });
+      if (name.length > ENVIRONMENT_NAME_MAX_LENGTH)
+        throw new BadRequestException({ error: `Environment name must be at most ${ENVIRONMENT_NAME_MAX_LENGTH} characters` });
+      if (!url) throw new BadRequestException({ error: "Environment URL is required" });
+      if (url.length > ENVIRONMENT_URL_MAX_LENGTH)
+        throw new BadRequestException({ error: `Environment URL must be at most ${ENVIRONMENT_URL_MAX_LENGTH} characters` });
+      let protocol = "";
+      try {
+        protocol = new URL(url).protocol;
+      } catch {
+        throw new BadRequestException({ error: "Enter a valid URL, e.g. https://staging.example.com" });
+      }
+      if (protocol !== "http:" && protocol !== "https:")
+        throw new BadRequestException({ error: "Environment URL must start with http:// or https://" });
+      if (names.has(name.toLowerCase())) throw new BadRequestException({ error: "An environment with this name already exists" });
+      if (urls.has(url.toLowerCase())) throw new BadRequestException({ error: "This URL is already added to another environment" });
+      names.add(name.toLowerCase());
+      urls.add(url.toLowerCase());
+    }
+  }
+  return settings;
+}
+
 /** Shared by createProject/updateProject. `name`/`description` undefined means "not being changed". */
 function validateProjectFields(name: string | undefined, description: string | undefined): void {
   if (name !== undefined) {
@@ -3281,25 +3334,34 @@ export class LegacyService implements OnModuleInit {
     const description = body.description !== undefined ? String(body.description) : undefined;
     validateProjectFields(name, description);
     const icon = validateProjectIcon(body.icon);
+    const settings = parseProjectSettingsInput(body.settings);
+    // One statement, so a failing icon write can no longer leave name/settings half-saved while the
+    // caller is told the save failed. The icon is a targeted jsonb_set rather than a read-modify-write
+    // of the whole blob, so it can't race a concurrent save of testcaseIdPrefix/testRunEnvironments
+    // and silently drop whichever one lost the race. `base` unwraps a settings value that an earlier
+    // build stored as a JSON *string* (the UI sent settings pre-stringified and this method
+    // stringified it again) — jsonb_set raises "cannot set path in scalar" on those rows.
     await this.db.query(
       `UPDATE projects SET
        name = COALESCE($2, name),
        description = COALESCE($3, description),
-       settings = COALESCE($4::jsonb, settings),
+       settings = CASE WHEN $5::jsonb IS NULL THEN COALESCE($4::jsonb, settings)
+         ELSE jsonb_set(
+           COALESCE($4::jsonb, CASE jsonb_typeof(settings)
+             WHEN 'object' THEN settings
+             WHEN 'string' THEN (settings #>> '{}')::jsonb
+             ELSE '{}'::jsonb END),
+           '{icon}', $5::jsonb, true) END,
        updated_at = now()
        WHERE id = $1`,
-      [id, name ?? null, description ?? null, body.settings ? JSON.stringify(body.settings) : null]
+      [
+        id,
+        name ?? null,
+        description ?? null,
+        settings ? JSON.stringify(settings) : null,
+        icon !== undefined ? JSON.stringify(icon) : null,
+      ]
     );
-    if (icon !== undefined) {
-      // A targeted jsonb_set rather than a read-modify-write of the whole settings blob, so an icon
-      // change can't race a concurrent save of testcaseIdPrefix/testRunEnvironments (or vice versa)
-      // and silently drop whichever one lost the race.
-      await this.db.query(
-        `UPDATE projects SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{icon}', $2::jsonb, true), updated_at = now()
-         WHERE id = $1`,
-        [id, JSON.stringify(icon)]
-      );
-    }
     // This request's own memoized project row (key/settings/organization_id) is now stale — drop it
     // so anything reading it later in this same request (externalIdPrefix after a testcaseIdPrefix
     // change, requireProjectAccess after a rename) sees the write that just happened.

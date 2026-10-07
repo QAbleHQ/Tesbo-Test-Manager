@@ -1211,3 +1211,164 @@ test.describe("projects overview", () => {
     }
   });
 });
+
+/*
+ * Project Settings -> Test Environments "Save always 500s".
+ *
+ * The settings screen sends `settings` as a pre-stringified JSON object. updateProject() stringified
+ * it a second time, so Postgres stored a jsonb *string*, and the icon write that follows
+ * (jsonb_set on '{icon}') then raised "cannot set path in scalar" -> 500. The first UPDATE had already
+ * committed, so the "failed" save still persisted the environments (and corrupted the column).
+ */
+test.describe("project settings save (test run environments)", () => {
+  // Must be one of the server's supported palette colours (same value the icon tests above use).
+  const PALETTE_COLOR = "#1F7A3D";
+
+  async function makeProject(request: APIRequestContext, label: string) {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Env ${label} ${suffix}`.slice(0, 30), key: `E2EENV${suffix}` },
+    });
+    expect(res.ok()).toBeTruthy();
+    return (await res.json()) as { id: string };
+  }
+  const settingsOf = async (request: APIRequestContext, id: string) =>
+    (await (await request.get(`/api/projects/${id}`)).json()).settings;
+  const envs = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ name: `Env ${i}`, url: `https://env-${i}.example.com` }));
+
+  test("saves the stringified settings + icon the UI sends, stored as an object", { tag: '@tesbo.testId("TES-TC-3021")' }, async ({ request }) => {
+    const project = await makeProject(request, "ui");
+    try {
+      const environments = [
+        { name: "Prod", url: "https://app.tesbo.io" },
+        { name: "localhost", url: "http://localhost:1020" },
+      ];
+      const res = await request.patch(`/api/projects/${project.id}`, {
+        data: {
+          name: "E2E Env renamed",
+          description: "d",
+          settings: JSON.stringify({ testcaseIdPrefix: "TC", testRunEnvironments: environments }),
+          icon: { color: PALETTE_COLOR, glyph: "Q" },
+        },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), await res.text()).toBeLessThan(300);
+
+      const settings = await settingsOf(request, project.id);
+      expect(typeof settings, "settings must be a jsonb object, not a double-encoded string").toBe("object");
+      expect(settings.testRunEnvironments).toEqual(environments);
+      expect(settings.icon).toEqual({ color: PALETTE_COLOR, glyph: "Q" });
+
+      // Second save in a row: the old failure corrupted the column, so every later save died too.
+      const again = await request.patch(`/api/projects/${project.id}`, {
+        data: { settings: JSON.stringify({ testRunEnvironments: [environments[0]] }), icon: { color: null, glyph: null } },
+        failOnStatusCode: false,
+      });
+      expect(again.status(), await again.text()).toBeLessThan(300);
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toEqual([environments[0]]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("an empty environment list clears the saved ones; 50 environments round-trip", { tag: '@tesbo.testId("TES-TC-3022")' }, async ({ request }) => {
+    const project = await makeProject(request, "many");
+    try {
+      await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: envs(50) } } });
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toHaveLength(50);
+      await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: [] } } });
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toEqual([]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a payload without settings leaves saved environments untouched", { tag: '@tesbo.testId("TES-TC-3023")' }, async ({ request }) => {
+    const project = await makeProject(request, "keep");
+    try {
+      await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: envs(2) } } });
+      const res = await request.patch(`/api/projects/${project.id}`, { data: { description: "only this" } });
+      expect(res.ok()).toBeTruthy();
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toEqual(envs(2));
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  const invalid: Array<[string, unknown, RegExp]> = [
+    ["non-JSON string", "{not json", /settings must be a JSON object/],
+    ["array settings", [1, 2], /settings must be a JSON object/],
+    ["number settings", 7, /settings must be a JSON object/],
+    ["environments not an array", { testRunEnvironments: "nope" }, /must be an array/],
+    ["blank name", { testRunEnvironments: [{ name: "   ", url: "https://a.example.com" }] }, /name is required/i],
+    ["missing url", { testRunEnvironments: [{ name: "A" }] }, /URL is required/i],
+    ["name over 50 chars", { testRunEnvironments: [{ name: "n".repeat(51), url: "https://a.example.com" }] }, /at most 50/],
+    ["url over 500 chars", { testRunEnvironments: [{ name: "A", url: `https://${"a".repeat(500)}.com` }] }, /at most 500/],
+    ["url not parseable", { testRunEnvironments: [{ name: "A", url: "not a url" }] }, /valid URL/i],
+    ["non-http scheme", { testRunEnvironments: [{ name: "A", url: "ftp://a.example.com" }] }, /http:\/\/ or https:\/\//],
+    [
+      "duplicate name in another casing",
+      { testRunEnvironments: [{ name: "Stage", url: "https://a.example.com" }, { name: "STAGE", url: "https://b.example.com" }] },
+      /already exists/i,
+    ],
+    [
+      "duplicate url in another casing",
+      { testRunEnvironments: [{ name: "A", url: "https://a.example.com" }, { name: "B", url: "https://A.example.com" }] },
+      /already added/i,
+    ],
+  ];
+  for (const [label, settings, message] of invalid) {
+    test(`rejects ${label} with a 400 and saves nothing`, { tag: '@tesbo.testId("TES-TC-3024")' }, async ({ request }) => {
+      const project = await makeProject(request, "bad");
+      try {
+        await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: envs(1) } } });
+        const res = await request.patch(`/api/projects/${project.id}`, {
+          data: { name: "should not apply", settings },
+          failOnStatusCode: false,
+        });
+        expect(res.status(), await res.text()).toBe(400);
+        expect((await res.json()).error).toMatch(message);
+        // Nothing half-applied: neither the rename nor the settings.
+        const after = await (await request.get(`/api/projects/${project.id}`)).json();
+        expect(after.name).not.toBe("should not apply");
+        expect(after.settings.testRunEnvironments).toEqual(envs(1));
+      } finally {
+        await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+      }
+    });
+  }
+
+  test("a bad icon rejects the whole save, environments included", { tag: '@tesbo.testId("TES-TC-3025")' }, async ({ request }) => {
+    const project = await makeProject(request, "icon");
+    try {
+      const res = await request.patch(`/api/projects/${project.id}`, {
+        data: { settings: { testRunEnvironments: envs(2) }, icon: { color: "#123456" } },
+        failOnStatusCode: false,
+      });
+      expect(res.status()).toBe(400);
+      expect((await settingsOf(request, project.id))?.testRunEnvironments ?? []).toEqual([]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("an unauthenticated caller cannot save settings", { tag: '@tesbo.testId("TES-TC-3026")' }, async ({ request }) => {
+    const project = await makeProject(request, "anon");
+    try {
+      const anon = await anonymousContext();
+      try {
+        const res = await anon.patch(`/api/projects/${project.id}`, {
+          data: { settings: { testRunEnvironments: envs(1) } },
+          failOnStatusCode: false,
+        });
+        expect([401, 403]).toContain(res.status());
+      } finally {
+        await anon.dispose();
+      }
+      expect((await settingsOf(request, project.id))?.testRunEnvironments ?? []).toEqual([]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+});
