@@ -998,6 +998,69 @@ test.describe("top bar — notifications", () => {
       deleteNotification(id);
     }
   });
+
+  test("NOTIF-UI-10 the bell shows an unread badge that counts down as notifications are read", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a real notification row");
+    const first = seedNotification({ title: `Unread one ${Date.now()}`, linkEntityType: "project", linkEntityId: tenant!.projectId });
+    const second = seedNotification({ title: `Unread two ${Date.now()}`, linkEntityType: "project", linkEntityId: tenant!.projectId });
+    try {
+      const api = await screensApi();
+      let unread: number;
+      try {
+        unread = (await (await api.get("/api/notifications")).json()).filter((n: { read_at: string | null }) => !n.read_at).length;
+      } finally {
+        await api.dispose();
+      }
+      expect(unread).toBeGreaterThanOrEqual(2);
+
+      // The count is fetched on page load, before the panel has ever been opened.
+      await page.reload();
+      const badge = page.getByTestId("notification-badge");
+      await expect(badge).toHaveText(unread > 9 ? "9+" : String(unread));
+      await expect(bell(page)).toHaveAccessibleName(`Notifications, ${unread} unread`);
+
+      await bell(page).click();
+      await panel(page).getByRole("menuitem", { name: /Unread one/ }).click();
+      await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.projectId}$`));
+
+      // Read state is server-side, so the badge on the next page load is one lower.
+      await page.goto("/projects");
+      await expect(badge).toHaveText(unread - 1 > 9 ? "9+" : String(unread - 1));
+    } finally {
+      deleteNotification(first);
+      deleteNotification(second);
+    }
+  });
+
+  test("NOTIF-UI-11 each Phase 1 link type resolves to its detail page", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed a real notification row");
+    const pid = tenant!.projectId;
+    const cases: Array<{ title: string; type: string; id: string; url: RegExp }> = [
+      { title: "Link members", type: "workspace_members", id: pid, url: /\/settings\/members$/ },
+      { title: "Link projects", type: "projects_list", id: pid, url: /\/projects$/ },
+      // The invite page itself shows "invalid" for a made-up token but stays on its URL.
+      { title: "Link invitation", type: "invitation", id: "a".repeat(64), url: new RegExp(`/invite/${"a".repeat(64)}$`) },
+      { title: "Link project members", type: "project_members", id: pid, url: new RegExp(`/projects/${pid}/members$`) },
+      { title: "Link run", type: "test_run", id: `${pid}:00000000-0000-4000-8000-000000000001`, url: new RegExp(`/projects/${pid}/cycles/00000000-0000-4000-8000-000000000001$`) },
+      { title: "Link kb doc", type: "knowledge_document", id: `${pid}:00000000-0000-4000-8000-000000000003`, url: new RegExp(`/projects/${pid}/knowledge-base/documents/00000000-0000-4000-8000-000000000003$`) },
+      { title: "Link bug", type: "bug", id: `${pid}:00000000-0000-4000-8000-000000000002`, url: new RegExp(`/projects/${pid}/bugs/00000000-0000-4000-8000-000000000002$`) },
+    ];
+    const stamp = Date.now();
+    const ids = cases.map((c) => seedNotification({ title: `${c.title} ${stamp}`, linkEntityType: c.type, linkEntityId: c.id }));
+    try {
+      for (const c of cases) {
+        await page.goto("/projects");
+        await bell(page).click();
+        const item = panel(page).getByRole("menuitem", { name: new RegExp(`${c.title} ${stamp}`) });
+        // A real <button>: a link type the frontend does not know would render as an inert <div>.
+        expect(await item.evaluate((el) => el.tagName), `${c.type} should be clickable`).toBe("BUTTON");
+        await item.click();
+        await expect(page, `${c.type} navigated somewhere unexpected`).toHaveURL(c.url);
+      }
+    } finally {
+      ids.forEach(deleteNotification);
+    }
+  });
 });
 
 /*

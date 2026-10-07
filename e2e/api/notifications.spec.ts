@@ -1,7 +1,17 @@
 import { expect, request, test, type APIRequestContext } from "@playwright/test";
-import { env } from "../utils/env";
-import { exec, literal } from "../utils/psql";
-import { loginAs, provisionRbacTenant, rbacSuiteSkipReason, type RbacTenant } from "../utils/rbac-tenant";
+import { env, testAddress } from "../utils/env";
+import { exec, literal, scalar } from "../utils/psql";
+import {
+  clearInvitations,
+  detachUserByEmail,
+  loginAs,
+  mintInviteToken,
+  provisionRbacTenant,
+  rbacSuiteSkipReason,
+  resetRbacMembership,
+  seedFixtureUser,
+  type RbacTenant,
+} from "../utils/rbac-tenant";
 
 /*
  * GET /api/notifications and POST /api/notifications/:id/read.
@@ -180,5 +190,509 @@ test.describe("notifications — real rows", () => {
     } finally {
       deleteNotification(id);
     }
+  });
+});
+
+/*
+ * The Phase 1 notification matrix: workspace + project membership, test runs, bugs.
+ *
+ * Messages are asserted verbatim — they are the product matrix's wording, so a reworded string is a
+ * behaviour change. Every scenario also pins who does NOT hear about it: the actor (never notified
+ * of their own action), and members of the same workspace who have no reason to care.
+ *
+ * Own tenant ("notification-events"): these tests change roles, remove members and accept
+ * invitations. Fixtures carry a unique stamp in their names and everything is purged in afterEach,
+ * so re-runs against the persistent volume don't collide.
+ */
+test.describe("notifications — Phase 1 matrix", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext;
+  let asManager: APIRequestContext;
+  let asQa: APIRequestContext;
+  let asGuest: APIRequestContext;
+  let workspaceName = "";
+  const PROJECT_NAME = "RBAC Main Project";
+  const SECOND_PROJECT_NAME = "RBAC Second Project";
+
+  type Row = { id: string; type: string; title: string; link_entity_type: string | null; link_entity_id: string | null; read_at: string | null };
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("notification-events");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+    asManager = await loginAs(tenant.manager);
+    asQa = await loginAs(tenant.qa);
+    asGuest = await loginAs(tenant.guest);
+    workspaceName = (await (await asOwner.get("/api/workspace")).json()).name;
+    purge(tenant);
+  });
+
+  test.afterAll(async () => {
+    if (tenant) {
+      purge(tenant);
+      resetRbacMembership(tenant);
+    }
+    await Promise.all([asOwner, asManager, asQa, asGuest].filter(Boolean).map((c) => c.dispose()));
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  test.afterEach(() => {
+    if (tenant) {
+      purge(tenant);
+      resetRbacMembership(tenant);
+      clearInvitations(tenant);
+    }
+  });
+
+  function purge(t: RbacTenant): void {
+    const users = [t.owner, t.manager, t.qa, t.guest].map((u) => literal(u.userId)).join(", ");
+    exec(`DELETE FROM notifications WHERE user_id IN (${users});`);
+    const projects = `${literal(t.mainProjectId)}, ${literal(t.secondProjectId)}`;
+    exec(`DELETE FROM bug_comments WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM bug_links WHERE bug_id IN (SELECT id FROM bugs WHERE project_id IN (${projects}) AND title LIKE 'E2E Notif%');`);
+    exec(`DELETE FROM bugs WHERE project_id IN (${projects}) AND title LIKE 'E2E Notif%';`);
+    exec(
+      "DELETE FROM executions WHERE cycle_item_id IN (SELECT ci.id FROM cycle_items ci JOIN cycles c " +
+        `ON c.id = ci.cycle_id WHERE c.project_id IN (${projects}) AND c.name LIKE 'E2E Notif%');`,
+    );
+    exec(`DELETE FROM cycle_items WHERE cycle_id IN (SELECT id FROM cycles WHERE project_id IN (${projects}) AND name LIKE 'E2E Notif%');`);
+    exec(`DELETE FROM cycles WHERE project_id IN (${projects}) AND name LIKE 'E2E Notif%';`);
+    exec(`DELETE FROM testcases WHERE project_id IN (${projects}) AND title LIKE 'E2E Notif%';`);
+  }
+
+  const stamp = (label: string) => `E2E Notif ${label} ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+
+  async function inbox(api: APIRequestContext): Promise<Row[]> {
+    const res = await api.get("/api/notifications");
+    expect(res.status(), await res.text()).toBe(200);
+    return res.json();
+  }
+
+  /** Titles in a user's inbox, newest first. */
+  async function titles(api: APIRequestContext): Promise<string[]> {
+    return (await inbox(api)).map((r) => r.title);
+  }
+
+  async function newBug(data: Record<string, unknown> = {}): Promise<{ id: string; externalId: string }> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/bugs`, { data: { title: stamp("bug"), ...data }, failOnStatusCode: false });
+    expect(res.status(), `creating a bug — ${await res.text()}`).toBeLessThan(300);
+    return res.json();
+  }
+
+  async function seedRun(count = 2): Promise<{ cycleId: string; cycleName: string; executionIds: string[]; tcIds: string[] }> {
+    const testcaseIds: string[] = [];
+    const tcIds: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, { data: { title: stamp(`case ${i + 1}`) } });
+      expect(res.status(), await res.text()).toBe(201);
+      const tc = await res.json();
+      testcaseIds.push(tc.id);
+      tcIds.push(tc.externalId);
+    }
+    const cycleName = stamp("run");
+    // ownerId: the run owner is one of the two recipients of a failed / blocked case.
+    const cycle = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/cycles`, { data: { name: cycleName, ownerId: tenant!.owner.userId } });
+    expect(cycle.status(), await cycle.text()).toBe(201);
+    const cycleId = (await cycle.json()).id;
+    expect((await asOwner.post(`/api/cycles/${cycleId}/testcases`, { data: { testcaseIds } })).status()).toBeLessThan(400);
+    const executions = await (await asOwner.get(`/api/cycles/${cycleId}/executions`)).json();
+    return { cycleId, cycleName, executionIds: executions.map((e: { id: string }) => e.id), tcIds };
+  }
+
+  // ─── Workspace ─────────────────────────────────────────────────────────────
+
+  test("NOTIF-P1-01 a workspace role change tells the affected user, once, and only on a real change", async () => {
+    const change = (role: string) => asOwner.post("/api/workspace/members/role", { data: { userId: tenant!.qa.userId, role }, failOnStatusCode: false });
+    expect((await change("manager")).ok()).toBeTruthy();
+
+    const qa = await inbox(asQa);
+    expect(qa.map((n) => n.title)).toEqual([`Your role in ${workspaceName} has been changed to Manager.`]);
+    expect(qa[0]).toMatchObject({ type: "workspace_role_changed", read_at: null });
+    // The actor is never told about their own action, and a bystander has no reason to be.
+    expect(await titles(asOwner)).toEqual([]);
+    expect(await titles(asManager)).toEqual([]);
+
+    // Re-submitting the role they already hold is not a change.
+    expect((await change("manager")).ok()).toBeTruthy();
+    expect(await titles(asQa)).toHaveLength(1);
+  });
+
+  test("NOTIF-P1-02 removing someone from the workspace tells them, with a link they can still click", async () => {
+    const res = await asOwner.delete(`/api/workspace/members/${tenant!.qa.userId}`, { failOnStatusCode: false });
+    expect(res.ok(), await res.text()).toBeTruthy();
+
+    // Read straight from the table: the removed user can no longer reach the workspace through the
+    // API, and the notification is the only thing that tells them why.
+    const rows = scalar(
+      `SELECT COALESCE(string_agg(title || '|' || COALESCE(link_entity_type, ''), ';'), '') FROM notifications WHERE user_id = ${literal(tenant!.qa.userId)};`,
+    );
+    expect(rows).toBe(`You have been removed from ${workspaceName}.|projects_list`);
+    expect(await titles(asOwner)).toEqual([]);
+  });
+
+  test("NOTIF-P1-03 a workspace invitation reaches an existing user once, and the acceptance reaches the inviter once", async () => {
+    const email = testAddress(`notif-invite-${Date.now()}`);
+    const invitee = seedFixtureUser(email, "E2E Notif Invitee");
+    const asInvitee = await loginAs(invitee);
+    try {
+      const created = await asOwner.post("/api/workspace/invitations", { data: { email, role: "qa_engineer", projectIds: [tenant!.secondProjectId] } });
+      expect(created.ok(), await created.text()).toBeTruthy();
+      const { id } = await created.json();
+
+      // An invitation that includes a project is two invitations: one to the workspace, one to the project.
+      expect((await titles(asInvitee)).sort()).toEqual(
+        [`You've been invited to join ${SECOND_PROJECT_NAME}.`, `You've been invited to join ${workspaceName}.`].sort(),
+      );
+      // Both open the accept page the invitation email links to: /invite/<token>.
+      const created1 = await inbox(asInvitee);
+      expect(created1.every((n) => n.link_entity_type === "invitation" && /^[0-9a-f]{64}$/.test(n.link_entity_id ?? ""))).toBe(true);
+      const firstToken = created1[0].link_entity_id;
+
+      // Resending reuses the invitation's dedupe key: still one of each. It also rotates the token,
+      // so the existing notifications must now carry the new one, not a dead link.
+      expect((await asOwner.post(`/api/workspace/invitations/${id}/resend`, { failOnStatusCode: false })).ok()).toBeTruthy();
+      const afterResend = await inbox(asInvitee);
+      expect(afterResend).toHaveLength(2);
+      expect(afterResend[0].link_entity_id).not.toBe(firstToken);
+      expect(new Set(afterResend.map((n) => n.link_entity_id)).size).toBe(1);
+
+      // If the original send never produced a notification, resending is the repair.
+      exec(`DELETE FROM notifications WHERE user_id = ${literal(invitee.userId)};`);
+      expect(await inbox(asInvitee)).toHaveLength(0);
+      expect((await asOwner.post(`/api/workspace/invitations/${id}/resend`, { failOnStatusCode: false })).ok()).toBeTruthy();
+      const repaired = await inbox(asInvitee);
+      expect(repaired.map((n) => n.title).sort()).toEqual(
+        [`You've been invited to join ${SECOND_PROJECT_NAME}.`, `You've been invited to join ${workspaceName}.`].sort(),
+      );
+      expect(repaired.every((n) => n.link_entity_type === "invitation")).toBe(true);
+
+      const token = mintInviteToken(id);
+      const accept = await asInvitee.post(`/api/invitations/${token}/accept`, { data: {}, failOnStatusCode: false });
+      expect(accept.ok(), await accept.text()).toBeTruthy();
+
+      // The owner is both the inviter and a workspace/project owner, and still gets exactly one of each.
+      const owner = await titles(asOwner);
+      expect(owner.filter((t) => t === `E2E Notif Invitee accepted your invitation to ${workspaceName}.`)).toHaveLength(1);
+      expect(owner.filter((t) => t === `E2E Notif Invitee accepted your invitation to ${SECOND_PROJECT_NAME}.`)).toHaveLength(1);
+      // Not the inviter, not an owner: no notification.
+      expect(await titles(asManager)).toEqual([]);
+      expect(await titles(asQa)).toEqual([]);
+      // The accepting user is the actor of the acceptance.
+      expect((await titles(asInvitee)).some((t) => t.includes("accepted your invitation"))).toBe(false);
+    } finally {
+      await asInvitee.dispose();
+      exec(`DELETE FROM notifications WHERE user_id = ${literal(invitee.userId)};`);
+      detachUserByEmail(email);
+    }
+  });
+
+  test("NOTIF-P1-04 inviting an email with no account writes no notification and does not fail the invite", async () => {
+    const email = testAddress(`notif-noaccount-${Date.now()}`);
+    const res = await asOwner.post("/api/workspace/invitations", { data: { email, role: "qa_engineer" }, failOnStatusCode: false });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    expect(
+      scalar(
+        `SELECT COUNT(*) FROM notifications WHERE title LIKE ${literal(`%invited to join ${workspaceName}%`)} ` +
+          `AND user_id IN (SELECT id FROM users WHERE lower(email) = ${literal(email.toLowerCase())});`,
+      ),
+    ).toBe("0");
+  });
+
+  // ─── Project ───────────────────────────────────────────────────────────────
+
+  test("NOTIF-P1-05 adding, re-roling and removing a project member each tell that member", async () => {
+    const base = `/api/projects/${tenant!.mainProjectId}/members`;
+    const added = await asOwner.post(base, { data: { userId: tenant!.guest.userId, role: "qa_engineer" }, failOnStatusCode: false });
+    expect(added.ok(), await added.text()).toBeTruthy();
+    expect(await titles(asGuest)).toEqual([`You've been invited to join ${PROJECT_NAME}.`]);
+
+    // Same role again: not a change.
+    expect((await asOwner.post(base, { data: { userId: tenant!.guest.userId, role: "qa_engineer" }, failOnStatusCode: false })).ok()).toBeTruthy();
+    expect(await titles(asGuest)).toHaveLength(1);
+
+    expect((await asOwner.post(base, { data: { userId: tenant!.guest.userId, role: "manager" }, failOnStatusCode: false })).ok()).toBeTruthy();
+    expect((await titles(asGuest))[0]).toBe(`Your role in ${PROJECT_NAME} has been changed to Manager.`);
+
+    const removed = await asOwner.delete(`${base}/${tenant!.guest.userId}`, { failOnStatusCode: false });
+    expect(removed.ok(), await removed.text()).toBeTruthy();
+    expect((await titles(asGuest))[0]).toBe(`You have been removed from ${PROJECT_NAME}.`);
+
+    // The actor and an uninvolved member hear nothing.
+    expect(await titles(asOwner)).toEqual([]);
+    expect(await titles(asQa)).toEqual([]);
+  });
+
+  // ─── Bugs ──────────────────────────────────────────────────────────────────
+
+  test("NOTIF-P1-06 a bug filed with an assignee tells the assignee, links to the bug, and read state persists", async () => {
+    const bug = await newBug({ assigneeId: tenant!.qa.userId });
+    const [row] = await inbox(asQa);
+    expect(row.title).toBe(`Bug ${bug.externalId} has been assigned to you.`);
+    expect(row).toMatchObject({ type: "bug_assigned", link_entity_type: "bug", link_entity_id: `${tenant!.mainProjectId}:${bug.id}`, read_at: null });
+    expect(await titles(asOwner)).toEqual([]);
+
+    // 201, not 200: see NOTIF-A-07.
+    expect((await asQa.post(`/api/notifications/${row.id}/read`)).status()).toBe(201);
+    expect((await inbox(asQa))[0].read_at).toBeTruthy();
+  });
+
+  test("NOTIF-P1-07 assigning, reassigning and self-assigning a bug notify the right person", async () => {
+    const bug = await newBug();
+    expect(await titles(asQa)).toEqual([]);
+
+    expect((await asOwner.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: tenant!.qa.userId } })).ok()).toBeTruthy();
+    expect(await titles(asQa)).toEqual([`Bug ${bug.externalId} has been assigned to you.`]);
+
+    expect((await asOwner.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: tenant!.manager.userId } })).ok()).toBeTruthy();
+    expect(await titles(asManager)).toEqual([`Bug ${bug.externalId} has been reassigned to you.`]);
+    expect(await titles(asQa)).toHaveLength(1); // the previous assignee is not told
+
+    // Assigning it to yourself is your own action on your own item.
+    expect((await asOwner.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: tenant!.owner.userId } })).ok()).toBeTruthy();
+    expect(await titles(asOwner)).toEqual([]);
+
+    // Saving without changing the assignee notifies nobody new.
+    expect((await asOwner.patch(`/api/bugs/${bug.id}`, { data: { title: stamp("renamed") } })).ok()).toBeTruthy();
+    expect(await titles(asManager)).toHaveLength(1);
+  });
+
+  test("NOTIF-P1-08 a bug status change goes to the reporter and the assignee, never the person who made it", async () => {
+    const bug = await newBug({ assigneeId: tenant!.manager.userId }); // reporter: owner, assignee: manager
+    expect((await asQa.patch(`/api/bugs/${bug.id}`, { data: { status: "Closed" } })).ok()).toBeTruthy();
+
+    const expected = `Bug ${bug.externalId} status changed to Closed.`;
+    expect(await titles(asOwner)).toEqual([expected]);
+    expect((await titles(asManager)).includes(expected)).toBe(true);
+    expect(await titles(asQa)).toEqual([]);
+
+    // The assignee closing their own bug: the reporter hears it, the assignee does not.
+    const other = await newBug({ assigneeId: tenant!.manager.userId });
+    expect((await asManager.patch(`/api/bugs/${other.id}`, { data: { status: "Closed" } })).ok()).toBeTruthy();
+    expect((await titles(asOwner)).includes(`Bug ${other.externalId} status changed to Closed.`)).toBe(true);
+    expect((await titles(asManager)).includes(`Bug ${other.externalId} status changed to Closed.`)).toBe(false);
+
+    // A no-op status save is not a change.
+    const count = (await titles(asOwner)).length;
+    expect((await asManager.patch(`/api/bugs/${other.id}`, { data: { status: "Closed" } })).ok()).toBeTruthy();
+    expect(await titles(asOwner)).toHaveLength(count);
+  });
+
+  test("NOTIF-P1-09 an @mention in a bug comment notifies the mentioned member only — not the author, not a non-member", async () => {
+    const bug = await newBug();
+    const res = await asQa.post(`/api/projects/${tenant!.mainProjectId}/bugs/${bug.id}/comments`, {
+      // The guest is a workspace member but not a project member: never mentionable, never notified.
+      data: { body: "@E2E notification-events Manager please look. cc @E2E notification-events Guest and @E2E notification-events QA" },
+    });
+    expect(res.status(), await res.text()).toBe(201);
+
+    const [row] = await inbox(asManager);
+    expect(row.title).toBe(`E2E notification-events QA mentioned you on bug ${bug.externalId}.`);
+    expect(row).toMatchObject({ type: "bug_mentioned", link_entity_type: "bug", link_entity_id: `${tenant!.mainProjectId}:${bug.id}` });
+    expect(await titles(asQa)).toEqual([]);
+    expect(await titles(asGuest)).toEqual([]);
+  });
+
+  // ─── Comment replies ───────────────────────────────────────────────────────
+
+  test("NOTIF-P1-09b a reply notifies everyone already in the thread — never the replier, never someone outside it", async () => {
+    const bug = await newBug();
+    const comments = `/api/projects/${tenant!.mainProjectId}/bugs/${bug.id}/comments`;
+    const top = await asQa.post(comments, { data: { body: "Reproduced on build 42" } });
+    expect(top.status(), await top.text()).toBe(201);
+    const topId = (await top.json()).id;
+
+    const reply = await asManager.post(comments, { data: { body: "Thanks, looking", parentCommentId: topId } });
+    expect(reply.status(), await reply.text()).toBe(201);
+
+    const [row] = await inbox(asQa);
+    expect(row.title).toBe("E2E notification-events Manager replied to your comment.");
+    expect(row).toMatchObject({ type: "comment_reply", link_entity_type: "bug", link_entity_id: `${tenant!.mainProjectId}:${bug.id}` });
+    expect(await titles(asManager)).toEqual([]); // the replier
+    expect(await titles(asOwner)).toEqual([]); // a bystander
+
+    // The thread continues: the UI's Reply on a reply also sends the top comment as the parent, so the
+    // earlier replier (manager) is told, and the author replying to their own thread is not.
+    expect((await asQa.post(comments, { data: { body: "Adding detail", parentCommentId: topId } })).status()).toBe(201);
+    expect(await titles(asQa)).toHaveLength(1);
+    expect(await titles(asManager)).toEqual(["E2E notification-events QA replied to your comment."]);
+    expect(await titles(asOwner)).toEqual([]);
+
+    // A third person joining the thread tells both earlier participants, once each.
+    expect((await asOwner.post(comments, { data: { body: "Same here", parentCommentId: topId } })).status()).toBe(201);
+    expect(await titles(asQa)).toHaveLength(2);
+    expect(await titles(asManager)).toHaveLength(2);
+    expect(await titles(asOwner)).toEqual([]);
+
+    // A top-level comment (not a reply) tells nobody.
+    expect((await asManager.post(comments, { data: { body: "Unrelated note" } })).status()).toBe(201);
+    expect(await titles(asQa)).toHaveLength(2);
+    expect(await titles(asManager)).toHaveLength(2);
+  });
+
+  test("NOTIF-P1-09c a reply that also @mentions the author sends the mention, not a second notification", async () => {
+    const bug = await newBug();
+    const comments = `/api/projects/${tenant!.mainProjectId}/bugs/${bug.id}/comments`;
+    const topId = (await (await asQa.post(comments, { data: { body: "First" } })).json()).id;
+    const reply = await asManager.post(comments, { data: { body: "@E2E notification-events QA agreed", parentCommentId: topId } });
+    expect(reply.status(), await reply.text()).toBe(201);
+    expect(await titles(asQa)).toEqual([`E2E notification-events Manager mentioned you on bug ${bug.externalId}.`]);
+  });
+
+  test("NOTIF-P1-09d a reply to a knowledge base comment notifies its author and opens the document", async () => {
+    const created = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents`, {
+      data: { title: stamp("kb doc"), contentText: "Body", contentHtml: "<p>Body</p>", documentType: "general" },
+      failOnStatusCode: false,
+    });
+    expect(created.ok(), `creating a document — ${await created.text()}`).toBeTruthy();
+    const docId = (await created.json()).id;
+    try {
+      const comments = `/api/projects/${tenant!.mainProjectId}/knowledge-base/documents/${docId}/comments`;
+      const top = await asQa.post(comments, { data: { body: "Is this still current?" } });
+      expect(top.ok(), await top.text()).toBeTruthy();
+      const topId = (await top.json()).id;
+      expect((await asManager.post(comments, { data: { body: "Yes", parentCommentId: topId } })).ok()).toBeTruthy();
+
+      const [row] = await inbox(asQa);
+      expect(row.title).toBe("E2E notification-events Manager replied to your comment.");
+      expect(row).toMatchObject({ type: "comment_reply", link_entity_type: "knowledge_document", link_entity_id: `${tenant!.mainProjectId}:${docId}` });
+      expect(await titles(asManager)).toEqual([]);
+    } finally {
+      await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/knowledge-base/documents/${docId}`, { failOnStatusCode: false });
+    }
+  });
+
+  // ─── Test runs ─────────────────────────────────────────────────────────────
+
+  test("NOTIF-P1-10 assigning a whole run is one notification, not one per case", async () => {
+    const run = await seedRun(3);
+    const res = await asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-assign`, { data: { executionIds: run.executionIds, assigneeId: tenant!.qa.userId } });
+    expect(res.ok(), await res.text()).toBeTruthy();
+
+    const rows = await inbox(asQa);
+    expect(rows.map((r) => r.title)).toEqual([`You've been assigned to test run ${run.cycleName}.`]);
+    expect(rows[0]).toMatchObject({ type: "test_run_assigned", link_entity_type: "test_run", link_entity_id: `${tenant!.mainProjectId}:${run.cycleId}` });
+    expect(await titles(asOwner)).toEqual([]);
+    expect(await titles(asManager)).toEqual([]);
+  });
+
+  test("NOTIF-P1-10b a run that has an ID is named with it, in the assigned and failed messages", async () => {
+    const run = await seedRun(1);
+    // cycles.external_id is only set by automation ingest, so a UI-made run has none; give this one
+    // an ID the way ingest would, to see it carried into the message.
+    const runId = `E2E-TR-${Date.now()}`;
+    exec(`UPDATE cycles SET external_id = ${literal(runId)} WHERE id = ${literal(run.cycleId)};`);
+    const label = `${runId} (${run.cycleName})`;
+
+    expect((await asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-assign`, { data: { executionIds: run.executionIds, assigneeId: tenant!.qa.userId } })).ok()).toBeTruthy();
+    expect(await titles(asQa)).toEqual([`You've been assigned to test run ${label}.`]);
+
+    expect((await asManager.patch(`/api/cycles/${run.cycleId}/executions/${run.executionIds[0]}`, { data: { status: "Failed" } })).ok()).toBeTruthy();
+    expect(await titles(asOwner)).toEqual([`${run.tcIds[0]} failed in test run ${label}.`]);
+  });
+
+  test("NOTIF-P1-11 a case failing or becoming blocked goes to the run owner and the case assignee, once per transition", async () => {
+    const run = await seedRun(2);
+    expect(
+      (await asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-assign`, { data: { executionIds: [run.executionIds[0]], assigneeId: tenant!.qa.userId } })).ok(),
+    ).toBeTruthy();
+    exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.qa.userId)};`);
+
+    const setStatus = (executionId: string, status: string) => asManager.patch(`/api/cycles/${run.cycleId}/executions/${executionId}`, { data: { status } });
+    expect((await setStatus(run.executionIds[0], "Failed")).ok()).toBeTruthy();
+
+    const failed = `${run.tcIds[0]} failed in test run ${run.cycleName}.`;
+    expect(await titles(asQa)).toEqual([failed]); // the case's assignee
+    expect(await titles(asOwner)).toEqual([failed]); // the run's owner
+    expect(await titles(asManager)).toEqual([]); // the actor
+    expect(await titles(asGuest)).toEqual([]);
+
+    // Saving Failed again is not a new failure.
+    expect((await setStatus(run.executionIds[0], "Failed")).ok()).toBeTruthy();
+    expect(await titles(asQa)).toHaveLength(1);
+
+    expect((await setStatus(run.executionIds[1], "Blocked")).ok()).toBeTruthy();
+    expect(await titles(asOwner)).toContain(`${run.tcIds[1]} is blocked in test run ${run.cycleName}.`);
+    // Passing an unassigned case: the run owner is only told about Failed / Blocked (NOTIF-P1-13
+    // covers an assignee being told about the rest).
+    expect((await setStatus(run.executionIds[1], "Passed")).ok()).toBeTruthy();
+    expect(await titles(asOwner)).toHaveLength(2);
+  });
+
+  test("NOTIF-P1-13 any other status change on a case tells its assignee — not the actor, not the run owner, and nobody when the case is unassigned", async () => {
+    const run = await seedRun(2);
+    expect(
+      (await asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-assign`, { data: { executionIds: [run.executionIds[0]], assigneeId: tenant!.qa.userId } })).ok(),
+    ).toBeTruthy();
+    exec(`DELETE FROM notifications WHERE user_id IN (${literal(tenant!.qa.userId)}, ${literal(tenant!.owner.userId)});`);
+
+    const setStatus = (api: APIRequestContext, executionId: string, status: string) =>
+      api.patch(`/api/cycles/${run.cycleId}/executions/${executionId}`, { data: { status } });
+
+    expect((await setStatus(asManager, run.executionIds[0], "Passed")).ok()).toBeTruthy();
+    expect(await titles(asQa)).toEqual([`${run.tcIds[0]} status changed to Passed in test run ${run.cycleName}.`]);
+    expect((await inbox(asQa))[0]).toMatchObject({ type: "test_case_status_changed", link_entity_type: "test_run", link_entity_id: `${tenant!.mainProjectId}:${run.cycleId}` });
+    expect(await titles(asManager)).toEqual([]); // the actor
+    expect(await titles(asOwner)).toEqual([]); // the run owner is told about Failed / Blocked, not every change
+
+    // Saving the same status again is not a change.
+    expect((await setStatus(asManager, run.executionIds[0], "Passed")).ok()).toBeTruthy();
+    expect(await titles(asQa)).toHaveLength(1);
+
+    // The assignee changing their own case's status is their own action.
+    expect((await setStatus(asQa, run.executionIds[0], "Skipped")).ok()).toBeTruthy();
+    expect(await titles(asQa)).toHaveLength(1);
+
+    // A case nobody is assigned to has nobody to tell.
+    expect((await setStatus(asManager, run.executionIds[1], "Passed")).ok()).toBeTruthy();
+    expect(await titles(asQa)).toHaveLength(1);
+
+    // Failed still reaches the assignee through its own matrix message — once, not twice.
+    expect((await setStatus(asManager, run.executionIds[0], "Failed")).ok()).toBeTruthy();
+    const qa = await titles(asQa);
+    expect(qa).toHaveLength(2);
+    expect(qa[0]).toBe(`${run.tcIds[0]} failed in test run ${run.cycleName}.`);
+  });
+
+  test("NOTIF-P1-14 a bulk status change is one summary per assignee, not one notification per case", async () => {
+    const run = await seedRun(3);
+    const assign = (executionIds: string[], assigneeId: string) =>
+      asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-assign`, { data: { executionIds, assigneeId } });
+    expect((await assign([run.executionIds[0], run.executionIds[1]], tenant!.qa.userId)).ok()).toBeTruthy();
+    expect((await assign([run.executionIds[2]], tenant!.manager.userId)).ok()).toBeTruthy();
+    exec(`DELETE FROM notifications WHERE user_id IN (${literal(tenant!.qa.userId)}, ${literal(tenant!.manager.userId)});`);
+
+    const res = await asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-status`, { data: { executionIds: run.executionIds, status: "Passed" } });
+    expect(res.ok(), await res.text()).toBeTruthy();
+
+    expect(await titles(asQa)).toEqual([`2 of your test cases in test run ${run.cycleName} were marked Passed.`]);
+    // One case: the same per-case wording as a single change.
+    expect(await titles(asManager)).toEqual([`${run.tcIds[2]} status changed to Passed in test run ${run.cycleName}.`]);
+    expect(await titles(asOwner)).toEqual([]); // the actor
+
+    // Nothing changed the second time, so nothing is sent.
+    const again = await asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-status`, { data: { executionIds: run.executionIds, status: "Passed" } });
+    expect(again.ok()).toBeTruthy();
+    expect(await titles(asQa)).toHaveLength(1);
+    expect(await titles(asManager)).toHaveLength(1);
+  });
+
+  // ─── Isolation ─────────────────────────────────────────────────────────────
+
+  test("NOTIF-P1-12 notifications never cross tenants or reach a workspace member outside the project", async ({ request }) => {
+    const bug = await newBug({ assigneeId: tenant!.qa.userId });
+    expect(await titles(asGuest)).toEqual([]);
+    // Account A (the shared smoke tenant) is in a different workspace entirely.
+    const smoke = await (await request.get("/api/notifications")).json();
+    expect(smoke.some((n: Row) => n.link_entity_id === `${tenant!.mainProjectId}:${bug.id}`)).toBe(false);
+
+    // Someone outside the project cannot be made an assignee in the first place (the recipient
+    // filter is a second line of defence, not the only one).
+    const refused = await asOwner.patch(`/api/bugs/${bug.id}`, { data: { assigneeId: tenant!.guest.userId }, failOnStatusCode: false });
+    expect(refused.status()).toBe(400);
+    expect(await titles(asGuest)).toEqual([]);
   });
 });

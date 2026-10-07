@@ -29,10 +29,33 @@ import { avatarColor } from "@/lib/avatarColors";
  * renders that notification as plain, non-interactive text rather than a link to nowhere.
  */
 function resolveNotificationHref(n: AppNotification): string | null {
-  if (n.link_entity_type === "zyra_task_board" && n.link_entity_id) {
-    return `/projects/${n.link_entity_id}/agents/tasks`;
+  const id = n.link_entity_id;
+  if (!id) return null;
+  // Project-scoped entities are stored as "<projectId>:<entityId>" (one VARCHAR column) — see
+  // notification-events.ts on the backend, which is the only writer of these.
+  const [projectId, entityId] = id.split(":");
+  switch (n.link_entity_type) {
+    case "zyra_task_board":
+      return `/projects/${id}/agents/tasks`;
+    case "workspace_members":
+      return "/settings/members";
+    case "invitation":
+      return `/invite/${id}`;
+    case "projects_list":
+      return "/projects";
+    case "project":
+      return `/projects/${id}`;
+    case "project_members":
+      return `/projects/${id}/members`;
+    case "test_run":
+      return projectId && entityId ? `/projects/${projectId}/cycles/${entityId}` : null;
+    case "knowledge_document":
+      return projectId && entityId ? `/projects/${projectId}/knowledge-base/documents/${entityId}` : null;
+    case "bug":
+      return projectId && entityId ? `/projects/${projectId}/bugs/${entityId}` : null;
+    default:
+      return null;
   }
-  return null;
 }
 
 function getInitials(name: string): string {
@@ -144,6 +167,25 @@ export default function TopBar() {
       setNotifLoading(false);
     }
   }
+
+  // Quiet refresh for the unread badge: no "Loading…" flash and no error UI — the badge simply
+  // stays as it was if the request fails. The dropdown's own fetch (above) still reports errors.
+  async function refreshNotifications() {
+    try {
+      setNotifItems(await listNotifications());
+    } catch {
+      /* badge is best-effort */
+    }
+  }
+
+  useEffect(() => {
+    void refreshNotifications();
+    const onFocus = () => void refreshNotifications();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  const unreadCount = notifItems.filter((n) => !n.read_at).length;
 
   function toggleNotifications() {
     const opening = !notifOpen;
@@ -302,13 +344,22 @@ export default function TopBar() {
         <div ref={notifBoxRef} className="relative">
           <button
             type="button"
-            aria-label="Notifications"
+            aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : "Notifications"}
             aria-haspopup="true"
             aria-expanded={notifOpen}
             onClick={toggleNotifications}
-            className="flex h-8 w-8 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted-soft)] transition-colors hover:border-white hover:bg-[var(--surface-secondary)]"
+            className="relative flex h-8 w-8 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted-soft)] transition-colors hover:border-white hover:bg-[var(--surface-secondary)]"
           >
             <IconBell size={16} stroke={1.75} />
+            {unreadCount > 0 && (
+              <span
+                data-testid="notification-badge"
+                className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none text-white"
+                style={{ background: "var(--brand-primary)" }}
+              >
+                {unreadCount > 9 ? "9+" : unreadCount}
+              </span>
+            )}
           </button>
 
           {notifOpen && (

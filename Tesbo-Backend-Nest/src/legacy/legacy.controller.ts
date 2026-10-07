@@ -420,6 +420,11 @@ export class LegacyController {
     return this.legacy.acceptInvitation(req.userId, token);
   }
 
+  @Post("/api/invitations/:token/decline")
+  declineInvitation(@Req() req: AuthenticatedRequest, @Param("token") token: string) {
+    return this.legacy.declineInvitation(req.userId, token);
+  }
+
   @Post("/api/invitations/:token/register")
   async registerFromInvitation(@Param("token") token: string, @Body() body: Record<string, any>) {
     const result = await this.legacy.registerFromInvitation(token, body);

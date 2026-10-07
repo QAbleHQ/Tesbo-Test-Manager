@@ -5,8 +5,10 @@ import {
   clearInvitations,
   detachUserByEmail,
   FIXTURE_PASSWORD,
+  inviteStatus,
   loginAs,
   mintInviteToken,
+  orgRoleForEmail,
   provisionRbacTenant,
   rbacSuiteSkipReason,
   seedFixtureUser,
@@ -394,6 +396,111 @@ test.describe("login reached from an invite while signed in as a different email
       await page.getByRole("button", { name: "Accept and join workspace" }).click();
 
       await page.waitForURL(/\/projects/, { timeout: 20_000 });
+    } finally {
+      await ctx.close();
+    }
+  });
+});
+
+/*
+ * The invite page's two ways out besides accepting: Decline (ends the invitation) and the X at the
+ * top right ("not now" — leaves it pending). Reuses the "invite-signin" tenant for the same reason
+ * as the describe above: it only needs pending invitations and a second role-holder.
+ */
+test.describe("invite page — decline and close", () => {
+  let tenant: RbacTenant | null = null;
+  let asOwner: APIRequestContext | undefined;
+  const inviteeEmails: string[] = [];
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("invite-signin");
+    if (!tenant) return;
+    asOwner = await loginAs(tenant.owner);
+  });
+
+  test.afterAll(async () => {
+    if (tenant) clearInvitations(tenant);
+    for (const email of inviteeEmails) detachUserByEmail(email);
+    await asOwner?.dispose();
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  /** A pending invitation for a real, signed-in invitee: their storage state, token and invite id. */
+  async function pendingInviteFor(label: string) {
+    const email = testAddress(`invite-decline-${label}`);
+    inviteeEmails.push(email);
+    const invitee = seedFixtureUser(email, `E2E Decline UI ${label}`);
+    const created = await asOwner!.post("/api/workspace/invitations", { data: { email, role: "qa_engineer" }, failOnStatusCode: false });
+    expect(created.ok(), `inviting ${email} — ${await created.text()}`).toBeTruthy();
+    const { id } = await created.json();
+    const token = mintInviteToken(id);
+    const state = await writeStorageState(invitee, `invite-decline-${label}`);
+    return { id, token, state, invitee };
+  }
+
+  test("INV-UI-DECLINE-01 Decline asks for confirmation, then ends the invitation", async ({ browser }) => {
+    const { id, token, state, invitee } = await pendingInviteFor("confirm");
+    const ctx = await browser.newContext({ storageState: state });
+    try {
+      const page = await ctx.newPage();
+      await page.goto(`/invite/${token}`);
+      await expect(page.getByRole("button", { name: "Accept and join workspace" })).toBeVisible();
+
+      // First click only asks; nothing has happened to the invitation yet.
+      await page.getByRole("button", { name: "Decline", exact: true }).click();
+      await expect(page.getByText(/Decline this invitation\?/)).toBeVisible();
+      await page.getByRole("button", { name: "Keep it" }).click();
+      await expect(page.getByText(/Decline this invitation\?/)).toHaveCount(0);
+      expect(inviteStatus(id)).toBe("pending");
+
+      await page.getByRole("button", { name: "Decline", exact: true }).click();
+      await page.getByRole("button", { name: "Yes, decline" }).click();
+      await expect(page.getByText("Invitation declined")).toBeVisible();
+      // The persisted outcome, not just the screen.
+      expect(inviteStatus(id)).toBe("declined");
+      expect(orgRoleForEmail(tenant!, invitee.email)).toBe("");
+
+      // Revisiting the link shows the same outcome, with no way to accept.
+      await page.goto(`/invite/${token}`);
+      await expect(page.getByText("Invitation declined")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Accept and join workspace" })).toHaveCount(0);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  test("INV-UI-DECLINE-02 the X is 'not now': it leaves without touching the invitation", async ({ browser }) => {
+    const { id, token, state } = await pendingInviteFor("close");
+    const ctx = await browser.newContext({ storageState: state });
+    try {
+      const page = await ctx.newPage();
+      await page.goto(`/invite/${token}`);
+      await page.getByRole("button", { name: "Close" }).click();
+      await page.waitForURL(/\/projects|\/onboarding|\/dashboard/);
+      expect(inviteStatus(id), "closing the card must not decide anything").toBe("pending");
+
+      // It can still be opened and accepted later.
+      await page.goto(`/invite/${token}`);
+      await expect(page.getByRole("button", { name: "Accept and join workspace" })).toBeVisible();
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  test("INV-UI-DECLINE-03 a signed-in stranger is offered neither Accept nor Decline (only the invitee can)", async ({ browser }) => {
+    const { token } = await pendingInviteFor("stranger");
+    const strangerState = await writeStorageState(tenant!.manager, "invite-decline-stranger");
+    const ctx = await browser.newContext({ storageState: strangerState });
+    try {
+      const page = await ctx.newPage();
+      await page.goto(`/invite/${token}`);
+      await expect(page.getByText(/signed in as a different email/i)).toBeVisible();
+      await expect(page.getByRole("button", { name: "Decline", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Accept and join workspace" })).toHaveCount(0);
     } finally {
       await ctx.close();
     }
