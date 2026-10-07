@@ -355,6 +355,118 @@ test.describe("invitations", () => {
     }
   });
 
+  // ─── Declining ─────────────────────────────────────────────────────────────
+
+  test("INV-DECLINE-01 the invitee can decline: it ends the invitation, drops off the pending list and cannot be redeemed afterwards", async () => {
+    const email = uniqueEmail("decline");
+    const invitee = seedFixtureUser(email, "E2E Decline Invitee");
+    const { id, token } = await invite(email, { projectIds: [tenant!.secondProjectId] });
+
+    const asInvitee = await loginAs(invitee);
+    try {
+      const res = await asInvitee.post(`/api/invitations/${token}/decline`, { data: {}, failOnStatusCode: false });
+      expect(res.ok(), `decline failed: ${res.status()} ${await res.text()}`).toBeTruthy();
+      expect((await res.json()).declined).toBe(true);
+      expect(inviteStatus(id)).toBe("declined");
+
+      // Declining grants nothing: not the workspace, not the project in the invite.
+      expect(orgRoleForEmail(tenant!, email)).toBe("");
+      expect(storedProjectRole(tenant!.secondProjectId, invitee.userId)).toBe("");
+
+      // The landing page can still explain what happened.
+      const lookup = await anon.get(`/api/invitations/${token}`, { failOnStatusCode: false });
+      expect(lookup.ok()).toBeTruthy();
+      expect((await lookup.json()).status).toBe("declined");
+
+      // It is not a pending invitation any more, so it leaves the list the owner manages.
+      const list = await (await asOwner.get("/api/workspace/invitations")).json();
+      expect(list.find((i: { id: string }) => i.id === id), "a declined invite should not stay in the pending list").toBeUndefined();
+
+      // And it can no longer be redeemed, by either route.
+      const accept = await asInvitee.post(`/api/invitations/${token}/accept`, { data: {}, failOnStatusCode: false });
+      expect(accept.status()).toBe(400);
+      expect((await accept.json()).error).toContain("declined");
+      expect(orgRoleForEmail(tenant!, email)).toBe("");
+      const register = await anon.post(`/api/invitations/${token}/register`, { data: { name: "Nope", password: "E2e-Decline-Pass-1!" }, failOnStatusCode: false });
+      expect(register.status()).toBe(400);
+
+      // A decline is not a block: the sender can invite the same address again.
+      const again = await asOwner.post("/api/workspace/invitations", { data: { email, role: "qa_engineer" }, failOnStatusCode: false });
+      expect(again.ok(), `re-inviting after a decline — ${await again.text()}`).toBeTruthy();
+    } finally {
+      await asInvitee.dispose();
+      detachUserByEmail(email);
+    }
+  });
+
+  test("INV-DECLINE-02 only the invited person can decline, only once, and only while it is pending", async () => {
+    const email = uniqueEmail("decline-guard");
+    const invitee = seedFixtureUser(email, "E2E Decline Guard");
+    const { id, token } = await invite(email);
+
+    // A different signed-in account holding the token cannot burn the invitation.
+    const wrong = await asQa.post(`/api/invitations/${token}/decline`, { data: {}, failOnStatusCode: false });
+    expect(wrong.status()).toBe(403);
+    expect(inviteStatus(id)).toBe("pending");
+
+    // Nor can someone who is not signed in.
+    const noSession = await anon.post(`/api/invitations/${token}/decline`, { data: {}, failOnStatusCode: false });
+    expect([400, 401]).toContain(noSession.status());
+    expect(inviteStatus(id)).toBe("pending");
+
+    const asInvitee = await loginAs(invitee);
+    try {
+      expect((await asInvitee.post(`/api/invitations/${token}/decline`, { data: {} })).ok()).toBeTruthy();
+      // The same click twice (two tabs, a retry) is a clean refusal, not a second state change.
+      const twice = await asInvitee.post(`/api/invitations/${token}/decline`, { data: {}, failOnStatusCode: false });
+      expect(twice.status()).toBe(400);
+      expect((await twice.json()).error).toContain("already declined");
+    } finally {
+      await asInvitee.dispose();
+      detachUserByEmail(email);
+    }
+  });
+
+  test("INV-DECLINE-03 an accepted, cancelled or expired invitation cannot be declined, and neither can a made-up token", async () => {
+    const accepted = uniqueEmail("decline-accepted");
+    const acceptedUser = seedFixtureUser(accepted, "E2E Decline Accepted");
+    const acceptedInvite = await invite(accepted);
+    const asAccepted = await loginAs(acceptedUser);
+
+    const cancelledEmail = uniqueEmail("decline-cancelled");
+    const cancelledUser = seedFixtureUser(cancelledEmail, "E2E Decline Cancelled");
+    const cancelledInvite = await invite(cancelledEmail);
+    const asCancelled = await loginAs(cancelledUser);
+
+    const expiredEmail = uniqueEmail("decline-expired");
+    const expiredUser = seedFixtureUser(expiredEmail, "E2E Decline Expired");
+    const expiredInvite = await invite(expiredEmail);
+    const asExpired = await loginAs(expiredUser);
+    try {
+      expect((await asAccepted.post(`/api/invitations/${acceptedInvite.token}/accept`, { data: {} })).ok()).toBeTruthy();
+      const afterAccept = await asAccepted.post(`/api/invitations/${acceptedInvite.token}/decline`, { data: {}, failOnStatusCode: false });
+      expect(afterAccept.status()).toBe(400);
+      expect(inviteStatus(acceptedInvite.id)).toBe("accepted");
+      expect(orgRoleForEmail(tenant!, accepted), "declining after accepting must not remove the membership").toBe("qa_engineer");
+
+      expect((await asOwner.delete(`/api/workspace/invitations/${cancelledInvite.id}`)).ok()).toBeTruthy();
+      expect((await asCancelled.post(`/api/invitations/${cancelledInvite.token}/decline`, { data: {}, failOnStatusCode: false })).status()).toBe(400);
+      expect(inviteStatus(cancelledInvite.id)).toBe("cancelled");
+
+      expireInvite(expiredInvite.id);
+      expect((await asExpired.post(`/api/invitations/${expiredInvite.token}/decline`, { data: {}, failOnStatusCode: false })).status()).toBe(400);
+      expect(inviteStatus(expiredInvite.id)).not.toBe("declined");
+
+      for (const token of ["0".repeat(64), "not-a-token", "%20", "../../etc/passwd"]) {
+        const res = await asAccepted.post(`/api/invitations/${encodeURIComponent(token)}/decline`, { data: {}, failOnStatusCode: false });
+        expect(res.status(), `declining "${token}" should be a clean 404`).toBe(404);
+      }
+    } finally {
+      await Promise.all([asAccepted.dispose(), asCancelled.dispose(), asExpired.dispose()]);
+      [accepted, cancelledEmail, expiredEmail].forEach(detachUserByEmail);
+    }
+  });
+
   test("an expired invitation is reported as expired and cannot be accepted", { tag: '@tesbo.testId("TES-TC-263")' }, async () => {
     const email = uniqueEmail("expired");
     const invitee = seedFixtureUser(email, "E2E Expired Invitee");

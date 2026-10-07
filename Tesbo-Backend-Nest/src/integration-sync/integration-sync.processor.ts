@@ -4,6 +4,8 @@ import { createHash } from "crypto";
 import type { Job } from "bullmq";
 import { DatabaseService } from "../database/database.service";
 import { truncateForColumn } from "../common/integration-text.util";
+import { notificationLinks, notificationMessages } from "../legacy/notification-events";
+import { writeNotifications } from "../legacy/notification-writer";
 import { summarizeTextChange } from "../common/text-diff.util";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { RagIngestionService } from "../rag/rag-ingestion.service";
@@ -294,6 +296,28 @@ export class IntegrationSyncProcessor extends WorkerHost {
               : `Sync run ${runId} failed: ${message}`
       );
       await this.runs.failRun(runId, message);
+      // The worker is where an expired or revoked token is most often discovered, and nothing else
+      // records it from here — so say so, to the person who connected it and the workspace owners.
+      if (err instanceof IntegrationConnectionInvalidError) await this.notifyAuthExpired(organizationId, provider);
+    }
+  }
+
+  private async notifyAuthExpired(organizationId: string, provider: SyncProvider): Promise<void> {
+    try {
+      const people = await this.db.query<{ user_id: string | null }>(
+        `SELECT connected_by AS user_id FROM integration_connections WHERE organization_id = $1 AND provider = $2
+         UNION SELECT user_id FROM organization_members WHERE organization_id = $1 AND role = 'owner'`,
+        [organizationId, provider]
+      );
+      await writeNotifications(this.db, people.rows.map((r) => r.user_id), {
+        type: "integration_auth_expired",
+        title: notificationMessages.integrationAuthExpired(provider),
+        link: notificationLinks.integrations(organizationId),
+        dedupeKey: `integration_auth:${organizationId}:${provider}:${new Date().toISOString().slice(0, 10)}`,
+        memberOf: { organizationId }
+      }, this.logger);
+    } catch (err) {
+      this.logger.warn(`Auth-expired notification failed — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

@@ -678,7 +678,7 @@ export interface InviteDetails {
   organizationName: string | null;
   email: string;
   role: string;
-  status: "pending" | "accepted" | "expired" | "cancelled";
+  status: "pending" | "accepted" | "expired" | "cancelled" | "declined";
   expiresAt: string;
   acceptedAt: string | null;
   createdAt: string;
@@ -692,6 +692,12 @@ export async function getInvitationByToken(token: string): Promise<InviteDetails
 
 export async function acceptInvitation(token: string): Promise<{ accepted: boolean; organizationId: string | null }> {
   return api<{ accepted: boolean; organizationId: string | null }>(`/api/invitations/${token}/accept`, {
+    method: "POST",
+  });
+}
+
+export async function declineInvitation(token: string): Promise<{ declined: boolean }> {
+  return api<{ declined: boolean }>(`/api/invitations/${token}/decline`, {
     method: "POST",
   });
 }
@@ -776,6 +782,10 @@ export interface AppNotification {
 
 export async function listNotifications(): Promise<AppNotification[]> {
   return api<AppNotification[]>("/api/notifications");
+}
+
+export async function markAllNotificationsRead(): Promise<void> {
+  await api<unknown>("/api/notifications/read-all", { method: "POST" });
 }
 
 export async function markNotificationRead(id: string): Promise<void> {

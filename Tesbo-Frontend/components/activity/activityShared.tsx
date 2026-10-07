@@ -78,6 +78,7 @@ const ACTION_META: Record<string, [string, StatusChipProps["tone"]]> = {
   workspace_member_removed: ["Removed", "error"],
   invitation_sent: ["Invited", "info"],
   invitation_cancelled: ["Cancelled", "error"],
+  invitation_declined: ["Declined", "error"],
   invitation_resent: ["Resent", "info"],
   invitation_accepted: ["Joined", "success"],
   custom_field_created: ["Created", "success"],
