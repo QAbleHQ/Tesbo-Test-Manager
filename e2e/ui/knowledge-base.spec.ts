@@ -2199,4 +2199,123 @@ test.describe("knowledge base (UI)", () => {
     await expect(page.locator(".ProseMirror").first().locator("p")).toHaveText(["First plain line", "Second line: 2 * 3 = 6"]);
     expect(storedDocument(documentId).html).toBe("<p>First plain line</p><p>Second line: 2 * 3 = 6</p>");
   });
+
+  // ─── Zyra AI Memory: entry timestamps in the sitewide date format ──────────
+  //
+  // Fix for "[Knowledgebase] Zyra Memory should show proper date and time format same as other
+  // sections". rememberZyraMemory (legacy.service.ts) stores each entry as `## <ISO timestamp>\n<note>`
+  // in content_text, and content_html as that same text escaped inside a bare <pre> — so the editor
+  // showed one code block with raw "2026-10-05T12:21:14.614Z" headings. The document page now
+  // rebuilds the display from content_text, formatting each heading with lib/date.ts's formatDateTime
+  // ("05 Oct 2026, 06:21 PM", viewer-local). The stored content is never rewritten.
+
+  const MEMORY_ISO_1 = "2026-10-05T12:21:14.614Z";
+  const MEMORY_ISO_2 = "2026-10-05T12:20:05.524Z";
+  const MEMORY_NOTE_1 = "QAB-242 was re-run and produced 26 testcase drafts using 3 knowledge-base sources.";
+  const MEMORY_NOTE_2 = "QAB-243 produced 24 testcase drafts using 2 knowledge-base sources and 1 Linear ticket.";
+  const MEMORY_TEXT = `## ${MEMORY_ISO_1}\n- ${MEMORY_NOTE_1}\n\n## ${MEMORY_ISO_2}\n- ${MEMORY_NOTE_2}`;
+
+  /** lib/date.ts formatDateTime's shape, from local Date fields — holds in whatever timezone this runs. */
+  function memoryHeading(iso: string): string {
+    const d = new Date(iso);
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const hours12 = String(d.getHours() % 12 || 12).padStart(2, "0");
+    const period = d.getHours() >= 12 ? "PM" : "AM";
+    return `${String(d.getDate()).padStart(2, "0")} ${months[d.getMonth()]} ${d.getFullYear()}, ${hours12}:${String(d.getMinutes()).padStart(2, "0")} ${period}`;
+  }
+
+  /** The bare-<pre> HTML rememberZyraMemory writes (`<pre>${escapeHtml(content)}</pre>`). */
+  function zyraPreHtml(text: string): string {
+    return `<pre>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")}</pre>`;
+  }
+
+  /**
+   * Inserted directly, as rememberZyraMemory does: the API can't create an is_ai_generated document,
+   * and producing a real one means a live model call. The title must be exactly "Zyra AI Memory";
+   * afterEach's purgeKb removes it, so successive tests never see each other's copy.
+   */
+  function seedZyraMemory(options: { text: string; html: string; isAiGenerated?: boolean; contentJson?: unknown }): string {
+    const json = options.contentJson === undefined ? "NULL" : `${literal(JSON.stringify(options.contentJson))}::jsonb`;
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, content_json, " +
+        "document_type, status, is_ai_generated) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, 'Zyra AI Memory', ` +
+        `${literal(options.text)}, ${literal(options.html)}, ${json}, 'general', 'published', ${options.isAiGenerated ?? true});`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Zyra AI Memory' AND is_deleted = false ORDER BY created_at DESC LIMIT 1;`,
+    );
+  }
+
+  async function openDocument(browser: Browser, documentId: string): Promise<{ page: Page; editor: Locator }> {
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    const editor = page.locator(".ProseMirror").first();
+    await expect(editor).toBeVisible();
+    return { page, editor };
+  }
+
+  test("KBU-56 Zyra AI Memory entry headings show in the sitewide date format, as headings and bullets — not raw ISO in a code block", async ({
+    browser,
+  }) => {
+    const html = zyraPreHtml(MEMORY_TEXT);
+    const documentId = seedZyraMemory({ text: MEMORY_TEXT, html });
+    const { page, editor } = await openDocument(browser, documentId);
+
+    await expect(editor.locator("h2")).toHaveText([memoryHeading(MEMORY_ISO_1), memoryHeading(MEMORY_ISO_2)]);
+    await expect(editor.locator("li")).toHaveText([MEMORY_NOTE_1, MEMORY_NOTE_2]);
+    await expect(editor.locator("pre")).toHaveCount(0);
+    const shown = await editor.innerText();
+    expect(shown).not.toContain(MEMORY_ISO_1);
+    expect(shown).not.toContain(MEMORY_ISO_2);
+    expect(shown, "no Markdown heading syntax left visible").not.toContain("## ");
+
+    // Display only: opening the document must not write the reformatted content back. The autosave
+    // debounce is 1.2s, so wait past it before reading the row.
+    await page.waitForTimeout(2500);
+    expect(storedDocument(documentId)).toEqual({ html, text: MEMORY_TEXT });
+  });
+
+  test("KBU-57 entries Zyra appends after a person edited its memory still show, with formatted dates", async ({ browser }) => {
+    // A person's save leaves content_json behind; Zyra's next append rewrites only content_text and
+    // content_html (back to a bare <pre>), so content_json is the stale copy and must not be shown.
+    const staleJson = { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Stale human-edited copy" }] }] };
+    const documentId = seedZyraMemory({ text: MEMORY_TEXT, html: zyraPreHtml(MEMORY_TEXT), contentJson: staleJson });
+    const { editor } = await openDocument(browser, documentId);
+
+    await expect(editor.locator("h2").first()).toHaveText(memoryHeading(MEMORY_ISO_1));
+    await expect(editor).toContainText(MEMORY_NOTE_1);
+    await expect(editor).not.toContainText("Stale human-edited copy");
+  });
+
+  test("KBU-58 a Zyra AI Memory document a person saved last is shown exactly as they saved it", async ({ browser }) => {
+    // After a person's save, content_html is the editor's own HTML (no bare <pre>), so it is left
+    // alone — even when its text still contains an ISO timestamp.
+    const savedHtml = `<h2>${MEMORY_ISO_1}</h2><p>Edited by hand</p>`;
+    const savedJson = {
+      type: "doc",
+      content: [
+        { type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: MEMORY_ISO_1 }] },
+        { type: "paragraph", content: [{ type: "text", text: "Edited by hand" }] },
+      ],
+    };
+    const documentId = seedZyraMemory({ text: `${MEMORY_ISO_1}\n\nEdited by hand`, html: savedHtml, contentJson: savedJson });
+    const { editor } = await openDocument(browser, documentId);
+
+    await expect(editor.locator("h2")).toHaveText(MEMORY_ISO_1);
+    await expect(editor.locator("p")).toHaveText("Edited by hand");
+  });
+
+  test("KBU-59 a person's own document titled Zyra AI Memory is not reformatted", async ({ browser }) => {
+    // Only Zyra's AI-generated document is rebuilt; a hand-made one with the same title and a <pre>
+    // body keeps its code block and its text verbatim.
+    const documentId = seedZyraMemory({ text: MEMORY_TEXT, html: zyraPreHtml(MEMORY_TEXT), isAiGenerated: false });
+    const { editor } = await openDocument(browser, documentId);
+
+    await expect(editor.locator("pre")).toHaveCount(1);
+    await expect(editor.locator("pre")).toContainText(`## ${MEMORY_ISO_1}`);
+    await expect(editor.locator("h2")).toHaveCount(0);
+  });
 });
