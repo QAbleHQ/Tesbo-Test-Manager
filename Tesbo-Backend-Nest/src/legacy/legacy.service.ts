@@ -19809,17 +19809,38 @@ export class LegacyService implements OnModuleInit {
   // invents (or copies from a different turn's transcript) is dropped silently — never surfaced —
   // exactly like reconcileZyraReply drops an unverifiable completion claim rather than passing it
   // through. Pure function: no I/O, no DB, safe to unit test directly against a fixed index.
+  //
+  // Matching tolerates how a model actually writes a label it was given, not only the exact text:
+  // case and spacing ("KB1", "kb 1"), a hyphen in a KB/BUG label ("KB-1"), a title trailing the
+  // label ("KB 1: Refund policy", "AIP-TC-73 — Successful login"), or an object ({label|id|key|ref}).
+  // Exact-only matching dropped such citations silently, and the draft showed "No specific source
+  // cited" though it was grounded. The resolved source is still always one from `knownRefs`, so
+  // nothing outside this turn's prompt can be cited.
   private static sanitizeZyraSourceRefs(rawRefs: unknown, knownRefs: Map<string, ZyraSourceRef>): ZyraSourceRef[] {
     if (!Array.isArray(rawRefs)) return [];
+    const canonical = (label: string) => label.toUpperCase().replace(/\s+/g, "").replace(/^(KB|BUG)-(?=\d+$)/, "$1");
+    const byCanonical = new Map<string, string>();
+    for (const label of knownRefs.keys()) byCanonical.set(canonical(label), label);
+    const resolve = (text: string): string | undefined => {
+      if (knownRefs.has(text)) return text;
+      // The label itself, then the label with a trailing title cut off at the first ":", dash
+      // separator, "|" or "(" — external ids keep their own internal hyphens ("AIP-TC-73").
+      const head = text.split(/\s*[:|(]\s*|\s+[-–—]\s+|\s*[–—]\s*/)[0];
+      return byCanonical.get(canonical(text)) ?? byCanonical.get(canonical(head));
+    };
     const resolved: ZyraSourceRef[] = [];
     const seen = new Set<string>();
     for (const raw of rawRefs.slice(0, 20)) {
-      const label = String(raw ?? "").trim();
+      const value = raw && typeof raw === "object"
+        ? (raw as Body).label ?? (raw as Body).id ?? (raw as Body).key ?? (raw as Body).ref
+        : raw;
+      if (typeof value !== "string" && typeof value !== "number") continue;
+      const text = String(value).trim();
+      if (!text) continue;
+      const label = resolve(text);
       if (!label || seen.has(label)) continue;
-      const match = knownRefs.get(label);
-      if (!match) continue;
       seen.add(label);
-      resolved.push(match);
+      resolved.push(knownRefs.get(label)!);
     }
     return resolved;
   }

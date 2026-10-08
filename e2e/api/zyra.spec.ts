@@ -3551,6 +3551,58 @@ test.describe("zyra chat — citations (fake provider)", () => {
     // Listed first, ahead of the 26 fillers that would otherwise outrank it.
     expect(listing.indexOf(target.externalId)).toBeLessThan(listing.indexOf("E2E filler"));
   });
+
+  // "[Zyra] … Context Used Is Incorrect/Missing": sanitizeZyraSourceRefs matched a draft's cited
+  // label only by its exact text, so "KB1", "kb 1: <title>", "<TC id> — <title>" or a {label} object
+  // were dropped silently and the card said "No specific source cited". Each must now resolve to the
+  // source it names — and still only to a source this turn's prompt actually offered.
+  test("ZYR-A-151 citations written in a different form still resolve to the exact source, per draft; unoffered ones never do", async () => {
+    await allocateFakeAiKey();
+    const { kbDocId, testcaseExternalId, bugId } = await seedCitableSources();
+    const sessionId = await newSession("E2E citation variants");
+    const kb = { type: "knowledge_document", id: kbDocId, title: "Biometric login policy" };
+    const tc = { type: "testcase", id: testcaseExternalId, title: "Biometric login happy path" };
+    const bug = { type: "bug", id: bugId, title: "Biometric login crashes on iOS 18" };
+    const cases: Array<{ title: string; refs: unknown[]; expected: unknown[] }> = [
+      { title: "Variant compact KB and hyphenated bug", refs: ["KB1", "BUG-1"], expected: [kb, bug] },
+      { title: "Variant lowercase KB with trailing title", refs: ["kb 1: Biometric login policy"], expected: [kb] },
+      { title: "Variant object label", refs: [{ label: "KB 1" }], expected: [kb] },
+      { title: "Variant test case id with trailing title", refs: [`${testcaseExternalId} — Biometric login happy path`], expected: [tc] },
+      { title: "Variant labels never offered", refs: ["KB 9", "GENERATED-999", `${testcaseExternalId}9`], expected: [] },
+      { title: "Variant genuinely uncited", refs: [], expected: [] },
+    ];
+
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating biometric login test cases.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: cases.length, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: cases.map((c) => ({
+        title: c.title,
+        preconditions: "",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do it", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "",
+        priority: "P2",
+        tags: [],
+        sourceRefs: c.refs,
+      })),
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Create ${cases.length} test cases for biometric login using the knowledge base, existing test cases and bugs.` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `the create turn — ${await turn.text()}`).toBeLessThan(300);
+
+    const rows = await lastAssistantTestcases(sessionId);
+    expect(rows.map((r) => r.title), "every generated draft reaches the review rows, in order").toEqual(cases.map((c) => c.title));
+    for (const [i, c] of cases.entries()) {
+      expect(rows[i].sourceRefs, `${c.title}: Context used`).toEqual(c.expected);
+    }
+    // The staged batch carries the same per-draft citations Save will persist.
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`));
+    expect(stored.map((e: { draft: { sourceRefs: unknown[] } }) => e.draft.sourceRefs)).toEqual(cases.map((c) => c.expected));
+  });
 });
 
 /*
