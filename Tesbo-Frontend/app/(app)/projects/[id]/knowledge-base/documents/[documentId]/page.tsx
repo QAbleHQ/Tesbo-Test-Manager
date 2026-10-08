@@ -1,6 +1,7 @@
 "use client";
 
-import { useParams, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import type { JSONContent } from "@tiptap/react";

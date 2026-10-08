@@ -450,6 +450,12 @@ export class LegacyController {
     return this.legacy.projectsOverview(req.userId);
   }
 
+  // Readable app URL segments -> uuids (see LegacyService.resolveRoute).
+  @Get("/api/route-resolve")
+  resolveRoute(@Req() req: AuthenticatedRequest, @Query() query: Record<string, any>) {
+    return this.legacy.resolveRoute(req.userId, query);
+  }
+
   @Get("/api/projects/:id")
   getProject(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
     return this.legacy.getProjectForUser(req.userId, id);

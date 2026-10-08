@@ -1,6 +1,7 @@
 "use client";
 
-import { useParams, useRouter, useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useEffect, useMemo, useState, useCallback } from "react";
 import Link from "next/link";
 import {

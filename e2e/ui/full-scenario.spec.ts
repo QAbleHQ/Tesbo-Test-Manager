@@ -116,7 +116,7 @@ test.describe("full test-management scenario", () => {
       await page.getByRole("combobox").first().selectOption("Failed");
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
       await expect(page.getByPlaceholder("Brief summary of the bug…")).toHaveValue(bugTitle);
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
       await expect(page.getByRole("combobox").first()).toHaveValue("Failed");
 
