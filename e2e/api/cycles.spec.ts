@@ -6,9 +6,20 @@ import { column, exec, literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
 
+/** Creates a test case in the shared project and adds it to the run; returns the case id. */
+async function addCase(request: any, runId: string): Promise<string> {
+  const tc = await (
+    await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Run Case ${Date.now()}` } })
+  ).json();
+  const res = await request.post(`/api/cycles/${runId}/testcases`, { data: { testcaseIds: [tc.id] } });
+  expect(res.ok()).toBeTruthy();
+  return tc.id;
+}
+
 test.describe("test cycle / run CRUD", () => {
   test("supports the create -> read -> update -> list -> delete lifecycle", { tag: '@tesbo.testId("TES-TC-170")' }, async ({ request }) => {
     const name = `E2E Cycle ${Date.now()}`;
+    let caseId: string | undefined;
     const created = await (
       await request.post(`/api/projects/${ctx.projectId}/cycles`, {
         data: { name, description: "Created by the e2e suite", environment: "staging", buildVersion: "1.2.3" },
@@ -23,6 +34,9 @@ test.describe("test cycle / run CRUD", () => {
       const getRes = await request.get(`/api/cycles/${created.id}`);
       expect(getRes.ok()).toBeTruthy();
       expect((await getRes.json()).buildVersion).toBe("1.2.3");
+
+      // A run can only be started once it has a case to execute.
+      caseId = await addCase(request, created.id);
 
       const updatedName = `${name} (updated)`;
       const patchRes = await request.patch(`/api/cycles/${created.id}`, {
@@ -40,6 +54,7 @@ test.describe("test cycle / run CRUD", () => {
       expect(list.some((c: { id: string }) => c.id === created.id)).toBeTruthy();
     } finally {
       await request.delete(`/api/cycles/${created.id}`, { failOnStatusCode: false });
+      if (caseId) await request.delete(`/api/projects/${ctx.projectId}/testcases/${caseId}`, { failOnStatusCode: false });
     }
 
     const getAfterDeleteRes = await request.get(`/api/cycles/${created.id}`, { failOnStatusCode: false });
@@ -496,7 +511,15 @@ test.describe("adding test cases to a run", () => {
  */
 test.describe("run timing", () => {
   async function createRun(request: any, name: string) {
-    return (await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name } })).json();
+    // Starting or completing a run needs at least one case, so every timing run gets one.
+    const run = await (await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name } })).json();
+    run.caseId = await addCase(request, run.id);
+    return run;
+  }
+
+  async function dropRun(request: any, run: { id: string; caseId?: string }) {
+    await request.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
+    if (run.caseId) await request.delete(`/api/projects/${ctx.projectId}/testcases/${run.caseId}`, { failOnStatusCode: false });
   }
 
   async function readRun(request: any, id: string) {
@@ -522,7 +545,7 @@ test.describe("run timing", () => {
       expect(completed.startedAt).toBe(started.startedAt);
       expect(new Date(completed.endedAt).getTime()).toBeGreaterThanOrEqual(new Date(completed.startedAt).getTime());
     } finally {
-      await request.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
+      await dropRun(request, run);
     }
   });
 
@@ -548,7 +571,7 @@ test.describe("run timing", () => {
       expect(renamed.startedAt).toBe(reopened.startedAt);
       expect(renamed.endedAt ?? null).toBeNull();
     } finally {
-      await request.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
+      await dropRun(request, run);
     }
   });
 
@@ -562,7 +585,51 @@ test.describe("run timing", () => {
       expect(completed.startedAt).toBeTruthy();
       expect(completed.endedAt).toBeTruthy();
     } finally {
+      await dropRun(request, run);
+    }
+  });
+});
+
+/*
+ * "[Test Run] Start Execution and Complete Run buttons should be disabled when no test cases are
+ * added". The UI disables both buttons; the API enforces the same rule so it is not a way around.
+ */
+test.describe("runs with no test cases", () => {
+  test("cannot be started or completed until a case is added", { tag: '@tesbo.testId("TES-TC-EMPTYRUN-1")' }, async ({ request }) => {
+    const run = await (await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Empty Run ${Date.now()}` } })).json();
+    let caseId: string | undefined;
+    try {
+      for (const status of ["In Progress", "Completed"]) {
+        const res = await request.patch(`/api/cycles/${run.id}`, { data: { status }, failOnStatusCode: false });
+        expect(res.status(), `${status} on an empty run`).toBe(400);
+      }
+      const unchanged = await (await request.get(`/api/cycles/${run.id}`)).json();
+      expect(unchanged.status).toBe("Planning");
+      expect(unchanged.startedAt ?? null).toBeNull();
+
+      // Edits that are not a start/complete transition stay allowed on an empty run.
+      expect((await request.patch(`/api/cycles/${run.id}`, { data: { name: `${run.name} renamed` } })).ok()).toBeTruthy();
+      expect((await request.patch(`/api/cycles/${run.id}`, { data: { status: "Planning" } })).ok()).toBeTruthy();
+
+      caseId = await addCase(request, run.id);
+      expect((await request.patch(`/api/cycles/${run.id}`, { data: { status: "In Progress" } })).ok()).toBeTruthy();
+      expect((await request.patch(`/api/cycles/${run.id}`, { data: { status: "Completed" } })).ok()).toBeTruthy();
+    } finally {
       await request.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
+      if (caseId) await request.delete(`/api/projects/${ctx.projectId}/testcases/${caseId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a run emptied of its cases cannot be started again", { tag: '@tesbo.testId("TES-TC-EMPTYRUN-2")' }, async ({ request }) => {
+    const run = await (await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Emptied Run ${Date.now()}` } })).json();
+    const caseId = await addCase(request, run.id);
+    try {
+      expect((await request.delete(`/api/cycles/${run.id}/testcases/${caseId}`)).ok()).toBeTruthy();
+      const res = await request.patch(`/api/cycles/${run.id}`, { data: { status: "In Progress" }, failOnStatusCode: false });
+      expect(res.status()).toBe(400);
+    } finally {
+      await request.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
+      await request.delete(`/api/projects/${ctx.projectId}/testcases/${caseId}`, { failOnStatusCode: false });
     }
   });
 });

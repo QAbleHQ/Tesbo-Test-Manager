@@ -6181,6 +6181,17 @@ export class LegacyService implements OnModuleInit {
      *   → Planning     leaves the original start alone but clears the end: it is not finished
      */
     const status = typeof body.status === "string" ? body.status : null;
+    // A run with no cases has nothing to execute or complete; the UI disables both buttons, and
+    // this keeps the API from being a way around it.
+    if (status === "In Progress" || status === "Completed") {
+      const items = await this.db.query(
+        "SELECT 1 FROM cycle_items WHERE cycle_id = $1 AND deleted_at IS NULL LIMIT 1",
+        [cycleId]
+      );
+      if (!items.rows[0]) {
+        throw new BadRequestException({ error: "Add at least one test case before starting or completing a run" });
+      }
+    }
     await this.db.query(
       `UPDATE cycles SET name=COALESCE($2,name), description=COALESCE($3,description),
        environment=COALESCE($4,environment), build_version=COALESCE($5,build_version),
