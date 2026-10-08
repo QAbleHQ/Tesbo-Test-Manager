@@ -5,6 +5,7 @@ import { AppConfigService } from "../config/app-config.service";
 import { EmailService } from "./email.service";
 import { SessionCacheService } from "../cache/session-cache.service";
 import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
+import { ACTIVITY_TZ } from "./user-activity.service";
 
 @Injectable()
 export class OtpService {
@@ -66,7 +67,28 @@ export class OtpService {
       "INSERT INTO sessions (user_id, token_hash, user_agent, ip_address, expires_at) VALUES ($1, $2, $3, $4, $5)",
       [userId, tokenHash, userAgent ?? null, ipAddress ?? null, expiresAt]
     );
+    // Not awaited: tracking must not add latency to, or be able to fail, a sign-in.
+    void this.recordLogin(userId);
     return token;
+  }
+
+  /**
+   * Feeds the daily analytics report (V136). Every sign-in path ends in createSession, so recording
+   * here covers OTP, password, signup and invite logins with one write. Best-effort: a tracking
+   * failure must never fail a login.
+   */
+  private async recordLogin(userId: string): Promise<void> {
+    try {
+      await this.db.query(
+        `WITH u AS (UPDATE users SET last_login_at = now(), last_active_at = now() WHERE id = $1 RETURNING id)
+         INSERT INTO user_daily_activity (user_id, activity_date, logged_in)
+         SELECT u.id, (now() AT TIME ZONE '${ACTIVITY_TZ}')::date, true FROM u
+         ON CONFLICT (user_id, activity_date) DO UPDATE SET logged_in = true`,
+        [userId]
+      );
+    } catch (error) {
+      console.warn("Login activity tracking failed (non-fatal):", error);
+    }
   }
 
   async resolveSession(sessionToken: string): Promise<string | null> {
