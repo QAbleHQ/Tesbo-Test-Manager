@@ -1,6 +1,7 @@
 "use client";
 
-import { useParams, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import type { JSONContent } from "@tiptap/react";
@@ -35,6 +36,7 @@ import { DocumentComments } from "@/components/knowledge-base/DocumentComments";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { blankDocumentFlagKey } from "@/lib/validation";
 import { formatDateTime } from "@/lib/date";
+import { renderMarkdown } from "@/lib/markdown";
 import { Breadcrumbs, type BreadcrumbItem } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -47,6 +49,46 @@ const MAX_DOCUMENT_PAYLOAD_BYTES = 20 * 1024 * 1024;
 function formatFileSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Zyra's own memory document (rememberZyraMemory, legacy.service.ts) is written server-side as
+// Markdown in content_text — one `## <ISO timestamp>` heading per entry — with content_html set to
+// that same text escaped inside a bare `<pre>`. Loaded as-is, the editor showed the whole document as
+// one code block with the raw "2026-10-05T12:21:14.614Z" headings, unlike every other date in the
+// product. The stored text stays exactly as written (Change History's section grouping and Zyra's own
+// re-reading key off those ISO headings, and only the viewer's browser knows their time zone), so the
+// display is rebuilt here instead: the Markdown is rendered, and each timestamp heading goes through
+// the sitewide formatDateTime — the same render-time approach ChangeHistory/ChangeDiffModal use.
+const ZYRA_MEMORY_TITLE = "Zyra AI Memory";
+const ZYRA_MEMORY_HEADING_RE = /^(#{1,6})\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s*$/;
+
+/**
+ * True only when the server's raw `<pre>` write is the latest version of Zyra's memory document. Once
+ * a person edits and saves it, content_html is the editor's own HTML and is shown untouched — until
+ * Zyra appends again, which rewrites content_text/content_html (never content_json), making `<pre>`
+ * the newest content again; content_text is then the only field that carries every entry.
+ * The `<pre>` check uses the bare tag: the editor's own code blocks always serialise as `<pre><code>`.
+ */
+function isRawZyraMemory(doc: KnowledgeDocument): boolean {
+  return (
+    doc.isAiGenerated &&
+    doc.title === ZYRA_MEMORY_TITLE &&
+    Boolean(doc.contentText?.trim()) &&
+    /^<pre>(?!<code)/.test(doc.contentHtml ?? "")
+  );
+}
+
+function zyraMemoryHtml(text: string): string {
+  const markdown = text
+    .split("\n")
+    .map((line) => {
+      const heading = ZYRA_MEMORY_HEADING_RE.exec(line.trim());
+      return heading ? `${heading[1]} ${formatDateTime(heading[2])}` : line;
+    })
+    .join("\n");
+  // renderMarkdown emits a <br/> per blank line, which the editor would turn into an empty paragraph
+  // between every entry; the headings already separate them.
+  return renderMarkdown(markdown).replace(/<br\/>/g, "");
 }
 
 function documentPayloadSize(payload: { contentJson: JSONContent; contentHtml: string; contentText: string } | null): number {
@@ -533,6 +575,7 @@ export default function KnowledgeDocumentPage() {
   // rejects updates. Comments are the writable channel — they're stored apart from the body.
   const isSyncedMirror = doc.isReadOnly && doc.sourceRole === "mirror";
   const providerLabel = integrationProviderLabel(doc.sourceProvider);
+  const zyraMemoryView = isRawZyraMemory(doc) ? zyraMemoryHtml(doc.contentText ?? "") : null;
 
   // Update History is the same data and component everywhere — the Knowledge Base list's
   // info-icon popover and this modal never drift into showing different things for the same
@@ -726,8 +769,8 @@ export default function KnowledgeDocumentPage() {
           </button>
         )}
         <RichTextEditor
-          contentJson={doc.contentJson as JSONContent | null}
-          contentHtml={doc.contentHtml}
+          contentJson={zyraMemoryView ? null : (doc.contentJson as JSONContent | null)}
+          contentHtml={zyraMemoryView ?? doc.contentHtml}
           editable={!isSyncedMirror}
           onUpdate={handleEditorUpdate}
           resetKey={contentResetKey}
