@@ -339,6 +339,9 @@ type ZyraChatDecision = {
     draft?: Body;
     fields?: Body;
     reason?: string;
+    // update only: why authorZyraUpdates could not write this op's content (timeout/provider error),
+    // so the turn says that instead of "the update changed nothing".
+    authoringError?: string;
   }>;
   testcases: Body[];
   // Set only when a provider call genuinely never answered within its budget (see
@@ -14699,10 +14702,11 @@ export class LegacyService implements OnModuleInit {
       "- create: create new testcase drafts/saved cases only when the user clearly asks to create/generate/add/write testcases. If the user names an existing suite for these new testcases (or a prior turn already established one, e.g. confirming 'yes' to save into the suite you just discussed), set operation.suiteId (preferred, from 'Existing suites' below) or operation.suiteName directly on the create operation so the testcase lands in that suite immediately — do not require a separate move_to_suite step for testcases you are creating in this same turn.",
       "CRITICAL for a create op: do NOT author the actual testcase content. Leave operation.draft unset and the top-level testcases array empty — a separate authoring step writes the real title/steps/preconditions/etc. immediately after this routing decision, using its own dedicated response budget, and never reads operation.draft or testcases for a create op. Only set operation.suiteId/operation.suiteName (when known) and operation.reason. Writing out full draft content here produces nothing useful (it is always discarded and re-generated from scratch) and for a large or 'exhaustive' request can consume your entire response before you finish the JSON envelope, corrupting this turn's routing decision — reply/reasoningSummary/action all become unrecoverable, not just the drafts.",
       "- update: update an existing testcase only when the user clearly asks to update/edit/mark/revise a testcase.",
-      // The schema below shows `"fields":{}` with no key names, and an unrecognized key is dropped by
-      // sanitizeZyraUpdateFields — so an update could arrive with every rewritten value lost while the
-      // reply still described the rewrite. The keys and the steps shape are spelled out here.
-      "For an update op, operation.fields MUST carry the new values themselves, using exactly these keys (camelCase): title, description, preconditions, postconditions, stepsJson, testData, priority, severity, type, automationStatus, automationTags, component, status, jiraIssueKey, jiraUrl. Include only the fields you are actually changing, each with its complete new value, and only when that value is genuinely different from the current one. To change any step (its action or its expected result), set fields.stepsJson to the FULL step list as an array of {\"stepNumber\":1,\"action\":\"...\",\"expectedResult\":\"...\"} — every step, including the ones you are not changing, copied exactly from the current steps shown under 'Existing testcases'. Each expected result must state the specific, observable outcome of its own step. Never describe a change in reply or reason that is not present in operation.fields.",
+      // Like create, an update's new content is NOT written here: a bulk request ("rewrite every vague
+      // expected result") made this routing call author full step lists for many test cases at once,
+      // which ran past its 60s / 4096-token budget and timed out. authorZyraUpdates writes the content
+      // in its own batched calls, with the generation budget, from each case's full current state.
+      "CRITICAL for an update op: do NOT write the new content. Leave operation.fields empty. Set operation.externalId to the test case to change, and set operation.reason to a precise instruction saying exactly what must change in that test case and why (e.g. 'Steps 1 and 2 have placeholder expected results — rewrite them as specific, observable outcomes'). A separate step reads the full test case and writes the changes from that instruction. Emit one update op per test case that genuinely needs a change, and none for test cases that are already fine. Leave the top-level testcases array empty for an update.",
       "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage. IMPORTANT: before archiving, always describe which testcases will be archived and explicitly ask the user to confirm (e.g. 'I found TC-5 Login Test. Should I archive it? Reply yes to confirm.'). Only include archive operations if the user's current message is a clear confirmation (yes, confirm, go ahead, proceed) after you already proposed what would be archived in the prior assistant turn. To archive a SET in one operation — every existing testcase, or several named ones — emit a single archive operation with operation.allExisting=true or operation.externalIds; the same confirmation rule applies. An archive emitted on the user's clear confirmation is APPLIED IMMEDIATELY (not staged for review): describe it as archived, never as staged or pending review.",
       "- create_suite: create a new test suite (a folder/group for testcases) when the user asks to create/add a suite, folder, or group. Put the suite name in operation.suiteName.",
       "- move_to_suite: move/assign EXISTING testcases into a suite when the user asks to move/assign/organize/group/put existing testcases into a suite. The target suite goes in operation.suiteName (it is created automatically if it does not already exist, so you do not need a separate create_suite op for the same suite). List the testcases to move in operation.externalIds (use the external IDs shown under 'Existing suites' / 'Existing testcases'), set operation.allExisting=true when the user means every existing testcase, or set operation.fromLastPlan=true when the user refers to 'all'/'the N cases' from a recent generation batch (see 'Most recently generated batch' below) — fromLastPlan is exact and does not depend on you correctly recalling every external ID from earlier in the conversation, so prefer it over externalIds whenever the user is clearly referring to a just-generated batch rather than naming specific unrelated testcases.",
@@ -14715,7 +14719,7 @@ export class LegacyService implements OnModuleInit {
       "When the user asks to create a suite AND move existing testcases into it in one message, return a single move_to_suite operation with the suiteName (the suite is auto-created) — or a create_suite plus move_to_suite — but never any create operations.",
       "Use the project snapshot to choose the action. If the query asks for numbers from Jira/testcase links, choose jira_pending_testcases instead of guessing.",
       "If the user asks a normal product, feature, explanation, example, or how-to question, choose answer with empty operations and empty testcases.",
-      "Only return testcase rows when the user explicitly asks to update, archive/remove, list, compare, or show testcase coverage — NOT for create (see the CRITICAL note under the create action above: leave testcases/operation.draft empty for a create op).",
+      "Only return testcase rows when the user explicitly asks to archive/remove, list, compare, or show testcase coverage — NOT for create or update (see the CRITICAL notes under those actions above: leave testcases/operation.draft empty for a create op, and testcases/operation.fields empty for an update op).",
       "Only create/update/archive when the user clearly asks for a repository mutation. Otherwise suggest what could be done without mutating anything.",
       "Do not reveal hidden chain-of-thought. Provide a concise reasoningSummary with observable factors and action steps.",
       "Treat remove/delete requests as archive operations unless the user clearly names an existing app delete control.",
@@ -14940,6 +14944,12 @@ export class LegacyService implements OnModuleInit {
           knowledgeConfidence,
           contextRefs: turn.contextRefs
         });
+      }
+      // Update ops arrive as "which test case, and what to change" only — their content is written
+      // here, in its own batched calls (see authorZyraUpdates). Failures are recorded per op, never
+      // thrown, so a slow batch can't take the whole turn down with it.
+      if (normalizeJsonArray(raw.operations).some((op) => op?.type === "update")) {
+        raw = await this.authorZyraUpdates({ projectId, provider, model, key, message, raw, onStage, trace });
       }
       return this.normalizeZyraChatDecision(raw, message, existingTestcases, modelIntent);
     } catch (err) {
@@ -15403,7 +15413,9 @@ export class LegacyService implements OnModuleInit {
           activity.push({
             actor: "agent",
             title: "Could not update testcase",
-            detail: `${row.externalId}: the proposed update did not change any field, so nothing was staged for it.`,
+            // authoringError: the drafting step itself failed (timeout/provider error) for this case —
+            // a different situation from a draft that genuinely changed nothing.
+            detail: op.authoringError || `${row.externalId}: the proposed update did not change any field, so nothing was staged for it.`,
             createdAt: new Date().toISOString()
           });
           continue;
@@ -20721,6 +20733,170 @@ export class LegacyService implements OnModuleInit {
     throw new Error(`Claude chat failed: ${lastStatus || "No compatible model was accepted."}`);
   }
 
+  /** Test cases per update-drafting call, and how many such calls run at once. */
+  private static readonly ZYRA_UPDATE_AUTHOR_BATCH = 5;
+  private static readonly ZYRA_UPDATE_AUTHOR_CONCURRENCY = 3;
+
+  /**
+   * Writes the content of a routed turn's update ops — the update counterpart of create's dedicated
+   * generation call. The router only names each test case and says what must change
+   * (operation.reason); this reads every named case in full and asks for the new field values,
+   * ZYRA_UPDATE_AUTHOR_BATCH cases per call, each with the generation budget rather than the
+   * router's 60s/4096-token one. A bulk request ("rewrite every vague expected result") used to make
+   * the router author full step lists for every case itself and time out.
+   *
+   * Never throws: a batch that fails or times out marks its ops with __authoringError and the turn
+   * carries on with the rest, so one slow call can't lose the batches that finished. Read-only — it
+   * only fills op.fields; staging (applyZyraChatOperations) and every write after it are unchanged.
+   */
+  private async authorZyraUpdates(params: {
+    projectId: string;
+    provider: string;
+    model: string;
+    key: Body;
+    message: string;
+    raw: Body;
+    onStage?: ZyraOnStage;
+    trace: Parameters<typeof recordGeneration>[0];
+  }): Promise<Body> {
+    const operations = normalizeJsonArray(params.raw.operations).map((op) => (op && typeof op === "object" ? { ...op } : op)) as Body[];
+    const targets: Array<{ op: Body; row: Body }> = [];
+    for (const op of operations) {
+      if (String(op?.type) !== "update" || !(op.testcaseId || op.externalId)) continue;
+      const found = await this.findProjectTestcase(params.projectId, op.testcaseId ? String(op.testcaseId) : undefined, op.externalId ? String(op.externalId) : undefined);
+      // Not found is left to applyZyraChatOperations, which already reports it.
+      if (!found) continue;
+      targets.push({ op, row: await this.getTestCase(found.id) });
+    }
+    if (!targets.length) return params.raw;
+
+    const batches: Array<typeof targets> = [];
+    for (let i = 0; i < targets.length; i += LegacyService.ZYRA_UPDATE_AUTHOR_BATCH) batches.push(targets.slice(i, i + LegacyService.ZYRA_UPDATE_AUTHOR_BATCH));
+    params.onStage?.("drafting:updates", { count: targets.length, batches: batches.length });
+
+    const system = [
+      "You revise existing test cases in a test management tool. For each test case below, apply the requested change and return the new values.",
+      "Return only a JSON object: {\"updates\":[{\"externalId\":\"\",\"fields\":{}}]} with one entry per test case you were given, using its exact externalId.",
+      "fields uses exactly these keys (camelCase): title, description, preconditions, postconditions, stepsJson, testData, priority, severity, type, automationStatus, automationTags, component, status. Include only fields you actually change, each with its complete new value, and only when it genuinely differs from the current value.",
+      "To change any step, set fields.stepsJson to the FULL step list as an array of {\"stepNumber\":1,\"action\":\"...\",\"expectedResult\":\"...\"} — every step, including unchanged ones copied exactly. Every expected result must state the specific, observable outcome of its own step; never leave a placeholder or vague result in a step you were asked to fix.",
+      "Keep each test case's existing language and terminology. If a test case genuinely needs no change, return it with an empty fields object."
+    ].join("\n");
+
+    const authorBatch = async (batch: typeof targets): Promise<void> => {
+      const cases = batch.map(({ op, row }) => ({
+        externalId: row.externalId,
+        requestedChange: String(op.reason || params.message),
+        current: {
+          title: row.title,
+          description: row.description || "",
+          preconditions: row.preconditions || "",
+          postconditions: row.postconditions || "",
+          testData: row.testData || "",
+          priority: row.priority,
+          severity: row.severity,
+          type: row.type,
+          component: row.component,
+          stepsJson: (this.safeSteps(row.steps) as Body[]).map((step, index) => ({ stepNumber: index + 1, action: step?.action || "", expectedResult: step?.expectedResult || "" }))
+        }
+      }));
+      const user = `The user asked: ${params.message}\n\nTest cases to revise:\n${JSON.stringify(cases, null, 2)}`;
+      try {
+        const { parsed, usage, rawText } = await this.zyraAuthorJson(params.key, params.provider, params.model, system, user, Math.min(16000, 2000 + batch.length * 2000));
+        await this.recordZyraTokenUsage(params.projectId, "chat_generate", params.provider, params.model, usage);
+        recordGeneration(params.trace, { name: "update_authoring", provider: params.provider, model: params.model, input: { cases: cases.length }, output: parsed, rawOutput: parsed ? undefined : rawText, usage });
+        const byId = new Map<string, Body>();
+        for (const entry of normalizeJsonArray(parsed?.updates)) {
+          if (entry && typeof entry === "object" && entry.externalId) byId.set(String(entry.externalId).toUpperCase(), entry);
+        }
+        for (const { op, row } of batch) {
+          const authored = byId.get(String(row.externalId).toUpperCase());
+          if (!authored) {
+            op.__authoringError = `${row.externalId}: the drafting step returned no changes for it.`;
+            continue;
+          }
+          const authoredFields = authored.fields && typeof authored.fields === "object" ? authored.fields : {};
+          op.fields = { ...(op.fields && typeof op.fields === "object" ? op.fields : {}), ...authoredFields };
+        }
+      } catch (err) {
+        const reason = this.isZyraTimeoutError(err) ? "drafting it timed out" : `drafting it failed (${this.extractAiErrorMessage(err)})`;
+        recordGeneration(params.trace, { name: "update_authoring", provider: params.provider, model: params.model, input: { cases: cases.length }, errorMessage: reason });
+        for (const { op, row } of batch) op.__authoringError = `${row.externalId}: ${reason}, so nothing was staged for it — ask again to retry.`;
+      }
+    };
+
+    // A small fixed pool: bounded concurrency against the provider, no shared mutable state between
+    // workers beyond each batch's own ops (every op belongs to exactly one batch).
+    let next = 0;
+    const worker = async () => {
+      while (next < batches.length) {
+        const batch = batches[next++];
+        await authorBatch(batch);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(LegacyService.ZYRA_UPDATE_AUTHOR_CONCURRENCY, batches.length) }, worker));
+    const failed = operations.filter((op) => op?.__authoringError).length;
+    params.onStage?.("drafting:updates", failed ? { status: failed === targets.length ? "failed" : "ok", failed } : { status: "ok" }, "update");
+    return { ...params.raw, operations };
+  }
+
+  /**
+   * One JSON completion with the generation budget (ZYRA_GENERATE_TIMEOUT_MS, caller-chosen
+   * max_tokens) — the router helpers above are pinned to the router's 60s/4096-token budget.
+   */
+  private async zyraAuthorJson(key: Body, provider: string, model: string, system: string, user: string, maxTokens: number): Promise<{ parsed: Body | null; usage: { input: number; output: number; total: number }; rawText: string }> {
+    const signal = () => LegacyService.zyraProviderSignal(LegacyService.ZYRA_GENERATE_TIMEOUT_MS);
+    if (providerWire(provider) === "anthropic") {
+      let lastStatus = "";
+      for (const candidate of providerModelCandidates(String(key.provider || "anthropic"), model)) {
+        const res = await fetch(normalizeAnthropicMessagesUrl(key.base_url), {
+          method: "POST",
+          headers: this.buildAnthropicAuthHeaders(key.api_key, key.auth_header_name, key.auth_scheme),
+          body: JSON.stringify({
+            model: candidate,
+            max_tokens: maxTokens,
+            system: `${system}\n\nRespond with the raw JSON object only — no markdown fence, no preamble.`,
+            messages: [{ role: "user", content: user }]
+          }),
+          signal: signal()
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({} as Body)) as Body;
+          const rawStatus = String(data.error?.message || data.error || res.status);
+          lastStatus = this.describeProviderError("anthropic", res.status, rawStatus) || rawStatus;
+          if (this.isProviderAuthError(res.status, rawStatus)) throw new Error(lastStatus);
+          if (!/model|not.?found|invalid/i.test(rawStatus)) break;
+          continue;
+        }
+        const data = await res.json() as Body;
+        const rawText = normalizeJsonArray(data.content).map((item) => item?.text || "").join("\n").trim();
+        const usage = data.usage || {};
+        const input = Number(usage.input_tokens || 0) + Number(usage.cache_read_input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0);
+        const output = Number(usage.output_tokens || 0);
+        return { parsed: this.parseModelJson(rawText || "{}"), usage: { input, output, total: input + output }, rawText };
+      }
+      throw new Error(`Claude update drafting failed: ${lastStatus || "No compatible model was accepted."}`);
+    }
+    const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+      method: "POST",
+      headers: this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme),
+      body: JSON.stringify({ model, response_format: { type: "json_object" }, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),
+      signal: signal()
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({} as Body)) as Body;
+      const rawMessage = String(errBody.error?.message || errBody.error || res.status);
+      throw new Error(this.describeProviderError(provider, res.status, rawMessage) || `Update drafting failed: ${rawMessage}`);
+    }
+    const data = await res.json() as Body;
+    const rawText = String(data.choices?.[0]?.message?.content || "{}");
+    const usage = data.usage || {};
+    return {
+      parsed: this.parseModelJson(rawText),
+      usage: { input: Number(usage.prompt_tokens || 0), output: Number(usage.completion_tokens || 0), total: Number(usage.total_tokens || 0) },
+      rawText
+    };
+  }
+
   private sanitizeZyraReply(raw: unknown, fallback: string): string {
     let text = String(raw ?? "").trim();
     // AI occasionally nests a full JSON blob inside the reply field — unwrap it. The tolerant
@@ -20761,7 +20937,8 @@ export class LegacyService implements OnModuleInit {
           suiteId: op?.suiteId ? String(op.suiteId).trim() : undefined,
           draft: op?.draft && typeof op.draft === "object" ? op.draft : undefined,
           fields: op?.fields && typeof op.fields === "object" ? op.fields : undefined,
-          reason: op?.reason ? String(op.reason).slice(0, 500) : undefined
+          reason: op?.reason ? String(op.reason).slice(0, 500) : undefined,
+          authoringError: op?.__authoringError ? String(op.__authoringError) : undefined
         };
       })
       .filter((op) => {
@@ -21679,13 +21856,15 @@ export class LegacyService implements OnModuleInit {
     // Every update named an existing test case but none of them would change anything (see
     // applyZyraChatOperations) — a different situation from "those test cases don't exist", so it
     // gets its own wording rather than the not-found one below.
+    // Also covers an update whose drafting step failed (authorZyraUpdates' authoringError) — the
+    // test case exists, so the not-found wording below would be wrong for it too.
     const unchangedUpdates = applied.activity
-      .filter((entry) => entry.title === "Could not update testcase" && /did not change any field/.test(String(entry.detail || "")))
+      .filter((entry) => entry.title === "Could not update testcase" && /did not change any field|drafting it|drafting step/.test(String(entry.detail || "")))
       .map((entry) => String(entry.detail));
     if (!appliedCount && unchangedUpdates.length) {
       if (ru) return [ZYRA_RU.nothingStagedNoChange(unchangedUpdates.length), "", decision.reply].join("\n") + moveSuffix;
       return [
-        `⚠️ Nothing was staged. ${unchangedUpdates.join(" ")} The test case${unchangedUpdates.length === 1 ? " is" : "s are"} unchanged — ask me again and say what should change.`,
+        `⚠️ Nothing was staged. ${unchangedUpdates.join(" ")} The test case${unchangedUpdates.length === 1 ? " is" : "s are"} unchanged.`,
         "",
         decision.reply
       ].join("\n") + moveSuffix;
