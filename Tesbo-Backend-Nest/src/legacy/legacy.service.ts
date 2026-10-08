@@ -9919,6 +9919,11 @@ export class LegacyService implements OnModuleInit {
     const project = await this.requireProjectAccess(uid, projectId);
     const title = String(body.title || "").trim();
     if (!title) throw new BadRequestException({ error: "Document title is required" });
+    // Zyra finds its memory by this exact title (most recently updated wins), so a hand-made
+    // document under it would be read as Zyra's memory.
+    if (title === LegacyService.ZYRA_MEMORY_DOC_TITLE) {
+      throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_RESERVED_TITLE_ERROR });
+    }
     if (title.length > LegacyService.KB_DOCUMENT_TITLE_MAX_LENGTH) {
       throw new BadRequestException({ error: `Title must be at most ${LegacyService.KB_DOCUMENT_TITLE_MAX_LENGTH} characters` });
     }
@@ -9965,7 +9970,7 @@ export class LegacyService implements OnModuleInit {
     // Resolved separately rather than joined: KB_DOCUMENT_COLUMNS is shared with INSERT/UPDATE
     // RETURNING clauses where a join isn't available.
     const syncedByName = await this.kbSyncedByName(doc.source_synced_by);
-    return { ...toCamel(doc), syncedByName, breadcrumb };
+    return { ...toCamel(doc), syncedByName, breadcrumb, ...this.zyraMemoryView(doc) };
   }
 
   // Powers the Knowledge Base Change History popover/modal: this document's full add/update
@@ -10203,6 +10208,18 @@ export class LegacyService implements OnModuleInit {
         error: `"${LegacyService.ZYRA_MEMORY_DOC_TITLE}" is managed by Zyra and can't be renamed — Zyra finds its memory by this title.`
       });
     }
+    // Zyra reads this body back as context on every chat turn and generation, so free-form edits
+    // (or a document-type/status flip) would feed it unreviewed text. Corrections go through the
+    // per-entry endpoints (updateZyraMemoryEntry / deleteZyraMemoryEntry), owner/manager only.
+    // Enforced here, not just in the UI, because the API and the MCP update tool both reach it.
+    if (this.isZyraMemoryDocument(doc)) {
+      const touched = ["contentJson", "contentHtml", "contentText", "documentType", "status"].filter((key) => body[key] !== undefined);
+      if (touched.length) {
+        throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_EDIT_ERROR });
+      }
+    } else if (nextTitle === LegacyService.ZYRA_MEMORY_DOC_TITLE && nextTitle !== doc.title) {
+      throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_RESERVED_TITLE_ERROR });
+    }
     const nextJson = body.contentJson !== undefined ? JSON.stringify(body.contentJson) : doc.content_json ? JSON.stringify(doc.content_json) : null;
     const nextHtml = body.contentHtml !== undefined ? body.contentHtml : doc.content_html;
     const nextText = body.contentText !== undefined ? body.contentText : doc.content_text;
@@ -10364,7 +10381,7 @@ export class LegacyService implements OnModuleInit {
     this.kbRequireMutateAccess(role, doc.created_by, uid);
     if (this.isZyraMemoryDocument(doc)) {
       throw new BadRequestException({
-        error: `"${LegacyService.ZYRA_MEMORY_DOC_TITLE}" is managed by Zyra and can't be deleted — it holds everything Zyra has learned about this project. To clear it, reset Zyra's memory from the agent's settings.`
+        error: `"${LegacyService.ZYRA_MEMORY_DOC_TITLE}" is managed by Zyra and can't be deleted — it holds everything Zyra has learned about this project. A project owner or manager can remove individual entries from it instead.`
       });
     }
     await this.db.query(
@@ -10374,6 +10391,137 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(projectId, uid, "deleted", "knowledge_document", documentId, doc.title, {});
     await this.notifyKnowledgeItem({ kind: "deleted", projectId, actorId: uid, itemId: documentId, name: doc.title, ownerId: doc.created_by ?? null, isDocument: true });
     return { success: true };
+  }
+
+  /**
+   * Splits Zyra's memory text into its entries — one per `## <ISO timestamp>` heading, in stored
+   * (newest-first) order — plus whatever text sits above the first heading. A note runs until the
+   * next heading, so the split is lossless: serializeZyraMemory puts it back together.
+   */
+  private parseZyraMemory(text: string | null | undefined): { unstructured: string; entries: Array<{ id: string; note: string }> } {
+    const unstructured: string[] = [];
+    const entries: Array<{ id: string; lines: string[] }> = [];
+    for (const line of String(text || "").split("\n")) {
+      const heading = LegacyService.ZYRA_MEMORY_ENTRY_HEADING_RE.exec(line.trim());
+      if (heading) {
+        entries.push({ id: heading[1], lines: [] });
+        continue;
+      }
+      (entries.length ? entries[entries.length - 1].lines : unstructured).push(line);
+    }
+    return {
+      unstructured: unstructured.join("\n").trim(),
+      entries: entries.map((entry) => ({ id: entry.id, note: entry.lines.join("\n").trim() }))
+    };
+  }
+
+  private serializeZyraMemory(memory: { unstructured: string; entries: Array<{ id: string; note: string }> }): string {
+    return [memory.unstructured, ...memory.entries.map((entry) => `## ${entry.id}\n${entry.note}`.trim())].filter(Boolean).join("\n\n");
+  }
+
+  /** Extra detail-response fields: whether this is Zyra's managed memory, and its parsed entries. */
+  private zyraMemoryView(doc: Body): { isManagedByZyra: boolean; zyraMemory?: ReturnType<LegacyService["parseZyraMemory"]> } {
+    if (!this.isZyraMemoryDocument(doc)) return { isManagedByZyra: false };
+    return { isManagedByZyra: true, zyraMemory: this.parseZyraMemory(doc.content_text) };
+  }
+
+  async updateZyraMemoryEntry(projectId: string, userId: string | null | undefined, documentId: string, entryId: string, body: Body) {
+    if (typeof body?.note !== "string") throw new BadRequestException({ error: "note is required" });
+    return this.writeZyraMemoryEntry(projectId, userId, documentId, entryId, body.note);
+  }
+
+  async deleteZyraMemoryEntry(projectId: string, userId: string | null | undefined, documentId: string, entryId: string) {
+    return this.writeZyraMemoryEntry(projectId, userId, documentId, entryId, null);
+  }
+
+  /**
+   * The only way people change Zyra's memory: replace one entry's note (keeping its timestamp) or
+   * remove one entry. Owner/manager only — this text steers Zyra for the whole project. Writes the
+   * body the same way rememberZyraMemory does (text + escaped <pre>, content_json cleared so no stale
+   * editor copy survives), snapshots a version so View history shows who changed what, and holds the
+   * same per-document lock rememberZyraMemory takes, so a correction and Zyra's own append can't
+   * overwrite each other.
+   */
+  private async writeZyraMemoryEntry(projectId: string, userId: string | null | undefined, documentId: string, entryId: string, note: string | null) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const doc = await this.kbDocument(projectId, documentId);
+    if (!this.isZyraMemoryDocument(doc)) {
+      throw new BadRequestException({ error: `Memory entries only exist on "${LegacyService.ZYRA_MEMORY_DOC_TITLE}".` });
+    }
+    this.kbRequireOwnerOrManager(await this.kbProjectRole(uid, projectId));
+
+    const id = String(entryId || "");
+    let nextNote: string | null = null;
+    if (note !== null) {
+      nextNote = note.trim();
+      if (!nextNote) throw new BadRequestException({ error: "A memory entry can't be empty — remove it instead." });
+      const max = LegacyService.ZYRA_MEMORY_ENTRY_MAX_LENGTH - `## ${id}\n`.length;
+      if (nextNote.length > max) throw new BadRequestException({ error: `A memory entry must be at most ${max} characters.` });
+      // A timestamp heading inside a note would split it into a second, fabricated entry on the next read.
+      if (nextNote.split("\n").some((line) => LegacyService.ZYRA_MEMORY_ENTRY_HEADING_RE.test(line.trim()))) {
+        throw new BadRequestException({ error: "A memory entry can't contain a timestamp heading line." });
+      }
+    }
+
+    const row = await this.db.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
+      // Re-read under the lock: Zyra may have appended since kbDocument above.
+      const current = (await client.query(
+        `SELECT ${LegacyService.KB_DOCUMENT_COLUMNS} FROM knowledge_documents WHERE id = $1 AND is_deleted = false`,
+        [documentId]
+      )).rows[0];
+      if (!current) throw new NotFoundException({ error: "Document not found" });
+
+      const memory = this.parseZyraMemory(current.content_text);
+      if (id === LegacyService.ZYRA_MEMORY_UNSTRUCTURED_ID) {
+        if (!memory.unstructured) throw new NotFoundException({ error: "Memory entry not found" });
+        memory.unstructured = nextNote ?? "";
+      } else {
+        const index = memory.entries.findIndex((entry) => entry.id === id);
+        if (index < 0) throw new NotFoundException({ error: "Memory entry not found" });
+        if (nextNote === null) memory.entries.splice(index, 1);
+        else memory.entries[index] = { id, note: nextNote };
+      }
+      const nextText = this.serializeZyraMemory(memory);
+
+      const diff = summarizeDocumentChange(
+        { title: current.title, contentText: current.content_text },
+        { title: current.title, contentText: nextText }
+      );
+      const nextVersion = await client.query<{ max: number }>(
+        "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
+        [documentId]
+      );
+      await client.query(
+        `INSERT INTO knowledge_document_versions
+           (document_id, version_number, title, content_json, content_html, content_text, created_by, changed_summary, changed_fields)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::jsonb)`,
+        [
+          documentId,
+          nextVersion.rows[0].max,
+          current.title,
+          current.content_json ? JSON.stringify(current.content_json) : null,
+          current.content_html,
+          current.content_text,
+          uid,
+          diff.summary,
+          JSON.stringify(diff.fields)
+        ]
+      );
+      return (await client.query(
+        `UPDATE knowledge_documents SET content_text = $2, content_html = $3, content_json = NULL, updated_by = $4, updated_at = now()
+         WHERE id = $1 RETURNING ${LegacyService.KB_DOCUMENT_COLUMNS}`,
+        [documentId, nextText, `<pre>${escapeHtml(nextText)}</pre>`, uid]
+      )).rows[0];
+    });
+
+    await this.logProjectActivity(projectId, uid, "updated", "knowledge_document", documentId, row.title, {
+      memoryEntry: id,
+      change: nextNote === null ? "removed" : "edited"
+    });
+    this.enqueueEmbedding(row.organization_id, projectId, "document", documentId, "updated");
+    return { ...toCamel(row), ...this.zyraMemoryView(row) };
   }
 
   async restoreKnowledgeDocument(projectId: string, userId: string | null | undefined, documentId: string) {
@@ -11007,6 +11155,10 @@ export class LegacyService implements OnModuleInit {
     const doc = await this.kbDocument(projectId, documentId);
     const role = await this.kbProjectRole(uid, projectId);
     this.kbRequireMutateAccess(role, doc.created_by, uid);
+    // A restore rewrites the whole body — the same unrestricted edit updateKnowledgeDocument refuses.
+    if (this.isZyraMemoryDocument(doc)) {
+      throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_EDIT_ERROR });
+    }
 
     // versionId is client input, so a missing or malformed one must read as "no such version"
     // rather than a failed uuid cast.
@@ -16038,6 +16190,20 @@ export class LegacyService implements OnModuleInit {
    * empty memory. Basecamp 10212786541.
    */
   private static readonly ZYRA_MEMORY_DOC_TITLE = "Zyra AI Memory";
+  private static readonly ZYRA_MEMORY_EDIT_ERROR =
+    `"Zyra AI Memory" is managed by Zyra and can't be edited directly — Zyra reads it as context for every response. A project owner or manager can correct or remove individual entries instead.`;
+  private static readonly ZYRA_MEMORY_RESERVED_TITLE_ERROR =
+    `"Zyra AI Memory" is reserved for Zyra's own memory document — choose a different title.`;
+  /** The heading rememberZyraMemory stamps on every entry. Its timestamp is the entry's id. */
+  private static readonly ZYRA_MEMORY_ENTRY_HEADING_RE = /^##\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s*$/;
+  /** Same cap rememberZyraMemory applies to one stamped entry (heading + note). */
+  private static readonly ZYRA_MEMORY_ENTRY_MAX_LENGTH = 2500;
+  /**
+   * Id of any text above the first timestamp heading — content that isn't one of Zyra's own entries,
+   * e.g. left behind by a direct edit made before this document was locked. Addressable so it can be
+   * removed or corrected too, rather than becoming permanent, unremovable context.
+   */
+  private static readonly ZYRA_MEMORY_UNSTRUCTURED_ID = "unstructured";
 
   // The scenario list was planned against the existing testcases already (planZyraChatScenarios is
   // told to avoid scenarios that have coverage). Without saying so, the generation prompt's general
@@ -18178,11 +18344,18 @@ export class LegacyService implements OnModuleInit {
     const stampedEntry = `## ${new Date().toISOString()}\n${entry.trim()}`.slice(0, 2500);
     const project = await this.db.query<{ organization_id: string }>("SELECT organization_id FROM projects WHERE id = $1", [projectId]);
     if (existing.rows[0]) {
-      const content = [stampedEntry, String(existing.rows[0].content_text || "")].filter(Boolean).join("\n\n").slice(0, 20000);
-      await this.db.query(
-        "UPDATE knowledge_documents SET content_text = $2, content_html = $3, updated_at = now() WHERE id = $1",
-        [existing.rows[0].id, content, `<pre>${escapeHtml(content)}</pre>`]
-      );
+      const documentId = existing.rows[0].id;
+      // Same per-document lock writeZyraMemoryEntry holds, with the text re-read under it, so an
+      // owner's correction landing mid-append is neither lost nor overwritten.
+      await this.db.transaction(async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
+        const current = await client.query<{ content_text: string | null }>("SELECT content_text FROM knowledge_documents WHERE id = $1", [documentId]);
+        const content = [stampedEntry, String(current.rows[0]?.content_text || "")].filter(Boolean).join("\n\n").slice(0, 20000);
+        await client.query(
+          "UPDATE knowledge_documents SET content_text = $2, content_html = $3, updated_at = now() WHERE id = $1",
+          [documentId, content, `<pre>${escapeHtml(content)}</pre>`]
+        );
+      });
       this.enqueueEmbedding(project.rows[0]?.organization_id, projectId, "document", existing.rows[0].id, "updated");
       return;
     }

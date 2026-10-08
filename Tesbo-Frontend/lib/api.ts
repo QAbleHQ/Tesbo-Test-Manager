@@ -3826,6 +3826,10 @@ export interface KnowledgeDocument {
   isReadOnly: boolean;
   /** Display name of whoever last ran the sync that wrote this document. Detail endpoint only. */
   syncedByName?: string | null;
+  /** Zyra's own memory document: not directly editable, changed one entry at a time. Detail endpoint only. */
+  isManagedByZyra?: boolean;
+  /** Its entries, newest first, plus any text above the first entry (id "unstructured"). Only when isManagedByZyra. */
+  zyraMemory?: { unstructured: string; entries: Array<{ id: string; note: string }> };
   createdBy: string | null;
   updatedBy: string | null;
   reviewedBy: string | null;
@@ -4018,6 +4022,21 @@ export function duplicateKnowledgeDocument(projectId: string, documentId: string
 
 export function deleteKnowledgeDocument(projectId: string, documentId: string): Promise<{ success: boolean }> {
   return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`, { method: "DELETE" });
+}
+
+/** Zyra AI Memory: replace one entry's note, keeping its timestamp. Owner/manager only. */
+export function updateZyraMemoryEntry(projectId: string, documentId: string, entryId: string, note: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/memory-entries/${encodeURIComponent(entryId)}`, {
+    method: "PATCH",
+    body: { note },
+  });
+}
+
+/** Zyra AI Memory: remove one entry. Owner/manager only. */
+export function deleteZyraMemoryEntry(projectId: string, documentId: string, entryId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/memory-entries/${encodeURIComponent(entryId)}`, {
+    method: "DELETE",
+  });
 }
 
 export function restoreKnowledgeDocument(projectId: string, documentId: string): Promise<KnowledgeDocument> {
