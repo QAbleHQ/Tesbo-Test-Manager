@@ -53,6 +53,17 @@ export class AppConfigService {
   // config/email-delivery.policy.ts for the full decision table.
   readonly emailDeliveryMode: "live" | "log" =
     this.string("EMAIL_DELIVERY_MODE", "log").trim().toLowerCase() === "live" ? "live" : "log";
+  // Daily Basecamp analytics report. Opt-in and PRODUCTION-ONLY: the scheduler registers only when this
+  // is exactly "true", and only the production Jenkinsfile sets it. Everything else (local, e2e,
+  // stage, or a stage stack pointed at the prod database) leaves it off, so a forgotten setting fails
+  // towards "no report posted", never towards a duplicate one.
+  readonly analyticsReportEnabled = this.optionalString("ANALYTICS_REPORT_ENABLED").toLowerCase() === "true";
+  readonly basecampClientId = this.optionalString("BASECAMP_CLIENT_ID");
+  readonly basecampClientSecret = this.optionalString("BASECAMP_CLIENT_SECRET");
+  readonly basecampRefreshToken = this.optionalString("BASECAMP_REFRESH_TOKEN");
+  readonly basecampAccountId = this.optionalString("BASECAMP_ACCOUNT_ID");
+  // Overrides the check-in the report is posted to (see analytics-report.constants.ts for the default).
+  readonly basecampAnalyticsQuestionUrl = this.optionalString("BASECAMP_ANALYTICS_QUESTION_URL");
   readonly otpExpiryMinutes = this.integer("OTP_EXPIRY_MINUTES", 10);
   readonly sessionDays = this.integer("SESSION_DAYS", 30);
   readonly sessionCookieName = "tesbo_session";

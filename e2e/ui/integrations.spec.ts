@@ -1075,3 +1075,81 @@ test.describe("Notion integration: project screens (UI)", () => {
     }
   });
 });
+
+/*
+ * "[Integration] Add 'Go to Requirements' button after successful Jira/Linear/Notion sync".
+ * The button sits in the page header (top right) of the shared ProjectIntegrationMapping screen, so
+ * all three providers are driven through the same mocked connected state with a varying last run.
+ */
+test.describe("Integration screens: Go to Requirements after a sync (UI)", () => {
+  function apiContext() {
+    return pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: path.join(__dirname, "../.auth/state.json") });
+  }
+
+  const LIST_PATH = { jira: "projects", linear: "teams", notion: "databases" } as const;
+
+  function runOf(status: string) {
+    return {
+      id: "run-1", provider: "x", status, stage: status === "running" ? "fetching" : "done",
+      remoteProjectKey: "OH", remoteProjectName: "Orange HRMS", totalTickets: 6, processedTickets: status === "failed" ? 0 : 6,
+      failedTickets: status === "partial" ? 2 : 0, documentsCreated: 0, documentsUpdated: 0, commentsSynced: 0,
+      decisionSummaries: 0, error: status === "failed" ? "boom" : null, triggeredByName: "E2E",
+      startedAt: new Date().toISOString(), finishedAt: status === "running" ? null : new Date().toISOString(), createdAt: new Date().toISOString(),
+    };
+  }
+
+  async function open(page: Page, context: BrowserContext, projectId: string, provider: keyof typeof LIST_PATH, run: unknown) {
+    await context.route(`**/api/projects/${projectId}/${provider}/status`, (route) =>
+      route.fulfill({ json: { connected: true, siteUrl: `https://e2e.${provider}.invalid`, connectedProjects: [{ id: "m1" }], history: [] } })
+    );
+    await context.route(`**/api/projects/${projectId}/${provider}/${LIST_PATH[provider]}`, (route) => route.fulfill({ json: [] }));
+    await context.route(`**/api/projects/${projectId}/integrations/${provider}/sync-status`, (route) => route.fulfill({ json: { run } }));
+    await page.goto(`/projects/${projectId}/settings/integrations/${provider}`);
+    await expect(page.getByRole("heading", { name: /Integration$/ })).toBeVisible();
+  }
+
+  for (const provider of ["jira", "linear", "notion"] as const) {
+    test(`INT-U-REQ-${provider} the button follows a finished sync and goes to Requirements`, async ({ page, context }) => {
+      const api = await apiContext();
+      let projectId: string | undefined;
+      try {
+        const suffix = Date.now().toString().slice(-8);
+        projectId = (await (await api.post("/api/projects", { data: { name: `UI Req Btn ${provider} ${suffix}`, key: `E2ER${suffix}` } })).json()).id;
+        await open(page, context, projectId!, provider, runOf("succeeded"));
+
+        const button = page.getByTestId("go-to-requirements");
+        await expect(button).toBeVisible();
+        await expect(button).toHaveText("Go to Requirements");
+        await button.click();
+        await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/requirements$`));
+      } finally {
+        if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+        await api.dispose();
+      }
+    });
+  }
+
+  test("INT-U-REQ-states the button is shown for a partial sync and hidden with no run, while syncing, or after a failure", async ({ page, context }) => {
+    const api = await apiContext();
+    let projectId: string | undefined;
+    try {
+      const suffix = Date.now().toString().slice(-8);
+      projectId = (await (await api.post("/api/projects", { data: { name: `UI Req Btn states ${suffix}`, key: `E2EQ${suffix}` } })).json()).id;
+      const button = page.getByTestId("go-to-requirements");
+
+      await open(page, context, projectId!, "jira", runOf("partial"));
+      await expect(button).toBeVisible();
+
+      for (const run of [null, runOf("running"), runOf("queued"), runOf("failed")]) {
+        await context.unroute(`**/api/projects/${projectId}/integrations/jira/sync-status`);
+        await context.route(`**/api/projects/${projectId}/integrations/jira/sync-status`, (route) => route.fulfill({ json: { run } }));
+        await page.reload();
+        await expect(page.getByRole("heading", { name: "Jira Integration" })).toBeVisible();
+        await expect(button, `run status ${run?.status ?? "none"}`).toHaveCount(0);
+      }
+    } finally {
+      if (projectId) await api.delete(`/api/projects/${projectId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});

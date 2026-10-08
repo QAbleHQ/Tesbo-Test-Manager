@@ -245,6 +245,19 @@ export function ProjectIntegrationMapping({
             ) : undefined
           }
           breadcrumb={breadcrumb}
+          // Offered once a sync has put items in (a partial sync still imported the rest), so the
+          // next step after a sync is one click away instead of a trip through the sidebar.
+          actions={
+            run && (run.status === "succeeded" || run.status === "partial") ? (
+              <Link
+                href={`/projects/${projectId}/requirements`}
+                data-testid="go-to-requirements"
+                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+              >
+                Go to Requirements
+              </Link>
+            ) : undefined
+          }
         />
       }
     >
