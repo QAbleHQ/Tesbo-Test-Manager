@@ -2200,14 +2200,19 @@ test.describe("knowledge base (UI)", () => {
     expect(storedDocument(documentId).html).toBe("<p>First plain line</p><p>Second line: 2 * 3 = 6</p>");
   });
 
-  // ─── Zyra AI Memory: entry timestamps in the sitewide date format ──────────
+  // ─── Zyra AI Memory: managed by Zyra, corrected one entry at a time ────────
   //
-  // Fix for "[Knowledgebase] Zyra Memory should show proper date and time format same as other
-  // sections". rememberZyraMemory (legacy.service.ts) stores each entry as `## <ISO timestamp>\n<note>`
-  // in content_text, and content_html as that same text escaped inside a bare <pre> — so the editor
-  // showed one code block with raw "2026-10-05T12:21:14.614Z" headings. The document page now
-  // rebuilds the display from content_text, formatting each heading with lib/date.ts's formatDateTime
-  // ("05 Oct 2026, 06:21 PM", viewer-local). The stored content is never rewritten.
+  // rememberZyraMemory (legacy.service.ts) stores each entry as `## <ISO timestamp>\n<note>` in
+  // content_text, with content_html as that text escaped inside a bare <pre>.
+  //
+  // "[Knowledgebase] Zyra Memory should show proper date and time format same as other sections":
+  // entry timestamps show in lib/date.ts's formatDateTime shape ("05 Oct 2026, 06:21 PM",
+  // viewer-local), never the raw ISO string, and never as one code block.
+  //
+  // "[Knowledge Base] Zyra Memory Should Not Support Unrestricted Direct Editing": Zyra reads this
+  // body back as context, so the page has no free-form editor for it — the API flags it
+  // (isManagedByZyra) and returns its entries parsed; owners/managers correct or remove one entry at
+  // a time (ZyraMemoryEntries.tsx), everyone else only reads. Ordinary documents are unchanged.
 
   const MEMORY_ISO_1 = "2026-10-05T12:21:14.614Z";
   const MEMORY_ISO_2 = "2026-10-05T12:20:05.524Z";
@@ -2230,92 +2235,266 @@ test.describe("knowledge base (UI)", () => {
   }
 
   /**
-   * Inserted directly, as rememberZyraMemory does: the API can't create an is_ai_generated document,
-   * and producing a real one means a live model call. The title must be exactly "Zyra AI Memory";
-   * afterEach's purgeKb removes it, so successive tests never see each other's copy.
+   * Inserted directly, as rememberZyraMemory does: the API refuses the reserved title, and producing a
+   * real one means a live model call. afterEach's purgeKb removes it (and its versions).
    */
-  function seedZyraMemory(options: { text: string; html: string; isAiGenerated?: boolean; contentJson?: unknown }): string {
+  function seedZyraMemory(options: { text?: string; contentJson?: unknown } = {}): string {
+    const text = options.text ?? MEMORY_TEXT;
     const json = options.contentJson === undefined ? "NULL" : `${literal(JSON.stringify(options.contentJson))}::jsonb`;
     exec(
       "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, content_json, " +
-        "document_type, status, is_ai_generated) VALUES (" +
+        "document_type, status, is_ai_generated, created_by, updated_by) VALUES (" +
         `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, 'Zyra AI Memory', ` +
-        `${literal(options.text)}, ${literal(options.html)}, ${json}, 'general', 'published', ${options.isAiGenerated ?? true});`,
+        `${literal(text)}, ${literal(zyraPreHtml(text))}, ${json}, 'general', 'published', true, ` +
+        `${literal(tenant!.owner.userId)}, ${literal(tenant!.owner.userId)});`,
     );
     return scalar(
       `SELECT id FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Zyra AI Memory' AND is_deleted = false ORDER BY created_at DESC LIMIT 1;`,
     );
   }
 
-  async function openDocument(browser: Browser, documentId: string): Promise<{ page: Page; editor: Locator }> {
-    const ctx = await browser.newContext({ storageState: states.get("owner") });
+  async function openDocument(browser: Browser, documentId: string, as: "owner" | "qa" = "owner"): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: states.get(as) });
     contexts.push(ctx);
     const page = await ctx.newPage();
     await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
-    const editor = page.locator(".ProseMirror").first();
-    await expect(editor).toBeVisible();
-    return { page, editor };
+    await expect(page.getByTestId("zyra-memory-banner").or(page.locator(".ProseMirror").first())).toBeVisible();
+    return page;
   }
 
-  test("KBU-56 Zyra AI Memory entry headings show in the sitewide date format, as headings and bullets — not raw ISO in a code block", async ({
+  function memoryEntry(page: Page, iso: string): Locator {
+    return page.locator(`[data-testid="zyra-memory-entry"][data-entry-id="${iso}"]`);
+  }
+
+  test("KBU-56 Zyra AI Memory shows each entry under a sitewide-format date, as rendered notes — no raw ISO, no code block, no editor", async ({
     browser,
   }) => {
-    const html = zyraPreHtml(MEMORY_TEXT);
-    const documentId = seedZyraMemory({ text: MEMORY_TEXT, html });
-    const { page, editor } = await openDocument(browser, documentId);
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
 
-    await expect(editor.locator("h2")).toHaveText([memoryHeading(MEMORY_ISO_1), memoryHeading(MEMORY_ISO_2)]);
-    await expect(editor.locator("li")).toHaveText([MEMORY_NOTE_1, MEMORY_NOTE_2]);
-    await expect(editor.locator("pre")).toHaveCount(0);
-    const shown = await editor.innerText();
+    const entries = page.getByTestId("zyra-memory-entry");
+    await expect(entries.locator("h2")).toHaveText([memoryHeading(MEMORY_ISO_1), memoryHeading(MEMORY_ISO_2)]);
+    await expect(entries.locator("li")).toHaveText([MEMORY_NOTE_1, MEMORY_NOTE_2]);
+    await expect(page.locator(".ProseMirror"), "Zyra's memory must not get the free-form editor").toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-entries").locator("pre")).toHaveCount(0);
+    const shown = await page.getByTestId("zyra-memory-entries").innerText();
     expect(shown).not.toContain(MEMORY_ISO_1);
     expect(shown).not.toContain(MEMORY_ISO_2);
     expect(shown, "no Markdown heading syntax left visible").not.toContain("## ");
 
-    // Display only: opening the document must not write the reformatted content back. The autosave
-    // debounce is 1.2s, so wait past it before reading the row.
+    // Display only: opening the document must not write anything back. The autosave debounce is
+    // 1.2s, so wait past it before reading the row.
     await page.waitForTimeout(2500);
-    expect(storedDocument(documentId)).toEqual({ html, text: MEMORY_TEXT });
+    expect(storedDocument(documentId)).toEqual({ html: zyraPreHtml(MEMORY_TEXT), text: MEMORY_TEXT });
   });
 
-  test("KBU-57 entries Zyra appends after a person edited its memory still show, with formatted dates", async ({ browser }) => {
-    // A person's save leaves content_json behind; Zyra's next append rewrites only content_text and
-    // content_html (back to a bare <pre>), so content_json is the stale copy and must not be shown.
-    const staleJson = { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Stale human-edited copy" }] }] };
-    const documentId = seedZyraMemory({ text: MEMORY_TEXT, html: zyraPreHtml(MEMORY_TEXT), contentJson: staleJson });
-    const { editor } = await openDocument(browser, documentId);
+  test("KBU-57 the memory page has no direct-edit controls: read-only title, no Save, no Delete, a managed-by-Zyra banner", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
 
-    await expect(editor.locator("h2").first()).toHaveText(memoryHeading(MEMORY_ISO_1));
-    await expect(editor).toContainText(MEMORY_NOTE_1);
-    await expect(editor).not.toContainText("Stale human-edited copy");
+    await expect(page.getByTestId("zyra-memory-banner")).toContainText("Managed by Zyra");
+    await expect(page.getByTestId("zyra-memory-banner")).toContainText("correct or remove individual entries");
+    await expect(page.getByPlaceholder("Untitled document")).toHaveAttribute("readonly", "");
+    await expect(page.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await expect(page.getByRole("button", { name: "View history" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Delete", exact: true }), "the memory can't be deleted, so no Delete is offered").toHaveCount(0);
   });
 
-  test("KBU-58 a Zyra AI Memory document a person saved last is shown exactly as they saved it", async ({ browser }) => {
-    // After a person's save, content_html is the editor's own HTML (no bare <pre>), so it is left
-    // alone — even when its text still contains an ISO timestamp.
-    const savedHtml = `<h2>${MEMORY_ISO_1}</h2><p>Edited by hand</p>`;
-    const savedJson = {
-      type: "doc",
-      content: [
-        { type: "heading", attrs: { level: 2 }, content: [{ type: "text", text: MEMORY_ISO_1 }] },
-        { type: "paragraph", content: [{ type: "text", text: "Edited by hand" }] },
-      ],
-    };
-    const documentId = seedZyraMemory({ text: `${MEMORY_ISO_1}\n\nEdited by hand`, html: savedHtml, contentJson: savedJson });
-    const { editor } = await openDocument(browser, documentId);
+  test("KBU-58 Edit opens the regular Knowledge Base editor with the entry formatted, and Save stores it back as Markdown", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+    const entryRequests: string[] = [];
+    page.on("request", (req) => {
+      if (req.url().includes("/memory-entries/")) entryRequests.push(req.method());
+    });
 
-    await expect(editor.locator("h2")).toHaveText(MEMORY_ISO_1);
-    await expect(editor.locator("p")).toHaveText("Edited by hand");
+    const entry = memoryEntry(page, MEMORY_ISO_1);
+    await entry.getByRole("button", { name: "Edit" }).click();
+    // The same editor ordinary documents use: toolbar and a contenteditable ProseMirror surface,
+    // with the note shown formatted (a real bullet) rather than its "- " Markdown source.
+    const editor = entry.locator(".ProseMirror");
+    await expect(editor).toHaveAttribute("contenteditable", "true");
+    await expect(entry.getByTitle("Bold")).toBeVisible();
+    await expect(editor.locator("li")).toHaveText(MEMORY_NOTE_1);
+    expect(await editor.innerText(), "raw Markdown syntax in the editor").not.toMatch(/^- |##/m);
+
+    // Saving without typing anything sends nothing, so the stored note can't be re-serialised.
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    await expect(entry.locator(".ProseMirror")).toHaveCount(0);
+    expect(entryRequests, "an untouched Save made a request").toEqual([]);
+
+    // Cancel discards typed changes.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror li").first().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" throwaway");
+    await entry.getByRole("button", { name: "Cancel" }).click();
+    await expect(entry.locator("li")).toHaveText(MEMORY_NOTE_1);
+    expect(entryRequests).toEqual([]);
+
+    // Emptying the editor disables Save — an empty entry is removed, not saved.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror").click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.press("Delete");
+    await expect(entry.getByRole("button", { name: "Save entry" })).toBeDisabled();
+    await entry.getByRole("button", { name: "Cancel" }).click();
+
+    // A real edit is stored as Markdown, under the same timestamp; the other entry is untouched.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror li").first().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" (corrected)");
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    await expect(entry.locator(".ProseMirror")).toHaveCount(0);
+    await expect(entry.locator("li")).toHaveText(`${MEMORY_NOTE_1} (corrected)`);
+    await expect(entry.locator("h2")).toHaveText(memoryHeading(MEMORY_ISO_1));
+    await expect(memoryEntry(page, MEMORY_ISO_2).locator("li")).toHaveText(MEMORY_NOTE_2);
+    expect(storedDocument(documentId).text).toBe(`## ${MEMORY_ISO_1}\n- ${MEMORY_NOTE_1} (corrected)\n\n## ${MEMORY_ISO_2}\n- ${MEMORY_NOTE_2}`);
+
+    // Survives a reload, and re-opening Edit shows the saved content formatted again.
+    await page.reload();
+    const reloaded = memoryEntry(page, MEMORY_ISO_1);
+    await expect(reloaded.locator("li")).toHaveText(`${MEMORY_NOTE_1} (corrected)`);
+    await reloaded.getByRole("button", { name: "Edit" }).click();
+    await expect(reloaded.locator(".ProseMirror li")).toHaveText(`${MEMORY_NOTE_1} (corrected)`);
+    await reloaded.getByRole("button", { name: "Cancel" }).click();
+
+    // The correction is in View history, but a whole-document restore is not offered for the memory.
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const history = modal(page, "Update History");
+    await expect(history).toBeVisible();
+    // Wait for the timeline itself (the correction's version row), so the absence below is real.
+    await expect(history.getByText("Updated", { exact: true }).first()).toBeVisible();
+    await expect(history.getByRole("button", { name: /^Restor/ })).toHaveCount(0);
   });
 
-  test("KBU-59 a person's own document titled Zyra AI Memory is not reformatted", async ({ browser }) => {
-    // Only Zyra's AI-generated document is rebuilt; a hand-made one with the same title and a <pre>
-    // body keeps its code block and its text verbatim.
-    const documentId = seedZyraMemory({ text: MEMORY_TEXT, html: zyraPreHtml(MEMORY_TEXT), isAiGenerated: false });
-    const { editor } = await openDocument(browser, documentId);
+  test("KBU-64 a formatted note keeps its heading, bold and list structure through View -> Edit -> Save", async ({ browser }) => {
+    const note = "### Context\n\n- **Login** flow covered\n- Second point";
+    const documentId = seedZyraMemory({ text: `## ${MEMORY_ISO_1}\n${note}` });
+    const page = await openDocument(browser, documentId);
 
-    await expect(editor.locator("pre")).toHaveCount(1);
-    await expect(editor.locator("pre")).toContainText(`## ${MEMORY_ISO_1}`);
-    await expect(editor.locator("h2")).toHaveCount(0);
+    const entry = memoryEntry(page, MEMORY_ISO_1);
+    // View: rendered, not raw.
+    await expect(entry.locator("h3")).toHaveText("Context");
+    await expect(entry.locator("strong")).toHaveText("Login");
+    await expect(entry.locator("li")).toHaveText(["Login flow covered", "Second point"]);
+
+    // Edit: the same structure inside the editor.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    const editor = entry.locator(".ProseMirror");
+    await expect(editor.locator("h3")).toHaveText("Context");
+    await expect(editor.locator("strong")).toHaveText("Login");
+    await expect(editor.locator("li")).toHaveText(["Login flow covered", "Second point"]);
+
+    await editor.locator("li").last().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" (edited)");
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    await expect(entry.locator(".ProseMirror")).toHaveCount(0);
+
+    // Stored back as Markdown with the structure intact.
+    const stored = storedDocument(documentId).text;
+    expect(stored.startsWith(`## ${MEMORY_ISO_1}\n`), stored).toBe(true);
+    expect(stored).toContain("### Context");
+    expect(stored).toContain("**Login** flow covered");
+    expect(stored).toContain("- Second point (edited)");
+    // And View shows it formatted again.
+    await expect(entry.locator("h3")).toHaveText("Context");
+    await expect(entry.locator("li")).toHaveText(["Login flow covered", "Second point (edited)"]);
+  });
+
+  test("KBU-59 an owner removes one entry after confirming; cancelling the confirmation keeps it", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+
+    const entry = memoryEntry(page, MEMORY_ISO_2);
+    await entry.getByRole("button", { name: "Remove" }).click();
+    const confirm = modal(page, "Remove memory entry");
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel" }).click();
+    await expect(entry).toBeVisible();
+    expect(storedDocument(documentId).text).toBe(MEMORY_TEXT);
+
+    await entry.getByRole("button", { name: "Remove" }).click();
+    await modal(page, "Remove memory entry").getByRole("button", { name: "Remove entry" }).click();
+    await expect(entry).toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-entry")).toHaveCount(1);
+    expect(storedDocument(documentId).text).toBe(`## ${MEMORY_ISO_1}\n- ${MEMORY_NOTE_1}`);
+  });
+
+  test("KBU-60 a QA engineer reads the memory but gets no Edit or Remove, and is told who can change it", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId, "qa");
+
+    await expect(page.getByTestId("zyra-memory-entry")).toHaveCount(2);
+    await expect(page.getByRole("button", { name: "Edit" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Remove" })).toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-banner")).toContainText("Only project owners and managers can correct or remove entries");
+  });
+
+  test("KBU-61 a failed correction shows the API's error and leaves the entry as it was", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+    // Forced server-side refusal: the UI must surface it rather than pretend the save worked.
+    await page.route("**/memory-entries/**", (route) =>
+      route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ error: "E2E forced refusal" }) }),
+    );
+
+    const entry = memoryEntry(page, MEMORY_ISO_1);
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror li").first().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" should not land");
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    // Scoped: Next's route announcer is also a role="alert" on the page.
+    await expect(page.getByTestId("zyra-memory-entries").getByRole("alert")).toContainText("E2E forced refusal");
+    // Still in the editor with the typed text, so nothing is silently lost.
+    await expect(entry.locator(".ProseMirror li")).toHaveText(`${MEMORY_NOTE_1} should not land`);
+    expect(storedDocument(documentId).text).toBe(MEMORY_TEXT);
+  });
+
+  test("KBU-62 text an old direct edit left above the entries shows as 'Unstructured notes' and can be removed", async ({ browser }) => {
+    // Rows saved through the old editor carry its JSON too; it must not be what the page shows.
+    const staleJson = { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Stale editor copy" }] }] };
+    // A flattened timestamp line (what an old editor save left behind), followed by the blank-line
+    // run empty paragraphs produce.
+    const documentId = seedZyraMemory({ text: `06 Oct 2026, 01:06 PM\n\n\n\n\nHand-typed line\n\n${MEMORY_TEXT}`, contentJson: staleJson });
+    const page = await openDocument(browser, documentId);
+
+    const unstructured = memoryEntry(page, "unstructured");
+    await expect(unstructured.locator("h2")).toHaveText("Unstructured notes");
+    await expect(unstructured).toContainText("Hand-typed line");
+    // The date line heads its own group, bold, directly above the text it belongs to.
+    const group = unstructured.getByTestId("zyra-memory-note-group").first();
+    const date = group.getByText("06 Oct 2026, 01:06 PM", { exact: true });
+    await expect(date).toHaveCSS("font-weight", "600");
+    await expect(group).toContainText("Hand-typed line");
+    // Blank-line runs leave no line breaks behind — spacing comes from paragraph margins only.
+    await expect(unstructured.locator("br")).toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-entries")).not.toContainText("Stale editor copy");
+
+    await unstructured.getByRole("button", { name: "Remove" }).click();
+    await modal(page, "Remove memory entry").getByRole("button", { name: "Remove entry" }).click();
+    await expect(unstructured).toHaveCount(0);
+    expect(storedDocument(documentId).text).toBe(MEMORY_TEXT);
+  });
+
+  test("KBU-63 an ordinary document keeps its editor, editable title, Save and Delete", async ({ browser }) => {
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title: stamp("Ordinary editable"), folderId: rootFolderId, documentType: "general", contentText: `## ${MEMORY_ISO_1}\nnot memory` },
+    });
+    expect(created.status(), await created.text()).toBe(201);
+    const documentId = (await created.json()).id;
+    const page = await openDocument(browser, documentId);
+
+    await expect(page.getByTestId("zyra-memory-banner")).toHaveCount(0);
+    await expect(page.locator(".ProseMirror").first()).toHaveAttribute("contenteditable", "true");
+    await expect(page.getByPlaceholder("Untitled document")).not.toHaveAttribute("readonly", "");
+    await expect(page.getByRole("button", { name: "Save", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "More actions" }).click();
+    await expect(page.getByRole("button", { name: "Delete", exact: true })).toBeVisible();
   });
 });

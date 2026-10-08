@@ -10076,6 +10076,11 @@ export class LegacyService implements OnModuleInit {
     const project = await this.requireProjectAccess(uid, projectId);
     const title = String(body.title || "").trim();
     if (!title) throw new BadRequestException({ error: "Document title is required" });
+    // Zyra finds its memory by this exact title (most recently updated wins), so a hand-made
+    // document under it would be read as Zyra's memory.
+    if (title === LegacyService.ZYRA_MEMORY_DOC_TITLE) {
+      throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_RESERVED_TITLE_ERROR });
+    }
     if (title.length > LegacyService.KB_DOCUMENT_TITLE_MAX_LENGTH) {
       throw new BadRequestException({ error: `Title must be at most ${LegacyService.KB_DOCUMENT_TITLE_MAX_LENGTH} characters` });
     }
@@ -10122,7 +10127,7 @@ export class LegacyService implements OnModuleInit {
     // Resolved separately rather than joined: KB_DOCUMENT_COLUMNS is shared with INSERT/UPDATE
     // RETURNING clauses where a join isn't available.
     const syncedByName = await this.kbSyncedByName(doc.source_synced_by);
-    return { ...toCamel(doc), syncedByName, breadcrumb };
+    return { ...toCamel(doc), syncedByName, breadcrumb, ...this.zyraMemoryView(doc) };
   }
 
   // Powers the Knowledge Base Change History popover/modal: this document's full add/update
@@ -10360,6 +10365,18 @@ export class LegacyService implements OnModuleInit {
         error: `"${LegacyService.ZYRA_MEMORY_DOC_TITLE}" is managed by Zyra and can't be renamed — Zyra finds its memory by this title.`
       });
     }
+    // Zyra reads this body back as context on every chat turn and generation, so free-form edits
+    // (or a document-type/status flip) would feed it unreviewed text. Corrections go through the
+    // per-entry endpoints (updateZyraMemoryEntry / deleteZyraMemoryEntry), owner/manager only.
+    // Enforced here, not just in the UI, because the API and the MCP update tool both reach it.
+    if (this.isZyraMemoryDocument(doc)) {
+      const touched = ["contentJson", "contentHtml", "contentText", "documentType", "status"].filter((key) => body[key] !== undefined);
+      if (touched.length) {
+        throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_EDIT_ERROR });
+      }
+    } else if (nextTitle === LegacyService.ZYRA_MEMORY_DOC_TITLE && nextTitle !== doc.title) {
+      throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_RESERVED_TITLE_ERROR });
+    }
     const nextJson = body.contentJson !== undefined ? JSON.stringify(body.contentJson) : doc.content_json ? JSON.stringify(doc.content_json) : null;
     const nextHtml = body.contentHtml !== undefined ? body.contentHtml : doc.content_html;
     const nextText = body.contentText !== undefined ? body.contentText : doc.content_text;
@@ -10521,7 +10538,7 @@ export class LegacyService implements OnModuleInit {
     this.kbRequireMutateAccess(role, doc.created_by, uid);
     if (this.isZyraMemoryDocument(doc)) {
       throw new BadRequestException({
-        error: `"${LegacyService.ZYRA_MEMORY_DOC_TITLE}" is managed by Zyra and can't be deleted — it holds everything Zyra has learned about this project. To clear it, reset Zyra's memory from the agent's settings.`
+        error: `"${LegacyService.ZYRA_MEMORY_DOC_TITLE}" is managed by Zyra and can't be deleted — it holds everything Zyra has learned about this project. A project owner or manager can remove individual entries from it instead.`
       });
     }
     await this.db.query(
@@ -10531,6 +10548,137 @@ export class LegacyService implements OnModuleInit {
     await this.logProjectActivity(projectId, uid, "deleted", "knowledge_document", documentId, doc.title, {});
     await this.notifyKnowledgeItem({ kind: "deleted", projectId, actorId: uid, itemId: documentId, name: doc.title, ownerId: doc.created_by ?? null, isDocument: true });
     return { success: true };
+  }
+
+  /**
+   * Splits Zyra's memory text into its entries — one per `## <ISO timestamp>` heading, in stored
+   * (newest-first) order — plus whatever text sits above the first heading. A note runs until the
+   * next heading, so the split is lossless: serializeZyraMemory puts it back together.
+   */
+  private parseZyraMemory(text: string | null | undefined): { unstructured: string; entries: Array<{ id: string; note: string }> } {
+    const unstructured: string[] = [];
+    const entries: Array<{ id: string; lines: string[] }> = [];
+    for (const line of String(text || "").split("\n")) {
+      const heading = LegacyService.ZYRA_MEMORY_ENTRY_HEADING_RE.exec(line.trim());
+      if (heading) {
+        entries.push({ id: heading[1], lines: [] });
+        continue;
+      }
+      (entries.length ? entries[entries.length - 1].lines : unstructured).push(line);
+    }
+    return {
+      unstructured: unstructured.join("\n").trim(),
+      entries: entries.map((entry) => ({ id: entry.id, note: entry.lines.join("\n").trim() }))
+    };
+  }
+
+  private serializeZyraMemory(memory: { unstructured: string; entries: Array<{ id: string; note: string }> }): string {
+    return [memory.unstructured, ...memory.entries.map((entry) => `## ${entry.id}\n${entry.note}`.trim())].filter(Boolean).join("\n\n");
+  }
+
+  /** Extra detail-response fields: whether this is Zyra's managed memory, and its parsed entries. */
+  private zyraMemoryView(doc: Body): { isManagedByZyra: boolean; zyraMemory?: ReturnType<LegacyService["parseZyraMemory"]> } {
+    if (!this.isZyraMemoryDocument(doc)) return { isManagedByZyra: false };
+    return { isManagedByZyra: true, zyraMemory: this.parseZyraMemory(doc.content_text) };
+  }
+
+  async updateZyraMemoryEntry(projectId: string, userId: string | null | undefined, documentId: string, entryId: string, body: Body) {
+    if (typeof body?.note !== "string") throw new BadRequestException({ error: "note is required" });
+    return this.writeZyraMemoryEntry(projectId, userId, documentId, entryId, body.note);
+  }
+
+  async deleteZyraMemoryEntry(projectId: string, userId: string | null | undefined, documentId: string, entryId: string) {
+    return this.writeZyraMemoryEntry(projectId, userId, documentId, entryId, null);
+  }
+
+  /**
+   * The only way people change Zyra's memory: replace one entry's note (keeping its timestamp) or
+   * remove one entry. Owner/manager only — this text steers Zyra for the whole project. Writes the
+   * body the same way rememberZyraMemory does (text + escaped <pre>, content_json cleared so no stale
+   * editor copy survives), snapshots a version so View history shows who changed what, and holds the
+   * same per-document lock rememberZyraMemory takes, so a correction and Zyra's own append can't
+   * overwrite each other.
+   */
+  private async writeZyraMemoryEntry(projectId: string, userId: string | null | undefined, documentId: string, entryId: string, note: string | null) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    const doc = await this.kbDocument(projectId, documentId);
+    if (!this.isZyraMemoryDocument(doc)) {
+      throw new BadRequestException({ error: `Memory entries only exist on "${LegacyService.ZYRA_MEMORY_DOC_TITLE}".` });
+    }
+    this.kbRequireOwnerOrManager(await this.kbProjectRole(uid, projectId));
+
+    const id = String(entryId || "");
+    let nextNote: string | null = null;
+    if (note !== null) {
+      nextNote = note.trim();
+      if (!nextNote) throw new BadRequestException({ error: "A memory entry can't be empty — remove it instead." });
+      const max = LegacyService.ZYRA_MEMORY_ENTRY_MAX_LENGTH - `## ${id}\n`.length;
+      if (nextNote.length > max) throw new BadRequestException({ error: `A memory entry must be at most ${max} characters.` });
+      // A timestamp heading inside a note would split it into a second, fabricated entry on the next read.
+      if (nextNote.split("\n").some((line) => LegacyService.ZYRA_MEMORY_ENTRY_HEADING_RE.test(line.trim()))) {
+        throw new BadRequestException({ error: "A memory entry can't contain a timestamp heading line." });
+      }
+    }
+
+    const row = await this.db.transaction(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
+      // Re-read under the lock: Zyra may have appended since kbDocument above.
+      const current = (await client.query(
+        `SELECT ${LegacyService.KB_DOCUMENT_COLUMNS} FROM knowledge_documents WHERE id = $1 AND is_deleted = false`,
+        [documentId]
+      )).rows[0];
+      if (!current) throw new NotFoundException({ error: "Document not found" });
+
+      const memory = this.parseZyraMemory(current.content_text);
+      if (id === LegacyService.ZYRA_MEMORY_UNSTRUCTURED_ID) {
+        if (!memory.unstructured) throw new NotFoundException({ error: "Memory entry not found" });
+        memory.unstructured = nextNote ?? "";
+      } else {
+        const index = memory.entries.findIndex((entry) => entry.id === id);
+        if (index < 0) throw new NotFoundException({ error: "Memory entry not found" });
+        if (nextNote === null) memory.entries.splice(index, 1);
+        else memory.entries[index] = { id, note: nextNote };
+      }
+      const nextText = this.serializeZyraMemory(memory);
+
+      const diff = summarizeDocumentChange(
+        { title: current.title, contentText: current.content_text },
+        { title: current.title, contentText: nextText }
+      );
+      const nextVersion = await client.query<{ max: number }>(
+        "SELECT COALESCE(MAX(version_number), 0) + 1 AS max FROM knowledge_document_versions WHERE document_id = $1",
+        [documentId]
+      );
+      await client.query(
+        `INSERT INTO knowledge_document_versions
+           (document_id, version_number, title, content_json, content_html, content_text, created_by, changed_summary, changed_fields)
+         VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9::jsonb)`,
+        [
+          documentId,
+          nextVersion.rows[0].max,
+          current.title,
+          current.content_json ? JSON.stringify(current.content_json) : null,
+          current.content_html,
+          current.content_text,
+          uid,
+          diff.summary,
+          JSON.stringify(diff.fields)
+        ]
+      );
+      return (await client.query(
+        `UPDATE knowledge_documents SET content_text = $2, content_html = $3, content_json = NULL, updated_by = $4, updated_at = now()
+         WHERE id = $1 RETURNING ${LegacyService.KB_DOCUMENT_COLUMNS}`,
+        [documentId, nextText, `<pre>${escapeHtml(nextText)}</pre>`, uid]
+      )).rows[0];
+    });
+
+    await this.logProjectActivity(projectId, uid, "updated", "knowledge_document", documentId, row.title, {
+      memoryEntry: id,
+      change: nextNote === null ? "removed" : "edited"
+    });
+    this.enqueueEmbedding(row.organization_id, projectId, "document", documentId, "updated");
+    return { ...toCamel(row), ...this.zyraMemoryView(row) };
   }
 
   async restoreKnowledgeDocument(projectId: string, userId: string | null | undefined, documentId: string) {
@@ -11164,6 +11312,10 @@ export class LegacyService implements OnModuleInit {
     const doc = await this.kbDocument(projectId, documentId);
     const role = await this.kbProjectRole(uid, projectId);
     this.kbRequireMutateAccess(role, doc.created_by, uid);
+    // A restore rewrites the whole body — the same unrestricted edit updateKnowledgeDocument refuses.
+    if (this.isZyraMemoryDocument(doc)) {
+      throw new BadRequestException({ error: LegacyService.ZYRA_MEMORY_EDIT_ERROR });
+    }
 
     // versionId is client input, so a missing or malformed one must read as "no such version"
     // rather than a failed uuid cast.
@@ -14634,6 +14786,10 @@ export class LegacyService implements OnModuleInit {
       "- create: create new testcase drafts/saved cases only when the user clearly asks to create/generate/add/write testcases. If the user names an existing suite for these new testcases (or a prior turn already established one, e.g. confirming 'yes' to save into the suite you just discussed), set operation.suiteId (preferred, from 'Existing suites' below) or operation.suiteName directly on the create operation so the testcase lands in that suite immediately — do not require a separate move_to_suite step for testcases you are creating in this same turn.",
       "CRITICAL for a create op: do NOT author the actual testcase content. Leave operation.draft unset and the top-level testcases array empty — a separate authoring step writes the real title/steps/preconditions/etc. immediately after this routing decision, using its own dedicated response budget, and never reads operation.draft or testcases for a create op. Only set operation.suiteId/operation.suiteName (when known) and operation.reason. Writing out full draft content here produces nothing useful (it is always discarded and re-generated from scratch) and for a large or 'exhaustive' request can consume your entire response before you finish the JSON envelope, corrupting this turn's routing decision — reply/reasoningSummary/action all become unrecoverable, not just the drafts.",
       "- update: update an existing testcase only when the user clearly asks to update/edit/mark/revise a testcase.",
+      // The schema below shows `"fields":{}` with no key names, and an unrecognized key is dropped by
+      // sanitizeZyraUpdateFields — so an update could arrive with every rewritten value lost while the
+      // reply still described the rewrite. The keys and the steps shape are spelled out here.
+      "For an update op, operation.fields MUST carry the new values themselves, using exactly these keys (camelCase): title, description, preconditions, postconditions, stepsJson, testData, priority, severity, type, automationStatus, automationTags, component, status, jiraIssueKey, jiraUrl. Include only the fields you are actually changing, each with its complete new value, and only when that value is genuinely different from the current one. To change any step (its action or its expected result), set fields.stepsJson to the FULL step list as an array of {\"stepNumber\":1,\"action\":\"...\",\"expectedResult\":\"...\"} — every step, including the ones you are not changing, copied exactly from the current steps shown under 'Existing testcases'. Each expected result must state the specific, observable outcome of its own step. Never describe a change in reply or reason that is not present in operation.fields.",
       "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage. IMPORTANT: before archiving, always describe which testcases will be archived and explicitly ask the user to confirm (e.g. 'I found TC-5 Login Test. Should I archive it? Reply yes to confirm.'). Only include archive operations if the user's current message is a clear confirmation (yes, confirm, go ahead, proceed) after you already proposed what would be archived in the prior assistant turn. To archive a SET in one operation — every existing testcase, or several named ones — emit a single archive operation with operation.allExisting=true or operation.externalIds; the same confirmation rule applies. An archive emitted on the user's clear confirmation is APPLIED IMMEDIATELY (not staged for review): describe it as archived, never as staged or pending review.",
       "- create_suite: create a new test suite (a folder/group for testcases) when the user asks to create/add a suite, folder, or group. Put the suite name in operation.suiteName.",
       "- move_to_suite: move/assign EXISTING testcases into a suite when the user asks to move/assign/organize/group/put existing testcases into a suite. The target suite goes in operation.suiteName (it is created automatically if it does not already exist, so you do not need a separate create_suite op for the same suite). List the testcases to move in operation.externalIds (use the external IDs shown under 'Existing suites' / 'Existing testcases'), set operation.allExisting=true when the user means every existing testcase, or set operation.fromLastPlan=true when the user refers to 'all'/'the N cases' from a recent generation batch (see 'Most recently generated batch' below) — fromLastPlan is exact and does not depend on you correctly recalling every external ID from earlier in the conversation, so prefer it over externalIds whenever the user is clearly referring to a just-generated batch rather than naming specific unrelated testcases.",
@@ -15325,8 +15481,20 @@ export class LegacyService implements OnModuleInit {
           });
           continue;
         }
-        const fields = op.type === "archive" ? { status: "Archived" } : this.sanitizeZyraUpdateFields(op.fields || {});
         const row = await this.getTestCase(found.id);
+        const fields = op.type === "archive" ? { status: "Archived" } : this.zyraEffectiveUpdateFields(this.sanitizeZyraUpdateFields(op.fields || {}), row);
+        // An update with nothing left to change is not staged. It used to be: a card showing the test
+        // case exactly as it is, under a reply describing a rewrite that was never carried in `fields`.
+        // The "Could not ..." title is what reconcileZyraReply reads to tell the user nothing was staged.
+        if (op.type === "update" && !Object.keys(fields).length) {
+          activity.push({
+            actor: "agent",
+            title: "Could not update testcase",
+            detail: `${row.externalId}: the proposed update did not change any field, so nothing was staged for it.`,
+            createdAt: new Date().toISOString()
+          });
+          continue;
+        }
         // Staged only — the real row is untouched until zyraSave applies `fields` to it.
         proposals.push({ opType: op.type, testcaseId: found.id, externalId: row.externalId, fields, reason: op.reason || "" });
         const action = op.type === "archive" ? "proposed-archive" : "proposed-update";
@@ -16223,6 +16391,20 @@ export class LegacyService implements OnModuleInit {
    * empty memory. Basecamp 10212786541.
    */
   private static readonly ZYRA_MEMORY_DOC_TITLE = "Zyra AI Memory";
+  private static readonly ZYRA_MEMORY_EDIT_ERROR =
+    `"Zyra AI Memory" is managed by Zyra and can't be edited directly — Zyra reads it as context for every response. A project owner or manager can correct or remove individual entries instead.`;
+  private static readonly ZYRA_MEMORY_RESERVED_TITLE_ERROR =
+    `"Zyra AI Memory" is reserved for Zyra's own memory document — choose a different title.`;
+  /** The heading rememberZyraMemory stamps on every entry. Its timestamp is the entry's id. */
+  private static readonly ZYRA_MEMORY_ENTRY_HEADING_RE = /^##\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s*$/;
+  /** Same cap rememberZyraMemory applies to one stamped entry (heading + note). */
+  private static readonly ZYRA_MEMORY_ENTRY_MAX_LENGTH = 2500;
+  /**
+   * Id of any text above the first timestamp heading — content that isn't one of Zyra's own entries,
+   * e.g. left behind by a direct edit made before this document was locked. Addressable so it can be
+   * removed or corrected too, rather than becoming permanent, unremovable context.
+   */
+  private static readonly ZYRA_MEMORY_UNSTRUCTURED_ID = "unstructured";
 
   // The scenario list was planned against the existing testcases already (planZyraChatScenarios is
   // told to avoid scenarios that have coverage). Without saying so, the generation prompt's general
@@ -18363,11 +18545,18 @@ export class LegacyService implements OnModuleInit {
     const stampedEntry = `## ${new Date().toISOString()}\n${entry.trim()}`.slice(0, 2500);
     const project = await this.db.query<{ organization_id: string }>("SELECT organization_id FROM projects WHERE id = $1", [projectId]);
     if (existing.rows[0]) {
-      const content = [stampedEntry, String(existing.rows[0].content_text || "")].filter(Boolean).join("\n\n").slice(0, 20000);
-      await this.db.query(
-        "UPDATE knowledge_documents SET content_text = $2, content_html = $3, updated_at = now() WHERE id = $1",
-        [existing.rows[0].id, content, `<pre>${escapeHtml(content)}</pre>`]
-      );
+      const documentId = existing.rows[0].id;
+      // Same per-document lock writeZyraMemoryEntry holds, with the text re-read under it, so an
+      // owner's correction landing mid-append is neither lost nor overwritten.
+      await this.db.transaction(async (client) => {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`kb-doc-version:${documentId}`]);
+        const current = await client.query<{ content_text: string | null }>("SELECT content_text FROM knowledge_documents WHERE id = $1", [documentId]);
+        const content = [stampedEntry, String(current.rows[0]?.content_text || "")].filter(Boolean).join("\n\n").slice(0, 20000);
+        await client.query(
+          "UPDATE knowledge_documents SET content_text = $2, content_html = $3, updated_at = now() WHERE id = $1",
+          [documentId, content, `<pre>${escapeHtml(content)}</pre>`]
+        );
+      });
       this.enqueueEmbedding(project.rows[0]?.organization_id, projectId, "document", existing.rows[0].id, "updated");
       return;
     }
@@ -18568,35 +18757,60 @@ export class LegacyService implements OnModuleInit {
   ): Promise<Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string; component: string }>> {
     const searchText = [story, context].join(" ").toLowerCase();
     const terms = Array.from(new Set(searchText.split(/[^a-z0-9]+/).filter((word) => word.length > 3))).slice(0, 8);
-    const values: any[] = [projectId];
+
+    // Test cases the request names by external id ("continue with PRO-TC-490") are fetched by that id
+    // and listed first, with their full steps. The keyword/recency ranking below never looks at ids
+    // (the "490" in one is even too short to be a search term), so in any project with more than 25
+    // test cases the one the user named could be missing, and Zyra answered that it couldn't see its
+    // steps. Anything id-shaped is tried; a Jira key or a typo simply matches no test case.
+    const namedIds = Array.from(
+      new Set(([story, context].join(" ").match(/\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*-\d+\b/g) || []).map((id) => id.toUpperCase()))
+    ).slice(0, LegacyService.ZYRA_NAMED_TESTCASE_LIMIT);
+    const named = namedIds.length
+      ? (await this.db.query(
+          `SELECT external_id, title, description, priority, status, steps, component
+           FROM testcases
+           WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND upper(external_id) = ANY($2::text[])
+           ORDER BY updated_at DESC`,
+          [projectId, namedIds]
+        )).rows
+      : [];
+
+    const values: any[] = [projectId, named.map((row) => String(row.external_id))];
     let orderBy = "updated_at DESC";
     if (terms.length) {
       values.push(terms.map((term) => `%${term}%`));
-      orderBy = `CASE WHEN lower(title) LIKE ANY($2::text[]) OR lower(coalesce(description, '')) LIKE ANY($2::text[]) THEN 0 ELSE 1 END, updated_at DESC`;
+      orderBy = `CASE WHEN lower(title) LIKE ANY($3::text[]) OR lower(coalesce(description, '')) LIKE ANY($3::text[]) THEN 0 ELSE 1 END, updated_at DESC`;
     }
     const res = await this.db.query(
       `SELECT external_id, title, description, priority, status, steps, component
        FROM testcases
-       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived'
+       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND NOT (coalesce(external_id, '') = ANY($2::text[]))
        ORDER BY ${orderBy}
        LIMIT 25`,
       values
     );
-    return res.rows.map((row) => ({
+    // A named case gets far more room than a listed one: it is the one the user is asking about, so
+    // cutting its steps mid-list would leave Zyra rewriting a test case it can only partly see.
+    const snapshot = (row: Body, isNamed: boolean) => ({
       externalId: row.external_id || "",
       title: String(row.title || "Untitled testcase").slice(0, 240),
-      description: String(row.description || "").slice(0, 500),
+      description: String(row.description || "").slice(0, isNamed ? 4000 : 500),
       priority: String(row.priority || "P2"),
       status: String(row.status || "Draft"),
       // safeSteps(), not normalizeJsonArray() — same reasoning as exportTestcases: `row.steps` may
       // be a JSON-encoded string, not a genuine array.
-      stepsSummary: JSON.stringify(this.safeSteps(row.steps)).slice(0, 800),
+      stepsSummary: JSON.stringify(this.safeSteps(row.steps)).slice(0, isNamed ? 12000 : 800),
       // Fed back into zyraStaticSourcePrompt so Zyra can reuse an existing component name for a new
       // draft instead of inventing a similarly-named variant (see zyraSystemPrompt's component
       // instruction) — an empty string, same as every other blank field here, when unset.
       component: String(row.component || "").slice(0, 255)
-    }));
+    });
+    return [...named.map((row) => snapshot(row, true)), ...res.rows.map((row) => snapshot(row, false))];
   }
+
+  /** How many test cases one request can name by id and get in full (see existingTestcaseSnapshot). */
+  private static readonly ZYRA_NAMED_TESTCASE_LIMIT = 10;
 
   // Words that carry no selectivity in a QA request — "generate test cases covering the login flow"
   // is only really about "login". Without stripping these, term matching against tickets or
@@ -19682,17 +19896,38 @@ export class LegacyService implements OnModuleInit {
   // invents (or copies from a different turn's transcript) is dropped silently — never surfaced —
   // exactly like reconcileZyraReply drops an unverifiable completion claim rather than passing it
   // through. Pure function: no I/O, no DB, safe to unit test directly against a fixed index.
+  //
+  // Matching tolerates how a model actually writes a label it was given, not only the exact text:
+  // case and spacing ("KB1", "kb 1"), a hyphen in a KB/BUG label ("KB-1"), a title trailing the
+  // label ("KB 1: Refund policy", "AIP-TC-73 — Successful login"), or an object ({label|id|key|ref}).
+  // Exact-only matching dropped such citations silently, and the draft showed "No specific source
+  // cited" though it was grounded. The resolved source is still always one from `knownRefs`, so
+  // nothing outside this turn's prompt can be cited.
   private static sanitizeZyraSourceRefs(rawRefs: unknown, knownRefs: Map<string, ZyraSourceRef>): ZyraSourceRef[] {
     if (!Array.isArray(rawRefs)) return [];
+    const canonical = (label: string) => label.toUpperCase().replace(/\s+/g, "").replace(/^(KB|BUG)-(?=\d+$)/, "$1");
+    const byCanonical = new Map<string, string>();
+    for (const label of knownRefs.keys()) byCanonical.set(canonical(label), label);
+    const resolve = (text: string): string | undefined => {
+      if (knownRefs.has(text)) return text;
+      // The label itself, then the label with a trailing title cut off at the first ":", dash
+      // separator, "|" or "(" — external ids keep their own internal hyphens ("AIP-TC-73").
+      const head = text.split(/\s*[:|(]\s*|\s+[-–—]\s+|\s*[–—]\s*/)[0];
+      return byCanonical.get(canonical(text)) ?? byCanonical.get(canonical(head));
+    };
     const resolved: ZyraSourceRef[] = [];
     const seen = new Set<string>();
     for (const raw of rawRefs.slice(0, 20)) {
-      const label = String(raw ?? "").trim();
+      const value = raw && typeof raw === "object"
+        ? (raw as Body).label ?? (raw as Body).id ?? (raw as Body).key ?? (raw as Body).ref
+        : raw;
+      if (typeof value !== "string" && typeof value !== "number") continue;
+      const text = String(value).trim();
+      if (!text) continue;
+      const label = resolve(text);
       if (!label || seen.has(label)) continue;
-      const match = knownRefs.get(label);
-      if (!match) continue;
       seen.add(label);
-      resolved.push(match);
+      resolved.push(knownRefs.get(label)!);
     }
     return resolved;
   }
@@ -21528,6 +21763,20 @@ export class LegacyService implements OnModuleInit {
     const appliedCount = applied.testcases.length;
 
     const ru = zyraReplyLanguage() === "ru";
+    // Every update named an existing test case but none of them would change anything (see
+    // applyZyraChatOperations) — a different situation from "those test cases don't exist", so it
+    // gets its own wording rather than the not-found one below.
+    const unchangedUpdates = applied.activity
+      .filter((entry) => entry.title === "Could not update testcase" && /did not change any field/.test(String(entry.detail || "")))
+      .map((entry) => String(entry.detail));
+    if (!appliedCount && unchangedUpdates.length) {
+      if (ru) return [ZYRA_RU.nothingStagedNoChange(unchangedUpdates.length), "", decision.reply].join("\n") + moveSuffix;
+      return [
+        `⚠️ Nothing was staged. ${unchangedUpdates.join(" ")} The test case${unchangedUpdates.length === 1 ? " is" : "s are"} unchanged — ask me again and say what should change.`,
+        "",
+        decision.reply
+      ].join("\n") + moveSuffix;
+    }
     if (!appliedCount && ru) {
       const detailRu = decision.operations.length ? ZYRA_RU.nothingSavedMissing : ZYRA_RU.nothingSavedNoOps;
       return [ZYRA_RU.nothingSaved(detailRu), "", decision.reply].join("\n") + moveSuffix;
@@ -22028,12 +22277,72 @@ export class LegacyService implements OnModuleInit {
 
   private sanitizeZyraUpdateFields(fields: Body): Body {
     const allowed = ["title", "description", "preconditions", "postconditions", "stepsJson", "testData", "priority", "severity", "type", "automationStatus", "automationTags", "component", "status", "jiraIssueKey", "jiraUrl"];
+    // The model sees existing steps as `[{stepNumber, action, expectedResult}]` and is given no strict
+    // schema, so it often names the field `steps` (or snake_cases a key) — which this allow-list used
+    // to drop silently, staging an update whose rewritten values had all been lost. Known spellings
+    // are folded onto the real key first; a key already given in its canonical form wins.
+    const stepAliases = new Set(["steps", "testSteps", "stepList"]);
+    const normalized: Body = {};
+    for (const [rawKey, value] of Object.entries(fields || {})) {
+      const camel = rawKey.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+      const key = stepAliases.has(camel) ? "stepsJson" : camel;
+      if (!(key in normalized) || rawKey === key) normalized[key] = value;
+    }
     const cleaned: Body = {};
     for (const key of allowed) {
-      if (fields[key] !== undefined && fields[key] !== null) cleaned[key] = fields[key];
+      if (normalized[key] !== undefined && normalized[key] !== null) cleaned[key] = normalized[key];
     }
     if (cleaned.stepsJson) cleaned.stepsJson = this.safeSteps(cleaned.stepsJson);
     return cleaned;
+  }
+
+  /**
+   * What an update would really change, measured against the test case as it is now.
+   *
+   * Steps: a step list that is shorter than the current one, or has steps with no action, is read as
+   * a patch — each given step is merged onto the current step with the same stepNumber (or position),
+   * keeping whatever it doesn't mention. Replacing the list outright would turn "fix step 2's expected
+   * result" into a test case with one step left. A complete list (every step with an action, at least
+   * as many as now) replaces the steps as before.
+   *
+   * Any field whose new value equals the current one is dropped, so the caller can tell an update
+   * that changes nothing apart from one that does — and must not stage the former.
+   */
+  private zyraEffectiveUpdateFields(fields: Body, current: Body): Body {
+    const effective: Body = {};
+    const text = (value: unknown) => (Array.isArray(value) ? value.join(", ") : String(value ?? "")).trim();
+    const stepCore = (steps: Body[]) => steps.map((step) => ({ action: text(step?.action), expectedResult: text(step?.expectedResult) }));
+    for (const [key, value] of Object.entries(fields)) {
+      if (key !== "stepsJson") {
+        if (text(value) !== text(current[key])) effective[key] = value;
+        continue;
+      }
+      const currentSteps = this.safeSteps(current.steps) as Body[];
+      const incoming = (this.safeSteps(value) as Body[]).filter((step) => step && typeof step === "object");
+      const isPatch = incoming.length < currentSteps.length || incoming.some((step) => !text(step.action));
+      let next: Body[];
+      if (!isPatch) {
+        next = incoming;
+      } else {
+        next = currentSteps.map((step) => ({ ...step }));
+        incoming.forEach((step, position) => {
+          const numbered = Number(step.stepNumber);
+          const index = Number.isInteger(numbered) && numbered >= 1 && numbered <= next.length ? numbered - 1 : position;
+          if (index < next.length) {
+            next[index] = {
+              ...next[index],
+              action: text(step.action) || next[index].action,
+              expectedResult: text(step.expectedResult) || next[index].expectedResult
+            };
+          } else if (text(step.action)) {
+            next.push(step);
+          }
+        });
+      }
+      next = next.map((step, index) => ({ ...step, stepNumber: index + 1 }));
+      if (JSON.stringify(stepCore(next)) !== JSON.stringify(stepCore(currentSteps))) effective.stepsJson = next;
+    }
+    return effective;
   }
 
   private static readonly ZYRA_PATCH_FIELD_COLUMNS = [
