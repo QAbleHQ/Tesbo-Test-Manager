@@ -14601,6 +14601,10 @@ export class LegacyService implements OnModuleInit {
       "- create: create new testcase drafts/saved cases only when the user clearly asks to create/generate/add/write testcases. If the user names an existing suite for these new testcases (or a prior turn already established one, e.g. confirming 'yes' to save into the suite you just discussed), set operation.suiteId (preferred, from 'Existing suites' below) or operation.suiteName directly on the create operation so the testcase lands in that suite immediately — do not require a separate move_to_suite step for testcases you are creating in this same turn.",
       "CRITICAL for a create op: do NOT author the actual testcase content. Leave operation.draft unset and the top-level testcases array empty — a separate authoring step writes the real title/steps/preconditions/etc. immediately after this routing decision, using its own dedicated response budget, and never reads operation.draft or testcases for a create op. Only set operation.suiteId/operation.suiteName (when known) and operation.reason. Writing out full draft content here produces nothing useful (it is always discarded and re-generated from scratch) and for a large or 'exhaustive' request can consume your entire response before you finish the JSON envelope, corrupting this turn's routing decision — reply/reasoningSummary/action all become unrecoverable, not just the drafts.",
       "- update: update an existing testcase only when the user clearly asks to update/edit/mark/revise a testcase.",
+      // The schema below shows `"fields":{}` with no key names, and an unrecognized key is dropped by
+      // sanitizeZyraUpdateFields — so an update could arrive with every rewritten value lost while the
+      // reply still described the rewrite. The keys and the steps shape are spelled out here.
+      "For an update op, operation.fields MUST carry the new values themselves, using exactly these keys (camelCase): title, description, preconditions, postconditions, stepsJson, testData, priority, severity, type, automationStatus, automationTags, component, status, jiraIssueKey, jiraUrl. Include only the fields you are actually changing, each with its complete new value, and only when that value is genuinely different from the current one. To change any step (its action or its expected result), set fields.stepsJson to the FULL step list as an array of {\"stepNumber\":1,\"action\":\"...\",\"expectedResult\":\"...\"} — every step, including the ones you are not changing, copied exactly from the current steps shown under 'Existing testcases'. Each expected result must state the specific, observable outcome of its own step. Never describe a change in reply or reason that is not present in operation.fields.",
       "- archive: archive an existing testcase when the user asks to remove/delete/archive testcase coverage. IMPORTANT: before archiving, always describe which testcases will be archived and explicitly ask the user to confirm (e.g. 'I found TC-5 Login Test. Should I archive it? Reply yes to confirm.'). Only include archive operations if the user's current message is a clear confirmation (yes, confirm, go ahead, proceed) after you already proposed what would be archived in the prior assistant turn. To archive a SET in one operation — every existing testcase, or several named ones — emit a single archive operation with operation.allExisting=true or operation.externalIds; the same confirmation rule applies. An archive emitted on the user's clear confirmation is APPLIED IMMEDIATELY (not staged for review): describe it as archived, never as staged or pending review.",
       "- create_suite: create a new test suite (a folder/group for testcases) when the user asks to create/add a suite, folder, or group. Put the suite name in operation.suiteName.",
       "- move_to_suite: move/assign EXISTING testcases into a suite when the user asks to move/assign/organize/group/put existing testcases into a suite. The target suite goes in operation.suiteName (it is created automatically if it does not already exist, so you do not need a separate create_suite op for the same suite). List the testcases to move in operation.externalIds (use the external IDs shown under 'Existing suites' / 'Existing testcases'), set operation.allExisting=true when the user means every existing testcase, or set operation.fromLastPlan=true when the user refers to 'all'/'the N cases' from a recent generation batch (see 'Most recently generated batch' below) — fromLastPlan is exact and does not depend on you correctly recalling every external ID from earlier in the conversation, so prefer it over externalIds whenever the user is clearly referring to a just-generated batch rather than naming specific unrelated testcases.",
@@ -15292,8 +15296,20 @@ export class LegacyService implements OnModuleInit {
           });
           continue;
         }
-        const fields = op.type === "archive" ? { status: "Archived" } : this.sanitizeZyraUpdateFields(op.fields || {});
         const row = await this.getTestCase(found.id);
+        const fields = op.type === "archive" ? { status: "Archived" } : this.zyraEffectiveUpdateFields(this.sanitizeZyraUpdateFields(op.fields || {}), row);
+        // An update with nothing left to change is not staged. It used to be: a card showing the test
+        // case exactly as it is, under a reply describing a rewrite that was never carried in `fields`.
+        // The "Could not ..." title is what reconcileZyraReply reads to tell the user nothing was staged.
+        if (op.type === "update" && !Object.keys(fields).length) {
+          activity.push({
+            actor: "agent",
+            title: "Could not update testcase",
+            detail: `${row.externalId}: the proposed update did not change any field, so nothing was staged for it.`,
+            createdAt: new Date().toISOString()
+          });
+          continue;
+        }
         // Staged only — the real row is untouched until zyraSave applies `fields` to it.
         proposals.push({ opType: op.type, testcaseId: found.id, externalId: row.externalId, fields, reason: op.reason || "" });
         const action = op.type === "archive" ? "proposed-archive" : "proposed-update";
@@ -18556,35 +18572,60 @@ export class LegacyService implements OnModuleInit {
   ): Promise<Array<{ externalId: string; title: string; description: string; priority: string; status: string; stepsSummary: string; component: string }>> {
     const searchText = [story, context].join(" ").toLowerCase();
     const terms = Array.from(new Set(searchText.split(/[^a-z0-9]+/).filter((word) => word.length > 3))).slice(0, 8);
-    const values: any[] = [projectId];
+
+    // Test cases the request names by external id ("continue with PRO-TC-490") are fetched by that id
+    // and listed first, with their full steps. The keyword/recency ranking below never looks at ids
+    // (the "490" in one is even too short to be a search term), so in any project with more than 25
+    // test cases the one the user named could be missing, and Zyra answered that it couldn't see its
+    // steps. Anything id-shaped is tried; a Jira key or a typo simply matches no test case.
+    const namedIds = Array.from(
+      new Set(([story, context].join(" ").match(/\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*-\d+\b/g) || []).map((id) => id.toUpperCase()))
+    ).slice(0, LegacyService.ZYRA_NAMED_TESTCASE_LIMIT);
+    const named = namedIds.length
+      ? (await this.db.query(
+          `SELECT external_id, title, description, priority, status, steps, component
+           FROM testcases
+           WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND upper(external_id) = ANY($2::text[])
+           ORDER BY updated_at DESC`,
+          [projectId, namedIds]
+        )).rows
+      : [];
+
+    const values: any[] = [projectId, named.map((row) => String(row.external_id))];
     let orderBy = "updated_at DESC";
     if (terms.length) {
       values.push(terms.map((term) => `%${term}%`));
-      orderBy = `CASE WHEN lower(title) LIKE ANY($2::text[]) OR lower(coalesce(description, '')) LIKE ANY($2::text[]) THEN 0 ELSE 1 END, updated_at DESC`;
+      orderBy = `CASE WHEN lower(title) LIKE ANY($3::text[]) OR lower(coalesce(description, '')) LIKE ANY($3::text[]) THEN 0 ELSE 1 END, updated_at DESC`;
     }
     const res = await this.db.query(
       `SELECT external_id, title, description, priority, status, steps, component
        FROM testcases
-       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived'
+       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND NOT (coalesce(external_id, '') = ANY($2::text[]))
        ORDER BY ${orderBy}
        LIMIT 25`,
       values
     );
-    return res.rows.map((row) => ({
+    // A named case gets far more room than a listed one: it is the one the user is asking about, so
+    // cutting its steps mid-list would leave Zyra rewriting a test case it can only partly see.
+    const snapshot = (row: Body, isNamed: boolean) => ({
       externalId: row.external_id || "",
       title: String(row.title || "Untitled testcase").slice(0, 240),
-      description: String(row.description || "").slice(0, 500),
+      description: String(row.description || "").slice(0, isNamed ? 4000 : 500),
       priority: String(row.priority || "P2"),
       status: String(row.status || "Draft"),
       // safeSteps(), not normalizeJsonArray() — same reasoning as exportTestcases: `row.steps` may
       // be a JSON-encoded string, not a genuine array.
-      stepsSummary: JSON.stringify(this.safeSteps(row.steps)).slice(0, 800),
+      stepsSummary: JSON.stringify(this.safeSteps(row.steps)).slice(0, isNamed ? 12000 : 800),
       // Fed back into zyraStaticSourcePrompt so Zyra can reuse an existing component name for a new
       // draft instead of inventing a similarly-named variant (see zyraSystemPrompt's component
       // instruction) — an empty string, same as every other blank field here, when unset.
       component: String(row.component || "").slice(0, 255)
-    }));
+    });
+    return [...named.map((row) => snapshot(row, true)), ...res.rows.map((row) => snapshot(row, false))];
   }
+
+  /** How many test cases one request can name by id and get in full (see existingTestcaseSnapshot). */
+  private static readonly ZYRA_NAMED_TESTCASE_LIMIT = 10;
 
   // Words that carry no selectivity in a QA request — "generate test cases covering the login flow"
   // is only really about "login". Without stripping these, term matching against tickets or
@@ -21516,6 +21557,20 @@ export class LegacyService implements OnModuleInit {
     const appliedCount = applied.testcases.length;
 
     const ru = zyraReplyLanguage() === "ru";
+    // Every update named an existing test case but none of them would change anything (see
+    // applyZyraChatOperations) — a different situation from "those test cases don't exist", so it
+    // gets its own wording rather than the not-found one below.
+    const unchangedUpdates = applied.activity
+      .filter((entry) => entry.title === "Could not update testcase" && /did not change any field/.test(String(entry.detail || "")))
+      .map((entry) => String(entry.detail));
+    if (!appliedCount && unchangedUpdates.length) {
+      if (ru) return [ZYRA_RU.nothingStagedNoChange(unchangedUpdates.length), "", decision.reply].join("\n") + moveSuffix;
+      return [
+        `⚠️ Nothing was staged. ${unchangedUpdates.join(" ")} The test case${unchangedUpdates.length === 1 ? " is" : "s are"} unchanged — ask me again and say what should change.`,
+        "",
+        decision.reply
+      ].join("\n") + moveSuffix;
+    }
     if (!appliedCount && ru) {
       const detailRu = decision.operations.length ? ZYRA_RU.nothingSavedMissing : ZYRA_RU.nothingSavedNoOps;
       return [ZYRA_RU.nothingSaved(detailRu), "", decision.reply].join("\n") + moveSuffix;
@@ -22016,12 +22071,72 @@ export class LegacyService implements OnModuleInit {
 
   private sanitizeZyraUpdateFields(fields: Body): Body {
     const allowed = ["title", "description", "preconditions", "postconditions", "stepsJson", "testData", "priority", "severity", "type", "automationStatus", "automationTags", "component", "status", "jiraIssueKey", "jiraUrl"];
+    // The model sees existing steps as `[{stepNumber, action, expectedResult}]` and is given no strict
+    // schema, so it often names the field `steps` (or snake_cases a key) — which this allow-list used
+    // to drop silently, staging an update whose rewritten values had all been lost. Known spellings
+    // are folded onto the real key first; a key already given in its canonical form wins.
+    const stepAliases = new Set(["steps", "testSteps", "stepList"]);
+    const normalized: Body = {};
+    for (const [rawKey, value] of Object.entries(fields || {})) {
+      const camel = rawKey.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+      const key = stepAliases.has(camel) ? "stepsJson" : camel;
+      if (!(key in normalized) || rawKey === key) normalized[key] = value;
+    }
     const cleaned: Body = {};
     for (const key of allowed) {
-      if (fields[key] !== undefined && fields[key] !== null) cleaned[key] = fields[key];
+      if (normalized[key] !== undefined && normalized[key] !== null) cleaned[key] = normalized[key];
     }
     if (cleaned.stepsJson) cleaned.stepsJson = this.safeSteps(cleaned.stepsJson);
     return cleaned;
+  }
+
+  /**
+   * What an update would really change, measured against the test case as it is now.
+   *
+   * Steps: a step list that is shorter than the current one, or has steps with no action, is read as
+   * a patch — each given step is merged onto the current step with the same stepNumber (or position),
+   * keeping whatever it doesn't mention. Replacing the list outright would turn "fix step 2's expected
+   * result" into a test case with one step left. A complete list (every step with an action, at least
+   * as many as now) replaces the steps as before.
+   *
+   * Any field whose new value equals the current one is dropped, so the caller can tell an update
+   * that changes nothing apart from one that does — and must not stage the former.
+   */
+  private zyraEffectiveUpdateFields(fields: Body, current: Body): Body {
+    const effective: Body = {};
+    const text = (value: unknown) => (Array.isArray(value) ? value.join(", ") : String(value ?? "")).trim();
+    const stepCore = (steps: Body[]) => steps.map((step) => ({ action: text(step?.action), expectedResult: text(step?.expectedResult) }));
+    for (const [key, value] of Object.entries(fields)) {
+      if (key !== "stepsJson") {
+        if (text(value) !== text(current[key])) effective[key] = value;
+        continue;
+      }
+      const currentSteps = this.safeSteps(current.steps) as Body[];
+      const incoming = (this.safeSteps(value) as Body[]).filter((step) => step && typeof step === "object");
+      const isPatch = incoming.length < currentSteps.length || incoming.some((step) => !text(step.action));
+      let next: Body[];
+      if (!isPatch) {
+        next = incoming;
+      } else {
+        next = currentSteps.map((step) => ({ ...step }));
+        incoming.forEach((step, position) => {
+          const numbered = Number(step.stepNumber);
+          const index = Number.isInteger(numbered) && numbered >= 1 && numbered <= next.length ? numbered - 1 : position;
+          if (index < next.length) {
+            next[index] = {
+              ...next[index],
+              action: text(step.action) || next[index].action,
+              expectedResult: text(step.expectedResult) || next[index].expectedResult
+            };
+          } else if (text(step.action)) {
+            next.push(step);
+          }
+        });
+      }
+      next = next.map((step, index) => ({ ...step, stepNumber: index + 1 }));
+      if (JSON.stringify(stepCore(next)) !== JSON.stringify(stepCore(currentSteps))) effective.stepsJson = next;
+    }
+    return effective;
   }
 
   private static readonly ZYRA_PATCH_FIELD_COLUMNS = [
