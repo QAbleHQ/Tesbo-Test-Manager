@@ -38,7 +38,7 @@ const ctxB = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context-b
  * uncovered is the response-shape handling of a live provider, which is stated in
  * docs/e2e-coverage-waves.md rather than silently skipped.
  *
- * The nightly sync cron (two BullMQ Job Schedulers firing at 00:00 IST — see
+ * The nightly sync cron (three BullMQ Job Schedulers, Jira, Linear and Notion, firing at 00:00 IST — see
  * integration-sync.module.ts) adds a per-ticket change log, read through
  * GET .../knowledge-base/documents/:id/history, which IS driven here end to end (authorization,
  * 404s, empty vs. populated timelines) with knowledge_document_sync_events seeded directly for the

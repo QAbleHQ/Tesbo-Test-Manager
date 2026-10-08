@@ -470,6 +470,71 @@ describe("IntegrationSyncProcessor, notion provider", () => {
     expect(runs.listNightlySyncTargets).toHaveBeenCalledWith("notion");
   });
 
+  describe("nightly orchestrator", () => {
+    const targets = [
+      { organizationId: "org-1", projectId: "proj-1", remoteKey: "db-1" },
+      { organizationId: "org-2", projectId: "proj-2", remoteKey: "db-2" },
+      { organizationId: "org-3", projectId: "proj-3", remoteKey: "db-3" }
+    ];
+
+    it("starts a nightly notion run per target, keyed by database id, with a null actor", async () => {
+      const startRun = jest.fn().mockResolvedValue({ run: { id: "run-x" }, alreadyRunning: false });
+      const { processor } = makeProcessor({ runs: { listNightlySyncTargets: jest.fn().mockResolvedValue(targets), startRun } });
+      await processor.process(job(INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, {}));
+      expect(startRun).toHaveBeenCalledTimes(3);
+      expect(startRun).toHaveBeenNthCalledWith(1, "org-1", "proj-1", "notion", null, "db-1", { triggerSource: "nightly", since: null });
+    });
+
+    it("first-ever sync is a full fetch (since null); later syncs use the last start minus the buffer", async () => {
+      const lastStart = new Date("2026-10-07T18:30:00.000Z");
+      const startRun = jest.fn().mockResolvedValue({ run: { id: "run-x" }, alreadyRunning: false });
+      const { processor } = makeProcessor({
+        runs: {
+          listNightlySyncTargets: jest.fn().mockResolvedValue(targets.slice(0, 2)),
+          getLastSuccessfulRunStart: jest.fn().mockResolvedValueOnce(lastStart).mockResolvedValueOnce(null),
+          startRun
+        }
+      });
+      await processor.process(job(INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, {}));
+      expect(startRun.mock.calls[0][5].since).toBe("2026-10-07T18:20:00.000Z");
+      expect(startRun.mock.calls[1][5].since).toBeNull();
+    });
+
+    it("one target failing to start (or an already-ran duplicate) never stops the rest", async () => {
+      const startRun = jest
+        .fn()
+        .mockRejectedValueOnce(new Error("db blip"))
+        .mockResolvedValueOnce({ run: { id: "run-2" }, alreadyRunning: true })
+        .mockResolvedValueOnce({ run: { id: "run-3" }, alreadyRunning: false });
+      const logSpy = jest.spyOn(Logger.prototype, "log").mockImplementation(() => undefined);
+      const { processor } = makeProcessor({ runs: { listNightlySyncTargets: jest.fn().mockResolvedValue(targets), startRun } });
+      await expect(processor.process(job(INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, {}))).resolves.toBeUndefined();
+      expect(startRun).toHaveBeenCalledTimes(3);
+      expect(logSpy.mock.calls.some(([l]) => String(l).includes("1 started, 1 already ran this cycle, 1 failed to start"))).toBe(true);
+      logSpy.mockRestore();
+    });
+
+    it("a failing cursor lookup for one target is isolated like a failing startRun", async () => {
+      const startRun = jest.fn().mockResolvedValue({ run: { id: "run-x" }, alreadyRunning: false });
+      const { processor } = makeProcessor({
+        runs: {
+          listNightlySyncTargets: jest.fn().mockResolvedValue(targets.slice(0, 2)),
+          getLastSuccessfulRunStart: jest.fn().mockRejectedValueOnce(new Error("boom")).mockResolvedValueOnce(null),
+          startRun
+        }
+      });
+      await processor.process(job(INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, {}));
+      expect(startRun).toHaveBeenCalledTimes(1);
+      expect(startRun.mock.calls[0][1]).toBe("proj-2");
+    });
+
+    it("an empty target list is a clean no-op", async () => {
+      const { processor, runs } = makeProcessor();
+      await processor.process(job(INTEGRATION_SYNC_NIGHTLY_NOTION_JOB, {}));
+      expect(runs.startRun).not.toHaveBeenCalled();
+    });
+  });
+
   it("reads the page body per ticket, stores it, and falls back to the cached body when the read fails", async () => {
     const updates: unknown[][] = [];
     const row = {
