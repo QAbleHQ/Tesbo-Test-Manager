@@ -697,6 +697,38 @@ test.describe("notifications — Phase 1 matrix", () => {
     expect(qa[0]).toBe(`${run.tcIds[0]} failed in test run ${run.cycleName}.`);
   });
 
+  test("NOTIF-P1-15 starting, completing and reopening a run tells its assigned users (and the owner on complete/reopen) — never the person who pressed the button", async () => {
+    const run = await seedRun(2);
+    // qa has a case in the run (an assigned user); the manager has none and is not the owner.
+    expect((await asOwner.post(`/api/cycles/${run.cycleId}/executions/bulk-assign`, { data: { executionIds: [run.executionIds[0]], assigneeId: tenant!.qa.userId } })).ok()).toBeTruthy();
+    exec(`DELETE FROM notifications WHERE user_id IN (${literal(tenant!.qa.userId)}, ${literal(tenant!.owner.userId)});`);
+    const label = run.cycleName;
+    const setStatus = (api: APIRequestContext, status: string) => api.patch(`/api/cycles/${run.cycleId}`, { data: { status }, failOnStatusCode: false });
+
+    // Start Execution: Planning → In Progress. Assigned users only (the owner isn't named in the matrix for this one).
+    const start = await setStatus(asManager, "In Progress");
+    expect(start.ok(), await start.text()).toBeTruthy();
+    expect(await titles(asQa)).toEqual([`Test run ${label} has started.`]);
+    expect((await inbox(asQa))[0]).toMatchObject({ type: "test_run_started", link_entity_type: "test_run", link_entity_id: `${tenant!.mainProjectId}:${run.cycleId}` });
+    expect(await titles(asOwner)).toEqual([]);
+    expect(await titles(asManager)).toEqual([]); // pressed the button
+
+    // Saving the same status is not a new start.
+    expect((await setStatus(asManager, "In Progress")).ok()).toBeTruthy();
+    expect(await titles(asQa)).toHaveLength(1);
+
+    // Mark Completed: assigned users and the run owner.
+    expect((await setStatus(asManager, "Completed")).ok()).toBeTruthy();
+    expect((await titles(asQa))[0]).toBe(`Test run ${label} has been completed.`);
+    expect(await titles(asOwner)).toEqual([`Test run ${label} has been completed.`]);
+
+    // Reopen: Completed → In Progress.
+    expect((await setStatus(asManager, "In Progress")).ok()).toBeTruthy();
+    expect((await titles(asQa))[0]).toBe(`Test run ${label} has been reopened.`);
+    expect((await titles(asOwner))[0]).toBe(`Test run ${label} has been reopened.`);
+    expect(await titles(asGuest)).toEqual([]); // not in the project
+  });
+
   test("NOTIF-P1-14 a bulk status change is one summary per assignee, not one notification per case", async () => {
     const run = await seedRun(3);
     const assign = (executionIds: string[], assigneeId: string) =>

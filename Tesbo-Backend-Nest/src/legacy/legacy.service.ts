@@ -19,7 +19,7 @@ import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
 import { writeNotifications } from "./notification-writer";
-import { notificationLinks, notificationMessages, runLabel, type NotificationLink, type NotificationType } from "./notification-events";
+import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
 import {
@@ -6158,8 +6158,59 @@ export class LegacyService implements OnModuleInit {
     return res.rows.map(toCamel);
   }
 
+  /**
+   * "Test run [Run] has started / has been completed / has been reopened" — the Start Execution,
+   * Mark Completed and Reopen buttons, all of which are one call here with a new `status`.
+   *   Planning → In Progress     started
+   *   → Completed                completed (the explicit button; a run can sit at 100% executed
+   *                              without being completed)
+   *   Completed → In Progress    reopened
+   * Told: the run's assigned users (anyone with a case in it assigned to them) — plus, for completed
+   * and reopened, the run's owner. Never the person who pressed the button. A save that does not
+   * change the status says nothing.
+   */
+  private async notifyRunLifecycle(
+    cycleId: string,
+    projectId: string,
+    actorId: string | null,
+    before: { status: string | null; name: string; external_id: string | null; owner_id: string | null },
+    nextStatus: string
+  ): Promise<void> {
+    try {
+      const was = before.status ?? "Planning";
+      let event: "started" | "completed" | "reopened" | null = null;
+      if (nextStatus === "Completed" && was !== "Completed") event = "completed";
+      else if (nextStatus === "In Progress" && was === "Completed") event = "reopened";
+      else if (nextStatus === "In Progress" && was !== "In Progress") event = "started";
+      if (!event) return;
+      const assigned = await this.db.query<{ assignee_id: string }>(
+        `SELECT DISTINCT e.assignee_id FROM executions e
+         JOIN cycle_items ci ON ci.id = e.cycle_item_id
+         WHERE ci.cycle_id = $1 AND e.assignee_id IS NOT NULL AND e.deleted_at IS NULL AND ci.deleted_at IS NULL`,
+        [cycleId]
+      );
+      const recipients: Array<string | null> = assigned.rows.map((r) => r.assignee_id);
+      if (event !== "started") recipients.push(before.owner_id);
+      const run = runLabel(before.name, before.external_id);
+      await this.notifyUsers(recipients, {
+        type: event === "started" ? "test_run_started" : event === "completed" ? "test_run_completed" : "test_run_reopened",
+        title:
+          event === "started"
+            ? notificationMessages.testRunStarted(run)
+            : event === "completed"
+              ? notificationMessages.testRunCompleted(run)
+              : notificationMessages.testRunReopened(run),
+        link: notificationLinks.testRun(projectId, cycleId),
+        actorId,
+        memberOf: { projectId }
+      });
+    } catch (err) {
+      this.logger.error(`Test run notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   async updateCycle(cycleId: string, userId: string | null | undefined, body: Body) {
-    await this.requireCycleAccess(userId, cycleId);
+    const projectId = await this.requireCycleAccess(userId, cycleId);
     validateBoundedField(body.name, "Test run name", CYCLE_NAME_MAX_LENGTH);
     validateBoundedField(body.environment, "Environment", CYCLE_LABEL_MAX_LENGTH);
     validateBoundedField(body.buildVersion, "Build version", CYCLE_LABEL_MAX_LENGTH);
@@ -6192,6 +6243,13 @@ export class LegacyService implements OnModuleInit {
         throw new BadRequestException({ error: "Add at least one test case before starting or completing a run" });
       }
     }
+    // What the run was before this save, so the status transition can be told after it.
+    const beforeRun = status
+      ? (await this.db.query<{ status: string | null; name: string; external_id: string | null; owner_id: string | null }>(
+          "SELECT status, name, external_id, owner_id FROM cycles WHERE id = $1",
+          [cycleId]
+        )).rows[0]
+      : undefined;
     await this.db.query(
       `UPDATE cycles SET name=COALESCE($2,name), description=COALESCE($3,description),
        environment=COALESCE($4,environment), build_version=COALESCE($5,build_version),
@@ -6213,6 +6271,7 @@ export class LegacyService implements OnModuleInit {
         status
       ]
     );
+    if (beforeRun && status) await this.notifyRunLifecycle(cycleId, projectId, userId ?? null, beforeRun, status);
   }
 
   /**
@@ -13523,6 +13582,31 @@ export class LegacyService implements OnModuleInit {
    * flipped to `sent` only after the assistant reply is written (or `failed` if the turn threw), so
    * polling getZyraChatSession is authoritative. Same shape as continueZyraChatMessage.
    */
+  /**
+   * "Zyra has completed coverage analysis." when a chat turn that asked for one (the "Find coverage
+   * gaps" quick action, or the same request typed) finishes with a real answer. The chat runs in the
+   * background, so the person may have left the page — they are the requester, and there is no actor:
+   * nobody pressed anything at this moment. A timed-out turn has not finished its analysis (it can
+   * be continued), so it says nothing yet. Never throws, and never delays the turn's own result.
+   */
+  private async notifyCoverageAnalysis(
+    turn: { projectId: string; uid: string; message: string; userMessageId: string },
+    payload: { message: Body } | undefined
+  ): Promise<void> {
+    try {
+      if (!isCoverageAnalysisRequest(turn.message) || payload?.message?.status === "timed_out") return;
+      await this.notifyUsers([turn.uid], {
+        type: "zyra_coverage_completed",
+        title: notificationMessages.zyraCoverageCompleted(),
+        link: notificationLinks.zyraChat(turn.projectId),
+        dedupeKey: `zyra_coverage:${turn.userMessageId}`,
+        memberOf: { projectId: turn.projectId }
+      });
+    } catch (err) {
+      this.logger.error(`Coverage-analysis notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   async startZyraChatMessage(
     projectId: string,
     userId: string | null | undefined,
@@ -13534,7 +13618,10 @@ export class LegacyService implements OnModuleInit {
     const recorder = new ZyraTurnTraceRecorder(onStage);
     const turn = await this.beginZyraChatTurn(projectId, userId, sessionId, body, LegacyService.ZYRA_USER_MESSAGE_PROCESSING, recorder);
     void this.runZyraChatTurn(turn, recorder).then(
-      (payload) => onSettled?.({ ok: true, payload }),
+      (payload) => {
+        void this.notifyCoverageAnalysis(turn, payload);
+        onSettled?.({ ok: true, payload });
+      },
       (err) => {
         this.logger.warn(`Background Zyra turn failed (session ${sessionId}, message ${turn.userMessageId}): ${err instanceof Error ? err.message : String(err)}`);
         onSettled?.({ ok: false, message: "This turn did not complete." });
