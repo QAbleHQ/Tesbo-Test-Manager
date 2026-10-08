@@ -65,6 +65,15 @@ services:
       JIRA_REDIRECT_URI: ${JIRA_REDIRECT_URI:-}
       LINEAR_REDIRECT_URI: ${LINEAR_REDIRECT_URI:-}
       NOTION_REDIRECT_URI: ${NOTION_REDIRECT_URI:-}
+      # Daily Basecamp analytics report (00:10 IST). PRODUCTION ONLY: the scheduler registers only when
+      # ANALYTICS_REPORT_ENABLED is exactly "true", and only the production Jenkinsfile sets it. Left
+      # false here so local, e2e and stage never post, even with BASECAMP_* present in .env.
+      ANALYTICS_REPORT_ENABLED: ${ANALYTICS_REPORT_ENABLED:-false}
+      BASECAMP_CLIENT_ID: ${BASECAMP_CLIENT_ID:-}
+      BASECAMP_CLIENT_SECRET: ${BASECAMP_CLIENT_SECRET:-}
+      BASECAMP_REFRESH_TOKEN: ${BASECAMP_REFRESH_TOKEN:-}
+      BASECAMP_ACCOUNT_ID: ${BASECAMP_ACCOUNT_ID:-}
+      BASECAMP_ANALYTICS_QUESTION_URL: ${BASECAMP_ANALYTICS_QUESTION_URL:-}
       POSTMARK_API_TOKEN: ${POSTMARK_API_TOKEN:-}
       POSTMARK_FROM_EMAIL: ${POSTMARK_FROM_EMAIL:-noreply@example.com}
       # "live" = real delivery, and only production should say it. Left at "log" here, which never

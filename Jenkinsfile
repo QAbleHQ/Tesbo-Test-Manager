@@ -126,6 +126,10 @@ git log -1 --oneline
 # docker-compose.yml threads GIT_SHA into the backend (/health, MCP serverInfo.version). Stage gets
 # it from Jenkins' own env; this remote shell never did, so prod always reported "local".
 export GIT_SHA="$(git rev-parse --short HEAD)"
+# The daily Basecamp analytics report runs in PRODUCTION ONLY. docker-compose.yml defaults this to
+# false; this shell export is what turns it on here (it overrides .env for compose interpolation) and
+# Jenkinsfile.stage deliberately does not set it. BASECAMP_* credentials still come from the server .env.
+export ANALYTICS_REPORT_ENABLED=true
 
 if [ -f "$ACTIVE_COLOR_FILE" ]; then
   ACTIVE="$(tr -d '[:space:]' < "$ACTIVE_COLOR_FILE" | tr '[:upper:]' '[:lower:]')"

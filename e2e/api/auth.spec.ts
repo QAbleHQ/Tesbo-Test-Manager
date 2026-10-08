@@ -97,8 +97,11 @@ test.describe("profile", () => {
     const verifyRes = await anon.post("/api/auth/otp/verify", { data: { email, code: "135790" } });
     expect(verifyRes.ok()).toBeTruthy();
 
-    const newFirstName = `E2EFirst${Date.now()}`;
-    const newLastName = `E2ELast${Date.now()}`;
+    // Letters only: person-name.util.ts rejects digits in a name, so a Date.now() suffix 400s. Uniqueness
+    // comes from a random letter run instead.
+    const letters = Array.from({ length: 8 }, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join("");
+    const newFirstName = `Efirst${letters}`;
+    const newLastName = `Elast${letters}`;
     // Already normalized: the API validates against the same strict "+<country code><digits>"
     // pattern as the users.mobile_number CHECK constraint and does not itself strip formatting —
     // that's the frontend's job (see ui/account.spec.ts for the spaced-input round trip).
@@ -642,5 +645,166 @@ test.describe("password login lockout", () => {
     } finally {
       await anon.dispose();
     }
+  });
+});
+
+test.describe("user activity tracking (daily analytics report inputs)", () => {
+  /*
+   * V136: sign-in stamps users.last_login_at + user_daily_activity.logged_in; a successful
+   * authenticated mutation stamps last_active_at + engaged. The daily Basecamp report counts those
+   * flags, so each rule it depends on is pinned here: reads (the frontend polls them), rejected
+   * requests and /api/auth/* must NOT count as activity, and none of this may change a response.
+   *
+   * Each test seeds its own user: the per-user write throttle lives in Redis for 5 minutes, so a
+   * shared account would leave a later test's first mutation silently skipped.
+   */
+  const skipReason = dbControlAvailable() ? null : "needs Postgres access to seed users and read the activity rows";
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  const created: string[] = [];
+  const PASSWORD = "ActivityTrack9!";
+  const TODAY_IST = "(now() AT TIME ZONE 'Asia/Kolkata')::date";
+
+  test.afterAll(() => {
+    if (skipReason) return;
+    for (const email of created) {
+      // user_daily_activity cascades with the user; audit rows need the immutability bypass.
+      execAllowingAuditImmutability(`DELETE FROM users WHERE email = ${literal(email.toLowerCase())};`);
+    }
+  });
+
+  function seedUser(label: string): { email: string; id: string } {
+    const email = disposableEmail(`activity-${label}`);
+    created.push(email);
+    exec(
+      `INSERT INTO users (email, name, password_hash, profile_completed_at) ` +
+        `VALUES (${literal(email.toLowerCase())}, 'E2E Activity User', ${literal(hashPasswordForSeed(PASSWORD))}, now());`,
+    );
+    return { email, id: scalar(`SELECT id FROM users WHERE email = ${literal(email.toLowerCase())};`) };
+  }
+
+  /** "<logged_in>|<engaged>" for today (IST), or "" when no row exists. */
+  function todayRow(userId: string): string {
+    return scalar(
+      `SELECT logged_in || '|' || engaged FROM user_daily_activity WHERE user_id = ${literal(userId)} AND activity_date = ${TODAY_IST};`,
+    );
+  }
+
+  async function signIn(playwright: import("@playwright/test").PlaywrightWorkerArgs["playwright"], email: string) {
+    const api = await anonContext(playwright);
+    const res = await api.post("/api/auth/password/login", { data: { email, password: PASSWORD }, failOnStatusCode: false });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return api;
+  }
+
+  test("ACT-01 sign-in records last_login_at and today's logged_in flag, not engaged", async ({ playwright }) => {
+    const user = seedUser("login");
+    const api = await signIn(playwright, user.email);
+    try {
+      await expect.poll(() => todayRow(user.id)).toBe("true|false");
+      expect(scalar(`SELECT last_login_at IS NOT NULL AND last_active_at IS NOT NULL FROM users WHERE id = ${literal(user.id)};`)).toBe("t");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-02 a second sign-in the same day keeps one row", async ({ playwright }) => {
+    const user = seedUser("relogin");
+    await (await signIn(playwright, user.email)).dispose();
+    const api = await signIn(playwright, user.email);
+    try {
+      await expect
+        .poll(() => scalar(`SELECT count(*) FROM user_daily_activity WHERE user_id = ${literal(user.id)};`))
+        .toBe("1");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-03 a failed sign-in records nothing", async ({ playwright }) => {
+    const user = seedUser("badpw");
+    const api = await anonContext(playwright);
+    try {
+      const res = await api.post("/api/auth/password/login", { data: { email: user.email, password: "wrong-password" }, failOnStatusCode: false });
+      expect(res.status()).toBe(401);
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(todayRow(user.id)).toBe("");
+      expect(scalar(`SELECT last_login_at IS NULL FROM users WHERE id = ${literal(user.id)};`)).toBe("t");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-04 a successful mutation marks the user engaged and keeps logged_in", async ({ playwright }) => {
+    const user = seedUser("mutate");
+    const api = await signIn(playwright, user.email);
+    try {
+      const res = await api.post("/api/notifications/read-all", { failOnStatusCode: false });
+      expect(res.ok(), await res.text()).toBeTruthy();
+      await expect.poll(() => todayRow(user.id)).toBe("true|true");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-05 reads (polled by the frontend) do not count as activity", async ({ playwright }) => {
+    const user = seedUser("reads");
+    const api = await signIn(playwright, user.email);
+    try {
+      for (let i = 0; i < 3; i++) expect((await api.get("/api/auth/me")).ok()).toBeTruthy();
+      await api.get("/api/notifications", { failOnStatusCode: false });
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(todayRow(user.id)).toBe("true|false");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-06 a rejected mutation does not count as activity", async ({ playwright }) => {
+    const user = seedUser("rejected");
+    const api = await signIn(playwright, user.email);
+    try {
+      const res = await api.post("/api/projects", { data: { name: "" }, failOnStatusCode: false });
+      expect(res.status(), "the fixture request must be rejected for this test to prove anything").toBeGreaterThanOrEqual(400);
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(todayRow(user.id)).toBe("true|false");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-07 /api/auth/* mutations (logout) do not count as activity", async ({ playwright }) => {
+    const user = seedUser("logout");
+    const api = await signIn(playwright, user.email);
+    try {
+      expect((await api.post("/api/auth/logout", { failOnStatusCode: false })).ok()).toBeTruthy();
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(todayRow(user.id)).toBe("true|false");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-08 an unauthenticated mutation is rejected as before and records nothing", async ({ playwright }) => {
+    const user = seedUser("anon");
+    const api = await anonContext(playwright);
+    try {
+      // The API answers an unauthenticated notifications mutation with a 4xx; what matters is that it is
+      // rejected and that nothing was recorded.
+      expect((await api.post("/api/notifications/read-all", { failOnStatusCode: false })).ok()).toBeFalsy();
+      expect(todayRow(user.id)).toBe("");
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  test("ACT-09 deleting the user removes their activity rows (no orphans)", async ({ playwright }) => {
+    const user = seedUser("cascade");
+    await (await signIn(playwright, user.email)).dispose();
+    await expect.poll(() => todayRow(user.id)).toBe("true|false");
+    execAllowingAuditImmutability(`DELETE FROM users WHERE id = ${literal(user.id)};`);
+    expect(scalar(`SELECT count(*) FROM user_daily_activity WHERE user_id = ${literal(user.id)};`)).toBe("0");
   });
 });
