@@ -1076,6 +1076,8 @@ test.describe("top bar — notifications", () => {
       { title: "Link jira sync", type: "project_integration", id: `${pid}:jira`, url: new RegExp(`/projects/${pid}/settings/integrations/jira$`) },
       { title: "Link linear sync", type: "project_integration", id: `${pid}:linear`, url: new RegExp(`/projects/${pid}/settings/integrations/linear$`) },
       { title: "Link notion sync", type: "project_integration", id: `${pid}:notion`, url: new RegExp(`/projects/${pid}/settings/integrations/notion$`) },
+      { title: "Link requirements", type: "requirements", id: pid, url: new RegExp(`/projects/${pid}/requirements$`) },
+      { title: "Link zyra chat", type: "zyra_chat", id: pid, url: new RegExp(`/projects/${pid}/agents/zyra$`) },
       { title: "Link kb list", type: "knowledge_base", id: pid, url: new RegExp(`/projects/${pid}/knowledge-base$`) },
       { title: "Link integrations", type: "integrations_settings", id: pid, url: /\/settings\/integrations$/ },
       { title: "Link zyra task", type: "zyra_task", id: `${pid}:00000000-0000-4000-8000-000000000004`, url: new RegExp(`/projects/${pid}/agents/tasks/00000000-0000-4000-8000-000000000004$`) },

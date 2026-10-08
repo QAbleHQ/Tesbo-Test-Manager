@@ -22,6 +22,9 @@ export type NotificationType =
   | "test_case_failed"
   | "test_case_blocked"
   | "test_case_status_changed"
+  | "test_run_started"
+  | "test_run_completed"
+  | "test_run_reopened"
   | "bug_assigned"
   | "bug_reassigned"
   | "bug_status_changed"
@@ -31,6 +34,7 @@ export type NotificationType =
   | "zyra_generation_failed"
   | "zyra_task_failed"
   | "zyra_review_completed"
+  | "zyra_coverage_completed"
   | "kb_document_ready"
   | "kb_document_failed"
   | "kb_document_updated"
@@ -40,7 +44,8 @@ export type NotificationType =
   | "integration_auth_expired"
   | "integration_sync_completed"
   | "integration_sync_failed"
-  | "integration_issue_linked";
+  | "integration_issue_linked"
+  | "requirement_updated";
 
 /**
  * Not implemented — the extension point for the integration notifications (connected, disconnected,
@@ -68,6 +73,10 @@ export const NOTIFICATION_PRIORITY: Record<NotificationType, NotificationPriorit
   // Not a row of the original matrix (which only names Failed / Blocked): added on request so an
   // assignee hears about any other status change on their case. Priority follows bug_status_changed.
   test_case_status_changed: "Medium",
+  // The run's own lifecycle — the Start Execution / Mark Completed / Reopen buttons.
+  test_run_started: "Medium",
+  test_run_completed: "Medium",
+  test_run_reopened: "Medium",
   bug_assigned: "High",
   bug_reassigned: "High",
   bug_status_changed: "Medium",
@@ -83,6 +92,7 @@ export const NOTIFICATION_PRIORITY: Record<NotificationType, NotificationPriorit
   zyra_generation_failed: "High",
   zyra_task_failed: "High",
   zyra_review_completed: "Medium",
+  zyra_coverage_completed: "Medium",
   // Phase 2 — Knowledge Base and integrations (Jira / Linear / Notion share every integration type).
   kb_document_ready: "Medium",
   kb_document_failed: "High",
@@ -93,7 +103,11 @@ export const NOTIFICATION_PRIORITY: Record<NotificationType, NotificationPriorit
   integration_auth_expired: "High",
   integration_sync_completed: "Low",
   integration_sync_failed: "High",
-  integration_issue_linked: "Low"
+  integration_issue_linked: "Low",
+  // A requirement is a ticket synced from Jira / Linear / Notion. "Requirement sync completed / failed"
+  // are the integration_sync_* notifications above: the Requirements page's "Sync all sources" is the
+  // same sync run, so there is one notification per run, not two.
+  requirement_updated: "Medium"
 };
 
 /** `notifications.title` is VARCHAR(255). */
@@ -131,6 +145,9 @@ export const notificationMessages = {
   testRunAssigned: (runName: string) => `You've been assigned to test run ${runName}.`,
   testCaseFailed: (tcId: string, runName: string) => `${tcId} failed in test run ${runName}.`,
   testCaseBlocked: (tcId: string, runName: string) => `${tcId} is blocked in test run ${runName}.`,
+  testRunStarted: (runName: string) => `Test run ${runName} has started.`,
+  testRunCompleted: (runName: string) => `Test run ${runName} has been completed.`,
+  testRunReopened: (runName: string) => `Test run ${runName} has been reopened.`,
   testCaseStatusChanged: (tcId: string, status: string, runName: string) => `${tcId} status changed to ${status} in test run ${runName}.`,
   /** One bulk status change, however many of the assignee's cases it covered. */
   testCasesStatusChangedBulk: (count: number, status: string, runName: string) =>
@@ -144,6 +161,7 @@ export const notificationMessages = {
   zyraGenerationFailed: () => "Zyra could not generate the requested test cases.",
   zyraTaskFailed: () => "Zyra task failed. Please retry or review the details.",
   zyraReviewCompleted: () => "Review completed for Zyra-generated test cases.",
+  zyraCoverageCompleted: () => "Zyra has completed coverage analysis.",
   kbDocumentReady: (name: string) => `${name} is ready to use with Zyra.`,
   kbDocumentFailed: (name: string) => `We couldn't process ${name}.`,
   kbDocumentUpdated: (name: string) => `${name} has been updated.`,
@@ -155,8 +173,29 @@ export const notificationMessages = {
   // database), so the message names it.
   integrationSyncCompleted: (provider: IntegrationProvider, projectName: string) => `${integrationLabel(provider)} sync completed successfully for ${projectName}.`,
   integrationSyncFailed: (provider: IntegrationProvider, projectName: string) => `${integrationLabel(provider)} sync failed for ${projectName}. Please review the connection.`,
-  integrationIssueLinked: (issueId: string) => `${issueId} has been linked successfully.`
+  integrationIssueLinked: (issueId: string) => `${issueId} has been linked successfully.`,
+  requirementUpdated: (requirementId: string) => `Requirement ${requirementId} has been updated.`
 };
+
+/**
+ * Zyra has no separate "coverage analysis" feature: "Find coverage gaps" in the chat is a canned
+ * prompt ("Analyze existing test cases and identify the most important areas of missing coverage."),
+ * and the reply is an ordinary chat answer. So a coverage analysis is recognised by what was asked.
+ * Deliberately narrow — "generate tests to improve coverage" is a generation request, not an analysis.
+ * English and Russian, the two languages the quick action is translated into.
+ */
+const COVERAGE_ANALYSIS_REQUEST = [
+  /\bcoverage\s+(gaps?|analysis|review|report)\b/i,
+  /\b(missing|insufficient|lacking)\s+coverage\b/i,
+  /\bareas?\s+of\s+(missing|low|poor)\s+coverage\b/i,
+  /пробел\p{L}*\s+в\s+покрыти/iu,
+  /не\s+хватает\s+покрытия/iu,
+  /анализ\p{L}*\s+покрытия/iu
+];
+
+export function isCoverageAnalysisRequest(message: string): boolean {
+  return COVERAGE_ANALYSIS_REQUEST.some((pattern) => pattern.test(message));
+}
 
 const INTEGRATION_LABELS: Record<IntegrationProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
 
@@ -188,6 +227,10 @@ export const notificationLinks = {
   project: (projectId: string): NotificationLink => ({ linkEntityType: "project", linkEntityId: projectId }),
   projectMembers: (projectId: string): NotificationLink => ({ linkEntityType: "project_members", linkEntityId: projectId }),
   testRun: (projectId: string, cycleId: string): NotificationLink => ({ linkEntityType: "test_run", linkEntityId: `${projectId}:${cycleId}` }),
+  /** The project's Requirements page (the id is the project's). */
+  requirements: (projectId: string): NotificationLink => ({ linkEntityType: "requirements", linkEntityId: projectId }),
+  /** The Zyra chat page (the id is the project's). */
+  zyraChat: (projectId: string): NotificationLink => ({ linkEntityType: "zyra_chat", linkEntityId: projectId }),
   zyraTask: (projectId: string, taskId: string): NotificationLink => ({ linkEntityType: "zyra_task", linkEntityId: `${projectId}:${taskId}` }),
   /** The task board (the id is the project's) — what the archive sweep's notification already uses. */
   zyraTaskBoard: (projectId: string): NotificationLink => ({ linkEntityType: "zyra_task_board", linkEntityId: projectId }),

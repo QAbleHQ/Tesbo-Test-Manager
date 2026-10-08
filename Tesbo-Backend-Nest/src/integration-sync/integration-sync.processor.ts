@@ -302,6 +302,37 @@ export class IntegrationSyncProcessor extends WorkerHost {
     }
   }
 
+  /**
+   * "Requirement [ID] has been updated." — a synced ticket's content changed. A synced ticket's
+   * assignee is an external name with no Tesbo user behind it and there are no watchers, so the people
+   * told are the ones who own the *coverage* of it: the owners and creators of the test cases linked
+   * to that ticket. Not the person who pressed Sync (their own action); a nightly run has no such
+   * person. At most once a day per requirement per person, however many syncs touch it.
+   */
+  private async notifyRequirementUpdated(projectId: string, provider: SyncProvider, ticket: RemoteTicket, documentId: string, triggeredBy: string | null): Promise<void> {
+    try {
+      // Column names are fixed here, never caller input. Notion links store the page id.
+      const column = provider === "jira" ? "jira_issue_key" : provider === "linear" ? "linear_issue_key" : "notion_page_id";
+      const key = provider === "notion" ? ticket.issueId : ticket.issueKey;
+      const linked = await this.db.query<{ owner_id: string | null; created_by: string | null }>(
+        `SELECT DISTINCT owner_id, created_by FROM testcases WHERE project_id = $1 AND deleted_at IS NULL AND ${column} = $2`,
+        [projectId, key]
+      );
+      const recipients = linked.rows.flatMap((r) => [r.owner_id, r.created_by]);
+      if (!recipients.length) return;
+      await writeNotifications(this.db, recipients, {
+        type: "requirement_updated",
+        title: notificationMessages.requirementUpdated(ticket.issueKey),
+        link: notificationLinks.requirements(projectId),
+        dedupeKey: `requirement_updated:${documentId}:${new Date().toISOString().slice(0, 10)}`,
+        actorId: triggeredBy,
+        memberOf: { projectId }
+      }, this.logger);
+    } catch (err) {
+      this.logger.warn(`Requirement notification failed for ${ticket.issueKey} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private async notifyAuthExpired(organizationId: string, provider: SyncProvider): Promise<void> {
     try {
       const people = await this.db.query<{ user_id: string | null }>(
@@ -567,6 +598,9 @@ export class IntegrationSyncProcessor extends WorkerHost {
       await this.runs
         .recordSyncEvent(mirrorDoc.id, runId, mirrorDoc.inserted ? "created" : "updated", provider, summary, fields, triggeredBy)
         .catch((err) => this.logger.warn(`Failed to record sync event for ${ticket.issueKey}: ${err instanceof Error ? err.message : err}`));
+      // Only a requirement that was already there and has now changed — not the first sync that
+      // brings it in, which would announce every ticket of a project on connection.
+      if (!mirrorDoc.inserted) await this.notifyRequirementUpdated(projectId, provider, ticket, mirrorDoc.id, triggeredBy ?? null);
     }
 
     await this.runs.recordTicketResult(runId, {
