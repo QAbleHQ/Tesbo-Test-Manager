@@ -1,5 +1,5 @@
 import { LegacyService } from "./legacy.service";
-import { clipNotificationTitle, NOTIFICATION_PRIORITY, notificationLinks, notificationMessages, runLabel } from "./notification-events";
+import { clipNotificationTitle, isCoverageAnalysisRequest, NOTIFICATION_PRIORITY, notificationLinks, notificationMessages, runLabel } from "./notification-events";
 import type { DatabaseService } from "../database/database.service";
 
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
@@ -36,6 +36,9 @@ describe("notification matrix wording (exact messages from the product matrix)",
     expect(notificationMessages.testCasesStatusChangedBulk(3, "Passed", "Sprint 4")).toBe("3 of your test cases in test run Sprint 4 were marked Passed.");
     expect(notificationMessages.commentReplied("Ann")).toBe("Ann replied to your comment.");
     expect(notificationLinks.knowledgeDocument(PROJECT_ID, "d1")).toEqual({ linkEntityType: "knowledge_document", linkEntityId: `${PROJECT_ID}:d1` });
+    expect(notificationMessages.testRunStarted("Sprint 4")).toBe("Test run Sprint 4 has started.");
+    expect(notificationMessages.testRunCompleted("TR-1 (Sprint 4)")).toBe("Test run TR-1 (Sprint 4) has been completed.");
+    expect(notificationMessages.testRunReopened("Sprint 4")).toBe("Test run Sprint 4 has been reopened.");
     expect(notificationMessages.bugAssigned("BUG-3")).toBe("Bug BUG-3 has been assigned to you.");
     expect(notificationMessages.bugReassigned("BUG-3")).toBe("Bug BUG-3 has been reassigned to you.");
     expect(notificationMessages.bugStatusChanged("BUG-3", "Closed")).toBe("Bug BUG-3 status changed to Closed.");
@@ -141,6 +144,8 @@ describe("Phase 2 wording (Zyra, Knowledge Base, integrations)", () => {
     expect(notificationMessages.integrationSyncCompleted("jira", "Project 1")).toBe("Jira sync completed successfully for Project 1.");
     expect(notificationMessages.integrationSyncFailed("linear", "Project 1")).toBe("Linear sync failed for Project 1. Please review the connection.");
     expect(notificationMessages.integrationIssueLinked("PRJ-12")).toBe("PRJ-12 has been linked successfully.");
+    expect(notificationMessages.requirementUpdated("QAD-12")).toBe("Requirement QAD-12 has been updated.");
+    expect(NOTIFICATION_PRIORITY.requirement_updated).toBe("Medium");
   });
 
   it("keeps the matrix priorities for the new types", () => {
@@ -179,5 +184,60 @@ describe("notifyZyraTask", () => {
     dbQuery.mockResolvedValueOnce({ rows: [{ requested_by: ACTOR }] });
     await notifyZyraTask(svc, PROJECT_ID, "task-1", "reviewed", ACTOR);
     expect(dbQuery).toHaveBeenCalledTimes(1); // the requester lookup only; the insert is skipped
+  });
+});
+
+describe("coverage analysis requests", () => {
+  it("recognises the quick action and typed variants, in English and Russian", () => {
+    for (const message of [
+      "Analyze existing test cases and identify the most important areas of missing coverage.",
+      "Find coverage gaps",
+      "can you run a coverage analysis for checkout?",
+      "Show me the coverage report",
+      "Проанализируй существующие тест-кейсы и найди самые важные области, где не хватает покрытия.",
+      "Найти пробелы в покрытии",
+      "Сделай анализ покрытия"
+    ]) {
+      expect(isCoverageAnalysisRequest(message)).toBe(true);
+    }
+  });
+
+  it("does not mistake generation or other quick actions for one", () => {
+    for (const message of [
+      "Generate smoke tests",
+      "Add negative scenarios",
+      "Improve expected results",
+      "Create test cases to improve coverage of login",
+      "How many test cases are there?",
+      "Review this module"
+    ]) {
+      expect(isCoverageAnalysisRequest(message)).toBe(false);
+    }
+  });
+});
+
+describe("notifyCoverageAnalysis", () => {
+  const run = (svc: LegacyService, message: string, payload: unknown) =>
+    (svc as unknown as { notifyCoverageAnalysis: (...a: unknown[]) => Promise<void> }).notifyCoverageAnalysis(
+      { projectId: PROJECT_ID, uid: OTHER, message, userMessageId: "m1" },
+      payload
+    );
+
+  it("tells the requester once the turn finishes, with no actor so the requester is not filtered out", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    dbQuery.mockResolvedValueOnce({ rows: [{ id: "n1" }] });
+    await run(svc, "Find coverage gaps", { message: { status: "completed" } });
+    const [, params] = dbQuery.mock.calls[0];
+    expect(params[0]).toEqual([OTHER]);
+    expect(params[1]).toBe("zyra_coverage_completed");
+    expect(params[2]).toBe("Zyra has completed coverage analysis.");
+    expect(params[5]).toBe("zyra_coverage:m1");
+  });
+
+  it("says nothing for a different question or a turn that timed out", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    await run(svc, "How many test cases are there?", { message: { status: "completed" } });
+    await run(svc, "Find coverage gaps", { message: { status: "timed_out" } });
+    expect(dbQuery).not.toHaveBeenCalled();
   });
 });

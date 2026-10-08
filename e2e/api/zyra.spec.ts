@@ -2688,6 +2688,63 @@ test.describe("zyra chat — citations (fake provider)", () => {
     return lastAssistant.testcases as Array<Record<string, unknown>>;
   }
 
+  /*
+   * "Find coverage gaps" is not its own feature: the chat page sends a canned prompt with
+   * `background: true` and the reply is an ordinary answer. The coverage-analysis notification is
+   * therefore keyed on what was asked, and only for the background turn the page uses — a caller that
+   * holds the request open (the plain POST) is already waiting for the answer.
+   */
+  test("ZYR-A-NOTIF-01 a finished coverage-gap turn notifies the requester; other questions and the plain POST do not", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E coverage notification");
+    const answer = (reply: string) =>
+      ai.queueReply({ reply, reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const notifications = async (): Promise<Array<{ title: string; type: string; link_entity_type: string; link_entity_id: string }>> =>
+      (await (await asOwner.get("/api/notifications")).json()).filter((n: { type: string }) => n.type === "zyra_coverage_completed");
+    const assistantReplies = async (): Promise<number> => {
+      const session = await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json();
+      return (session.messages as Array<{ role: string }>).filter((m) => m.role === "assistant").length;
+    };
+    exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    try {
+      // The quick action's own prompt, sent the way the page sends it.
+      answer("I found 3 coverage gaps around password reset.");
+      const started = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Analyze existing test cases and identify the most important areas of missing coverage.", background: true },
+        failOnStatusCode: false,
+      });
+      expect(started.status(), await started.text()).toBeLessThan(300);
+      await expect.poll(assistantReplies, { message: "the background turn should finish", timeout: 30_000 }).toBe(1);
+      await expect.poll(async () => (await notifications()).length, { timeout: 15_000 }).toBe(1);
+      expect((await notifications())[0]).toMatchObject({
+        title: "Zyra has completed coverage analysis.",
+        link_entity_type: "zyra_chat",
+        link_entity_id: tenant!.mainProjectId,
+      });
+
+      // An ordinary background question is not a coverage analysis.
+      answer("This project has 0 test cases.");
+      const other = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "How many test cases are there?", background: true },
+        failOnStatusCode: false,
+      });
+      expect(other.status()).toBeLessThan(300);
+      await expect.poll(assistantReplies, { timeout: 30_000 }).toBe(2);
+      expect(await notifications()).toHaveLength(1);
+
+      // The plain (awaited) POST already returned the answer to the caller — nothing to announce.
+      answer("Still 3 gaps.");
+      const plain = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Find coverage gaps again" },
+        failOnStatusCode: false,
+      });
+      expect(plain.status(), await plain.text()).toBeLessThan(300);
+      expect(await notifications()).toHaveLength(1);
+    } finally {
+      exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    }
+  });
+
   test("ZYR-A-63 a generated test case cites the exact KB doc, Jira ticket, test case, and bug it was shown, and drops a fabricated label", async () => {
     await allocateFakeAiKey();
     const { kbDocId, jiraKey, testcaseExternalId, bugId } = await seedCitableSources();
