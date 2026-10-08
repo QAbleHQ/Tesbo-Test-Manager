@@ -450,6 +450,12 @@ export class LegacyController {
     return this.legacy.projectsOverview(req.userId);
   }
 
+  // Readable app URL segments -> uuids (see LegacyService.resolveRoute).
+  @Get("/api/route-resolve")
+  resolveRoute(@Req() req: AuthenticatedRequest, @Query() query: Record<string, any>) {
+    return this.legacy.resolveRoute(req.userId, query);
+  }
+
   @Get("/api/projects/:id")
   getProject(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
     return this.legacy.getProjectForUser(req.userId, id);
@@ -1847,6 +1853,28 @@ export class LegacyController {
     @Body() body: Record<string, any>
   ) {
     return this.legacy.updateKnowledgeDocument(projectId, req.userId, documentId, body);
+  }
+
+  // Zyra AI Memory's only write path for people: correct or remove one entry (owner/manager only).
+  @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/memory-entries/:entryId")
+  updateZyraMemoryEntry(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Param("entryId") entryId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateZyraMemoryEntry(projectId, req.userId, documentId, entryId, body);
+  }
+
+  @Delete("/api/projects/:projectId/knowledge-base/documents/:documentId/memory-entries/:entryId")
+  deleteZyraMemoryEntry(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Param("entryId") entryId: string
+  ) {
+    return this.legacy.deleteZyraMemoryEntry(projectId, req.userId, documentId, entryId);
   }
 
   @Delete("/api/projects/:projectId/knowledge-base/documents/:documentId")

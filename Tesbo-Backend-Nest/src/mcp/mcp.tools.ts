@@ -1361,7 +1361,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "update_knowledge_document",
       description:
-        "Update a Knowledge Base document's title or content. Required: documentId. Optional: title, contentText, contentHtml, contentJson, documentType, status. Rejected if the document is synced from Jira/Linear (read-only) or is Zyra's AI Memory document being renamed. Only the document's creator, or a project owner/manager, may update it.",
+        "Update a Knowledge Base document's title or content. Required: documentId. Optional: title, contentText, contentHtml, contentJson, documentType, status. Rejected if the document is synced from Jira/Linear (read-only) or is Zyra's AI Memory document (which can't be renamed or have its content, type or status edited; it is managed by Zyra). A new title of exactly \"Zyra AI Memory\" is also rejected. Only the document's creator, or a project owner/manager, may update it.",
       requiredScope: "write",
       inputSchema: {
         type: "object",

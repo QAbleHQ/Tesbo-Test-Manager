@@ -14,11 +14,11 @@ async function setUpCycleWithOneCase(title: string) {
   // The inline status <select> only renders when the run's own status is "In Progress"
   // (page.tsx: `const isInProgress = run.status === "In Progress"`) — cycles are created in
   // "Planning" by default (migrations/V9_cycle_status.sql), so this must be set explicitly.
-  await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
   const testcase = await (
     await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title } })
   ).json();
   await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+  await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
   await api.dispose();
   return { cycle, testcase };
 }
@@ -60,7 +60,7 @@ test.describe("auto bug-filing on Failed", () => {
       await expect(severitySelect).toHaveValue("");
       await severitySelect.selectOption("Critical");
 
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -91,7 +91,6 @@ test.describe("auto bug-filing on Failed", () => {
     const cycle = await (
       await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Bug Severity Reset Cycle ${stamp}` } })
     ).json();
-    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
     const testcaseA = await (
       await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: titleA } })
     ).json();
@@ -99,6 +98,7 @@ test.describe("auto bug-filing on Failed", () => {
       await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: titleB } })
     ).json();
     await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcaseA.id, testcaseB.id] } });
+    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
     await api.dispose();
 
     try {
@@ -115,7 +115,7 @@ test.describe("auto bug-filing on Failed", () => {
       expect(optionValues).toEqual(["Not selected", "Critical", "High", "Medium", "Low"]);
 
       await severitySelect.selectOption("Low");
-      await page.getByRole("button", { name: "Skip", exact: true }).click();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       // Fail the second case — its dialog must reset to Not selected, not inherit "Low". Severity is not
@@ -123,8 +123,8 @@ test.describe("auto bug-filing on Failed", () => {
       await page.getByRole("combobox").nth(1).selectOption("Failed");
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
       await expect(page.getByRole("combobox", { name: "Severity" })).toHaveValue("");
-      await expect(page.getByRole("button", { name: "File Bug" })).toBeEnabled();
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await expect(page.getByRole("button", { name: "Report Bug", exact: true })).toBeEnabled();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       const verifyApi = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -167,7 +167,7 @@ test.describe("auto bug-filing on Failed", () => {
       await page.getByRole("combobox").first().selectOption("Failed");
 
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
-      await page.getByRole("button", { name: "Skip", exact: true }).click();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
@@ -228,7 +228,7 @@ test.describe("auto bug-filing on Failed", () => {
         })),
       );
 
-      const submit = page.getByRole("button", { name: "File Bug" });
+      const submit = page.getByRole("button", { name: "Report Bug", exact: true });
       await submit.click();
       await expect(page.getByTestId("log-bug-error")).toBeVisible();
       // The dialog stays open with the same staged files — exactly what invited the original defect.
@@ -360,7 +360,7 @@ test.describe("auto bug-filing on Failed", () => {
       await expect(page.getByPlaceholder("https://example.com/browse/BUG-123")).toBeHidden();
       await expect(page.getByText("No issue selected.", { exact: true })).toBeVisible();
 
-      const submit = page.getByRole("button", { name: "File Bug" });
+      const submit = page.getByRole("button", { name: "Report Bug", exact: true });
       await expect(submit).toBeDisabled();
       await expect(page.getByText("Select a Jira ticket before saving.", { exact: true })).toBeVisible();
 
@@ -1379,7 +1379,6 @@ test.describe("bulk assignment (run detail)", () => {
     const cycle = await (
       await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Bulk Assign Cycle ${stamp}` } })
     ).json();
-    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
     const testcaseA = await (
       await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${prefix} A ${stamp}` } })
     ).json();
@@ -1387,6 +1386,7 @@ test.describe("bulk assignment (run detail)", () => {
       await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${prefix} B ${stamp}` } })
     ).json();
     await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcaseA.id, testcaseB.id] } });
+    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
     await api.dispose();
     return { cycle, testcaseA, testcaseB };
   }
@@ -1497,7 +1497,6 @@ test.describe("removing cases from a run", () => {
     const cycle = await (
       await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Run Count ${stamp}` } })
     ).json();
-    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
     const testcaseIds: string[] = [];
     for (let i = 0; i < count; i++) {
       const tc = await (
@@ -1508,6 +1507,7 @@ test.describe("removing cases from a run", () => {
       testcaseIds.push(tc.id);
     }
     await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds } });
+    await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
     await api.dispose();
     return { cycle, testcaseIds };
   }
@@ -1779,7 +1779,6 @@ test.describe("run detail — progress, defects and the bug modal", () => {
         await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Bug Race Cycle ${stamp}` } })
       ).json();
       cycleId = cycle.id;
-      await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
       const testcaseA = await (
         await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `UI Bug Race A ${stamp}` } })
       ).json();
@@ -1788,6 +1787,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       ).json();
       testcaseIds.push(testcaseA.id, testcaseB.id);
       await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcaseA.id, testcaseB.id] } });
+      await api.patch(`/api/cycles/${cycle.id}`, { data: { status: "In Progress" } });
       const executions = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
       const execA = executions.find((e: { testcaseId: string }) => e.testcaseId === testcaseA.id);
 
@@ -1932,7 +1932,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
       const bugTitle = `E2E No-Save Log Bug ${Date.now()}`;
       await page.getByPlaceholder("Brief summary of the bug…").fill(bugTitle);
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeHidden();
 
       // The panel must reopen on this same test case, as Failed, with the bug it just filed —
@@ -2026,7 +2026,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
 
       await page.getByLabel("Assign to").selectOption(me.userId);
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
 
       const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
@@ -2054,7 +2054,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await expect(page.getByText("Report a Bug", { exact: true })).toBeVisible();
 
       await page.getByLabel("Assign to").selectOption(me.userId);
-      await page.getByRole("button", { name: "File Bug" }).click();
+      await page.getByRole("button", { name: "Report Bug", exact: true }).click();
       await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
 
       const bugs = await (await api.get(`/api/projects/${ctx.projectId}/bugs`)).json();
@@ -2422,6 +2422,47 @@ test.describe("execution evidence and automation provenance", () => {
       await expect(page.getByText(/No evidence attached/)).toBeVisible();
     } finally {
       await cleanUp(cycle.id, testcase.id);
+    }
+  });
+});
+
+/*
+ * "[Test Run] Start Execution and Complete Run buttons should be disabled when no test cases are
+ * added". The header actions render in the TopBar, so they are found by role + name on the page.
+ */
+test.describe("run header actions on an empty run", () => {
+  test("Start Execution and Mark Completed stay disabled until the run has a case", { tag: '@tesbo.testId("TES-TC-EMPTYRUN-UI-1")' }, async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = Date.now();
+    const cycle = await (
+      await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `UI Empty Run Buttons ${stamp}` } })
+    ).json();
+    const testcase = await (
+      await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `UI Empty Run Case ${stamp}` } })
+    ).json();
+    try {
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      const start = page.getByRole("button", { name: "Start Execution" });
+      await expect(start).toBeVisible();
+      await expect(start).toBeDisabled();
+      // The run itself must not have moved.
+      expect((await (await api.get(`/api/cycles/${cycle.id}`)).json()).status).toBe("Planning");
+
+      await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds: [testcase.id] } });
+      await page.reload();
+      await expect(start).toBeEnabled();
+      await start.click();
+      await expect(page.getByRole("button", { name: "Mark Completed" })).toBeEnabled();
+      expect((await (await api.get(`/api/cycles/${cycle.id}`)).json()).status).toBe("In Progress");
+
+      // Removing the last case (API, then reload) leaves an In Progress run that cannot be completed.
+      await api.delete(`/api/cycles/${cycle.id}/testcases/${testcase.id}`);
+      await page.reload();
+      await expect(page.getByRole("button", { name: "Mark Completed" })).toBeDisabled();
+    } finally {
+      await api.delete(`/api/cycles/${cycle.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
+      await api.dispose();
     }
   });
 });

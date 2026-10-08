@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { deleteZyraTaskDraft, editZyraTaskDraft, saveZyraTask, closeZyraTask, getZyraTask, type ZyraChatTestcaseRow } from "@/lib/api";
+import { deleteZyraTaskDraft, editZyraTaskDraft, saveZyraTask, closeZyraTask, getZyraTask, type ZyraChatTestcaseRow, type ZyraTask } from "@/lib/api";
 import { refreshPageCachesAfterZyraSave } from "@/lib/zyraCacheSync";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { Button, CopyButton, StatusChip, type Severity } from "@/components/ui";
@@ -71,6 +71,13 @@ const TECHNIQUE_BADGE_CLASS =
  * renders nothing — no empty row, no placeholder text, matching how ZyraCitationsList and the
  * plain `tags` line elsewhere already render nothing rather than a hollow "no data" note.
  */
+// The batch's current drafts, as the server holds them now, in the same row shape the chat message
+// carries (formatAiTask normalizes a chat-staged entry through the same chatDraftRow). Each row's
+// draftIndex is its position in that list, which is exactly what discard/edit/save address.
+function rowsFromTask(task: ZyraTask): ZyraChatTestcaseRow[] {
+  return (task.drafts as unknown as ZyraChatTestcaseRow[]).map((row, index) => ({ ...row, draftIndex: index }));
+}
+
 export function TechniqueBadges({ techniques }: { techniques?: string[] }) {
   const t = useZyraText();
   const real = (techniques || []).filter((t) => t !== "general");
@@ -87,11 +94,15 @@ export function TechniqueBadges({ techniques }: { techniques?: string[] }) {
 /**
  * Renders a not-yet-saved batch of create/update/archive proposals from a Zyra chat message —
  * the review step the Test Case Repository was missing (select/deselect, edit, discard, or save
- * into the repository). `initialRows` come straight off the message (already fetched); this only
- * calls the server again to confirm the batch is still pending (another tab may have already
- * saved or closed it), and thereafter manages the working set of rows entirely client-side —
- * every action below (edit/discard/save) tells the server exactly what changed, so there is never
- * a need to reconstruct a full drafts array back into display rows.
+ * into the repository).
+ *
+ * The rows shown are the batch AS THE SERVER HOLDS IT NOW, not the message's copy. `initialRows` is
+ * the turn-time snapshot stored on the chat message, and nothing updates it when a draft is
+ * discarded or partly saved — while the server's list shrinks and every later draft moves up one
+ * position. Rendering the snapshot after a reload brought discarded/saved cards back and pointed
+ * each card's index at a different draft, so Save/Discard on one card acted on another (and the
+ * intended one silently stayed or vanished). So the batch is loaded on mount (the status check
+ * already fetched it), replaced from the server's response after a discard, and re-read after a save.
  */
 export function ZyraChatReviewPanel({
   projectId,
@@ -117,6 +128,12 @@ export function ZyraChatReviewPanel({
     getZyraTask(projectId, reviewRequestId)
       .then((task) => {
         if (cancelled) return;
+        if (task.taskStatus === "in_review") {
+          // Nothing is interactive while status is "checking", so no selection can be lost here.
+          const current = rowsFromTask(task);
+          setRows(current);
+          setSelected(current.map((_, index) => index));
+        }
         setStatus(task.taskStatus === "in_review" ? "in_review" : "resolved");
       })
       .catch(() => {
@@ -150,8 +167,10 @@ export function ZyraChatReviewPanel({
     setWorking(true);
     setError(null);
     try {
-      await deleteZyraTaskDraft(projectId, reviewRequestId, index);
-      setRows((prev) => prev.filter((_, i) => i !== index).map((row, newIndex) => ({ ...row, draftIndex: newIndex })));
+      // The server's response IS the batch after the removal — used as-is rather than mirrored by
+      // local index arithmetic, so the cards can never drift from what the next action addresses.
+      const task = await deleteZyraTaskDraft(projectId, reviewRequestId, index);
+      setRows(rowsFromTask(task));
       setSelected((prev) => prev.filter((item) => item !== index).map((item) => (item > index ? item - 1 : item)));
       if (editingIndex === index) setEditingIndex(null);
     } catch (err) {
@@ -216,6 +235,17 @@ export function ZyraChatReviewPanel({
       setRows((prev) => prev.filter((_, i) => !savedSet.has(i)).map((row, newIndex) => ({ ...row, draftIndex: newIndex })));
       setSelected([]);
       if (!result.remaining) setStatus("resolved");
+      else {
+        // Partial save: re-read what is still staged so the remaining cards match the server's list.
+        // Awaited inside this action (buttons stay disabled while `working`), so a discard can't
+        // start before it lands and then be overwritten by this older read. A failed re-read keeps
+        // the locally-pruned rows above, which already mirror the same removal.
+        try {
+          setRows(rowsFromTask(await getZyraTask(projectId, reviewRequestId)));
+        } catch {
+          // keep the locally-pruned rows
+        }
+      }
       setMessage(t("review.savedMsg", { n: result.savedCount }));
     } catch (err) {
       setError(err instanceof Error ? err.message : t("review.err.save"));

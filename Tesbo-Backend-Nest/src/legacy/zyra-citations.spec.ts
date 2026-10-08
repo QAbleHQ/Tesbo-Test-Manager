@@ -168,6 +168,28 @@ describe("Zyra citation guards", () => {
       expect(out.length).toBeLessThanOrEqual(20);
     });
 
+    it("resolves a label written the way models actually write it — case, spacing, hyphen, trailing title, or an object", () => {
+      const refs = new Map<string, SourceRef>([
+        ["KB 1", { type: "knowledge_document", id: "doc-1", title: "Refund policy v4" }],
+        ["AIP-TC-73", { type: "testcase", id: "AIP-TC-73", title: "Successful login" }],
+        ["BUG 2", { type: "bug", id: "bug-2", title: "Crash on save" }]
+      ]);
+      const kb = { type: "knowledge_document", id: "doc-1", title: "Refund policy v4" };
+      for (const variant of ["KB1", "kb 1", "KB-1", "KB 1: Refund policy v4", "KB 1 (Refund policy v4)", "KB 1 — Refund policy v4", { label: "KB 1" }, { id: "kb1" }]) {
+        expect(statics().sanitizeZyraSourceRefs([variant], refs)).toEqual([kb]);
+      }
+      // An external id keeps its own hyphens; a title after a spaced dash or colon is cut off.
+      expect(statics().sanitizeZyraSourceRefs(["AIP-TC-73 - Successful login", "aip-tc-73: Successful login"], refs)).toEqual([
+        { type: "testcase", id: "AIP-TC-73", title: "Successful login" }
+      ]);
+      expect(statics().sanitizeZyraSourceRefs(["bug-2"], refs)).toEqual([{ type: "bug", id: "bug-2", title: "Crash on save" }]);
+    });
+
+    it("still never resolves to a source that was not offered, however the label is written", () => {
+      const out = statics().sanitizeZyraSourceRefs(["KB 2", "KB 12", "AIP-TC-7", "AIP-TC-730", "KB 1x", { label: "PAY-2291" }], knownRefs);
+      expect(out).toEqual([]);
+    });
+
     it("ignores non-string entries inside an otherwise-valid array", () => {
       const out = statics().sanitizeZyraSourceRefs([123, null, "KB 1", {}], knownRefs);
       expect(out).toEqual([{ type: "knowledge_document", id: "doc-1", title: "Refund policy v4" }]);

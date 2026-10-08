@@ -2976,6 +2976,45 @@ test.describe("zyra / agents (UI)", () => {
       .toEqual(["Sign in with a wrong password"]);
   });
 
+  /*
+   * "[Zyra] … Some Generated Test Cases Are Missing": the review panel rendered the chat message's
+   * turn-time snapshot, which nothing updates after a discard or a partial save — while the server's
+   * staged list shrinks and every later draft moves up one index. After a reload, discarded/saved
+   * cards came back and each card's index pointed at a different draft, so Save on one card saved
+   * another and the intended one silently stayed behind. The panel now renders the live batch.
+   */
+  test("ZYU-141 after a discard and a reload, the panel shows the live batch and Save saves exactly the card selected", async ({ browser }) => {
+    const [a, b, c] = [stamp("Stale A"), stamp("Stale B"), stamp("Stale C")];
+    const draft = (title: string) => ({ opType: "create" as const, draft: { suiteId: null, title, description: "", preconditions: "", stepsJson: "[]", priority: "P2" } });
+    const { taskId } = seedChatReviewBatch({ entries: [draft(a), draft(b), draft(c)] });
+    const page = await open(browser, "/agents/zyra");
+
+    await page.getByRole("listitem").filter({ hasText: b }).getByRole("button", { name: "Discard" }).click();
+    await expect(page.getByText(b)).toHaveCount(0);
+    await expect.poll(() => draftTitles(taskId)).toEqual([a, c]);
+
+    // The chat message still holds all three; the panel must not resurrect B or keep old indexes.
+    await page.reload();
+    await expect(page.getByText(a)).toBeVisible();
+    await expect(page.getByText(c)).toBeVisible();
+    await expect(page.getByText(b), "a discarded draft must not come back after a reload").toHaveCount(0);
+    await expect(page.getByText(/2 of 2 selected/)).toBeVisible();
+
+    // Save only C (the second card now). With the stale snapshot this addressed index 2 — out of
+    // range on the server — or, with A unchecked, saved the wrong draft.
+    await page.getByRole("checkbox", { name: "Select proposed test case 1" }).uncheck();
+    await page.getByRole("button", { name: /Save 1 to repository/ }).click();
+    await expect.poll(() => draftTitles(taskId), { message: "only C may leave the staged batch" }).toEqual([a]);
+    expect(Number(scalar(`SELECT count(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(c)};`))).toBe(1);
+    expect(Number(scalar(`SELECT count(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(a)};`))).toBe(0);
+
+    // After a partial save and another reload, the saved card stays gone and A is still staged.
+    await page.reload();
+    await expect(page.getByText(a)).toBeVisible();
+    await expect(page.getByRole("listitem").filter({ hasText: c }), "a saved draft must not reappear as staged").toHaveCount(0);
+    await expect(page.getByText(/1 of 1 selected/)).toBeVisible();
+  });
+
   test("ZYU-66 editing a proposed row updates what's displayed and what's stored", async ({ browser }) => {
     const { taskId } = seedChatReviewBatch();
     const page = await open(browser, "/agents/zyra");
@@ -3085,8 +3124,10 @@ test.describe("zyra / agents (UI)", () => {
 
     const row = page.getByRole("listitem").filter({ hasText: title });
     await row.getByRole("button", { name: "Edit" }).click();
-    // The message snapshot predates the field, so the editor genuinely has no value to show here.
-    await expect(editorTextarea(row, "Test Data")).toHaveValue("");
+    // The message snapshot predates the field, but the panel now renders the batch as the server
+    // holds it (ZyraChatReviewPanel loads it on mount), so the stored value is shown rather than a
+    // blank read off the stale snapshot.
+    await expect(editorTextarea(row, "Test Data")).toHaveValue("keep: me");
     await editorTextarea(row, "Preconditions").fill("Signed in as an employee");
     await row.getByRole("button", { name: "Save edit" }).click();
 

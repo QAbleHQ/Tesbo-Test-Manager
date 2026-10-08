@@ -126,6 +126,7 @@ const EN = {
   "stage.tool:jira_coverage": "Checking Jira test case coverage",
   "stage.summarizing": "Summarizing the result",
   "stage.generating": "Generating your test cases",
+  "stage.drafting:updates": "Drafting the updates",
   "stage.staging": "Staging results",
   "stage.finalizing": "Finalizing",
 
@@ -531,6 +532,7 @@ const RU: Record<ZyraTextKey, Entry> = {
   "stage.tool:jira_coverage": "Проверяем покрытие задач Jira тест-кейсами",
   "stage.summarizing": "Подводим итог",
   "stage.generating": "Генерируем тест-кейсы",
+  "stage.drafting:updates": "Готовим изменения",
   "stage.staging": "Подготавливаем результаты",
   "stage.finalizing": "Завершаем",
 

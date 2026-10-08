@@ -1,6 +1,7 @@
 "use client";
 
-import { useParams, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import type { JSONContent } from "@tiptap/react";
@@ -32,6 +33,7 @@ import {
 import { Button, Input, Modal, PageLoader, StatusChip } from "@/components/ui";
 import RichTextEditor from "@/components/knowledge-base/RichTextEditor";
 import { DocumentComments } from "@/components/knowledge-base/DocumentComments";
+import { ZyraMemoryEntries } from "@/components/knowledge-base/ZyraMemoryEntries";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { blankDocumentFlagKey } from "@/lib/validation";
 import { formatDateTime } from "@/lib/date";
@@ -533,6 +535,11 @@ export default function KnowledgeDocumentPage() {
   // rejects updates. Comments are the writable channel — they're stored apart from the body.
   const isSyncedMirror = doc.isReadOnly && doc.sourceRole === "mirror";
   const providerLabel = integrationProviderLabel(doc.sourceProvider);
+  // Zyra's own memory (flagged by the API): readable by everyone, but its body is never free-form
+  // editable — Zyra reads it back as context. Owners/managers correct or remove single entries in
+  // ZyraMemoryEntries instead; the API refuses direct content edits and version restores too.
+  const isZyraMemory = Boolean(doc.isManagedByZyra);
+  const bodyLocked = isSyncedMirror || isZyraMemory;
 
   // Update History is the same data and component everywhere — the Knowledge Base list's
   // info-icon popover and this modal never drift into showing different things for the same
@@ -565,7 +572,7 @@ export default function KnowledgeDocumentPage() {
     // The confirmation step above is a separate modal body, not an in-list "Restoring…" state —
     // by the time a restore is actually in flight this branch isn't rendered at all.
     historyModalBody = (
-      <ChangeHistoryList projectId={projectId} documentId={documentId} showHeading={false} onRestoreVersion={requestRestoreVersion} />
+      <ChangeHistoryList projectId={projectId} documentId={documentId} showHeading={false} onRestoreVersion={isZyraMemory ? undefined : requestRestoreVersion} />
     );
   }
 
@@ -604,9 +611,9 @@ export default function KnowledgeDocumentPage() {
         <Input
           value={title}
           onChange={(e) => handleTitleChange(e.target.value)}
-          readOnly={isSyncedMirror}
+          readOnly={bodyLocked}
           className={`!h-auto flex-1 border-0 !bg-transparent px-0 text-[26px] font-semibold shadow-none focus:ring-0 ${
-            isSyncedMirror ? "cursor-default" : ""
+            bodyLocked ? "cursor-default" : ""
           }`}
           placeholder="Untitled document"
         />
@@ -626,7 +633,7 @@ export default function KnowledgeDocumentPage() {
               {DOC_TYPE_LABELS[doc.documentType] || "Document"}
             </span>
           )}
-          {!isSyncedMirror && (
+          {!bodyLocked && (
             <span className="text-[12px] text-[var(--muted-soft)]">
               {saveStatus === "saving" ? "Saving…" : saveStatus === "unsaved" ? "Unsaved changes" : "Saved"}
             </span>
@@ -650,13 +657,15 @@ export default function KnowledgeDocumentPage() {
                 <button onClick={handleCopyLink} className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] hover:bg-[var(--surface-secondary)]">
                   <IconLink size={14} /> {linkCopied ? "Copied!" : "Copy link"}
                 </button>
-                <button onClick={handleDelete} className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-[var(--error-foreground)] hover:bg-[var(--error-soft)]">
-                  <IconTrash size={14} /> Delete
-                </button>
+                {!isZyraMemory && (
+                  <button onClick={handleDelete} className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-[var(--error-foreground)] hover:bg-[var(--error-soft)]">
+                    <IconTrash size={14} /> Delete
+                  </button>
+                )}
               </div>
             )}
           </div>
-          {!isSyncedMirror && (
+          {!bodyLocked && (
             <Button variant="secondary" size="sm" onClick={handleManualSave}>Save</Button>
           )}
         </div>
@@ -696,6 +705,19 @@ export default function KnowledgeDocumentPage() {
         </div>
       )}
 
+      {isZyraMemory && (
+        <div data-testid="zyra-memory-banner" className="mb-4 rounded-[10px] border border-[var(--ai-border)] bg-[var(--ai-soft)] px-4 py-3">
+          <p className="text-[13px] text-[var(--ai-primary)]">
+            Managed by Zyra — it reads this memory as context for every response and test-case generation, so it can&apos;t be edited directly.
+          </p>
+          <p className="mt-1 text-[12px] text-[var(--muted)]">
+            {canApprove
+              ? "As a project owner or manager, you can correct or remove individual entries below. Every change is kept in View history."
+              : "Only project owners and managers can correct or remove entries. You can still comment on it."}
+          </p>
+        </div>
+      )}
+
       {isAiMemory && canApprove && doc.status !== "approved" && doc.status !== "rejected" && (
         <div className="mb-4 flex items-center justify-between rounded-[10px] border border-[var(--ai-border)] bg-[var(--ai-soft)] px-4 py-3">
           <p className="text-[13px] text-[var(--ai-primary)]">This is AI-generated memory. Review before it&apos;s trusted as context.</p>
@@ -725,13 +747,23 @@ export default function KnowledgeDocumentPage() {
             <IconMessagePlus size={14} /> Comment
           </button>
         )}
-        <RichTextEditor
-          contentJson={doc.contentJson as JSONContent | null}
-          contentHtml={doc.contentHtml}
-          editable={!isSyncedMirror}
-          onUpdate={handleEditorUpdate}
-          resetKey={contentResetKey}
-        />
+        {isZyraMemory ? (
+          <ZyraMemoryEntries
+            projectId={projectId}
+            documentId={documentId}
+            memory={doc.zyraMemory ?? { unstructured: "", entries: [] }}
+            canManage={canApprove}
+            onUpdated={(updated) => setDoc((prev) => (prev ? { ...prev, ...updated } : updated))}
+          />
+        ) : (
+          <RichTextEditor
+            contentJson={doc.contentJson as JSONContent | null}
+            contentHtml={doc.contentHtml}
+            editable={!isSyncedMirror}
+            onUpdate={handleEditorUpdate}
+            resetKey={contentResetKey}
+          />
+        )}
       </div>
 
       <div id="kb-comments">

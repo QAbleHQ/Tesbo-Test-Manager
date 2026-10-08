@@ -1,6 +1,7 @@
 "use client";
 
-import { useParams, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useCallback, useEffect, useState } from "react";
 import { IconStack2 } from "@tabler/icons-react";
 import {

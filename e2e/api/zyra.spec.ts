@@ -2688,6 +2688,63 @@ test.describe("zyra chat — citations (fake provider)", () => {
     return lastAssistant.testcases as Array<Record<string, unknown>>;
   }
 
+  /*
+   * "Find coverage gaps" is not its own feature: the chat page sends a canned prompt with
+   * `background: true` and the reply is an ordinary answer. The coverage-analysis notification is
+   * therefore keyed on what was asked, and only for the background turn the page uses — a caller that
+   * holds the request open (the plain POST) is already waiting for the answer.
+   */
+  test("ZYR-A-NOTIF-01 a finished coverage-gap turn notifies the requester; other questions and the plain POST do not", async () => {
+    await allocateFakeAiKey();
+    const sessionId = await newSession("E2E coverage notification");
+    const answer = (reply: string) =>
+      ai.queueReply({ reply, reasoningSummary: "Answered directly.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const notifications = async (): Promise<Array<{ title: string; type: string; link_entity_type: string; link_entity_id: string }>> =>
+      (await (await asOwner.get("/api/notifications")).json()).filter((n: { type: string }) => n.type === "zyra_coverage_completed");
+    const assistantReplies = async (): Promise<number> => {
+      const session = await (await asOwner.get(url(`/chat/sessions/${sessionId}`))).json();
+      return (session.messages as Array<{ role: string }>).filter((m) => m.role === "assistant").length;
+    };
+    exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    try {
+      // The quick action's own prompt, sent the way the page sends it.
+      answer("I found 3 coverage gaps around password reset.");
+      const started = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Analyze existing test cases and identify the most important areas of missing coverage.", background: true },
+        failOnStatusCode: false,
+      });
+      expect(started.status(), await started.text()).toBeLessThan(300);
+      await expect.poll(assistantReplies, { message: "the background turn should finish", timeout: 30_000 }).toBe(1);
+      await expect.poll(async () => (await notifications()).length, { timeout: 15_000 }).toBe(1);
+      expect((await notifications())[0]).toMatchObject({
+        title: "Zyra has completed coverage analysis.",
+        link_entity_type: "zyra_chat",
+        link_entity_id: tenant!.mainProjectId,
+      });
+
+      // An ordinary background question is not a coverage analysis.
+      answer("This project has 0 test cases.");
+      const other = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "How many test cases are there?", background: true },
+        failOnStatusCode: false,
+      });
+      expect(other.status()).toBeLessThan(300);
+      await expect.poll(assistantReplies, { timeout: 30_000 }).toBe(2);
+      expect(await notifications()).toHaveLength(1);
+
+      // The plain (awaited) POST already returned the answer to the caller — nothing to announce.
+      answer("Still 3 gaps.");
+      const plain = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Find coverage gaps again" },
+        failOnStatusCode: false,
+      });
+      expect(plain.status(), await plain.text()).toBeLessThan(300);
+      expect(await notifications()).toHaveLength(1);
+    } finally {
+      exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    }
+  });
+
   test("ZYR-A-63 a generated test case cites the exact KB doc, Jira ticket, test case, and bug it was shown, and drops a fabricated label", async () => {
     await allocateFakeAiKey();
     const { kbDocId, jiraKey, testcaseExternalId, bugId } = await seedCitableSources();
@@ -3348,6 +3405,336 @@ test.describe("zyra chat — citations (fake provider)", () => {
       await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${seededId}`, { failOnStatusCode: false });
       await asOwner.delete(`/api/projects/${tenant!.secondProjectId}/testcases/${seededOtherId}`, { failOnStatusCode: false });
     }
+  });
+
+  // ─── Chat updates carry their new values into the staged proposal ─────────
+  //
+  // "[Zyra] Updated Expected Results Are Not Actually Updated": the chat prompt's schema showed
+  // `"fields":{}` with no key names, and sanitizeZyraUpdateFields kept only an exact allow-list
+  // (`stepsJson`, not `steps`), so the model's rewritten values were dropped and an update with
+  // `fields: {}` was still staged — a review card showing the test case exactly as it was, under a
+  // reply describing the rewrite. Now: known key spellings are folded onto the real ones, a partial
+  // step list is merged onto the current steps, unchanged values are dropped, and an update left with
+  // nothing to change is not staged at all. Nothing reaches the repository until Save, as before.
+
+  const WEAK_STEPS = [
+    { stepNumber: 1, action: "Open the profile page", expectedResult: "test" },
+    { stepNumber: 2, action: "Upload a 12 MB PNG as the profile photo", expectedResult: "tes" },
+    { stepNumber: 3, action: "Check the photo area", expectedResult: "The previous photo is still shown" },
+  ];
+
+  async function seedCase(title: string, steps = WEAK_STEPS): Promise<{ id: string; externalId: string }> {
+    const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, { data: { title, steps, priority: "P2" }, failOnStatusCode: false });
+    expect(res.status(), `seeding the test case — ${await res.text()}`).toBe(201);
+    const body = await res.json();
+    return { id: body.id, externalId: body.externalId };
+  }
+
+  function storedSteps(testcaseId: string): Array<{ action: string; expectedResult: string }> {
+    const raw = scalar(`SELECT steps::text FROM testcases WHERE id = ${literal(testcaseId)};`);
+    let parsed: unknown = JSON.parse(raw);
+    if (typeof parsed === "string") parsed = JSON.parse(parsed);
+    return (parsed as Array<Record<string, string>>).map((s) => ({ action: s.action, expectedResult: s.expectedResult }));
+  }
+
+  /** The staged update entries this session's chat turn wrote, as stored. */
+  function stagedUpdates(sessionId: string): Array<{ opType: string; externalId: string; fields: Record<string, unknown> }> {
+    const raw = scalar(
+      `SELECT coalesce(generated_payload::text, '[]') FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
+    );
+    return (JSON.parse(raw || "[]") as Array<{ opType: string; externalId: string; fields: Record<string, unknown> }>).filter((e) => e.opType === "update");
+  }
+
+  async function lastAssistantReply(sessionId: string): Promise<string> {
+    const session = await asOwner.get(url(`/chat/sessions/${sessionId}`), { failOnStatusCode: false });
+    const messages = (await session.json()).messages as Array<Record<string, unknown>>;
+    return String([...messages].reverse().find((m) => m.role === "assistant")?.content || "");
+  }
+
+  /**
+   * One update turn the way the backend now makes it: the router names each test case and the
+   * change (no content), then authorZyraUpdates' drafting call returns the new field values. Each
+   * op's `fields` here is what the drafting call returns for that case; `authoring` overrides the
+   * whole drafting reply (e.g. to simulate a malformed one).
+   */
+  async function updateTurn(
+    sessionId: string,
+    operations: Array<Record<string, unknown>>,
+    reply = "Rewriting the vague expected results.",
+    authoring?: Record<string, unknown> | string,
+  ): Promise<void> {
+    const routerOps = operations.map(({ fields: _fields, ...op }) => op);
+    ai.queueReply({ reply, reasoningSummary: "Updating weak expected results.", action: "update", actionType: "update", operations: routerOps, testcases: [] });
+    ai.queueReply(authoring ?? { updates: operations.map((op) => ({ externalId: op.externalId, fields: op.fields ?? {} })) });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Review existing test cases and rewrite any weak or vague expected result" },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `the update turn — ${await turn.text()}`).toBeLessThan(300);
+  }
+
+  test("ZYR-A-145 an update sent under `steps` stages the rewritten expected results, shows them on the card, and Save writes them", async () => {
+    await allocateFakeAiKey();
+    const tc = await seedCase(`E2E weak results ${Date.now()}`);
+    const sessionId = await newSession("E2E update steps alias");
+    const improved = [
+      { stepNumber: 1, action: "Open the profile page", expectedResult: "The profile page loads with the current photo and an Upload button" },
+      { stepNumber: 2, action: "Upload a 12 MB PNG as the profile photo", expectedResult: "Upload is rejected with 'File exceeds the 5 MB limit'" },
+      { stepNumber: 3, action: "Check the photo area", expectedResult: "The previous photo is still shown" },
+    ];
+    await updateTurn(sessionId, [{ type: "update", externalId: tc.externalId, fields: { steps: improved }, reason: "Steps 1 and 2 had placeholder results." }]);
+
+    const staged = stagedUpdates(sessionId);
+    expect(staged, "exactly one update staged").toHaveLength(1);
+    const stagedSteps = (staged[0].fields.stepsJson as Array<Record<string, string>>).map((s) => s.expectedResult);
+    expect(stagedSteps).toEqual(improved.map((s) => s.expectedResult));
+
+    // The review card previews the new values, not the current ones.
+    const card = (await lastAssistantTestcases(sessionId))[0] as Record<string, unknown>;
+    expect(JSON.stringify(card)).toContain("File exceeds the 5 MB limit");
+    expect(await lastAssistantReply(sessionId)).toContain("staged for your review");
+
+    // Staged only: the repository is untouched until Save.
+    expect(storedSteps(tc.id).map((s) => s.expectedResult)).toEqual(["test", "tes", "The previous photo is still shown"]);
+
+    const reviewId = scalar(`SELECT id FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`);
+    const saved = await asOwner.post(url(`/tasks/${reviewId}/save`), { data: { selectedDraftIndexes: [0] }, failOnStatusCode: false });
+    expect(saved.status(), `saving the staged update — ${await saved.text()}`).toBe(201);
+    expect(storedSteps(tc.id)).toEqual(improved.map(({ action, expectedResult }) => ({ action, expectedResult })));
+  });
+
+  test("ZYR-A-146 a partial step patch changes only the named step and keeps every other step and action", async () => {
+    await allocateFakeAiKey();
+    const tc = await seedCase(`E2E partial steps ${Date.now()}`);
+    const sessionId = await newSession("E2E partial step patch");
+    await updateTurn(sessionId, [
+      { type: "update", externalId: tc.externalId, fields: { stepsJson: [{ stepNumber: 2, expectedResult: "Upload is rejected with a size-limit error" }] }, reason: "" },
+    ]);
+
+    const staged = stagedUpdates(sessionId);
+    expect(staged).toHaveLength(1);
+    const steps = (staged[0].fields.stepsJson as Array<Record<string, unknown>>).map((s) => ({ n: s.stepNumber, action: s.action, expectedResult: s.expectedResult }));
+    expect(steps).toEqual([
+      { n: 1, action: WEAK_STEPS[0].action, expectedResult: "test" },
+      { n: 2, action: WEAK_STEPS[1].action, expectedResult: "Upload is rejected with a size-limit error" },
+      { n: 3, action: WEAK_STEPS[2].action, expectedResult: WEAK_STEPS[2].expectedResult },
+    ]);
+  });
+
+  test("ZYR-A-147 snake_case and synonym keys reach the staged update for every field, not just steps", async () => {
+    await allocateFakeAiKey();
+    const tc = await seedCase(`E2E field aliases ${Date.now()}`);
+    const sessionId = await newSession("E2E field aliases");
+    await updateTurn(sessionId, [
+      {
+        type: "update",
+        externalId: tc.externalId,
+        fields: {
+          test_data: "user: alice@example.com / photo: 12MB.png",
+          automation_status: "Automated",
+          priority: "P1",
+          test_steps: WEAK_STEPS.map((s, i) => ({ step: s.action, expected: i === 0 ? "The profile page shows an Upload button" : s.expectedResult })),
+        },
+        reason: "",
+      },
+    ]);
+
+    const staged = stagedUpdates(sessionId);
+    expect(staged).toHaveLength(1);
+    expect(staged[0].fields.testData).toBe("user: alice@example.com / photo: 12MB.png");
+    expect(staged[0].fields.automationStatus).toBe("Automated");
+    expect(staged[0].fields.priority).toBe("P1");
+    const steps = staged[0].fields.stepsJson as Array<Record<string, string>>;
+    expect(steps.map((s) => s.action)).toEqual(WEAK_STEPS.map((s) => s.action));
+    expect(steps[0].expectedResult).toBe("The profile page shows an Upload button");
+  });
+
+  for (const [label, fields] of [
+    ["empty fields — the reported bug", {}],
+    ["values identical to the current test case", { priority: "P2", stepsJson: WEAK_STEPS }],
+    ["only unknown keys", { expectedOutcome: "something", foo: 1 }],
+  ] as const) {
+    test(`ZYR-A-148 an update with ${label} is not staged, and the reply says nothing was staged`, async () => {
+      await allocateFakeAiKey();
+      const tc = await seedCase(`E2E no-op update ${Date.now()}`);
+      const sessionId = await newSession("E2E no-op update");
+      await updateTurn(sessionId, [{ type: "update", externalId: tc.externalId, fields, reason: "Rewriting placeholders." }], `Updating ${tc.externalId} to replace the placeholder expected results.`);
+
+      expect(stagedUpdates(sessionId), "an update that changes nothing must not be staged").toHaveLength(0);
+      const reply = await lastAssistantReply(sessionId);
+      expect(reply).toContain("⚠️ Nothing was staged.");
+      expect(reply).toContain(tc.externalId);
+      expect(reply).not.toContain("staged for your review");
+      expect(storedSteps(tc.id).map((s) => s.expectedResult)).toEqual(["test", "tes", "The previous photo is still shown"]);
+    });
+  }
+
+  test("ZYR-A-149 in a turn with one real update and one no-op, only the real one is staged and the reply names the skipped one", async () => {
+    await allocateFakeAiKey();
+    const real = await seedCase(`E2E real update ${Date.now()}`);
+    const noop = await seedCase(`E2E noop update ${Date.now()}`);
+    const sessionId = await newSession("E2E mixed updates");
+    await updateTurn(sessionId, [
+      { type: "update", externalId: real.externalId, fields: { title: `E2E retitled ${Date.now()}` }, reason: "" },
+      { type: "update", externalId: noop.externalId, fields: {}, reason: "" },
+    ]);
+
+    const staged = stagedUpdates(sessionId);
+    expect(staged.map((e) => e.externalId)).toEqual([real.externalId]);
+    const reply = await lastAssistantReply(sessionId);
+    expect(reply).toContain("1 of 2 test case operation(s) were drafted for review");
+    expect(reply).toContain(`${noop.externalId}: the proposed update did not change any field`);
+  });
+
+  /*
+   * "Review existing test cases and rewrite any weak or vague expected results" timed out at 1m01s:
+   * the router call (60s / 4096 tokens) also authored every update's full step list itself. The
+   * router now only names each case and the change; authorZyraUpdates drafts the content in its own
+   * calls, ZYRA_UPDATE_AUTHOR_BATCH (5) cases per call, with the generation budget.
+   */
+  test("ZYR-A-152 a bulk update is drafted in batches of 5 from each case's full current state, and every case is staged", async () => {
+    await allocateFakeAiKey();
+    const cases: Array<{ id: string; externalId: string }> = [];
+    for (let i = 0; i < 7; i += 1) cases.push(await seedCase(`E2E bulk weak ${i} ${Date.now()}`));
+    const sessionId = await newSession("E2E bulk update drafting");
+    const improved = (i: number) => WEAK_STEPS.map((s, n) => ({ ...s, expectedResult: n < 2 ? `Specific outcome ${n + 1} for case ${i}` : s.expectedResult }));
+    const updates = cases.map((tc, i) => ({ externalId: tc.externalId, fields: { stepsJson: improved(i) } }));
+    // Both drafting calls get the full set: the two batches run concurrently, so which reply lands on
+    // which batch isn't fixed — each batch picks out only its own cases by externalId.
+    ai.queueReply({
+      reply: "Rewriting placeholder expected results across 7 test cases.", reasoningSummary: "Bulk update.", action: "update", actionType: "update", testcases: [],
+      operations: cases.map((tc) => ({ type: "update", externalId: tc.externalId, reason: "Steps 1 and 2 have placeholder expected results — rewrite them." })),
+    });
+    ai.queueReply({ updates });
+    ai.queueReply({ updates });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Review existing test cases and rewrite any weak or vague expected results to be more specific." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `the bulk update turn — ${await turn.text()}`).toBeLessThan(300);
+
+    // The router is told not to author update content.
+    const routerPrompt = ai.requests[0].messages.map((m) => m.content).join("\n");
+    expect(routerPrompt).toContain("CRITICAL for an update op: do NOT write the new content");
+
+    // Two drafting calls (5 + 2), each carrying full current steps and the router's instruction.
+    const drafting = ai.requests.slice(1).filter((r) => r.messages.some((m) => m.content.includes("Test cases to revise:")));
+    expect(drafting, "one drafting call per batch of 5").toHaveLength(2);
+    const perCall = drafting.map((r) => cases.filter((tc) => r.messages.some((m) => m.content.includes(`"externalId": "${tc.externalId}"`))).length).sort();
+    expect(perCall).toEqual([2, 5]);
+    const draftingText = drafting.map((r) => r.messages.map((m) => m.content).join("\n")).join("\n");
+    expect(draftingText).toContain(WEAK_STEPS[1].action);
+    expect(draftingText).toContain("Steps 1 and 2 have placeholder expected results");
+
+    const staged = stagedUpdates(sessionId);
+    expect(staged.map((e) => e.externalId).sort()).toEqual(cases.map((tc) => tc.externalId).sort());
+    for (const entry of staged) {
+      const i = cases.findIndex((tc) => tc.externalId === entry.externalId);
+      expect((entry.fields.stepsJson as Array<Record<string, string>>).map((s) => s.expectedResult)).toEqual(improved(i).map((s) => s.expectedResult));
+    }
+    expect(await lastAssistantReply(sessionId)).toContain("7 of them are staged for your review");
+  });
+
+  test("ZYR-A-153 a drafting call that returns nothing usable stages nothing for those cases and says why — never a false 'staged'", async () => {
+    await allocateFakeAiKey();
+    const tc = await seedCase(`E2E drafting failure ${Date.now()}`);
+    const sessionId = await newSession("E2E drafting failure");
+    await updateTurn(sessionId, [{ type: "update", externalId: tc.externalId, reason: "Rewrite the placeholders." }], "Updating the placeholders.", "this is not json");
+
+    expect(stagedUpdates(sessionId)).toHaveLength(0);
+    const reply = await lastAssistantReply(sessionId);
+    expect(reply).toContain("⚠️ Nothing was staged.");
+    expect(reply).toContain(`${tc.externalId}: the drafting step returned no changes for it`);
+    expect(reply).not.toContain("staged for your review");
+    expect(storedSteps(tc.id).map((s) => s.expectedResult)).toEqual(["test", "tes", "The previous photo is still shown"]);
+  });
+
+  // "continue with PRO-TC-490" — Zyra answered that it couldn't see the test case's steps. Its context
+  // holds 25 test cases ranked by title/description keywords, then recency, and never looked at ids,
+  // so in a bigger project the one the user named was simply not among them; steps were also cut at
+  // 800 characters. A test case named by id is now fetched by that id, listed first, in full.
+  test("ZYR-A-150 a test case named by id reaches Zyra's context in full, even when 25 others rank above it", async () => {
+    await allocateFakeAiKey();
+    const longSteps = Array.from({ length: 8 }, (_, i) => ({
+      stepNumber: i + 1,
+      action: `Perform detailed action number ${i + 1} on the expense claim form with all mandatory fields`,
+      expectedResult: i === 7 ? "NAMED-END-MARKER the claim is submitted and listed as Pending" : `Detailed expected outcome ${i + 1} that is long enough to push the step list past the old cut`,
+    }));
+    const target = await seedCase(`E2E named target ${Date.now()}`, longSteps);
+    expect(JSON.stringify(longSteps).length, "the fixture must be longer than the old 800-character cut").toBeGreaterThan(800);
+    // Oldest in the project, so the recency ranking alone would never pick it.
+    exec(`UPDATE testcases SET updated_at = now() - interval '30 days' WHERE id = ${literal(target.id)};`);
+    for (let i = 0; i < 26; i += 1) {
+      await seedCase(`E2E filler ${i} ${Date.now()}`, [{ stepNumber: 1, action: "Filler step", expectedResult: "Filler result" }]);
+    }
+
+    const sessionId = await newSession("E2E named test case");
+    ai.queueReply({ reply: "Here is what I see.", reasoningSummary: "Reading the named test case.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      // Also names an id that matches no test case: it must be ignored, not fail the turn.
+      data: { message: `continue with ${target.externalId} and NOPE-TC-99999` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `the turn — ${await turn.text()}`).toBeLessThan(300);
+
+    const prompt = ai.requests[0].messages.map((m) => m.content).join("\n");
+    const listing = prompt.slice(prompt.indexOf("Existing testcases:"));
+    expect(listing.indexOf(target.externalId), "the named test case must be in Zyra's test case listing").toBeGreaterThanOrEqual(0);
+    expect(listing, "its steps must arrive in full, last step included").toContain("NAMED-END-MARKER");
+    // Listed first, ahead of the 26 fillers that would otherwise outrank it.
+    expect(listing.indexOf(target.externalId)).toBeLessThan(listing.indexOf("E2E filler"));
+  });
+
+  // "[Zyra] … Context Used Is Incorrect/Missing": sanitizeZyraSourceRefs matched a draft's cited
+  // label only by its exact text, so "KB1", "kb 1: <title>", "<TC id> — <title>" or a {label} object
+  // were dropped silently and the card said "No specific source cited". Each must now resolve to the
+  // source it names — and still only to a source this turn's prompt actually offered.
+  test("ZYR-A-151 citations written in a different form still resolve to the exact source, per draft; unoffered ones never do", async () => {
+    await allocateFakeAiKey();
+    const { kbDocId, testcaseExternalId, bugId } = await seedCitableSources();
+    const sessionId = await newSession("E2E citation variants");
+    const kb = { type: "knowledge_document", id: kbDocId, title: "Biometric login policy" };
+    const tc = { type: "testcase", id: testcaseExternalId, title: "Biometric login happy path" };
+    const bug = { type: "bug", id: bugId, title: "Biometric login crashes on iOS 18" };
+    const cases: Array<{ title: string; refs: unknown[]; expected: unknown[] }> = [
+      { title: "Variant compact KB and hyphenated bug", refs: ["KB1", "BUG-1"], expected: [kb, bug] },
+      { title: "Variant lowercase KB with trailing title", refs: ["kb 1: Biometric login policy"], expected: [kb] },
+      { title: "Variant object label", refs: [{ label: "KB 1" }], expected: [kb] },
+      { title: "Variant test case id with trailing title", refs: [`${testcaseExternalId} — Biometric login happy path`], expected: [tc] },
+      { title: "Variant labels never offered", refs: ["KB 9", "GENERATED-999", `${testcaseExternalId}9`], expected: [] },
+      { title: "Variant genuinely uncited", refs: [], expected: [] },
+    ];
+
+    ai.queueReply({
+      reply: "", reasoningSummary: "Creating biometric login test cases.",
+      action: "create", actionType: "create", operations: [], testcases: [], requestedCount: cases.length, exhaustive: false,
+    });
+    ai.queueReply({
+      drafts: cases.map((c) => ({
+        title: c.title,
+        preconditions: "",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do it", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "",
+        priority: "P2",
+        tags: [],
+        sourceRefs: c.refs,
+      })),
+    });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: `Create ${cases.length} test cases for biometric login using the knowledge base, existing test cases and bugs.` },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `the create turn — ${await turn.text()}`).toBeLessThan(300);
+
+    const rows = await lastAssistantTestcases(sessionId);
+    expect(rows.map((r) => r.title), "every generated draft reaches the review rows, in order").toEqual(cases.map((c) => c.title));
+    for (const [i, c] of cases.entries()) {
+      expect(rows[i].sourceRefs, `${c.title}: Context used`).toEqual(c.expected);
+    }
+    // The staged batch carries the same per-draft citations Save will persist.
+    const stored = JSON.parse(scalar(`SELECT generated_payload::text FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`));
+    expect(stored.map((e: { draft: { sourceRefs: unknown[] } }) => e.draft.sourceRefs)).toEqual(cases.map((c) => c.expected));
   });
 });
 

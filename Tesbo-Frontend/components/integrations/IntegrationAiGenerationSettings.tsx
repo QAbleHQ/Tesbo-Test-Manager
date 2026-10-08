@@ -1,6 +1,6 @@
 "use client";
 
-import { useParams } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useCallback, useEffect, useState } from "react";
 import { getProject, updateProject, type IntegrationProvider } from "@/lib/api";
 import { Button, Card } from "@/components/ui";
