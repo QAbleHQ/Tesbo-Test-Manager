@@ -53,7 +53,7 @@ export function buildRedisCacheClient(config: AppConfigService): Redis {
     TestcasesListCacheService,
     ProjectOverviewCacheService
   ],
-  exports: [SessionCacheService, EntitlementCacheService, SuitesCacheService, TestcasesListCacheService, ProjectOverviewCacheService]
+  exports: [REDIS_CACHE_CLIENT, SessionCacheService, EntitlementCacheService, SuitesCacheService, TestcasesListCacheService, ProjectOverviewCacheService]
 })
 export class RedisCacheModule implements OnApplicationShutdown {
   constructor(@Inject(REDIS_CACHE_CLIENT) private readonly client: Redis) {}
