@@ -3394,8 +3394,21 @@ test.describe("zyra chat — citations (fake provider)", () => {
     return String([...messages].reverse().find((m) => m.role === "assistant")?.content || "");
   }
 
-  async function updateTurn(sessionId: string, operations: Array<Record<string, unknown>>, reply = "Rewriting the vague expected results."): Promise<void> {
-    ai.queueReply({ reply, reasoningSummary: "Updating weak expected results.", action: "update", actionType: "update", operations, testcases: [] });
+  /**
+   * One update turn the way the backend now makes it: the router names each test case and the
+   * change (no content), then authorZyraUpdates' drafting call returns the new field values. Each
+   * op's `fields` here is what the drafting call returns for that case; `authoring` overrides the
+   * whole drafting reply (e.g. to simulate a malformed one).
+   */
+  async function updateTurn(
+    sessionId: string,
+    operations: Array<Record<string, unknown>>,
+    reply = "Rewriting the vague expected results.",
+    authoring?: Record<string, unknown> | string,
+  ): Promise<void> {
+    const routerOps = operations.map(({ fields: _fields, ...op }) => op);
+    ai.queueReply({ reply, reasoningSummary: "Updating weak expected results.", action: "update", actionType: "update", operations: routerOps, testcases: [] });
+    ai.queueReply(authoring ?? { updates: operations.map((op) => ({ externalId: op.externalId, fields: op.fields ?? {} })) });
     const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
       data: { message: "Review existing test cases and rewrite any weak or vague expected result" },
       failOnStatusCode: false,
@@ -3514,6 +3527,69 @@ test.describe("zyra chat — citations (fake provider)", () => {
     const reply = await lastAssistantReply(sessionId);
     expect(reply).toContain("1 of 2 test case operation(s) were drafted for review");
     expect(reply).toContain(`${noop.externalId}: the proposed update did not change any field`);
+  });
+
+  /*
+   * "Review existing test cases and rewrite any weak or vague expected results" timed out at 1m01s:
+   * the router call (60s / 4096 tokens) also authored every update's full step list itself. The
+   * router now only names each case and the change; authorZyraUpdates drafts the content in its own
+   * calls, ZYRA_UPDATE_AUTHOR_BATCH (5) cases per call, with the generation budget.
+   */
+  test("ZYR-A-152 a bulk update is drafted in batches of 5 from each case's full current state, and every case is staged", async () => {
+    await allocateFakeAiKey();
+    const cases: Array<{ id: string; externalId: string }> = [];
+    for (let i = 0; i < 7; i += 1) cases.push(await seedCase(`E2E bulk weak ${i} ${Date.now()}`));
+    const sessionId = await newSession("E2E bulk update drafting");
+    const improved = (i: number) => WEAK_STEPS.map((s, n) => ({ ...s, expectedResult: n < 2 ? `Specific outcome ${n + 1} for case ${i}` : s.expectedResult }));
+    const updates = cases.map((tc, i) => ({ externalId: tc.externalId, fields: { stepsJson: improved(i) } }));
+    // Both drafting calls get the full set: the two batches run concurrently, so which reply lands on
+    // which batch isn't fixed — each batch picks out only its own cases by externalId.
+    ai.queueReply({
+      reply: "Rewriting placeholder expected results across 7 test cases.", reasoningSummary: "Bulk update.", action: "update", actionType: "update", testcases: [],
+      operations: cases.map((tc) => ({ type: "update", externalId: tc.externalId, reason: "Steps 1 and 2 have placeholder expected results — rewrite them." })),
+    });
+    ai.queueReply({ updates });
+    ai.queueReply({ updates });
+    const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+      data: { message: "Review existing test cases and rewrite any weak or vague expected results to be more specific." },
+      failOnStatusCode: false,
+    });
+    expect(turn.status(), `the bulk update turn — ${await turn.text()}`).toBeLessThan(300);
+
+    // The router is told not to author update content.
+    const routerPrompt = ai.requests[0].messages.map((m) => m.content).join("\n");
+    expect(routerPrompt).toContain("CRITICAL for an update op: do NOT write the new content");
+
+    // Two drafting calls (5 + 2), each carrying full current steps and the router's instruction.
+    const drafting = ai.requests.slice(1).filter((r) => r.messages.some((m) => m.content.includes("Test cases to revise:")));
+    expect(drafting, "one drafting call per batch of 5").toHaveLength(2);
+    const perCall = drafting.map((r) => cases.filter((tc) => r.messages.some((m) => m.content.includes(`"externalId": "${tc.externalId}"`))).length).sort();
+    expect(perCall).toEqual([2, 5]);
+    const draftingText = drafting.map((r) => r.messages.map((m) => m.content).join("\n")).join("\n");
+    expect(draftingText).toContain(WEAK_STEPS[1].action);
+    expect(draftingText).toContain("Steps 1 and 2 have placeholder expected results");
+
+    const staged = stagedUpdates(sessionId);
+    expect(staged.map((e) => e.externalId).sort()).toEqual(cases.map((tc) => tc.externalId).sort());
+    for (const entry of staged) {
+      const i = cases.findIndex((tc) => tc.externalId === entry.externalId);
+      expect((entry.fields.stepsJson as Array<Record<string, string>>).map((s) => s.expectedResult)).toEqual(improved(i).map((s) => s.expectedResult));
+    }
+    expect(await lastAssistantReply(sessionId)).toContain("7 of them are staged for your review");
+  });
+
+  test("ZYR-A-153 a drafting call that returns nothing usable stages nothing for those cases and says why — never a false 'staged'", async () => {
+    await allocateFakeAiKey();
+    const tc = await seedCase(`E2E drafting failure ${Date.now()}`);
+    const sessionId = await newSession("E2E drafting failure");
+    await updateTurn(sessionId, [{ type: "update", externalId: tc.externalId, reason: "Rewrite the placeholders." }], "Updating the placeholders.", "this is not json");
+
+    expect(stagedUpdates(sessionId)).toHaveLength(0);
+    const reply = await lastAssistantReply(sessionId);
+    expect(reply).toContain("⚠️ Nothing was staged.");
+    expect(reply).toContain(`${tc.externalId}: the drafting step returned no changes for it`);
+    expect(reply).not.toContain("staged for your review");
+    expect(storedSteps(tc.id).map((s) => s.expectedResult)).toEqual(["test", "tes", "The previous photo is still shown"]);
   });
 
   // "continue with PRO-TC-490" — Zyra answered that it couldn't see the test case's steps. Its context
