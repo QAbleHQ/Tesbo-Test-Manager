@@ -1553,22 +1553,75 @@ test.describe("knowledge base v2 — folders and documents", () => {
    * RENAME is worse than a delete — rememberZyraMemory and zyraMemoryText both find it BY TITLE, so a
    * renamed document is silently abandoned and a second, empty memory starts beside it.
    *
-   * All three tests fail against the unfixed code, where the document had no protection at all.
+   * "[Knowledge Base] Zyra Memory Should Not Support Unrestricted Direct Editing" then closed the
+   * body too: Zyra reads it back as context on every response, so free-form edits (and version
+   * restores, document-type/status flips) are refused, and owners/managers correct or remove one
+   * entry at a time through /memory-entries/:entryId. The title is also reserved — a hand-made
+   * document under it would be picked up as Zyra's memory (most recently updated wins).
+   *
+   * The memory is therefore seeded the way rememberZyraMemory writes it (`## <ISO>\n<note>` text,
+   * escaped <pre> html, is_ai_generated) — the API can no longer create one under that title.
    */
   const ZYRA_MEMORY_TITLE = "Zyra AI Memory";
+  const MEMORY_ISO_NEW = "2026-10-05T12:21:14.614Z";
+  const MEMORY_ISO_OLD = "2026-10-05T12:20:05.524Z";
+  const MEMORY_NOTE_NEW = "- QAB-242 was re-run and produced 26 testcase drafts.";
+  const MEMORY_NOTE_OLD = "- QAB-243 produced 24 testcase drafts using 1 Linear ticket.";
+  const MEMORY_TEXT = `## ${MEMORY_ISO_NEW}\n${MEMORY_NOTE_NEW}\n\n## ${MEMORY_ISO_OLD}\n${MEMORY_NOTE_OLD}`;
+
+  function zyraPreHtml(text: string): string {
+    return `<pre>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")}</pre>`;
+  }
+
+  /** Writes Zyra's memory as rememberZyraMemory does. `createdBy` defaults to the owner. */
+  function seedZyraMemory(options: { text?: string; folderId?: string; createdBy?: string } = {}): string {
+    const text = options.text ?? MEMORY_TEXT;
+    const createdBy = options.createdBy ?? tenant!.owner.userId;
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
+        "document_type, status, is_ai_generated, created_by, updated_by) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(options.folderId ?? rootFolderId)}, ` +
+        `${literal(ZYRA_MEMORY_TITLE)}, ${literal(text)}, ${literal(zyraPreHtml(text))}, 'general', 'published', true, ` +
+        `${literal(createdBy)}, ${literal(createdBy)});`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(ZYRA_MEMORY_TITLE)} ` +
+        "AND is_deleted = false ORDER BY created_at DESC LIMIT 1;",
+    );
+  }
+
+  function memoryText(id: string): string {
+    return scalar(`SELECT coalesce(content_text, '') FROM knowledge_documents WHERE id = ${literal(id)};`);
+  }
+
+  function versionCount(id: string): number {
+    return Number(scalar(`SELECT count(*) FROM knowledge_document_versions WHERE document_id = ${literal(id)};`));
+  }
+
+  function dropDocuments(...ids: string[]): void {
+    const list = ids.filter(Boolean).map((id) => literal(id)).join(", ");
+    if (!list) return;
+    exec(`DELETE FROM knowledge_document_versions WHERE document_id IN (${list});`);
+    exec(`DELETE FROM knowledge_documents WHERE id IN (${list});`);
+  }
+
+  function entryUrl(documentId: string, entryId: string, projectId?: string): string {
+    return kbUrl(`/documents/${documentId}/memory-entries/${encodeURIComponent(entryId)}`, projectId);
+  }
 
   test("KB-A-55 the Zyra memory document cannot be deleted or renamed", { tag: '@tesbo.testId("TES-TC-931")' }, async () => {
-    // Created with the real title, which is the only thing the guard keys on.
-    const memory = await createDocument({ title: ZYRA_MEMORY_TITLE });
+    const memoryId = seedZyraMemory();
     try {
-      const deleted = await asOwner.delete(kbUrl(`/documents/${memory.id}`), { failOnStatusCode: false });
+      const deleted = await asOwner.delete(kbUrl(`/documents/${memoryId}`), { failOnStatusCode: false });
       expect(
         deleted.status(),
         `deleting Zyra's memory answered ${deleted.status()}: ${await deleted.text()}`,
       ).toBeGreaterThanOrEqual(400);
-      expect(isDeleted("knowledge_documents", memory.id), "Zyra's memory was deleted").toBe(false);
+      expect(isDeleted("knowledge_documents", memoryId), "Zyra's memory was deleted").toBe(false);
+      // The refusal points at what can be done instead, not at a setting that doesn't exist.
+      expect(await deleted.text()).toMatch(/remove individual entries/i);
 
-      const renamed = await asOwner.patch(kbUrl(`/documents/${memory.id}`), {
+      const renamed = await asOwner.patch(kbUrl(`/documents/${memoryId}`), {
         data: { title: "Team notes" },
         failOnStatusCode: false,
       });
@@ -1577,32 +1630,62 @@ test.describe("knowledge base v2 — folders and documents", () => {
         `renaming Zyra's memory answered ${renamed.status()}: ${await renamed.text()}`,
       ).toBeGreaterThanOrEqual(400);
       expect(
-        scalar(`SELECT title FROM knowledge_documents WHERE id = ${literal(memory.id)};`),
+        scalar(`SELECT title FROM knowledge_documents WHERE id = ${literal(memoryId)};`),
         "Zyra's memory was renamed, which detaches it from the agent",
       ).toBe(ZYRA_MEMORY_TITLE);
     } finally {
       // The guard is the point of the test, so the row is removed directly rather than through the API.
-      exec(`DELETE FROM knowledge_documents WHERE id = ${literal(memory.id)};`);
+      dropDocuments(memoryId);
     }
   });
 
-  test("KB-A-56 its body is still editable, and ordinary documents are still deletable", { tag: '@tesbo.testId("TES-TC-932")' }, async () => {
-    // The protection is deliberately narrow: the document is readable and writable content-wise
-    // (rememberZyraMemory prepends to whatever is there), and nothing else changed about the KB.
-    const memory = await createDocument({ title: ZYRA_MEMORY_TITLE });
+  test("KB-A-56 its body can't be edited directly — content, type, status and version restores are refused; ordinary documents still edit and delete", { tag: '@tesbo.testId("TES-TC-932")' }, async () => {
+    const memoryId = seedZyraMemory();
     const ordinary = await createDocument({ title: stamp("Ordinary doc") });
     try {
-      const edited = await asOwner.patch(kbUrl(`/documents/${memory.id}`), {
-        data: { contentText: "Zyra learned something." },
+      for (const data of [
+        { contentText: "Injected context" },
+        { contentHtml: "<p>Injected context</p>" },
+        { contentJson: { type: "doc", content: [] } },
+        { documentType: "ai_memory" },
+        { status: "draft" },
+        // The same title alongside a content change is still a content change.
+        { title: ZYRA_MEMORY_TITLE, contentText: "Injected context" },
+      ]) {
+        for (const [who, api] of [["owner", asOwner], ["manager", asManager]] as const) {
+          const res = await api.patch(kbUrl(`/documents/${memoryId}`), { data, failOnStatusCode: false });
+          expect(res.status(), `${who} PATCH ${JSON.stringify(data)} answered ${res.status()}: ${await res.text()}`).toBe(400);
+          expect(await res.text()).toMatch(/can't be edited directly/i);
+        }
+      }
+      expect(memoryText(memoryId), "a refused edit still changed Zyra's memory").toBe(MEMORY_TEXT);
+      expect(scalar(`SELECT document_type || '/' || status FROM knowledge_documents WHERE id = ${literal(memoryId)};`)).toBe("general/published");
+
+      // A version restore rewrites the whole body, so it is refused too.
+      exec(
+        "INSERT INTO knowledge_document_versions (document_id, version_number, title, content_text, created_by) VALUES (" +
+          `${literal(memoryId)}, 1, ${literal(ZYRA_MEMORY_TITLE)}, 'Older injected body', ${literal(tenant!.owner.userId)});`,
+      );
+      const versionId = scalar(`SELECT id FROM knowledge_document_versions WHERE document_id = ${literal(memoryId)} LIMIT 1;`);
+      const restored = await asOwner.post(kbUrl(`/documents/${memoryId}/restore-version`), {
+        data: { versionId },
         failOnStatusCode: false,
       });
-      expect(edited.status(), `editing the memory body — ${await edited.text()}`).toBeLessThan(400);
+      expect(restored.status(), `restoring a version answered ${restored.status()}: ${await restored.text()}`).toBe(400);
+      expect(memoryText(memoryId)).toBe(MEMORY_TEXT);
 
+      // Ordinary documents are untouched by any of this.
+      const edited = await asOwner.patch(kbUrl(`/documents/${ordinary.id}`), {
+        data: { contentText: "Edited body", contentHtml: "<p>Edited body</p>" },
+        failOnStatusCode: false,
+      });
+      expect(edited.status(), `editing an ordinary doc — ${await edited.text()}`).toBe(200);
+      expect(memoryText(ordinary.id)).toBe("Edited body");
       const deleted = await asOwner.delete(kbUrl(`/documents/${ordinary.id}`), { failOnStatusCode: false });
       expect(deleted.status(), `deleting an ordinary doc — ${await deleted.text()}`).toBeLessThan(400);
       expect(isDeleted("knowledge_documents", ordinary.id)).toBe(true);
     } finally {
-      exec(`DELETE FROM knowledge_documents WHERE id IN (${literal(memory.id)}, ${literal(ordinary.id)});`);
+      dropDocuments(memoryId, ordinary.id);
     }
   });
 
@@ -1614,7 +1697,7 @@ test.describe("knowledge base v2 — folders and documents", () => {
      * deleted folder would appear in no listing — kept but invisible is worse than a clear refusal.
      */
     const folder = await createFolder({ name: stamp("AI memory folder") });
-    const memory = await createDocument({ title: ZYRA_MEMORY_TITLE, folderId: folder.id });
+    const memoryId = seedZyraMemory({ folderId: folder.id });
     const sibling = await createDocument({ title: stamp("Sibling doc"), folderId: folder.id });
     try {
       const res = await asOwner.delete(kbUrl(`/folders/${folder.id}`), { failOnStatusCode: false });
@@ -1623,10 +1706,10 @@ test.describe("knowledge base v2 — folders and documents", () => {
       // The sibling goes, as it always did — the cascade still works.
       expect(isDeleted("knowledge_documents", sibling.id), "the cascade stopped working").toBe(true);
       // The memory survives, and is reachable rather than orphaned under a deleted folder.
-      expect(isDeleted("knowledge_documents", memory.id), "Zyra's memory died with its folder").toBe(false);
+      expect(isDeleted("knowledge_documents", memoryId), "Zyra's memory died with its folder").toBe(false);
       const parent = scalar(
         `SELECT coalesce(f.is_root::text, 'no-folder') FROM knowledge_documents d ` +
-          `LEFT JOIN knowledge_folders f ON f.id = d.folder_id WHERE d.id = ${literal(memory.id)};`,
+          `LEFT JOIN knowledge_folders f ON f.id = d.folder_id WHERE d.id = ${literal(memoryId)};`,
       );
       // "true", not "t": the query casts with `is_root::text`, and boolean::text renders as
       // true/false. "t" is only psql's display form for an *uncast* boolean column.
@@ -1636,14 +1719,236 @@ test.describe("knowledge base v2 — folders and documents", () => {
       const listed = await asOwner.get(kbUrl("/documents"), { failOnStatusCode: false });
       expect(listed.status()).toBe(200);
       expect(
-        (await listed.json()).some((d: { id: string }) => d.id === memory.id),
+        (await listed.json()).some((d: { id: string }) => d.id === memoryId),
         "Zyra's memory survived but is no longer listed anywhere",
       ).toBe(true);
     } finally {
-      exec(`DELETE FROM knowledge_documents WHERE id IN (${literal(memory.id)}, ${literal(sibling.id)});`);
+      dropDocuments(memoryId, sibling.id);
       exec(`DELETE FROM knowledge_folders WHERE id = ${literal(folder.id)};`);
     }
   });
+
+  test("KB-A-63 the Zyra memory title is reserved: no new document and no rename can take it", async () => {
+    const countTitled = () =>
+      Number(
+        scalar(
+          `SELECT count(*) FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(ZYRA_MEMORY_TITLE)};`,
+        ),
+      );
+    const before = countTitled();
+    const ordinary = await createDocument({ title: stamp("Rename me") });
+    try {
+      for (const title of [ZYRA_MEMORY_TITLE, `  ${ZYRA_MEMORY_TITLE}  `]) {
+        for (const [who, api] of [["owner", asOwner], ["qa", asQa]] as const) {
+          const created = await api.post(kbUrl("/documents"), {
+            data: { title, folderId: rootFolderId, contentText: "Hijack" },
+            failOnStatusCode: false,
+          });
+          expect(created.status(), `${who} creating ${JSON.stringify(title)} answered ${created.status()}: ${await created.text()}`).toBe(400);
+          expect(await created.text()).toMatch(/reserved/i);
+        }
+        const renamed = await asOwner.patch(kbUrl(`/documents/${ordinary.id}`), { data: { title }, failOnStatusCode: false });
+        expect(renamed.status(), `renaming to ${JSON.stringify(title)} answered ${renamed.status()}: ${await renamed.text()}`).toBe(400);
+      }
+      expect(countTitled(), "a document was created or renamed into Zyra's memory title").toBe(before);
+      // Titles that merely mention it are still ordinary titles.
+      const similar = await asOwner.patch(kbUrl(`/documents/${ordinary.id}`), {
+        data: { title: `${ZYRA_MEMORY_TITLE} notes` },
+        failOnStatusCode: false,
+      });
+      expect(similar.status(), await similar.text()).toBe(200);
+    } finally {
+      dropDocuments(ordinary.id);
+    }
+  });
+
+  test("KB-A-64 the document detail flags Zyra's memory and returns its entries newest first; ordinary documents are not flagged", async () => {
+    const memoryId = seedZyraMemory();
+    const ordinary = await createDocument({ title: stamp("Plain doc"), contentText: `## ${MEMORY_ISO_NEW}\nnot a memory` });
+    try {
+      const memory = await (await asQa.get(kbUrl(`/documents/${memoryId}`))).json();
+      expect(memory.isManagedByZyra).toBe(true);
+      expect(memory.zyraMemory).toEqual({
+        unstructured: "",
+        entries: [
+          { id: MEMORY_ISO_NEW, note: MEMORY_NOTE_NEW },
+          { id: MEMORY_ISO_OLD, note: MEMORY_NOTE_OLD },
+        ],
+      });
+
+      const plain = await (await asOwner.get(kbUrl(`/documents/${ordinary.id}`))).json();
+      expect(plain.isManagedByZyra).toBe(false);
+      expect(plain.zyraMemory).toBeUndefined();
+    } finally {
+      dropDocuments(memoryId, ordinary.id);
+    }
+  });
+
+  test("KB-A-65 an owner corrects one entry: its note changes, its timestamp and the other entry don't, and the change is versioned", async () => {
+    const memoryId = seedZyraMemory();
+    try {
+      const corrected = "- QAB-242 produced 26 drafts (corrected).";
+      const res = await asOwner.patch(entryUrl(memoryId, MEMORY_ISO_NEW), { data: { note: `  ${corrected}\n` }, failOnStatusCode: false });
+      expect(res.status(), await res.text()).toBe(200);
+      const body = await res.json();
+      expect(body.zyraMemory.entries).toEqual([
+        { id: MEMORY_ISO_NEW, note: corrected },
+        { id: MEMORY_ISO_OLD, note: MEMORY_NOTE_OLD },
+      ]);
+
+      // Stored exactly the way rememberZyraMemory writes, so Zyra and Change History read it unchanged.
+      const expectedText = `## ${MEMORY_ISO_NEW}\n${corrected}\n\n## ${MEMORY_ISO_OLD}\n${MEMORY_NOTE_OLD}`;
+      expect(memoryText(memoryId)).toBe(expectedText);
+      expect(scalar(`SELECT content_html FROM knowledge_documents WHERE id = ${literal(memoryId)};`)).toBe(zyraPreHtml(expectedText));
+      expect(scalar(`SELECT (content_json IS NULL)::text FROM knowledge_documents WHERE id = ${literal(memoryId)};`)).toBe("true");
+      // The previous body is kept as a version, attributed to whoever made the correction.
+      expect(versionCount(memoryId)).toBe(1);
+      expect(scalar(`SELECT content_text FROM knowledge_document_versions WHERE document_id = ${literal(memoryId)};`)).toBe(MEMORY_TEXT);
+      expect(scalar(`SELECT created_by FROM knowledge_document_versions WHERE document_id = ${literal(memoryId)};`)).toBe(tenant!.owner.userId);
+
+      // Re-submitting the same correction is harmless: the content stays the same.
+      const again = await asOwner.patch(entryUrl(memoryId, MEMORY_ISO_NEW), { data: { note: corrected }, failOnStatusCode: false });
+      expect(again.status()).toBe(200);
+      expect(memoryText(memoryId)).toBe(expectedText);
+    } finally {
+      dropDocuments(memoryId);
+    }
+  });
+
+  test("KB-A-66 a manager removes entries one at a time; removing the last leaves an empty memory, not a deleted document", async () => {
+    const memoryId = seedZyraMemory();
+    try {
+      const first = await asManager.delete(entryUrl(memoryId, MEMORY_ISO_OLD), { failOnStatusCode: false });
+      expect(first.status(), await first.text()).toBe(200);
+      expect((await first.json()).zyraMemory.entries).toEqual([{ id: MEMORY_ISO_NEW, note: MEMORY_NOTE_NEW }]);
+      expect(memoryText(memoryId)).toBe(`## ${MEMORY_ISO_NEW}\n${MEMORY_NOTE_NEW}`);
+
+      // Removing it twice: the second is a 404, not a silent success or a 500.
+      const twice = await asManager.delete(entryUrl(memoryId, MEMORY_ISO_OLD), { failOnStatusCode: false });
+      expect(twice.status()).toBe(404);
+
+      const last = await asManager.delete(entryUrl(memoryId, MEMORY_ISO_NEW), { failOnStatusCode: false });
+      expect(last.status(), await last.text()).toBe(200);
+      expect((await last.json()).zyraMemory).toEqual({ unstructured: "", entries: [] });
+      expect(memoryText(memoryId)).toBe("");
+      expect(isDeleted("knowledge_documents", memoryId), "emptying the memory deleted the document").toBe(false);
+      expect(versionCount(memoryId)).toBe(2);
+    } finally {
+      dropDocuments(memoryId);
+    }
+  });
+
+  test("KB-A-67 a QA engineer — even the one who created the memory — and a non-member can't change entries", async () => {
+    // created_by is whoever triggered Zyra's first run; that must not grant control of the memory.
+    const memoryId = seedZyraMemory({ createdBy: tenant!.qa.userId });
+    try {
+      for (const [who, api] of [["qa (creator)", asQa], ["guest (non-member)", asGuest]] as const) {
+        const edit = await api.patch(entryUrl(memoryId, MEMORY_ISO_NEW), { data: { note: "Injected" }, failOnStatusCode: false });
+        const remove = await api.delete(entryUrl(memoryId, MEMORY_ISO_NEW), { failOnStatusCode: false });
+        for (const [action, res] of [["edit", edit], ["remove", remove]] as const) {
+          if (who.startsWith("qa")) expect(res.status(), `${who} ${action}: ${await res.text()}`).toBe(403);
+          else expect([403, 404], `${who} ${action} answered ${res.status()}: ${await res.text()}`).toContain(res.status());
+        }
+      }
+      // QA can still read it.
+      const read = await asQa.get(kbUrl(`/documents/${memoryId}`), { failOnStatusCode: false });
+      expect(read.status()).toBe(200);
+      expect(memoryText(memoryId)).toBe(MEMORY_TEXT);
+      expect(versionCount(memoryId)).toBe(0);
+    } finally {
+      dropDocuments(memoryId);
+    }
+  });
+
+  test("KB-A-68 entry endpoints need a session and stay inside their own project", async () => {
+    const memoryId = seedZyraMemory();
+    try {
+      await expectUnauthenticated(
+        await anon.patch(entryUrl(memoryId, MEMORY_ISO_NEW), { data: { note: "x" }, failOnStatusCode: false }),
+        "PATCH memory entry",
+      );
+      await expectUnauthenticated(await anon.delete(entryUrl(memoryId, MEMORY_ISO_NEW), { failOnStatusCode: false }), "DELETE memory entry");
+
+      // The owner belongs to the second project too, but this document doesn't.
+      const crossProject = await asOwner.delete(entryUrl(memoryId, MEMORY_ISO_NEW, tenant!.secondProjectId), { failOnStatusCode: false });
+      expect(crossProject.status(), await crossProject.text()).toBe(404);
+      expect(memoryText(memoryId)).toBe(MEMORY_TEXT);
+    } finally {
+      dropDocuments(memoryId);
+    }
+  });
+
+  test("KB-A-69 invalid corrections are refused with a 4xx and change nothing", async () => {
+    const memoryId = seedZyraMemory();
+    const ordinary = await createDocument({ title: stamp("Not memory"), contentText: `## ${MEMORY_ISO_NEW}\nbody` });
+    try {
+      const patch = (data: Record<string, unknown>, entry = MEMORY_ISO_NEW) =>
+        asOwner.patch(entryUrl(memoryId, entry), { data, failOnStatusCode: false });
+      const cases: Array<[string, () => Promise<APIResponse>, number]> = [
+        ["empty note", () => patch({ note: "" }), 400],
+        ["whitespace note", () => patch({ note: "  \n\t " }), 400],
+        ["missing note", () => patch({}), 400],
+        ["non-string note", () => patch({ note: 42 }), 400],
+        ["over-long note", () => patch({ note: "x".repeat(2500) }), 400],
+        ["note smuggling a second entry", () => patch({ note: "ok\n## 2026-10-09T00:00:00.000Z\nfake" }), 400],
+        ["unknown entry", () => patch({ note: "x" }, "2020-01-01T00:00:00.000Z"), 404],
+        ["garbage entry id", () => asOwner.delete(entryUrl(memoryId, "not-a-timestamp"), { failOnStatusCode: false }), 404],
+        ["no unstructured text to remove", () => asOwner.delete(entryUrl(memoryId, "unstructured"), { failOnStatusCode: false }), 404],
+        ["ordinary document", () => asOwner.delete(entryUrl(ordinary.id, MEMORY_ISO_NEW), { failOnStatusCode: false }), 400],
+        ["malformed document id", () => asOwner.delete(entryUrl("not-a-uuid", MEMORY_ISO_NEW), { failOnStatusCode: false }), 404],
+      ];
+      for (const [what, attempt, status] of cases) {
+        const res = await attempt();
+        expect(res.status(), `${what} answered ${res.status()}: ${await res.text()}`).toBe(status);
+      }
+      expect(memoryText(memoryId)).toBe(MEMORY_TEXT);
+      expect(memoryText(ordinary.id)).toBe(`## ${MEMORY_ISO_NEW}\nbody`);
+      expect(versionCount(memoryId)).toBe(0);
+
+      // The boundary: the longest accepted note is the stamped-entry cap minus its own heading.
+      const max = 2500 - `## ${MEMORY_ISO_NEW}\n`.length;
+      const atMax = await patch({ note: "y".repeat(max) });
+      expect(atMax.status(), await atMax.text()).toBe(200);
+    } finally {
+      dropDocuments(memoryId, ordinary.id);
+    }
+  });
+
+  test("KB-A-70 text above the first entry, left by an old direct edit, is exposed as 'unstructured' and can be corrected or removed", async () => {
+    const text = `Hand-typed line from before the lock\n\n${MEMORY_TEXT}`;
+    const memoryId = seedZyraMemory({ text });
+    try {
+      const detail = await (await asOwner.get(kbUrl(`/documents/${memoryId}`))).json();
+      expect(detail.zyraMemory.unstructured).toBe("Hand-typed line from before the lock");
+      expect(detail.zyraMemory.entries).toHaveLength(2);
+
+      const edited = await asOwner.patch(entryUrl(memoryId, "unstructured"), { data: { note: "Corrected preamble" }, failOnStatusCode: false });
+      expect(edited.status(), await edited.text()).toBe(200);
+      expect(memoryText(memoryId)).toBe(`Corrected preamble\n\n${MEMORY_TEXT}`);
+
+      const removed = await asOwner.delete(entryUrl(memoryId, "unstructured"), { failOnStatusCode: false });
+      expect(removed.status(), await removed.text()).toBe(200);
+      expect(memoryText(memoryId)).toBe(MEMORY_TEXT);
+    } finally {
+      dropDocuments(memoryId);
+    }
+  });
+
+  test("KB-A-71 two removals of different entries at once both land — neither overwrites the other", async () => {
+    const memoryId = seedZyraMemory();
+    try {
+      const [a, b] = await Promise.all([
+        asOwner.delete(entryUrl(memoryId, MEMORY_ISO_NEW), { failOnStatusCode: false }),
+        asManager.delete(entryUrl(memoryId, MEMORY_ISO_OLD), { failOnStatusCode: false }),
+      ]);
+      expect([a.status(), b.status()]).toEqual([200, 200]);
+      expect(memoryText(memoryId), "one concurrent removal was lost").toBe("");
+      expect(versionCount(memoryId)).toBe(2);
+    } finally {
+      dropDocuments(memoryId);
+    }
+  });
+
   // ─── Folder name length, and what a folder reports as its size ────────────
 
   test("KB-A-58 an over-long folder name is refused with a 400, never a 500", { tag: '@tesbo.testId("TES-TC-934")' }, async () => {

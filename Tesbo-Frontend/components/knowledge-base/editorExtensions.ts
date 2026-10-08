@@ -36,3 +36,17 @@ export function markdownToDocument(markdown: string): { json: JSONContent; html:
     editor.destroy();
   }
 }
+
+/**
+ * The inverse of `markdownToDocument`: serialises editor JSON back to Markdown through the same
+ * Markdown extension, for content that is stored as Markdown (a Zyra AI Memory entry's note) but
+ * edited in the regular editor. Browser-only, like `markdownToDocument`.
+ */
+export function documentToMarkdown(json: JSONContent): string {
+  const editor = new Editor({ extensions: KB_EDITOR_EXTENSIONS, content: json });
+  try {
+    return editor.getMarkdown();
+  } finally {
+    editor.destroy();
+  }
+}
