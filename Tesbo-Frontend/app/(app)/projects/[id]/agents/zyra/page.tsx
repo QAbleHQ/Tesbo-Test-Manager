@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { createPortal } from "react-dom";
 import { FormEvent, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { IconArrowDown, IconClipboardCheck, IconCopy, IconPencil, IconPlus, IconSettings, IconSparkles, IconTrash } from "@tabler/icons-react";

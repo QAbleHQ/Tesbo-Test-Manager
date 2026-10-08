@@ -3406,6 +3406,93 @@ export class LegacyService implements OnModuleInit {
     this.requestCache.invalidatePrefix(`access:${projectId}:`);
   }
 
+  /**
+   * Maps the readable segments of an app URL (/projects/LOH/bugs/LOH-BUG-1) to the uuids the rest of
+   * the API is addressed by. Every segment also accepts a uuid, so links minted before readable URLs
+   * existed keep working, and the response carries the canonical readable form for the page to
+   * rewrite the address bar to.
+   *
+   * Access is the same as everywhere else: the project is looked up inside the caller's active
+   * workspace and membership, and every entity inside that project — so another tenant's `LOH`, or
+   * another project's `LOH-BUG-1`, is a 404 rather than a lookup oracle.
+   */
+  async resolveRoute(userId: string | null | undefined, q: Body) {
+    const uid = this.requireUser(userId);
+    const projectRef = String(q.project ?? "").trim();
+    if (!projectRef) throw new BadRequestException({ error: "project is required" });
+    let project: Body;
+    if (isUuid(projectRef)) {
+      project = await this.requireProjectAccess(uid, projectRef);
+    } else {
+      const workspace = await this.workspace(uid);
+      const res = await this.db.query(
+        `SELECT p.*, pm.role AS caller_role FROM projects p
+         JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = $1
+         WHERE lower(p.key) = lower($2) AND p.archived_at IS NULL AND p.organization_id = $3`,
+        [uid, projectRef, workspace.id]
+      );
+      if (!res.rows[0]) throw new NotFoundException({ error: "Project not found" });
+      project = res.rows[0];
+    }
+    const projectId = String(project.id);
+    const prefix = await this.externalIdPrefix(projectId);
+    const out: Body = { projectId, projectKey: project.key };
+
+    const seqOf = (ref: string, infix: string): number | null => {
+      const m = new RegExp(`-${infix}-(\\d+)$`, "i").exec(ref);
+      return m ? Number(m[1]) : null;
+    };
+    const wanted = (name: string) => {
+      const v = q[name];
+      return v === undefined || v === null || String(v).trim() === "" ? null : String(v).trim();
+    };
+
+    const bug = wanted("bug");
+    if (bug) {
+      const res = isUuid(bug)
+        ? await this.db.query("SELECT id, external_id FROM bugs WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [bug, projectId])
+        : await this.db.query("SELECT id, external_id FROM bugs WHERE lower(external_id) = lower($1) AND project_id = $2 AND deleted_at IS NULL", [bug, projectId]);
+      if (!res.rows[0]) throw new NotFoundException({ error: "Bug not found" });
+      out.bugId = res.rows[0].id;
+      out.bugRef = res.rows[0].external_id;
+    }
+
+    const testcase = wanted("testcase");
+    if (testcase) {
+      const res = isUuid(testcase)
+        ? await this.db.query("SELECT id, external_id FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [testcase, projectId])
+        : await this.db.query("SELECT id, external_id FROM testcases WHERE lower(external_id) = lower($1) AND project_id = $2 AND deleted_at IS NULL", [testcase, projectId]);
+      if (!res.rows[0]) throw new NotFoundException({ error: "Test case not found" });
+      out.testcaseId = res.rows[0].id;
+      out.testcaseRef = res.rows[0].external_id;
+    }
+
+    const cycle = wanted("cycle");
+    if (cycle) {
+      const seq = isUuid(cycle) ? null : seqOf(cycle, "RUN");
+      if (!isUuid(cycle) && seq === null) throw new NotFoundException({ error: "Test run not found" });
+      const res = isUuid(cycle)
+        ? await this.db.query("SELECT id, seq FROM cycles WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [cycle, projectId])
+        : await this.db.query("SELECT id, seq FROM cycles WHERE seq = $1 AND project_id = $2 AND deleted_at IS NULL", [seq, projectId]);
+      if (!res.rows[0]) throw new NotFoundException({ error: "Test run not found" });
+      out.cycleId = res.rows[0].id;
+      out.cycleRef = `${prefix}-RUN-${res.rows[0].seq}`;
+    }
+
+    const task = wanted("task");
+    if (task) {
+      const seq = isUuid(task) ? null : seqOf(task, "TASK");
+      if (!isUuid(task) && seq === null) throw new NotFoundException({ error: "Zyra task not found" });
+      const res = isUuid(task)
+        ? await this.db.query("SELECT id, seq FROM ai_generation_requests WHERE id = $1 AND project_id = $2 AND agent_name = ANY($3::text[])", [task, projectId, ZYRA_AGENT_NAMES])
+        : await this.db.query("SELECT id, seq FROM ai_generation_requests WHERE seq = $1 AND project_id = $2 AND agent_name = ANY($3::text[])", [seq, projectId, ZYRA_AGENT_NAMES]);
+      if (!res.rows[0]) throw new NotFoundException({ error: "Zyra task not found" });
+      out.taskId = res.rows[0].id;
+      out.taskRef = `${prefix}-TASK-${res.rows[0].seq}`;
+    }
+    return out;
+  }
+
   async getProjectForUser(userId: string | null | undefined, id: string) {
     return toCamel(await this.requireProjectAccess(userId, id));
   }
@@ -6094,6 +6181,17 @@ export class LegacyService implements OnModuleInit {
      *   → Planning     leaves the original start alone but clears the end: it is not finished
      */
     const status = typeof body.status === "string" ? body.status : null;
+    // A run with no cases has nothing to execute or complete; the UI disables both buttons, and
+    // this keeps the API from being a way around it.
+    if (status === "In Progress" || status === "Completed") {
+      const items = await this.db.query(
+        "SELECT 1 FROM cycle_items WHERE cycle_id = $1 AND deleted_at IS NULL LIMIT 1",
+        [cycleId]
+      );
+      if (!items.rows[0]) {
+        throw new BadRequestException({ error: "Add at least one test case before starting or completing a run" });
+      }
+    }
     await this.db.query(
       `UPDATE cycles SET name=COALESCE($2,name), description=COALESCE($3,description),
        environment=COALESCE($4,environment), build_version=COALESCE($5,build_version),

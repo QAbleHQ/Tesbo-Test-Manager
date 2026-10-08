@@ -87,7 +87,8 @@ function stamp(label: string): string {
  */
 async function seedSharedRun(counts: Partial<Record<BucketLabel, number>>): Promise<SharedRun> {
   const projectId = await seedProject(api, stamp("project"));
-  const run = await seedRun(api, projectId, { name: stamp("run"), status: "Completed" });
+  // Completed is applied after the cases are added: the API refuses to complete a run with none.
+  const run = await seedRun(api, projectId, { name: stamp("run") });
 
   const wanted: { status: string; label: BucketLabel }[] = [];
   for (const bucket of BUCKETS) {
@@ -111,6 +112,9 @@ async function seedSharedRun(counts: Partial<Record<BucketLabel, number>>): Prom
       .map((want, i) => ({ executionId: byCase.get(caseIds[i])!, status: want.status }))
       .filter((r) => r.executionId && r.status !== "Untested");
     setExecutionResults(results);
+
+    const completed = await api.patch(`/api/cycles/${run.id}`, { data: { status: "Completed" }, failOnStatusCode: false });
+    expect(completed.ok(), `completing the run — ${await completed.text()}`).toBeTruthy();
   }
 
   const shared = await api.post(`/api/cycles/${run.id}/share`, { data: { enabled: true }, failOnStatusCode: false });

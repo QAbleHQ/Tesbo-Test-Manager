@@ -1,6 +1,7 @@
 "use client";
 
-import { useParams, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import Link from "next/link";
 import { createPortal } from "react-dom";
@@ -910,6 +911,7 @@ export default function TestRunDetailPage() {
   /* ───── Change run status ───── */
   async function handleRunStatusChange(newStatus: string) {
     if (!run) return;
+    if (newStatus !== "Planning" && executions.length === 0) return;
     try {
       await updateTestRun(cycleId, { status: newStatus });
       setRun({ ...run, status: newStatus });
@@ -1098,13 +1100,21 @@ export default function TestRunDetailPage() {
           createPortal(
             <div className="flex flex-wrap items-center gap-2">
               {isPlanning && (
-                <Button onClick={() => handleRunStatusChange("In Progress")}>
+                <Button
+                  onClick={() => handleRunStatusChange("In Progress")}
+                  disabled={executions.length === 0}
+                  title={executions.length === 0 ? "Add test cases to start the run" : undefined}
+                >
                   <IconPlayerPlay size={14} />
                   Start Execution
                 </Button>
               )}
               {isInProgress && (
-                <Button onClick={() => handleRunStatusChange("Completed")}>
+                <Button
+                  onClick={() => handleRunStatusChange("Completed")}
+                  disabled={executions.length === 0}
+                  title={executions.length === 0 ? "Add test cases to complete the run" : undefined}
+                >
                   <IconCircleCheck size={14} />
                   Mark Completed
                 </Button>

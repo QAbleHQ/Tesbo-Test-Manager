@@ -15,9 +15,10 @@ export const LINEAR_PAGE_SIZE = 100;
 export const NOTION_PAGE_SIZE = 100;
 
 // Hard ceiling on tickets pulled in a single run, so a first sync against a 50k-issue Jira
-// project can't run for hours or blow up the queue. Ordered by most-recently-updated, so the
-// cutoff drops the stalest tickets first. Surfaced to the user when it bites.
-export const MAX_TICKETS_PER_RUN = 5000;
+// project can't run for hours or blow up the queue. Counts only tickets that still need syncing:
+// a run that hits it stops, is flagged unfinished (V134), and the next Sync continues the same pass
+// with the rest. Surfaced to the user when it bites.
+export const MAX_TICKETS_PER_RUN = 20000;
 
 // Comments per ticket. Jira and Linear both return newest-last; we keep the most recent
 // COMMENTS_PER_TICKET so a 300-comment epic doesn't dominate the document or the AI prompt.
@@ -86,7 +87,7 @@ export const SYNC_WATCHDOG_INTERVAL_MS = 5 * 60 * 1000;
 // setStage, setTotals, or recordTicketResult — every real step touches updated_at) before the
 // watchdog fails it. Comfortably above any legitimate gap: a page fetch and a ticket's comment
 // fetch are each bounded by INTEGRATION_SYNC_FETCH_TIMEOUT_MS above, so a genuinely progressing
-// run — even a 5000-ticket one — touches updated_at far more often than this.
+// run — even a 20000-ticket one — touches updated_at far more often than this.
 export const SYNC_RUN_STALE_MINUTES = 20;
 
 export const INTEGRATION_SYNC_WATCHDOG_JOB = "sync-watchdog";

@@ -2567,6 +2567,10 @@ test.describe("bug comments", () => {
       await openPanel(page, bug.title);
       const section = comments(panelBody(page));
       await expect(section.getByText("No comments yet.")).toBeVisible();
+      // Collapsed until clicked: no editor and no Add Comment button yet.
+      await expect(section.getByLabel("Add a comment")).toHaveCount(0);
+      await expect(section.getByRole("button", { name: "Add Comment" })).toHaveCount(0);
+      await openComposer(section);
       const add = section.getByRole("button", { name: "Add Comment" });
       await expect(add).toBeDisabled();
       await section.getByLabel("Add a comment").fill("   \n  ");
@@ -2593,6 +2597,8 @@ test.describe("bug comments", () => {
         return route.continue();
       });
 
+      await openComposer(section);
+
       await section.getByLabel("Add a comment").fill(`  ${body}  `);
       await section.getByRole("button", { name: "Add Comment" }).click();
 
@@ -2601,7 +2607,9 @@ test.describe("bug comments", () => {
       await expect(items.first()).toContainText(body);
       await expect(section.getByText("No comments yet.")).toHaveCount(0);
       await expect(panelBody(page).getByRole("tab", { name: "Comments (1)" })).toBeVisible();
-      await expect(section.getByLabel("Add a comment")).toHaveText("");
+      // Posting collapses the box again.
+      await expect(section.getByLabel("Add a comment")).toHaveCount(0);
+      await expect(section.getByTestId("bug-comment-open")).toBeVisible();
       expect(listFetches).toBe(0);
 
       const persisted = await (await api.get(commentsUrl(bug.id))).json();
@@ -2630,6 +2638,7 @@ test.describe("bug comments", () => {
           ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Comment service unavailable." }) })
           : route.continue(),
       );
+      await openComposer(section);
       await section.getByLabel("Add a comment").fill(body);
       await section.getByRole("button", { name: "Add Comment" }).click();
 
@@ -2689,6 +2698,7 @@ test.describe("bug comments", () => {
       await seedComment(a.id, "Only on bug A");
       await openPanel(page, a.title);
       await expect(comments(panelBody(page)).getByText("Only on bug A")).toBeVisible();
+      await openComposer(comments(panelBody(page)));
       await comments(panelBody(page)).getByLabel("Add a comment").fill("Unsent draft for A");
 
       await panelBody(page).getByRole("button", { name: "Close", exact: true }).click();
@@ -2696,7 +2706,8 @@ test.describe("bug comments", () => {
       const section = comments(panelBody(page));
       await expect(section.getByText("No comments yet.")).toBeVisible();
       await expect(section.getByText("Only on bug A")).toHaveCount(0);
-      await expect(section.getByLabel("Add a comment")).toHaveText("");
+      await expect(section.getByLabel("Add a comment")).toHaveCount(0);
+      await expect(section.getByTestId("bug-comment-open")).toBeVisible();
     } finally {
       await api.delete(`/api/bugs/${a.id}`, { failOnStatusCode: false });
       await api.delete(`/api/bugs/${b.id}`, { failOnStatusCode: false });
@@ -2712,6 +2723,8 @@ test.describe("bug comments", () => {
       const section = comments(page.getByRole("region", { name: "Bug details" }));
       await expect(section.getByTestId("bug-comment")).toHaveCount(1);
       await expect(section.getByText(seeded.authorName, { exact: true })).toBeVisible();
+
+      await openComposer(section);
 
       await section.getByLabel("Add a comment").fill(body);
       await section.getByRole("button", { name: "Add Comment" }).click();
@@ -2743,6 +2756,7 @@ test.describe("bug comments", () => {
     try {
       await openPanel(page, bug.title);
       const section = comments(panelBody(page));
+      await openComposer(section);
       const box = composer(section);
       await box.click();
 
@@ -2800,6 +2814,7 @@ test.describe("bug comments", () => {
     try {
       await openPanel(page, bug.title);
       const section = comments(panelBody(page));
+      await openComposer(section);
       const box = composer(section);
       await box.click();
 
@@ -2856,6 +2871,7 @@ test.describe("bug comments", () => {
 
       await openPanel(page, bug.title);
       const section = comments(panelBody(page));
+      await openComposer(section);
       const box = composer(section);
       await box.click();
       await page.keyboard.type(`Over to @${label.slice(0, 3)}`);
@@ -2921,6 +2937,8 @@ test.describe("bug comments", () => {
       await section.getByRole("button", { name: "Remove console.txt" }).click();
       await expect(section.getByTestId("bug-comment-staged-file")).toHaveCount(1);
       await input.setInputFiles([{ name: "console.txt", mimeType: "text/plain", buffer: Buffer.from("TypeError") }]);
+
+      await openComposer(section);
 
       await composer(section).click();
       await page.keyboard.type("Evidence attached");
@@ -3140,7 +3158,7 @@ test.describe("bug comments", () => {
       await expect(section.getByTestId("bug-comment"), "a reply is not a new top-level comment").toHaveCount(1);
       // The count is on the Comments tab now, not a heading inside the section.
       await expect(panelBody(page).getByRole("tab", { name: "Comments (2)" })).toBeVisible();
-      await expect(composer(section), "the main box is untouched").toHaveText("");
+      await expect(composer(section), "the main box is untouched (still collapsed)").toHaveCount(0);
 
       const persisted = (await (await api.get(commentsUrl(bug.id))).json()).list;
       expect(persisted[1]).toMatchObject({ parentCommentId: top.id, body: "**Confirmed** on staging" });
@@ -3713,6 +3731,8 @@ test.describe("bug activity", () => {
       const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
       await expect(tab(page, /^Activity/)).toHaveAccessibleName("Activity (1)");
 
+      await openComposer(comments);
+
       await comments.getByLabel("Add a comment").fill("Seen again on build 12");
       await comments.getByRole("button", { name: "Add Comment" }).click();
       await expect(comments.getByTestId("bug-comment")).toHaveCount(1);
@@ -3772,6 +3792,7 @@ test.describe("bug activity", () => {
       await page.getByRole("button", { name: "List", exact: true }).click();
       await page.locator("tbody tr").filter({ hasText: first.title }).click();
       const comments = detailsRegion(page).getByRole("region", { name: "Comments" });
+      await openComposer(comments);
       await comments.getByLabel("Add a comment").fill("Half-written note");
 
       await openActivity(page);
@@ -3821,3 +3842,12 @@ test.describe("bug activity", () => {
     }
   });
 });
+
+/**
+ * The comment box is collapsed ("Add a comment…") until clicked, so every spec that types into it
+ * opens it first. A no-op when it is already open, e.g. after an earlier fill in the same test.
+ */
+async function openComposer(section: Locator): Promise<void> {
+  const opener = section.getByTestId("bug-comment-open");
+  if (await opener.isVisible()) await opener.click();
+}

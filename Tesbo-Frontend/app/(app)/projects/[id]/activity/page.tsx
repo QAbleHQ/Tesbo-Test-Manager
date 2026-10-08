@@ -1,6 +1,7 @@
 "use client";
 
-import { useParams, useRouter } from "next/navigation";
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { IconActivity, IconSearch } from "@tabler/icons-react";
 import {
