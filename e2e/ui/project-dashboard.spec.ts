@@ -157,6 +157,32 @@ test.describe("project dashboard — the stat cards", () => {
     }
   });
 
+  test("DSH-U-07b the test case card leaves out an archived case, matching the repository list", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id);
+      await createTestCase(api, project.id);
+      const archived = await createTestCase(api, project.id);
+      const patched = await api.patch(`/api/projects/${project.id}/testcases/${archived.id}`, {
+        data: { status: "Archived" },
+        failOnStatusCode: false,
+      });
+      expect(patched.status(), `archiving — ${await patched.text()}`).toBeLessThan(300);
+      const listTotal = Number(
+        (await api.get(`/api/projects/${project.id}/testcases`, { params: { limit: 1 } })).headers()["x-total-count"],
+      );
+      expect(listTotal).toBe(2);
+
+      await page.goto(`/projects/${project.id}/dashboard`);
+      const card = statCard(page, "Test cases");
+      await expect(card).toBeVisible();
+      expect(await statValue(card), "the card is still counting the archived case").toBe(String(listTotal));
+      await expect(card).toContainText("+2 this week");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
   test("DSH-U-09 the pass rate card shows a percentage and a proportional bar", { tag: '@tesbo.testId("TES-TC-730")' }, async ({ page }) => {
     const project = await createProject(api);
     try {

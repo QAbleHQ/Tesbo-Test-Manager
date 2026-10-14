@@ -745,7 +745,7 @@ function ProjectsPageContent() {
                             <div className="text-xl font-semibold tracking-tight" style={{ color: passRateTextColor(p.currentPassRate) }}>
                               {p.currentPassRate !== null ? `${p.currentPassRate}%` : "—"}
                             </div>
-                            <div className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Pass rate</div>
+                            <div className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Last run pass rate</div>
                           </div>
                         </div>
                         {p.runCounts ? <PassRateBar counts={p.runCounts} /> : null}
@@ -772,7 +772,7 @@ function ProjectsPageContent() {
                 <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Status</div>
                 <div className="text-center text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Test cases</div>
                 <div className="text-center text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Total Suites</div>
-                <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Pass rate</div>
+                <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Last run pass rate</div>
                 <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Team</div>
                 <div className="text-right text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Updated</div>
               </div>
