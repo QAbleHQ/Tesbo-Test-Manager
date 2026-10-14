@@ -65,6 +65,7 @@ pipeline {
           ]) {
             sh '''
               set -eu
+              set +x  # Jenkins sh runs with -x; keep SONAR_TOKEN out of the console log
               set -a
               # shellcheck disable=SC1090
               . "$TESBO_ENV_FILE"

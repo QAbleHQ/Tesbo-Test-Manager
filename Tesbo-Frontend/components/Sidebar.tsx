@@ -224,11 +224,9 @@ function SidebarContent() {
       >
         <Link href="/projects" className="flex shrink-0 items-center justify-center" aria-label="Tesbo Test Manager">
           {isCollapsed ? (
-            <span className="grid h-8 w-8 place-items-center rounded-lg border border-[var(--glass-border)] bg-[var(--glass-surface-strong)] shadow-sm">
-              <BrandLogo mark decorative className="h-6 w-auto object-contain" />
-            </span>
+            <BrandLogo decorative className="w-10" />
           ) : (
-            <BrandLogo className="h-10 max-w-[150px] object-contain" />
+            <BrandLogo className="h-8" />
           )}
         </Link>
         <button
