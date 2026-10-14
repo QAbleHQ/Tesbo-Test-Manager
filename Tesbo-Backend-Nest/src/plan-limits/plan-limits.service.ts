@@ -404,6 +404,7 @@ export class PlanLimitsService {
   }
 
   async assertReviewBoardEnabled(organizationId: string): Promise<void> {
+    if (!this.config.isStripeBillingEnabled) return;
     const { effectivePlan } = await this.getEntitlement(organizationId);
     if (effectivePlan !== "pro") {
       throw new ForbiddenException({
