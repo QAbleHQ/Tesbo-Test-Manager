@@ -5,6 +5,7 @@ import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { useAppData } from "@/components/app/AppDataProvider";
+import { getBillingInfo } from "@/lib/api";
 import { Breadcrumbs } from "@/components/workflows";
 import { PageLoader } from "@/components/ui";
 import GeneralTab from "@/components/settings/GeneralTab";
@@ -24,6 +25,7 @@ function WorkspaceSettingsContent() {
   const [workspaceName, setWorkspaceName] = useState("");
   const [canManageWorkspace, setCanManageWorkspace] = useState(false);
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
+  const [billingEnabled, setBillingEnabled] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTab | null>(null);
   const { startEl: topBarStartEl, setFilled: setTopBarFilled } = useTopBarSlots();
 
@@ -35,12 +37,12 @@ function WorkspaceSettingsContent() {
             { key: "members", label: "Members" },
             { key: "integrations", label: "Integrations" },
             { key: "ai", label: "AI Providers" },
-            { key: "billing", label: "Billing" },
+            ...(billingEnabled ? ([{ key: "billing", label: "Billing" }] as const) : []),
           ] as const)
         : []),
       ...(isPlatformAdmin ? ([{ key: "admins", label: "Manage Admins" }] as const) : []),
     ],
-    [canManageWorkspace, isPlatformAdmin]
+    [canManageWorkspace, isPlatformAdmin, billingEnabled]
   );
 
   const load = useCallback(() => {
@@ -65,6 +67,12 @@ function WorkspaceSettingsContent() {
     setWorkspaceName(workspace.name || "");
     setCanManageWorkspace(canManage);
     setIsPlatformAdmin(platformAdmin);
+    void getBillingInfo()
+      .then((billing) => {
+        // enabled:false → hide tab; enabled:true (or omitted on old servers) → show.
+        setBillingEnabled(billing.enabled !== false);
+      })
+      .catch(() => setBillingEnabled(false));
     setStatus("ready");
   }, [router, currentUser, workspace]);
 
