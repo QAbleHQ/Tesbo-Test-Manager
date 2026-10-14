@@ -9144,7 +9144,8 @@ export class LegacyService implements OnModuleInit {
       return { rows: res.rows.map(toCamel) };
     }
 
-    const limit = Math.min(Math.max(Math.trunc(opts.limit) || 50, 1), 200);
+    // No upper bound: a caller that asks for more cases per page gets them.
+    const limit = Math.max(Math.trunc(opts.limit) || 50, 1);
     const offset = Math.max(Math.trunc(opts.offset ?? 0) || 0, 0);
     // The cases on the page / in the result. Without a search no cycle joins are needed to pick them.
     const matched = term
