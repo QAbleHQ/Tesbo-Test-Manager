@@ -48,7 +48,7 @@ suite("review board (real Postgres)", () => {
 
     const requestCache = new RequestCacheService({} as Any);
     const entitlementCache = { get: async () => undefined, set: async () => undefined, invalidate: async () => undefined };
-    const planLimits = new PlanLimitsService(db, {} as Any, {} as Any, requestCache, entitlementCache as Any);
+    const planLimits = new PlanLimitsService(db, { isStripeBillingEnabled: true } as Any, {} as Any, requestCache, entitlementCache as Any);
     const invalidating = { invalidate: async () => undefined };
     const legacy = new LegacyService(
       db,
