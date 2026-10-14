@@ -1251,6 +1251,12 @@ export class LegacyController {
     }
     const typedView = view as ReportExportView;
     const locale = this.exportLocale(req, query);
+    // One row per test case per run — ~700k on a large project — so it is written to the response page
+    // by page instead of being built in memory first. Every other view is a handful of rows.
+    if (typedView === "matrix") {
+      await this.streamMatrixExport(req, projectId, format, locale, res);
+      return;
+    }
     const { headers: keys, rows: rawRows } = await this.reportExportRows(req, projectId, typedView, query);
     const { headers, rows } = this.localizeReportRows(locale, typedView, keys, rawRows);
     const fileName = `report-${typedView}`;
@@ -1259,6 +1265,74 @@ export class LegacyController {
       return;
     }
     await this.sendWorkbook(res, `${fileName}.xlsx`, exportSheetName(locale, REPORT_VIEW_SHEET_NAMES[typedView]), rows, headers);
+  }
+
+  /**
+   * The traceability matrix as csv/xlsx, streamed: 200 test cases at a time are read, localized and
+   * written, so memory stays flat however large the project is. The first page goes through the
+   * access check BEFORE any byte is sent, so a 403/404 is still a normal error response; a failure
+   * after that point can only abort the connection (the status line is already out).
+   * Pages are read one after another, not in a snapshot, so a case created mid-export may be missed.
+   */
+  private async streamMatrixExport(
+    req: AuthenticatedRequest,
+    projectId: string,
+    format: "csv" | "xlsx",
+    locale: ExportLocale,
+    res: Response
+  ) {
+    const PAGE = 200;
+    const readPage = async (offset: number) => {
+      const matrix =
+        offset === 0
+          ? await this.legacy.requirementMatrixForUser(req.userId, projectId, { limit: PAGE, offset })
+          : await this.legacy.requirementMatrix(projectId, { limit: PAGE, offset });
+      const shaped = (matrix.rows ?? []).map((row: Record<string, unknown>) =>
+        Object.fromEntries(REPORT_MATRIX_HEADERS.map((header) => [header, row[header] ?? ""]))
+      );
+      const { headers, rows } = this.localizeReportRows(locale, "matrix", REPORT_MATRIX_HEADERS, shaped);
+      return { headers, rows, total: (matrix as { total?: number }).total ?? 0 };
+    };
+    const first = await readPage(0);
+    const { headers } = first;
+    // Respect backpressure: a slow client must slow the reads down, not pile the pages up in memory.
+    const write = async (chunk: string) => {
+      if (!res.write(chunk)) await new Promise<void>((resolve) => res.once("drain", resolve));
+    };
+
+    try {
+      if (format === "csv") {
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="report-matrix.csv"`);
+        await write((locale === "en" ? "" : UTF8_BOM) + headers.join(","));
+        for (let offset = 0, page = first; ; ) {
+          const lines = page.rows.map((row) => "\n" + headers.map((h) => this.csvEscape(row[h])).join(","));
+          if (lines.length) await write(lines.join(""));
+          offset += PAGE;
+          if (offset >= first.total || res.destroyed) break;
+          page = await readPage(offset);
+        }
+        res.end();
+        return;
+      }
+
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="report-matrix.xlsx"`);
+      const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useSharedStrings: false });
+      const sheet = workbook.addWorksheet(exportSheetName(locale, REPORT_VIEW_SHEET_NAMES.matrix));
+      sheet.addRow(headers).commit();
+      for (let offset = 0, page = first; ; ) {
+        for (const row of page.rows) sheet.addRow(headers.map((h) => this.cellValue(row[h]))).commit();
+        offset += PAGE;
+        if (offset >= first.total || res.destroyed) break;
+        page = await readPage(offset);
+      }
+      await sheet.commit();
+      await workbook.commit();
+    } catch (err) {
+      if (!res.headersSent) throw err;
+      res.destroy(err as Error);
+    }
   }
 
   // Applied after reportExportRows so the English file is built exactly as before and the
