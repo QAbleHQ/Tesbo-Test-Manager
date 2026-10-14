@@ -128,7 +128,7 @@ const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
   severity: 100,
   component: 140,
   status: 112,
-  updated: 108,
+  updated: 136,
   type: 120,
   automation: 136,
   context: 168,
@@ -144,7 +144,7 @@ const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
   severity: 80,
   component: 96,
   status: 88,
-  updated: 96,
+  updated: 124,
   type: 88,
   automation: 96,
   context: 120,
@@ -533,7 +533,7 @@ export function RepositoryTestCaseTable({
       case "type":
         return (
           <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
-            <span className={innerTruncate}>{tc.type}</span>
+            <span className={innerTruncate}>{tc.type?.trim() || "—"}</span>
           </td>
         );
       case "severity":
@@ -551,12 +551,16 @@ export function RepositoryTestCaseTable({
       case "automation":
         return (
           <td key={col} style={tdStyle} className={cellClass}>
-            <StatusChip
-              tone={repoAutomationTone(tc.automationStatus)}
-              className="max-w-full !px-[9px] !py-[2px] !text-[11px] !font-medium"
-            >
-              <span className={innerTruncate}>{tc.automationStatus}</span>
-            </StatusChip>
+            {tc.automationStatus?.trim() ? (
+              <StatusChip
+                tone={repoAutomationTone(tc.automationStatus)}
+                className="max-w-full !px-[9px] !py-[2px] !text-[11px] !font-medium"
+              >
+                <span className={innerTruncate}>{tc.automationStatus}</span>
+              </StatusChip>
+            ) : (
+              <span className="text-[11px] text-[var(--muted-soft)]">—</span>
+            )}
           </td>
         );
       case "context":

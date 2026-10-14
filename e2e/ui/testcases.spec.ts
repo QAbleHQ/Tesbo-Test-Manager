@@ -206,6 +206,60 @@ test.describe("test case creation", () => {
     }
   });
 
+  test("repository row shows an em dash in Type and Automation Type when a case has none", async ({ page }) => {
+    const title = `UI blank type row ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let testcaseId = "";
+    try {
+      testcaseId = (
+        await (
+          await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+            data: { title, priority: "", type: "", automationStatus: "" },
+          })
+        ).json()
+      ).id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder(/Search by ID/).fill(title);
+      const row = page.getByRole("row").filter({ hasText: title });
+      await expect(row).toBeVisible();
+      // Type and Automation Type columns are in the default set; with no values both must read "—".
+      const headers = await page.getByRole("columnheader").allInnerTexts();
+      for (const name of ["TYPE", "AUTOMATION"]) {
+        const idx = headers.findIndex((h) => h.toUpperCase().includes(name));
+        expect(idx, `${name} column present`).toBeGreaterThanOrEqual(0);
+        await expect(row.getByRole("cell").nth(idx)).toHaveText("—");
+      }
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("repository Updated column shows the full date including the year, not truncated", async ({ page }) => {
+    const title = `UI updated col width ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let testcaseId = "";
+    try {
+      testcaseId = (await (await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title } })).json()).id;
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByPlaceholder(/Search by ID/).fill(title);
+      const row = page.getByRole("row").filter({ hasText: title });
+      await expect(row).toBeVisible();
+      const headers = await page.getByRole("columnheader").allInnerTexts();
+      const idx = headers.findIndex((h) => h.toUpperCase().includes("UPDATED"));
+      expect(idx).toBeGreaterThanOrEqual(0);
+      const span = row.getByRole("cell").nth(idx).locator("span").first();
+      await expect(span).toHaveText(/\d{2} \w{3} \d{4}/);
+      // truncate renders an ellipsis when scrollWidth exceeds clientWidth.
+      const clipped = await span.evaluate((el) => el.scrollWidth > el.clientWidth);
+      expect(clipped).toBe(false);
+    } finally {
+      if (testcaseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${testcaseId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
   // A case that already has real values must not be disturbed by the fix above — reopening and
   // saving it unchanged has to round-trip the exact values it already had.
   test("Edit Test Case preserves existing Type/Priority/Automation Type/Suite values when saved with no changes", async ({ page }) => {
