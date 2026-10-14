@@ -376,7 +376,7 @@ test.describe("MCP sessions keep a client's tool list current across deploys", (
 });
 
 test.describe("MCP list_testcases and the repository total agree on Archived cases", () => {
-  test("includeArchived lets an MCP caller reach the same total the repository summary counts", async ({
+  test("the default list leaves Archived out like the repository total, and includeArchived still reaches them", async ({
     request,
   }) => {
     const title = `E2E MCP archived ${Date.now()}`;
@@ -406,8 +406,8 @@ test.describe("MCP list_testcases and the repository total agree on Archived cas
       expect(withoutArchived.total).toBe(0);
       expect(withoutArchived.rows.some((r: { id: string }) => r.id === created.id)).toBe(false);
 
-      // includeArchived is the fix under test: previously undeclared on the tool's inputSchema, so
-      // no MCP caller could ask for it and there was no way to match the repository header's total.
+      // includeArchived keeps archived cases reachable: previously undeclared on the tool's
+      // inputSchema, so no MCP caller could ask for them at all.
       const withArchived = await callMcpTool(mcpApi, token, "list_testcases", {
         search: title,
         includeArchived: true,
@@ -415,13 +415,13 @@ test.describe("MCP list_testcases and the repository total agree on Archived cas
       expect(withArchived.total).toBe(1);
       expect(withArchived.rows.some((r: { id: string }) => r.id === created.id)).toBe(true);
 
-      // The repository summary total (the UI header tile) already counts this Archived case into its
-      // "Archived" bucket — includeArchived:true is what lets an MCP caller see the same dataset.
+      // The repository summary agrees with the default list: the Archived case is outside its total
+      // and its byStatus buckets, and reported on its own as archivedTestCases (the "N archived" chip).
       const summaryRes = await request.get(`/api/projects/${ctx.projectId}/reports/repository-summary`);
       expect(summaryRes.ok()).toBeTruthy();
       const summary = await summaryRes.json();
-      const archivedBucket = summary.byStatus.find((s: { name: string }) => s.name === "Archived");
-      expect(archivedBucket?.count ?? 0).toBeGreaterThanOrEqual(1);
+      expect(summary.byStatus.find((s: { name: string }) => s.name === "Archived")).toBeUndefined();
+      expect(summary.archivedTestCases).toBeGreaterThanOrEqual(1);
     } finally {
       if (tokenId) {
         await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
