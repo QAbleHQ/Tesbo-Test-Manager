@@ -59,25 +59,25 @@ export function TraceabilityTab({
   loading,
   search,
   onSearchChange,
+  total,
+  offset,
+  pageSize,
+  onOffsetChange,
 }: {
   rows: RequirementMatrixRow[];
   loading: boolean;
   search: string;
   onSearchChange: (v: string) => void;
+  /** Test cases matching the search across all pages; `rows` holds only the current page's. */
+  total: number;
+  offset: number;
+  pageSize: number;
+  onOffsetChange: (v: number) => void;
 }) {
   const { widths, onMouseDown } = useResizableColumns(MATRIX_COLUMNS);
 
-  const filteredRows = useMemo(() => {
-    if (!search) return rows;
-    const q = search.toLowerCase();
-    return rows.filter(
-      (r) =>
-        r.externalId?.toLowerCase().includes(q) ||
-        r.testcaseTitle?.toLowerCase().includes(q) ||
-        r.runName?.toLowerCase().includes(q) ||
-        r.bugTitle?.toLowerCase().includes(q)
-    );
-  }, [rows, search]);
+  // Search is applied by the server (so it covers every page), so the rows arrive already filtered.
+  const filteredRows = rows;
 
   const groupedRows = useMemo(() => {
     const groups: { testcaseId: string; externalId: string; testcaseTitle: string; priority: string; testcaseStatus: string; suiteName: string | null; runs: RequirementMatrixRow[] }[] = [];
@@ -189,8 +189,28 @@ export function TraceabilityTab({
             </table>
           </div>
           {groupedRows.length > 0 && (
-            <div className="border-t border-[var(--border)] px-4 py-2.5 text-[11px] text-[var(--muted-soft)]">
-              {groupedRows.length} test case{groupedRows.length !== 1 ? "s" : ""} across {filteredRows.length} row{filteredRows.length !== 1 ? "s" : ""}
+            <div className="flex items-center justify-between gap-4 border-t border-[var(--border)] px-4 py-2.5 text-[11px] text-[var(--muted-soft)]">
+              <span>
+                Test cases {offset + 1}–{offset + groupedRows.length} of {total} ({filteredRows.length} row{filteredRows.length !== 1 ? "s" : ""} on this page)
+              </span>
+              <span className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={offset === 0}
+                  onClick={() => onOffsetChange(Math.max(0, offset - pageSize))}
+                  className="rounded-[6px] border border-[var(--border)] px-2.5 py-1 disabled:opacity-40"
+                >
+                  Previous
+                </button>
+                <button
+                  type="button"
+                  disabled={offset + pageSize >= total}
+                  onClick={() => onOffsetChange(offset + pageSize)}
+                  className="rounded-[6px] border border-[var(--border)] px-2.5 py-1 disabled:opacity-40"
+                >
+                  Next
+                </button>
+              </span>
             </div>
           )}
         </div>

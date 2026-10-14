@@ -8981,9 +8981,13 @@ export class LegacyService implements OnModuleInit {
     return this.executionReport(projectId, query);
   }
 
-  async requirementMatrixForUser(userId: string | null | undefined, projectId: string) {
+  async requirementMatrixForUser(
+    userId: string | null | undefined,
+    projectId: string,
+    opts: { limit?: number; offset?: number; search?: string } = {}
+  ) {
     await this.requireProjectAccess(userId, projectId);
-    return this.requirementMatrix(projectId);
+    return this.requirementMatrix(projectId, opts);
   }
 
   async repositorySummaryForUser(userId: string | null | undefined, projectId: string) {
@@ -9009,94 +9013,119 @@ export class LegacyService implements OnModuleInit {
   async executionReport(projectId: string, query: Body) {
     const filterBy = String(query.filterBy || "overall");
     const filterValue = query.filterValue ? String(query.filterValue) : null;
-    const res = await this.db.query(
-      `SELECT
-         e.id AS execution_id,
-         COALESCE(e.status, 'Untested') AS execution_status,
-         e.assignee_id,
-         ci.testcase_id,
-         COALESCE(NULLIF(ci.snapshot_title, ''), NULLIF(t.title, ''), 'Untitled test case') AS testcase_title,
-         COALESCE(ci.snapshot_priority, t.priority, 'Unspecified') AS priority,
-         COALESCE(ci.snapshot_suite_id, t.suite_id) AS suite_id,
-         COALESCE(s.name, 'No Suite') AS suite_name,
-         c.id AS run_id,
-         COALESCE(c.name, 'Untitled test run') AS run_name,
-         c.plan_id,
-         COALESCE(CASE WHEN p.deleted_at IS NOT NULL THEN p.name || ' (deleted)' ELSE p.name END, 'No Plan') AS plan_name,
-         COALESCE(u.name, u.email, 'Unassigned') AS assignee_name,
-         COALESCE(tag_agg.tags, '[]'::json) AS custom_tags_json
-       FROM cycles c
-       JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
-       LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       LEFT JOIN testcases t ON t.id = ci.testcase_id
-       LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
-       LEFT JOIN plans p ON p.id = c.plan_id
-       LEFT JOIN users u ON u.id = e.assignee_id
-       LEFT JOIN LATERAL (
-         SELECT json_agg(json_build_object('id', ct.id, 'name', ct.name) ORDER BY ct.name) AS tags
-         FROM testcase_custom_tags tct
-         JOIN custom_tags ct ON ct.id = tct.tag_id
-         WHERE tct.testcase_id = t.id
-       ) tag_agg ON true
-       WHERE c.project_id = $1 AND c.deleted_at IS NULL
-       ORDER BY c.created_at DESC, ci.position, ci.created_at`,
-      [projectId]
-    );
-    const statusKeys = ["Passed", "Failed", "Blocked", "Skipped", "Untested", "Retest"] as const;
-    const groups = new Map<string, Body>();
-    const add = (groupId: string, groupName: string, status: string) => {
-      const normalizedStatus = statusKeys.includes(status as any) ? status : "Untested";
-      const row = groups.get(groupId) || {
-        groupId,
-        groupName,
-        Passed: 0,
-        Failed: 0,
-        Blocked: 0,
-        Skipped: 0,
-        Untested: 0,
-        Retest: 0,
-        total: 0
-      };
-      row[normalizedStatus] = Number(row[normalizedStatus] || 0) + 1;
-      row.total = Number(row.total || 0) + 1;
-      groups.set(groupId, row);
-    };
-    for (const row of res.rows) {
-      const tcTags: { id: string; name: string }[] = Array.isArray(row.custom_tags_json) ? row.custom_tags_json : [];
-      const matchesFilter = (() => {
-        if (!filterValue || filterBy === "overall") return true;
-        if (filterBy === "person") return String(row.assignee_id || "unassigned") === filterValue;
-        if (filterBy === "plan") return String(row.plan_id || "none") === filterValue;
-        if (filterBy === "run") return String(row.run_id) === filterValue;
-        if (filterBy === "suite") return String(row.suite_id || "none") === filterValue;
-        if (filterBy === "priority") return String(row.priority || "Unspecified") === filterValue;
-        if (filterBy === "tags") return tcTags.some((tag) => tag.id === filterValue);
-        return true;
-      })();
-      if (!matchesFilter) continue;
-      const status = String(row.execution_status || "Untested");
-      if (filterBy === "person") add(String(row.assignee_id || "unassigned"), String(row.assignee_name || "Unassigned"), status);
-      else if (filterBy === "plan") add(String(row.plan_id || "none"), String(row.plan_name || "No Plan"), status);
-      else if (filterBy === "suite") add(String(row.suite_id || "none"), String(row.suite_name || "No Suite"), status);
-      else if (filterBy === "priority") add(String(row.priority || "Unspecified"), String(row.priority || "Unspecified"), status);
-      else if (filterBy === "tags") {
-        const effectiveTags = tcTags.length ? tcTags : [{ id: "untagged", name: "Untagged" }];
-        for (const tag of effectiveTags) add(tag.id, tag.name, status);
-      } else {
-        add(String(row.run_id), String(row.run_name || "Untitled test run"), status);
+
+    /*
+     * Grouped and filtered in SQL. This used to SELECT one fat row per execution in the project (six
+     * joins plus a per-row tag subquery, ~700k rows on a large tenant), ship them all to Node and count
+     * them in JS — which is what blew the statement timeout. Now Postgres returns one row per group.
+     * Names are looked up AFTER the GROUP BY, on the few group ids, not joined onto every execution.
+     *
+     * key/ref: the group id (text) and the uuid its name is looked up by. baseJoin: extra joins the key
+     * or filter needs. filter: row filter for `filterValue` ($2); a typed one (`::uuid`) needs a
+     * uuid-shaped value, otherwise nothing can match.
+     */
+    const suiteId = "COALESCE(ci.snapshot_suite_id, t.suite_id)";
+    const priority = "COALESCE(NULLIF(COALESCE(ci.snapshot_priority, t.priority), ''), 'Unspecified')";
+    const joinTestcase = "LEFT JOIN testcases t ON t.id = ci.testcase_id";
+    type GroupMode = { key: string; ref: string; baseJoin: string; nameJoin: string; name: string; filter: string; typedFilter?: boolean };
+    const modes: Record<string, GroupMode> = {
+      run: {
+        key: "c.id::text",
+        ref: "c.id",
+        baseJoin: "",
+        nameJoin: "LEFT JOIN cycles x ON x.id = a.ref",
+        name: "COALESCE(x.name, 'Untitled test run')",
+        filter: "c.id = $2::uuid",
+        typedFilter: true
+      },
+      person: {
+        key: "COALESCE(e.assignee_id::text, 'unassigned')",
+        ref: "e.assignee_id",
+        baseJoin: "",
+        nameJoin: "LEFT JOIN users x ON x.id = a.ref",
+        name: "COALESCE(x.name, x.email, 'Unassigned')",
+        filter: "COALESCE(e.assignee_id::text, 'unassigned') = $2"
+      },
+      plan: {
+        key: "COALESCE(c.plan_id::text, 'none')",
+        ref: "c.plan_id",
+        baseJoin: "",
+        nameJoin: "LEFT JOIN plans x ON x.id = a.ref",
+        name: "COALESCE(CASE WHEN x.deleted_at IS NOT NULL THEN x.name || ' (deleted)' ELSE x.name END, 'No Plan')",
+        filter: "COALESCE(c.plan_id::text, 'none') = $2"
+      },
+      suite: {
+        key: `COALESCE(${suiteId}::text, 'none')`,
+        ref: suiteId,
+        baseJoin: joinTestcase,
+        nameJoin: "LEFT JOIN suites x ON x.id = a.ref AND x.deleted_at IS NULL",
+        name: "COALESCE(x.name, 'No Suite')",
+        filter: `COALESCE(${suiteId}::text, 'none') = $2`
+      },
+      priority: {
+        key: priority,
+        ref: "NULL::uuid",
+        baseJoin: joinTestcase,
+        nameJoin: "",
+        name: "a.gkey",
+        filter: `${priority} = $2`
+      },
+      // A multi-tagged case lands in one group per tag; an untagged one in "untagged". A tag filter keeps
+      // the matching cases whole, so their other tags still get groups (pinned by RPT-A-13).
+      tags: {
+        key: "COALESCE(ct.id::text, 'untagged')",
+        ref: "ct.id",
+        baseJoin:
+          "LEFT JOIN testcase_custom_tags tct ON tct.testcase_id = ci.testcase_id LEFT JOIN custom_tags ct ON ct.id = tct.tag_id",
+        nameJoin: "LEFT JOIN custom_tags x ON x.id = a.ref",
+        name: "COALESCE(x.name, 'Untagged')",
+        filter:
+          "EXISTS (SELECT 1 FROM testcase_custom_tags f WHERE f.testcase_id = ci.testcase_id AND f.tag_id = $2::uuid)",
+        typedFilter: true
       }
-    }
-    return {
-      filterBy,
-      filterValue,
-      rows: Array.from(groups.values()).sort((a, b) => Number(b.total || 0) - Number(a.total || 0))
     };
+    // "overall" and any unknown grouping fall back to per-run rows; "overall" ignores filterValue.
+    const mode = modes[filterBy] ?? modes.run;
+    const filtered = !!filterValue && filterBy !== "overall";
+    if (filtered && mode.typedFilter && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(filterValue!)) {
+      return { filterBy, filterValue, rows: [] };
+    }
+    // Per-group status counters; anything outside the six reported statuses counts as Untested.
+    const statusKeys = ["Passed", "Failed", "Blocked", "Skipped", "Untested", "Retest"] as const;
+    const counters = statusKeys
+      .map((s) =>
+        s === "Untested"
+          ? `COUNT(*) FILTER (WHERE e.status IS NULL OR e.status NOT IN ('Passed','Failed','Blocked','Skipped','Retest'))::int AS "Untested"`
+          : `COUNT(*) FILTER (WHERE e.status = '${s}')::int AS "${s}"`
+      )
+      .join(", ");
+    const res = await this.db.query(
+      `SELECT a.gkey AS "groupId", ${mode.name} AS "groupName",
+              a."Passed", a."Failed", a."Blocked", a."Skipped", a."Untested", a."Retest", a.total
+         FROM (
+           SELECT ${mode.key} AS gkey, ${mode.ref} AS ref, ${counters}, COUNT(*)::int AS total
+             FROM cycles c
+             JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
+             LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+             ${mode.baseJoin}
+            WHERE c.project_id = $1 AND c.deleted_at IS NULL${filtered ? ` AND ${mode.filter}` : ""}
+            GROUP BY 1, 2
+         ) a
+         ${mode.nameJoin}
+        ORDER BY a.total DESC, 2, a.gkey`,
+      filtered ? [projectId, filterValue] : [projectId]
+    );
+    return { filterBy, filterValue, rows: res.rows };
   }
 
-  async requirementMatrix(projectId: string) {
-    const res = await this.db.query(
-      `SELECT
-         t.id AS testcase_id,
+  /**
+   * `limit` pages by TEST CASE (a case's runs are never split across pages) and adds `total` — the
+   * number of matching cases — to the result; `search` keeps only rows matching id/title/run/bug, as
+   * the tab's old client-side filter did. Without `limit` every row comes back, which the export and MCP
+   * callers rely on. The screen pages because one row per case-per-run is ~700k rows on a large tenant.
+   */
+  async requirementMatrix(projectId: string, opts: { limit?: number; offset?: number; search?: string } = {}) {
+    const cols = `t.id AS testcase_id,
          COALESCE(t.external_id, '') AS external_id,
          COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS testcase_title,
          COALESCE(t.priority, '') AS priority,
@@ -9111,18 +9140,46 @@ export class LegacyService implements OnModuleInit {
          b.id AS bug_id,
          b.title AS bug_title,
          b.status AS bug_status,
-         b.external_url AS bug_url
-       FROM testcases t
-       LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+         b.external_url AS bug_url`;
+    const joins = `LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
        LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
        LEFT JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       LEFT JOIN bugs b ON b.execution_id = e.id AND b.deleted_at IS NULL
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
-       ORDER BY t.external_id, c.created_at DESC NULLS LAST`,
-      [projectId]
-    );
-    return { rows: res.rows.map(toCamel) };
+       LEFT JOIN bugs b ON b.execution_id = e.id AND b.deleted_at IS NULL`;
+    const base = "t.project_id = $1 AND t.deleted_at IS NULL";
+    const order = "ORDER BY t.external_id, t.id, c.created_at DESC NULLS LAST";
+    const params: unknown[] = [projectId];
+    let match = "";
+    const term = opts.search?.trim();
+    if (term) {
+      params.push(`%${term.replace(/[\\%_]/g, "\\$&")}%`);
+      match = ` AND (COALESCE(t.external_id, '') ILIKE $2 OR COALESCE(t.title, ci.snapshot_title, '') ILIKE $2
+                     OR COALESCE(c.name, '') ILIKE $2 OR COALESCE(b.title, '') ILIKE $2)`;
+    }
+
+    if (opts.limit === undefined) {
+      const res = await this.db.query(`SELECT ${cols} FROM testcases t ${joins} WHERE ${base}${match} ${order}`, params);
+      return { rows: res.rows.map(toCamel) };
+    }
+
+    // No upper bound: a caller that asks for more cases per page gets them.
+    const limit = Math.max(Math.trunc(opts.limit) || 50, 1);
+    const offset = Math.max(Math.trunc(opts.offset ?? 0) || 0, 0);
+    // The cases on the page / in the result. Without a search no cycle joins are needed to pick them.
+    const matched = term
+      ? `SELECT DISTINCT t.id, t.external_id FROM testcases t ${joins} WHERE ${base}${match}`
+      : `SELECT t.id, t.external_id FROM testcases t WHERE ${base}`;
+    const [total, res] = await Promise.all([
+      this.db.query<{ count: number }>(`SELECT COUNT(*)::int AS count FROM (${matched}) m`, params),
+      this.db.query(
+        `WITH page AS (
+           SELECT id FROM (${matched}) m ORDER BY external_id, id LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+         )
+         SELECT ${cols} FROM testcases t JOIN page p ON p.id = t.id ${joins} WHERE ${base}${match} ${order}`,
+        [...params, limit, offset]
+      )
+    ]);
+    return { rows: res.rows.map(toCamel), total: total.rows[0]?.count ?? 0, limit, offset };
   }
 
   /*
@@ -9326,16 +9383,21 @@ export class LegacyService implements OnModuleInit {
     }>(
       `SELECT c.id, c.name, c.created_at,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
-       FROM cycles c
+       FROM (
+         -- Only the newest N runs are ever reported, so pick them first. Aggregating every run
+         -- in the project and slicing in JS meant counting all ~700k executions for ten rows of output.
+         SELECT id, name, created_at FROM cycles
+          WHERE project_id = $1 AND deleted_at IS NULL
+          ORDER BY created_at DESC, id DESC
+          LIMIT $2
+       ) c
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.project_id = $1 AND c.deleted_at IS NULL
-       GROUP BY c.id
-       ORDER BY c.created_at ASC`,
-      [projectId]
+       GROUP BY c.id, c.name, c.created_at
+       ORDER BY c.created_at ASC, c.id ASC`,
+      [projectId, limit]
     );
-    const rows = res.rows.slice(-limit);
-    return rows.map((r) => {
+    return res.rows.map((r) => {
       const passed = Number(r.passed) || 0;
       const failed = Number(r.failed) || 0;
       const blocked = Number(r.blocked) || 0;
@@ -9434,83 +9496,111 @@ export class LegacyService implements OnModuleInit {
 
   private async untestedP1Count(projectId: string) {
     const res = await this.db.query<{ count: string }>(
-      `SELECT COUNT(*)::int AS count FROM (
-         SELECT t.id
+      // NOT EXISTS stops at the first settled execution per P1 case instead of joining and grouping
+      // every execution the case ever had.
+      `SELECT COUNT(*)::int AS count
          FROM testcases t
-         LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
-           AND EXISTS (SELECT 1 FROM cycles c WHERE c.id = ci.cycle_id AND c.deleted_at IS NULL)
-         -- A soft-deleted result is not a result; it used to make an untested P1 read as tested.
-         LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-         WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")} AND t.priority = 'P1'
-         GROUP BY t.id
-         HAVING COUNT(*) FILTER (WHERE e.status IS NOT NULL AND e.status <> 'Untested') = 0
-       ) sub`,
+        WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")} AND t.priority = 'P1'
+          AND NOT EXISTS (
+            SELECT 1 FROM cycle_items ci
+              -- A soft-deleted result is not a result; it used to make an untested P1 read as tested.
+              JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+             WHERE ci.testcase_id = t.id AND ci.deleted_at IS NULL
+               -- Only items still in a live run: a deleted run's results don't make a case tested.
+               AND EXISTS (SELECT 1 FROM cycles c WHERE c.id = ci.cycle_id AND c.deleted_at IS NULL)
+               AND e.status IS NOT NULL AND e.status <> 'Untested'
+          )`,
       [projectId]
     );
     return Number(res.rows[0]?.count || 0);
   }
 
+  /** Runs `run` once for concurrent callers with the same key; the entry is dropped when it settles, so nothing is ever served stale. */
+  private readonly inflightReads = new Map<string, Promise<any>>();
+  private dedupe<T>(key: string, run: () => Promise<T>): Promise<T> {
+    let pending = this.inflightReads.get(key);
+    if (!pending) {
+      pending = run().finally(() => this.inflightReads.delete(key));
+      this.inflightReads.set(key, pending);
+    }
+    return pending;
+  }
+
   private async detectFlakyTests(projectId: string) {
-    const res = await this.db.query<{
+    // Only the 20 flakiest cases are ever reported, so rank them in SQL (a case is flaky when it has 2+
+    // settled results and more than one distinct status; flips = status changes between consecutive
+    // runs, oldest first) and fetch run-by-run detail for those 20 alone. This used to ship every
+    // settled execution in the project to Node and walk them there.
+    const ranked = await this.db.query<{ testcase_id: string; flips: number; results: number }>(
+      `SELECT testcase_id, COUNT(*) FILTER (WHERE prev IS NOT NULL AND prev <> status)::int AS flips, COUNT(*)::int AS results
+         FROM (
+           SELECT ci.testcase_id, e.status,
+                  LAG(e.status) OVER (PARTITION BY ci.testcase_id ORDER BY c.created_at, c.id, ci.created_at, ci.id) AS prev
+             FROM cycles c
+             JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
+             JOIN executions e ON e.cycle_item_id = ci.id
+            WHERE c.project_id = $1 AND c.deleted_at IS NULL
+              AND e.status IS NOT NULL AND e.status <> 'Untested'
+         ) s
+        GROUP BY testcase_id
+       HAVING COUNT(*) >= 2 AND COUNT(DISTINCT status) >= 2
+        ORDER BY flips DESC, testcase_id
+        LIMIT 20`,
+      [projectId]
+    );
+    if (ranked.rows.length === 0) return [];
+    const detail = await this.db.query<{
       testcase_id: string;
       external_id: string;
       title: string;
       suite_name: string;
       status: string;
       run_name: string;
-      run_created_at: string;
     }>(
       `SELECT ci.testcase_id, COALESCE(ci.snapshot_external_id, t.external_id, '') AS external_id,
               COALESCE(t.title, ci.snapshot_title, 'Untitled test case') AS title,
               COALESCE(s.name, 'Unassigned') AS suite_name,
-              e.status, c.name AS run_name, c.created_at AS run_created_at
+              e.status, c.name AS run_name
        FROM cycle_items ci
        JOIN executions e ON e.cycle_item_id = ci.id
        JOIN cycles c ON c.id = ci.cycle_id
        LEFT JOIN testcases t ON t.id = ci.testcase_id
        LEFT JOIN suites s ON s.id = COALESCE(ci.snapshot_suite_id, t.suite_id) AND s.deleted_at IS NULL
-       WHERE c.project_id = $1 AND c.deleted_at IS NULL AND ci.deleted_at IS NULL
+       WHERE ci.testcase_id = ANY($2::uuid[]) AND c.project_id = $1 AND c.deleted_at IS NULL AND ci.deleted_at IS NULL
          AND e.status IS NOT NULL AND e.status <> 'Untested'
-       ORDER BY ci.testcase_id, c.created_at ASC`,
-      [projectId]
+       ORDER BY ci.testcase_id, c.created_at ASC, c.id, ci.created_at, ci.id`,
+      [projectId, ranked.rows.map((r) => r.testcase_id)]
     );
-    const byTestcase = new Map<string, typeof res.rows>();
-    for (const row of res.rows) {
+    const byTestcase = new Map<string, typeof detail.rows>();
+    for (const row of detail.rows) {
       const list = byTestcase.get(row.testcase_id) || [];
       list.push(row);
       byTestcase.set(row.testcase_id, list);
     }
-    const flaky: Body[] = [];
-    for (const [testcaseId, rows] of byTestcase) {
-      if (rows.length < 2) continue;
-      const distinctStatuses = new Set(rows.map((r) => r.status));
-      if (distinctStatuses.size < 2) continue;
-      let flips = 0;
-      for (let i = 1; i < rows.length; i++) {
-        if (rows[i].status !== rows[i - 1].status) flips++;
-      }
-      const flipRate = flips / (rows.length - 1);
-      flaky.push({
-        testcaseId,
-        externalId: rows[0].external_id,
-        title: rows[0].title,
-        suiteName: rows[0].suite_name,
-        runs: rows.map((r) => ({ runName: r.run_name, status: r.status })),
-        flipCount: flips,
+    return ranked.rows.map((r) => {
+      const rows = byTestcase.get(r.testcase_id) ?? [];
+      const flipRate = r.flips / (r.results - 1);
+      return {
+        testcaseId: r.testcase_id,
+        externalId: rows[0]?.external_id ?? "",
+        title: rows[0]?.title ?? "Untitled test case",
+        suiteName: rows[0]?.suite_name ?? "Unassigned",
+        runs: rows.map((x) => ({ runName: x.run_name, status: x.status })),
+        flipCount: r.flips,
         flakinessLabel: flipRate >= 0.5 ? "High" : flipRate >= 0.25 ? "Medium" : "Low"
-      });
-    }
-    flaky.sort((a, b) => (b.flipCount as number) - (a.flipCount as number));
-    return flaky.slice(0, 20);
+      } as Body;
+    });
   }
 
   async reportsOverview(projectId: string) {
+    // The Reports page requests overview and insights at the same moment and they share four of these
+    // reads; dedupe() lets the second request ride on the first one's in-flight query.
     const [passRateSeries, suiteHealth, coverage, untestedP1, flaky] = await Promise.all([
-      this.cyclePassRateSeries(projectId, 10),
+      this.dedupe(`passRate10:${projectId}`, () => this.cyclePassRateSeries(projectId, 10)),
       this.suiteHealth(projectId),
-      this.coverageBySuite(projectId),
-      this.untestedP1Count(projectId),
-      this.detectFlakyTests(projectId)
+      this.dedupe(`coverage:${projectId}`, () => this.coverageBySuite(projectId)),
+      this.dedupe(`untestedP1:${projectId}`, () => this.untestedP1Count(projectId)),
+      this.dedupe(`flaky:${projectId}`, () => this.detectFlakyTests(projectId))
     ]);
     const withRate = passRateSeries.filter((p) => p.passRate !== null);
     const trendDelta = withRate.length >= 2 ? withRate[withRate.length - 1].passRate! - withRate[0].passRate! : 0;
@@ -9543,10 +9633,10 @@ export class LegacyService implements OnModuleInit {
 
   async reportsInsights(projectId: string) {
     const [coverage, untestedP1, flaky, passRateSeries] = await Promise.all([
-      this.coverageBySuite(projectId),
-      this.untestedP1Count(projectId),
-      this.detectFlakyTests(projectId),
-      this.cyclePassRateSeries(projectId, 10)
+      this.dedupe(`coverage:${projectId}`, () => this.coverageBySuite(projectId)),
+      this.dedupe(`untestedP1:${projectId}`, () => this.untestedP1Count(projectId)),
+      this.dedupe(`flaky:${projectId}`, () => this.detectFlakyTests(projectId)),
+      this.dedupe(`passRate10:${projectId}`, () => this.cyclePassRateSeries(projectId, 10))
     ]);
     const withRate = passRateSeries.filter((p) => p.passRate !== null);
     const avgPassRate = withRate.length > 0 ? withRate.reduce((sum, p) => sum + (p.passRate as number), 0) / withRate.length : 0;

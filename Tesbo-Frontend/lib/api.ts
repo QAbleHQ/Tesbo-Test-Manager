@@ -3152,8 +3152,16 @@ export interface RequirementMatrixRow {
   bugUrl: string | null;
 }
 
-export async function getRequirementMatrix(projectId: string): Promise<{ rows: RequirementMatrixRow[] }> {
-  return api<{ rows: RequirementMatrixRow[] }>(`/api/projects/${projectId}/reports/requirement-matrix`);
+// Paged by test case: `total` is the number of matching test cases, not rows.
+export async function getRequirementMatrix(
+  projectId: string,
+  opts: { limit: number; offset: number; search?: string },
+): Promise<{ rows: RequirementMatrixRow[]; total: number }> {
+  const qs = new URLSearchParams({ limit: String(opts.limit), offset: String(opts.offset) });
+  if (opts.search) qs.set("search", opts.search);
+  return api<{ rows: RequirementMatrixRow[]; total: number }>(
+    `/api/projects/${projectId}/reports/requirement-matrix?${qs}`,
+  );
 }
 
 // ── Report: Repository Summary ──

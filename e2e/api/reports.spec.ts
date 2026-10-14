@@ -708,6 +708,91 @@ test.describe("traceability matrix", () => {
       expect(body).toEqual({ rows: [] });
     });
   });
+
+  // The Reports tab pages the matrix by test case; without `limit` the full matrix is unchanged
+  // (RPT-A-19..23), which is what the export and MCP callers rely on.
+  test("RPT-A-23b paging is by test case: a case's runs are never split across pages and no case repeats", async () => {
+    const url = `/api/projects/${fixture.projectId}/reports/requirement-matrix`;
+    const full = await getJson(asOwner, url);
+    const caseIds: string[] = [...new Set<string>(full.rows.map((r: any) => r.testcaseId))];
+    expect(caseIds.length).toBeGreaterThan(2);
+
+    const seen: string[] = [];
+    let rowTotal = 0;
+    for (let offset = 0; offset < caseIds.length; offset += 2) {
+      const page = await getJson(asOwner, `${url}?limit=2&offset=${offset}`);
+      expect(page.total).toBe(caseIds.length);
+      expect(page.limit).toBe(2);
+      expect(page.offset).toBe(offset);
+      const pageCaseIds = [...new Set<string>(page.rows.map((r: any) => r.testcaseId))];
+      expect(pageCaseIds.length).toBeLessThanOrEqual(2);
+      // Every run of a case on the page is present (not cut mid-case).
+      for (const id of pageCaseIds) {
+        expect(page.rows.filter((r: any) => r.testcaseId === id)).toHaveLength(
+          full.rows.filter((r: any) => r.testcaseId === id).length,
+        );
+      }
+      seen.push(...pageCaseIds);
+      rowTotal += page.rows.length;
+    }
+    expect(seen).toHaveLength(caseIds.length);
+    expect(new Set(seen).size).toBe(caseIds.length);
+    expect(rowTotal).toBe(full.rows.length);
+
+    const past = await getJson(asOwner, `${url}?limit=2&offset=${caseIds.length + 10}`);
+    expect(past.rows).toEqual([]);
+    expect(past.total).toBe(caseIds.length);
+  });
+
+  test("RPT-A-23c a server-side search narrows to matching rows and reports the matching case count", async () => {
+    const url = `/api/projects/${fixture.projectId}/reports/requirement-matrix`;
+    const byId = await getJson(
+      asOwner,
+      `${url}?limit=50&offset=0&search=${encodeURIComponent(fixture.cases.flaky.externalId)}`,
+    );
+    expect(byId.total).toBe(1);
+    expect(byId.rows).toHaveLength(11);
+    expect(byId.rows.every((r: any) => r.testcaseId === fixture.cases.flaky.id)).toBeTruthy();
+
+    // A bug title matches only the rows that carry the bug, as the old client-side filter did.
+    const byBug = await getJson(
+      asOwner,
+      `${url}?limit=50&offset=0&search=${encodeURIComponent(fixture.bugTitles.thisWeek)}`,
+    );
+    expect(byBug.rows.length).toBeGreaterThan(0);
+    expect(byBug.rows.every((r: any) => r.bugTitle === fixture.bugTitles.thisWeek)).toBeTruthy();
+
+    const none = await getJson(asOwner, `${url}?limit=50&offset=0&search=zzz-matches-nothing-${Date.now()}`);
+    expect(none).toMatchObject({ rows: [], total: 0 });
+  });
+
+  test("RPT-A-23d search text is literal: LIKE wildcards match nothing, and limit is not capped", async () => {
+    const url = `/api/projects/${fixture.projectId}/reports/requirement-matrix`;
+    const full = await getJson(asOwner, url);
+    // Every fixture title starts "E2E Reports ...", so an unescaped `_` or `%` would match it.
+    const literal = await getJson(asOwner, `${url}?limit=50&offset=0&search=${encodeURIComponent("E2E Reports")}`);
+    expect(literal.total).toBeGreaterThan(0);
+    for (const wildcard of ["E_E Reports", "E%Reports", "E\\E Reports"]) {
+      const body = await getJson(asOwner, `${url}?limit=50&offset=0&search=${encodeURIComponent(wildcard)}`);
+      expect(body.total, `search "${wildcard}" must be matched literally`).toBe(0);
+    }
+    // No upper bound on limit: it is honoured as asked, never silently cut to a smaller page.
+    const huge = await getJson(asOwner, `${url}?limit=100000&offset=0`);
+    expect(huge.limit).toBe(100000);
+    expect(huge.rows).toHaveLength(full.rows.length);
+    const nonPositive = await getJson(asOwner, `${url}?limit=-5&offset=0`);
+    expect(nonPositive.limit).toBe(1);
+    const junk = await getJson(asOwner, `${url}?limit=abc`);
+    expect(Array.isArray(junk.rows)).toBeTruthy(); // not a number: falls back to the unpaged matrix
+    expect(junk.total).toBeUndefined();
+  });
+
+  test("RPT-A-23e a paged request on an empty project reports zero cases", async () => {
+    await withEmptyProject(async (projectId) => {
+      const body = await getJson(asOwner, `/api/projects/${projectId}/reports/requirement-matrix?limit=50&offset=0`);
+      expect(body).toEqual({ rows: [], total: 0, limit: 50, offset: 0 });
+    });
+  });
 });
 
 test.describe("repository summary", () => {
@@ -1404,7 +1489,54 @@ test.describe("report export", () => {
     }
   });
 
-  test("RPT-A-61 an unknown view is refused, naming the ones that exist", { tag: '@tesbo.testId("TES-TC-1204")' }, async () => {
+  test("RPT-A-60b the matrix is streamed page by page: a project past one page exports every case once, as csv and xlsx", async () => {
+    // The export reads 200 test cases per page, so only a project bigger than that exercises the page
+    // loop — the 6-case fixture never leaves page one. 205 cases = one full page + a partial one.
+    test.setTimeout(240_000);
+    const stamp = Date.now();
+    const projectId = await seedProject(asOwner, `E2E Export Streaming ${stamp}`);
+    try {
+      const total = 205;
+      for (let i = 0; i < total; i += 15) {
+        await Promise.all(
+          Array.from({ length: Math.min(15, total - i) }, (_, k) =>
+            seedTestCase(asOwner, projectId, { title: `E2E stream case ${stamp}-${i + k}`, priority: "P3" }),
+          ),
+        );
+      }
+      const json = await getJson(asOwner, `/api/projects/${projectId}/reports/requirement-matrix`);
+      expect(json.rows).toHaveLength(total);
+
+      const csv = csvRows(await (await asOwner.get(`/api/projects/${projectId}/reports/export/csv?view=matrix`)).text());
+      const titleCol = csv[0].indexOf("testcaseTitle");
+      const csvTitles = csv.slice(1).map((r) => r[titleCol]);
+      expect(csvTitles, "one csv row per case, header excluded").toHaveLength(total);
+      expect(new Set(csvTitles).size, "no case may repeat across the page boundary").toBe(total);
+
+      const xlsxRes = await asOwner.get(`/api/projects/${projectId}/reports/export/xlsx?view=matrix`);
+      expect(xlsxRes.status()).toBe(200);
+      expect(xlsxRes.headers()["content-disposition"]).toContain('filename="report-matrix.xlsx"');
+      const sheet = XLSX.read(await xlsxRes.body(), { type: "buffer" });
+      const sheetRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet.Sheets[sheet.SheetNames[0]]);
+      expect(sheetRows).toHaveLength(total);
+      expect(new Set(sheetRows.map((r) => r.testcaseTitle)).size).toBe(total);
+    } finally {
+      purgeProject(projectId);
+    }
+  });
+
+  test("RPT-A-60c a matrix export of a project the caller cannot open is refused before any file is sent", async () => {
+    // The first page carries the access check and runs before streaming starts; if it ran after, the
+    // refusal would be a half-written 200.
+    const res = await asOwner.get(
+      `/api/projects/00000000-0000-0000-0000-000000000000/reports/export/csv?view=matrix`,
+      { failOnStatusCode: false },
+    );
+    expect([403, 404]).toContain(res.status());
+    expect(res.headers()["content-disposition"] ?? "").not.toContain("attachment");
+  });
+
+  test("RPT-A-61 an unknown view is refused, naming the ones that exist",{ tag: '@tesbo.testId("TES-TC-1204")' }, async () => {
     const res = await asOwner.get(exportUrl("everything", "csv"), { failOnStatusCode: false });
     expect(res.status()).toBe(400);
     const { error } = await res.json();
