@@ -69,7 +69,9 @@ interface ReportsExecFiltersData {
  * Named per view because the export is per view — the file says which report it is, and the menu
  * says which one it is about to hand over. Same six ids as ReportsNav.
  */
-const MATRIX_PAGE_SIZE = 50; // test cases per page of the Traceability tab
+// Test cases per page of the Traceability tab. A page is one row per case per run, so on a project where
+// each case has been run ~140 times 50 cases is ~7,000 rows to send, parse and render; 20 is ~2,800.
+const MATRIX_PAGE_SIZE = 20;
 
 const REPORT_VIEW_LABELS: Record<ReportView, string> = {
   overview: "Overview",

@@ -679,6 +679,87 @@ test.describe("list-cycles bucket counts", () => {
       });
     }
   });
+  // `?limit=N` returns the newest N runs, counted without reading the older runs' executions: the project
+  // home draws four run cards and used to aggregate every execution of every run to do it.
+  test("?limit=N returns the newest N runs with the same counts the full list gives them", async ({ request }) => {
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const runIds: string[] = [];
+    let caseIds: string[] = [];
+    try {
+      const created = await (
+        await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: { testcases: [0, 1, 2].map((i) => ({ title: `E2E Limit Case ${stamp}-${i}`, status: "Approved" })) },
+        })
+      ).json();
+      caseIds = created.created.map((c: { id: string }) => c.id);
+
+      // Three runs of different sizes, created in turn so created_at increases: 1, 2 and 3 cases.
+      for (let i = 0; i < 3; i++) {
+        const run = await (
+          await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Limit Run ${stamp}-${i}` } })
+        ).json();
+        runIds.push(run.id);
+        const add = await request.post(`/api/cycles/${run.id}/testcases`, { data: { testcaseIds: caseIds.slice(0, i + 1) } });
+        expect(add.ok(), await add.text()).toBeTruthy();
+      }
+
+      // Other spec files create runs in this project at the same time, so which two are newest can change
+      // between requests. Assert on what cannot: the count, the ordering, and each returned run's numbers.
+      const limited: { id: string; createdAt: string; totalCases: number }[] = await (
+        await request.get(`/api/projects/${ctx.projectId}/cycles`, { params: { limit: 2 } })
+      ).json();
+      expect(limited).toHaveLength(2);
+      expect(Date.parse(limited[0].createdAt), "newest first").toBeGreaterThanOrEqual(Date.parse(limited[1].createdAt));
+
+      // Compared on identity only: a neighbouring spec's run can have its execution counts change between
+      // the two requests, and the counts of the runs this test made are checked below, where nothing else
+      // touches them.
+      const full: { id: string; name: string; createdAt: string }[] = await (
+        await request.get(`/api/projects/${ctx.projectId}/cycles`)
+      ).json();
+      for (const run of limited) {
+        const same = full.find((r) => r.id === run.id);
+        expect(same, "a run the limited list returned is missing from the full list").toBeTruthy();
+        expect({ name: same!.name, createdAt: same!.createdAt }).toEqual({ name: (run as unknown as { name: string }).name, createdAt: run.createdAt });
+      }
+
+      // A limit bigger than the project's runs is all of them; limit=1 is exactly one.
+      const huge = await (await request.get(`/api/projects/${ctx.projectId}/cycles`, { params: { limit: 100000 } })).json();
+      expect(huge.length).toBeGreaterThanOrEqual(3);
+      const one = await (await request.get(`/api/projects/${ctx.projectId}/cycles`, { params: { limit: 1 } })).json();
+      expect(one).toHaveLength(1);
+
+      // A limit that means nothing falls back to the full list rather than erroring or returning none.
+      for (const bad of ["0", "-3", "abc", ""]) {
+        const res = await request.get(`/api/projects/${ctx.projectId}/cycles`, { params: { limit: bad }, failOnStatusCode: false });
+        expect(res.status(), `limit=${bad}`).toBe(200);
+        expect((await res.json()).length, `limit=${bad}`).toBeGreaterThanOrEqual(3);
+      }
+
+      // The three runs just made are all in the unlimited list, with the sizes they were given.
+      const sizes = new Map((full as unknown as { id: string; totalCases: number }[]).map((r) => [r.id, r.totalCases]));
+      expect(runIds.map((id) => sizes.get(id))).toEqual([1, 2, 3]);
+    } finally {
+      for (const id of runIds) await request.delete(`/api/cycles/${id}`, { failOnStatusCode: false });
+      if (caseIds.length) {
+        await request.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, { data: { testcaseIds: caseIds }, failOnStatusCode: false });
+      }
+    }
+  });
+
+  test("?limit=N is still access-checked and project-scoped", async ({ request }) => {
+    const res = await request.get(`/api/projects/${ctx.projectId}/cycles`, { params: { limit: 5 } });
+    expect(res.ok()).toBeTruthy();
+    for (const run of await res.json()) expect(run.projectId).toBe(ctx.projectId);
+
+    const anon = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    try {
+      const refused = await anon.get(`/api/projects/${ctx.projectId}/cycles`, { params: { limit: 5 }, failOnStatusCode: false });
+      expect(refused.status()).toBe(401);
+    } finally {
+      await anon.dispose();
+    }
+  });
 });
 
 /*

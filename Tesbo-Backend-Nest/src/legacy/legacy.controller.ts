@@ -667,8 +667,9 @@ export class LegacyController {
   }
 
   @Get("/api/projects/:projectId/cycles")
-  listCycles(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
-    return this.legacy.listCyclesForUser(req.userId, projectId);
+  listCycles(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    // `?limit=N` returns only the newest N runs (the project home asks for four); without it, every run.
+    return this.legacy.listCyclesForUser(req.userId, projectId, { limit: query.limit !== undefined ? Number(query.limit) : undefined });
   }
 
   @Post("/api/projects/:projectId/cycles")
