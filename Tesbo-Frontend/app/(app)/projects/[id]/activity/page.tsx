@@ -61,6 +61,8 @@ export default function ActivityPage() {
   // below revalidate it in the background, instead of blocking behind a spinner on every click.
   const [loading, setLoading] = useState(!cached);
   const [loadingMore, setLoadingMore] = useState(false);
+  // A failed load used to render as "No activity yet", which reads as an empty project rather than an error.
+  const [loadFailed, setLoadFailed] = useState(false);
   const [offset, setOffset] = useState(cached?.offset ?? 0);
 
   const [typeFilter, setTypeFilter] = useState("");
@@ -80,6 +82,7 @@ export default function ActivityPage() {
     // re-show the spinner over data the user can already see.
     async (reset: boolean, currentOffset: number, options?: { silent?: boolean }) => {
       if (reset) {
+        setLoadFailed(false);
         if (!options?.silent) setLoading(true);
       } else {
         setLoadingMore(true);
@@ -108,7 +111,11 @@ export default function ActivityPage() {
           });
         }
       } catch {
-        if (reset) setActivities([]);
+        // A silent revalidation keeps the cached rows already on screen; only a visible load clears them.
+        if (reset && !options?.silent) {
+          setActivities([]);
+          setLoadFailed(true);
+        }
       } finally {
         setLoading(false);
         setLoadingMore(false);
@@ -236,6 +243,17 @@ export default function ActivityPage() {
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             </div>
+          ) : loadFailed && activities.length === 0 ? (
+            <EmptyStateBlock
+              title="Couldn't load activity"
+              description="The activity feed didn't respond. Try again in a moment."
+              icon={<IconActivity size={28} stroke={1.5} />}
+              action={
+                <Button variant="secondary" size="md" onClick={() => fetchActivities(true, 0)}>
+                  Retry
+                </Button>
+              }
+            />
           ) : activities.length === 0 ? (
             <EmptyStateBlock
               title="No activity yet"

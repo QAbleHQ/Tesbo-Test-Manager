@@ -606,6 +606,55 @@ test.describe("project dashboard summary", () => {
     }
   });
 
+
+  test("DSH-A-08b executions older than 14 days never move deltaThisWeek, but still count toward the all-time pass rate", async () => {
+    /*
+     * The delta is read from the last 14 days only, so the query is bounded to that window (and indexed on
+     * executed_at). That bound must not change the answer: older history is invisible to the delta, and
+     * the boundary sits at exactly 14 days.
+     */
+    test.skip(!dbControlAvailable(), "needs psql access to place executions in the comparison windows");
+    const project = await createProject(api);
+    try {
+      // Recent window: 2 of 2 passed = 100%.
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed"] });
+      // Just inside the prior window (13d 23h): 1 of 2 passed = 50%. Delta = +50.
+      const inside = await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+      backdate("executions", "executed_at", inside.executionIds, "13 days 23 hours");
+      expect((await getDashboard(api, project.id)).passRate.deltaThisWeek).toBe(50);
+
+      // Just outside it (14d 1h), a month back, and over a year back: all failures, none of them in either window.
+      const justOutside = await seedRun(api, project.id, { statuses: ["Failed", "Failed"] });
+      backdate("executions", "executed_at", justOutside.executionIds, "14 days 1 hour");
+      const monthOld = await seedRun(api, project.id, { statuses: ["Failed", "Failed", "Failed"] });
+      backdate("executions", "executed_at", monthOld.executionIds, "30 days");
+      const yearOld = await seedRun(api, project.id, { statuses: ["Failed"] });
+      backdate("executions", "executed_at", yearOld.executionIds, "400 days");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.deltaThisWeek, "history older than 14 days leaked into a comparison window").toBe(50);
+      // All-time pass rate still sees every execution: 3 passed of 9 settled.
+      expect(Math.round(summary.passRate.value ?? -1)).toBe(33);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-08c a project whose executions are all older than 14 days has a null delta and a real pass rate", async () => {
+    test.skip(!dbControlAvailable(), "needs psql access to place executions outside the comparison windows");
+    const project = await createProject(api);
+    try {
+      const old = await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Failed", "Failed"] });
+      backdate("executions", "executed_at", old.executionIds, "60 days");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.deltaThisWeek).toBeNull();
+      expect(summary.passRate.value).toBe(50);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
   test("DSH-A-09 openBugs counts Open and Reopened, and nothing else", { tag: '@tesbo.testId("TES-TC-419")' }, async () => {
     const project = await createProject(api);
     try {

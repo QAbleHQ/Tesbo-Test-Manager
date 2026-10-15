@@ -286,6 +286,35 @@ test.describe("connection pool under load", () => {
     for (const res of responses) expect(res.status()).toBe(200);
   });
 
+
+  test("a burst of dashboard, activity and report loads still leaves a light request answering promptly", async ({ request }) => {
+    /*
+     * Analytical reads are capped at a quarter of the pool (DatabaseService.heavyQuery), so a few page
+     * loads cannot take every connection and leave the ones behind them waiting for a free one. 24 heavy
+     * requests are well past that cap; a light read fired in the middle of them must not queue behind all
+     * of them, and every one of them must still complete.
+     */
+    test.setTimeout(120_000);
+    const p = `/api/projects/${ctx.projectId}`;
+    const heavy = Array.from({ length: 24 }, (_, i) =>
+      request.get([`${p}/dashboard`, `${p}/activity`, `${p}/activity/summary`, `${p}/reports/overview`][i % 4], {
+        params: i % 4 === 1 ? { limit: 30 } : undefined,
+        failOnStatusCode: false,
+      }),
+    );
+
+    // Fired while the burst is in flight.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const t0 = Date.now();
+    const light = await request.get(`${p}/testcases`, { params: { limit: 1 }, failOnStatusCode: false });
+    const lightMs = Date.now() - t0;
+
+    const responses = await Promise.all(heavy);
+    expect(light.status(), await light.text()).toBe(200);
+    expect(lightMs, `a light request took ${lightMs}ms while heavy reads were running`).toBeLessThan(5000);
+    for (const [i, res] of responses.entries()) expect(res.status(), `heavy request #${i}: ${await res.text()}`).toBe(200);
+  });
+
   test("a rejected request returns its connection instead of leaking it", { tag: '@tesbo.testId("TES-TC-974")' }, async ({ request }) => {
     // The leak this catches: a failing path that takes a client from the pool and never releases it
     // drains the pool one bad request at a time, and the symptom arrives much later as a hang. 25
