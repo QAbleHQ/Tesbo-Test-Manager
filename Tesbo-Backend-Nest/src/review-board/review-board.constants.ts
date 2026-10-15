@@ -11,5 +11,10 @@ export const RUN_LEASE_MINUTES = 10;
 /** A *running* run silent this long may be re-claimed by a redelivered (stalled) BullMQ job. */
 export const RUN_RECLAIM_MINUTES = 2;
 
-/** Weighted token-overlap score at or above which two non-identical cases are reported as Similar. */
-export const SIMILAR_THRESHOLD = 0.7;
+/**
+ * Score at or above which two non-identical cases are reported as Similar. The score is half wording similarity and
+ * half the share of identical steps (see blendedScore), which lands lower than wording alone did, so the cut-off was
+ * lowered from 0.70 to keep genuine near-duplicates listed (measured on the sandbox data: every earlier finding kept,
+ * while valid-vs-invalid look-alikes at 56-58% stay out).
+ */
+export const SIMILAR_THRESHOLD = 0.6;

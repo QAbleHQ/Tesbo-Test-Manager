@@ -15,6 +15,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface NotifyOptions {
   type: NotificationType;
   title: string;
+  /** The second line the bell shows under the title (`notifications.body`, TEXT). */
+  body?: string | null;
   link?: NotificationLink | null;
   /** Rides the (user_id, dedupe_key) unique index: a repeat for the same recipient is absorbed. */
   dedupeKey?: string;
@@ -42,7 +44,8 @@ export async function writeNotifications(
       clipNotificationTitle(opts.title),
       opts.link?.linkEntityType ?? null,
       opts.link?.linkEntityId ?? null,
-      opts.dedupeKey ?? null
+      opts.dedupeKey ?? null,
+      opts.body?.trim() || null
     ];
     let scope = "";
     if (opts.memberOf?.organizationId) {
@@ -54,8 +57,8 @@ export async function writeNotifications(
       scope += ` AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.user_id = u.id AND pm.project_id = $${params.length}::uuid)`;
     }
     const res = await db.query(
-      `INSERT INTO notifications (user_id, type, title, link_entity_type, link_entity_id, dedupe_key)
-       SELECT u.id, $2, $3, $4, $5, $6 FROM users u WHERE u.id = ANY($1::uuid[])${scope}
+      `INSERT INTO notifications (user_id, type, title, link_entity_type, link_entity_id, dedupe_key, body)
+       SELECT u.id, $2, $3, $4, $5, $6, $7::text FROM users u WHERE u.id = ANY($1::uuid[])${scope}
        ON CONFLICT (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
        RETURNING id`,
       params

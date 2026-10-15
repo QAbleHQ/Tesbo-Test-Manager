@@ -16,7 +16,8 @@ import { TestcasesListCacheService } from "../cache/testcases-list-cache.service
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
-import { analyse, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
+import { changesBetween, type FieldChange } from "./review-board.edit-diff";
+import { analyse, rescorePair, stepAgreement, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
 import {
   MAX_TESTCASES_PER_RUN,
   REVIEW_BOARD_JOB,
@@ -27,10 +28,22 @@ import {
 
 type Row = Record<string, any>;
 
+/**
+ * When a re-analysis sends an existing finding back to "To review": it had stopped matching (obsolete), or a decision of
+ * 'kept' no longer applies because either test case's content changed. An EDITED finding is never reopened — the
+ * reviewer already acted on it, it belongs in the Edited tab with its before/after, and further changes to those test
+ * cases are simply reflected in its refreshed match.
+ */
+const REOPENS_FINDING = `(review_recommendations.review_status = 'obsolete'
+               OR (review_recommendations.review_status <> 'edited'
+                   AND (review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
+                     OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b)))`;
+
 const REVIEW_STATUSES = ["pending", "kept", "edited", "removed", "obsolete"] as const;
 const EDITABLE_TEXT_FIELDS = ["title", "description", "preconditions", "postconditions", "testData"] as const;
 const MAX_STEPS_ON_EDIT = 200;
 const MAX_STEP_FIELD_CHARS = 5000;
+const EDIT_SNAPSHOT_COLUMNS = "title, description, preconditions, postconditions, test_data, steps";
 
 /** a.col AS a_col, … for every column a TestcaseSource needs, so each query selects exactly what the type requires. */
 const selectSide = (alias: "a" | "b") => TESTCASE_SOURCE_COLUMNS.map((c) => `${alias}.${c} AS ${alias}_${c}`).join(", ");
@@ -283,21 +296,9 @@ export class ReviewBoardService {
              similarity     = EXCLUDED.similarity,
              explanation    = EXCLUDED.explanation,
              differences    = EXCLUDED.differences,
-             review_status  = CASE
-               WHEN review_recommendations.review_status = 'obsolete' THEN 'pending'
-               WHEN review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
-                 OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b THEN 'pending'
-               ELSE review_recommendations.review_status END,
-             reviewed_by    = CASE
-               WHEN review_recommendations.review_status = 'obsolete'
-                 OR review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
-                 OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b THEN NULL
-               ELSE review_recommendations.reviewed_by END,
-             reviewed_at    = CASE
-               WHEN review_recommendations.review_status = 'obsolete'
-                 OR review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
-                 OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b THEN NULL
-               ELSE review_recommendations.reviewed_at END,
+             review_status  = CASE WHEN ${REOPENS_FINDING} THEN 'pending' ELSE review_recommendations.review_status END,
+             reviewed_by    = CASE WHEN ${REOPENS_FINDING} THEN NULL ELSE review_recommendations.reviewed_by END,
+             reviewed_at    = CASE WHEN ${REOPENS_FINDING} THEN NULL ELSE review_recommendations.reviewed_at END,
              fingerprint_a  = EXCLUDED.fingerprint_a,
              fingerprint_b  = EXCLUDED.fingerprint_b,
              -- Re-describes the finding from the current facts. Refreshing these never touches review_status above:
@@ -366,12 +367,10 @@ export class ReviewBoardService {
         `SELECT count(*)::text AS n FROM review_recommendations r ${live} WHERE r.project_id = $1 AND r.review_status = ANY($2::text[])`,
         [projectId, statuses]
       ),
-      this.db.query<{ review_status: string; n: string }>(
-        `SELECT r.review_status, count(*)::text AS n FROM review_recommendations r ${live} WHERE r.project_id = $1 GROUP BY r.review_status`,
-        [projectId]
-      )
+      this.loadCounts(projectId)
     ]);
 
+    const edits = await this.loadEdits(rows.rows.filter((r) => r.review_status === "edited").map((r) => r.id));
     const items = rows.rows.map((r) => {
       const caseA = toComparable(sourceOf(r, "a"));
       const caseB = toComparable(sourceOf(r, "b"));
@@ -387,6 +386,11 @@ export class ReviewBoardService {
         // stale finding are refused by the API, not just disabled in the UI.
         stale: staleReason !== null,
         staleReason,
+        // How many steps the two cases share RIGHT NOW (same action and expected result), so the number next to the
+        // match percentage is never out of date, even after an edit.
+        stepAgreement: stepAgreement(caseA, caseB),
+        // For an edited finding: which test case was edited and what changed (before / after). Null for everything else.
+        edit: edits.get(r.id) ?? null,
         reviewedBy: r.reviewed_by,
         reviewedAt: r.reviewed_at,
         lastAnalysis: { runId: r.last_run_id, status: r.run_status, finishedAt: r.run_finished_at },
@@ -394,9 +398,130 @@ export class ReviewBoardService {
         testcaseB: { id: caseB.id, externalId: caseB.externalId, title: caseB.title, repositoryName: project.name }
       };
     });
+    return { items, total: Number(total.rows[0].n), counts };
+  }
+
+  /**
+   * The before/after of each edited finding, from the audit entry written when the edit was saved. Edits saved before the
+   * Review Board recorded its own before/after are recovered from the standard `testcase_updated` entry of the same save
+   * (same test case, written moments earlier); if neither exists, `recorded` is false and the UI says so.
+   */
+  private async loadEdits(recommendationIds: string[]) {
+    const out = new Map<
+      string,
+      { testcaseId: string | null; editedAt: string; editedBy: string | null; similarityBefore: number | null; similarityAfter: number | null; recorded: boolean; changes: FieldChange[] }
+    >();
+    if (recommendationIds.length === 0) return out;
+    const parse = (v: unknown): Row => ((typeof v === "string" ? JSON.parse(v) : v) ?? {}) as Row;
+    const res = await this.db.query(
+      `SELECT DISTINCT ON (a.entity_id) a.entity_id AS rec_id, a.created_at, a.diff, u.name AS actor_name
+         FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
+        WHERE a.action = 'review_board_edited' AND a.entity_id = ANY($1::text[])
+        ORDER BY a.entity_id, a.created_at DESC`,
+      [recommendationIds]
+    );
+    await Promise.all(
+      res.rows.map(async (row) => {
+        const diff = parse(row.diff);
+        let changes: FieldChange[] | null = Array.isArray(diff.changes) ? (diff.changes as FieldChange[]) : null;
+        if (changes === null && typeof diff.editedTestcaseId === "string") {
+          const legacy = await this.db.query(
+            `SELECT diff FROM audit_logs
+              WHERE action = 'testcase_updated' AND entity_id = $1
+                AND created_at <= $2 AND created_at >= $2::timestamptz - interval '2 minutes'
+              ORDER BY created_at DESC LIMIT 1`,
+            [diff.editedTestcaseId, row.created_at]
+          );
+          const before = parse(legacy.rows[0]?.diff);
+          if (before.before && before.after) changes = changesBetween(before.before as Row, before.after as Row);
+        }
+        out.set(row.rec_id, {
+          testcaseId: typeof diff.editedTestcaseId === "string" ? diff.editedTestcaseId : null,
+          editedAt: row.created_at,
+          editedBy: row.actor_name ?? null,
+          similarityBefore: typeof diff.similarityBefore === "number" ? diff.similarityBefore : null,
+          similarityAfter: typeof diff.similarityAfter === "number" ? diff.similarityAfter : null,
+          recorded: changes !== null,
+          changes: changes ?? []
+        });
+      })
+    );
+    return out;
+  }
+
+  /**
+   * Findings per status for the tab counts. Open findings only count while BOTH test cases still exist (a finding about
+   * a deleted case is not actionable), but 'removed' ones count regardless: a removed finding by definition has a
+   * deleted test case, and they are exactly what the History tab lists.
+   */
+  private async loadCounts(projectId: string): Promise<Record<string, number>> {
+    const res = await this.db.query<{ review_status: string; n: string }>(
+      `SELECT r.review_status, count(*)::text AS n
+         FROM review_recommendations r
+         LEFT JOIN testcases a ON a.id = r.testcase_a_id AND a.deleted_at IS NULL
+         LEFT JOIN testcases b ON b.id = r.testcase_b_id AND b.deleted_at IS NULL
+        WHERE r.project_id = $1 AND (r.review_status = 'removed' OR (a.id IS NOT NULL AND b.id IS NOT NULL))
+        GROUP BY r.review_status`,
+      [projectId]
+    );
     const byStatus: Record<string, number> = Object.fromEntries(REVIEW_STATUSES.map((s) => [s, 0]));
-    for (const c of counts.rows) byStatus[c.review_status] = Number(c.n);
-    return { items, total: Number(total.rows[0].n), counts: byStatus };
+    for (const c of res.rows) byStatus[c.review_status] = Number(c.n);
+    return byStatus;
+  }
+
+  /**
+   * History: the test cases removed from this project through the Review Board, newest first. Read-only. Everything shown
+   * is already recorded when a removal happens (who, when, which case went, which stayed, the match at that moment), so
+   * this needs no extra storage. `stillDeleted` / `deleted` are read live: a removed case that someone restored elsewhere
+   * is reported as such rather than as deleted, and a kept case that was deleted later is flagged.
+   */
+  async listHistory(userId: string | null | undefined, projectId: string, query: { limit?: string; offset?: string }) {
+    const project = await this.requireReviewAccess(userId, projectId);
+    const limit = Math.min(Math.max(Math.trunc(Number(query.limit)) || 25, 1), 100);
+    const offset = Math.max(Math.trunc(Number(query.offset)) || 0, 0);
+
+    const [rows, total, counts] = await Promise.all([
+      this.db.query(
+        `SELECT r.id, r.classification, r.similarity, r.explanation, r.reviewed_at, r.removed_testcase_id,
+                r.testcase_a_id, r.testcase_b_id, u.name AS reviewer_name,
+                a.external_id AS a_external_id, a.title AS a_title, a.deleted_at AS a_deleted_at,
+                b.external_id AS b_external_id, b.title AS b_title, b.deleted_at AS b_deleted_at
+           FROM review_recommendations r
+           JOIN testcases a ON a.id = r.testcase_a_id AND a.project_id = r.project_id
+           JOIN testcases b ON b.id = r.testcase_b_id AND b.project_id = r.project_id
+           LEFT JOIN users u ON u.id = r.reviewed_by
+          WHERE r.project_id = $1 AND r.review_status = 'removed'
+          ORDER BY r.reviewed_at DESC NULLS LAST, r.id
+          LIMIT $2 OFFSET $3`,
+        [projectId, limit, offset]
+      ),
+      this.db.query<{ n: string }>("SELECT count(*)::text AS n FROM review_recommendations WHERE project_id = $1 AND review_status = 'removed'", [projectId]),
+      this.loadCounts(projectId)
+    ]);
+
+    const items = rows.rows.map((r) => {
+      const removedIsA = r.removed_testcase_id === r.testcase_a_id;
+      const side = (isA: boolean) => ({
+        id: isA ? r.testcase_a_id : r.testcase_b_id,
+        externalId: isA ? r.a_external_id : r.b_external_id,
+        title: isA ? r.a_title : r.b_title,
+        deleted: Boolean(isA ? r.a_deleted_at : r.b_deleted_at)
+      });
+      const removed = side(removedIsA);
+      const kept = side(!removedIsA);
+      return {
+        id: r.id,
+        classification: r.classification,
+        similarity: Number(r.similarity),
+        explanation: r.explanation,
+        removedAt: r.reviewed_at,
+        removedBy: r.reviewer_name ?? null,
+        repositoryName: project.name,
+        removed: { id: removed.id, externalId: removed.externalId, title: removed.title, stillDeleted: removed.deleted },
+        kept
+      };
+    });
+    return { items, total: Number(total.rows[0].n), counts };
   }
 
   /** The recommendation plus both live test cases, scoped to this project. 404 when any part is gone. */
@@ -620,22 +745,62 @@ export class ReviewBoardService {
     if (body.steps !== undefined) changes.steps = this.validateEditedSteps(body.steps);
     if (Object.keys(changes).length === 0) throw new BadRequestException({ error: "No editable fields were provided." });
 
-    const current = await this.db.query("SELECT suite_id, owner_id FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [testcaseId, projectId]);
+    const current = await this.db.query(`SELECT suite_id, owner_id, ${EDIT_SNAPSHOT_COLUMNS} FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`, [testcaseId, projectId]);
     if (!current.rows[0]) throw new NotFoundException({ error: "Test case not found" });
     await this.legacy.updateTestCaseForUser(userId, projectId, testcaseId, {
       ...changes,
       suiteId: current.rows[0].suite_id,
       ownerId: current.rows[0].owner_id
     });
+    // What the test case looked like before and after, kept in the (append-only) audit entry written below, so the
+    // Edited tab can show the reviewer exactly what changed even after further edits elsewhere.
+    const afterRow = await this.db.query(`SELECT ${EDIT_SNAPSHOT_COLUMNS} FROM testcases WHERE id = $1 AND project_id = $2`, [testcaseId, projectId]);
+    const fieldChanges: FieldChange[] = afterRow.rows[0] ? changesBetween(current.rows[0], afterRow.rows[0]) : [];
 
-    await this.db.transaction(async (client) => {
+    const rescored = await this.db.transaction(async (client) => {
       await this.markReviewed(client, recommendationId, userId, "edited");
+      const result = await this.rescoreFinding(client, projectId, rec);
       await this.audit(client, projectId, userId, "review_board_edited", "review_recommendation", recommendationId, null, {
         editedTestcaseId: testcaseId,
-        fields: Object.keys(changes)
+        fields: Object.keys(changes),
+        changes: fieldChanges,
+        ...(result ? { similarityBefore: Number(rec.similarity), similarityAfter: result.similarity } : {})
       });
+      return result;
     });
-    return { id: recommendationId, reviewStatus: "edited", editedTestcaseId: testcaseId };
+    return {
+      id: recommendationId,
+      reviewStatus: "edited",
+      editedTestcaseId: testcaseId,
+      // The pair's match as it is NOW, so the caller can show it without waiting for another analysis.
+      classification: rescored?.classification ?? rec.classification,
+      similarity: rescored?.similarity ?? Number(rec.similarity)
+    };
+  }
+
+  /**
+   * Re-scores a finding from the CURRENT content of its two test cases and stores the result on the same row:
+   * classification, match, explanation, differences, and both fingerprints. Called after an edit, so the finding
+   * never keeps showing the pre-edit match, and an edited finding is not left reading "changed since analysis".
+   * Returns null (and leaves the row alone) if either test case is gone.
+   */
+  private async rescoreFinding(client: PoolClient, projectId: string, rec: Row): Promise<Finding | null> {
+    const res = await client.query(
+      `SELECT id, ${TESTCASE_SOURCE_COLUMNS.join(", ")} FROM testcases
+        WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL`,
+      [[rec.testcase_a_id, rec.testcase_b_id], projectId]
+    );
+    if (res.rows.length !== 2) return null;
+    const [x, y] = res.rows.map((r) => toComparable(r as unknown as TestcaseSource));
+    const f = rescorePair(x, y);
+    await client.query(
+      `UPDATE review_recommendations
+          SET classification = $2, similarity = $3, explanation = $4, differences = $5::jsonb,
+              fingerprint_a = $6, fingerprint_b = $7, state_fingerprint_a = $8, state_fingerprint_b = $9, updated_at = now()
+        WHERE id = $1`,
+      [rec.id, f.classification, f.similarity, f.explanation, JSON.stringify(f.differences), f.fingerprintA, f.fingerprintB, f.stateFingerprintA, f.stateFingerprintB]
+    );
+    return f;
   }
 }
 

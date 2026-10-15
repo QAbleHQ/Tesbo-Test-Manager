@@ -1,5 +1,5 @@
 import { LegacyService } from "./legacy.service";
-import { clipNotificationTitle, isCoverageAnalysisRequest, NOTIFICATION_PRIORITY, notificationLinks, notificationMessages, runLabel } from "./notification-events";
+import { clipNotificationTitle, isCoverageAnalysisRequest, NOTIFICATION_PRIORITY, notificationLinks, notificationMessages, runLabel, zyraSubject } from "./notification-events";
 import type { DatabaseService } from "../database/database.service";
 
 process.env.SECRETS_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString("base64");
@@ -130,8 +130,14 @@ describe("notifyUsers", () => {
 
 describe("Phase 2 wording (Zyra, Knowledge Base, integrations)", () => {
   it("renders the matrix messages", () => {
-    expect(notificationMessages.zyraGenerationReady()).toBe("Zyra-generated test cases are ready for your review.");
-    expect(notificationMessages.zyraGenerationFailed()).toBe("Zyra could not generate the requested test cases.");
+    expect(notificationMessages.zyraGenerationReady(12, "PROJ-123 – Login Flow")).toEqual({
+      title: "Test Cases Ready for Review",
+      body: "Zyra generated 12 test cases for PROJ-123 – Login Flow. Review and save the test cases."
+    });
+    expect(notificationMessages.zyraGenerationFailed("PROJ-123 – Login Flow")).toEqual({
+      title: "Test Case Generation Failed",
+      body: "Zyra could not generate test cases for PROJ-123 – Login Flow. Open the task to see what went wrong and try again."
+    });
     expect(notificationMessages.zyraTaskFailed()).toBe("Zyra task failed. Please retry or review the details.");
     expect(notificationMessages.zyraReviewCompleted()).toBe("Review completed for Zyra-generated test cases.");
     expect(notificationMessages.kbDocumentReady("Spec.pdf")).toBe("Spec.pdf is ready to use with Zyra.");
@@ -168,8 +174,68 @@ describe("notifyZyraTask", () => {
     const [, params] = dbQuery.mock.calls[1];
     expect(params[0]).toEqual([OTHER]);
     expect(params[1]).toBe("zyra_generation_failed");
-    expect(params[2]).toBe("Zyra could not generate the requested test cases.");
+    expect(params[2]).toBe("Test Case Generation Failed");
     expect(params[4]).toBe(`${PROJECT_ID}:task-1`);
+    expect(params[6]).toBe("Zyra could not generate test cases. Open the task to see what went wrong and try again.");
+  });
+
+  it("names the count and the single ticket (key and synced title) in a ready notification", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    dbQuery
+      .mockResolvedValueOnce({ rows: [{ requested_by: OTHER, generated_count: 12, user_story: "ignored", jira_issue_keys: ["PROJ-123"], linear_issue_keys: [], notion_page_ids: [] }] })
+      .mockResolvedValueOnce({ rows: [{ summary: "Login Flow" }] })
+      .mockResolvedValueOnce({ rows: [{ id: "n1" }] });
+    await notifyZyraTask(svc, PROJECT_ID, "task-1", "ready");
+    const [, params] = dbQuery.mock.calls[2];
+    expect(params[2]).toBe("Test Cases Ready for Review");
+    expect(params[6]).toBe("Zyra generated 12 test cases for PROJ-123 – Login Flow. Review and save the test cases.");
+  });
+
+  it("still notifies when the ticket's title lookup fails, falling back to the key alone", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    dbQuery
+      .mockResolvedValueOnce({ rows: [{ requested_by: OTHER, generated_count: 1, user_story: "", jira_issue_keys: ["PROJ-9"], linear_issue_keys: [], notion_page_ids: [] }] })
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce({ rows: [{ id: "n1" }] });
+    await notifyZyraTask(svc, PROJECT_ID, "task-1", "ready");
+    expect(dbQuery.mock.calls[2][1][6]).toBe("Zyra generated 1 test case for PROJ-9. Review and save the test case.");
+  });
+
+  it("an empty batch is not announced as ready for review", async () => {
+    const { svc, dbQuery } = makeLegacy();
+    dbQuery.mockResolvedValueOnce({ rows: [{ requested_by: OTHER, generated_count: 0, user_story: "", jira_issue_keys: [], linear_issue_keys: [], notion_page_ids: [] }] }).mockResolvedValueOnce({ rows: [{ id: "n1" }] });
+    await notifyZyraTask(svc, PROJECT_ID, "task-1", "ready");
+    expect(dbQuery.mock.calls[1][1][2]).toBe("No Test Cases Generated");
+  });
+
+  // Pure wording helper; kept in this block only so the notifyZyraTask tests below stay contiguous.
+  it("names one ticket by key and title, or key alone without a title", () => {
+    expect(zyraSubject([{ key: "PROJ-1", title: "  Login \n Flow " }])).toBe("PROJ-1 – Login Flow");
+    expect(zyraSubject([{ key: "PROJ-1", title: null }])).toBe("PROJ-1");
+    expect(zyraSubject([{ key: "PROJ-1", title: "   " }])).toBe("PROJ-1");
+  });
+
+  it("clips a very long title", () => {
+    const subject = zyraSubject([{ key: "PROJ-1", title: "x".repeat(300) }]);
+    expect(subject.length).toBeLessThanOrEqual("PROJ-1 – ".length + 80);
+    expect(subject.endsWith("…")).toBe(true);
+  });
+
+  it("lists several tickets by key, deduplicated, with the rest counted", () => {
+    expect(zyraSubject([{ key: "A-1" }, { key: "A-1" }, { key: "B-2" }])).toBe("A-1, B-2");
+    expect(zyraSubject([{ key: "A-1" }, { key: "B-2" }, { key: "C-3" }, { key: "D-4" }])).toBe("A-1, B-2 and 2 more");
+  });
+
+  it("falls back to the quoted user story, and to nothing when there is none", () => {
+    expect(zyraSubject([], "As a user\nI want to log in")).toBe('"As a user I want to log in"');
+    expect(zyraSubject([], "y".repeat(200))).toMatch(/^"y+…"$/);
+    expect(zyraSubject([], "   ")).toBe("");
+    expect(zyraSubject([{ key: " " }], null)).toBe("");
+  });
+
+  it("pluralises the count and handles a ready batch without a subject", () => {
+    expect(notificationMessages.zyraGenerationReady(1).body).toBe("Zyra generated 1 test case. Review and save the test case.");
+    expect(notificationMessages.zyraGenerationReady(0).title).toBe("No Test Cases Generated");
   });
 
   it("notifies nobody for a task with no requester (the archive sweep's rows)", async () => {

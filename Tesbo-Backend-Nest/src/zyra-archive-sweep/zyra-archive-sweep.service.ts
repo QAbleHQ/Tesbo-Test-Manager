@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
+import { notificationMessages } from "../legacy/notification-events";
 import { ZYRA_ARCHIVE_SWEEP_LINEAR_CONCURRENCY } from "./zyra-archive-sweep.constants";
 
 type Body = Record<string, any>;
@@ -185,11 +186,11 @@ export class ZyraArchiveSweepService {
       if (count <= 0) continue;
       try {
         const projectName = await this.loadProjectName(projectId);
-        const label = projectName ? ` in ${projectName}` : "";
+        const { title, body } = notificationMessages.zyraTasksAwaitingReview(await this.loadPendingReviewCount(projectId, count), projectName);
         const rows = await this.legacy.notifyProjectMembers(projectId, {
           type: "zyra_archive_sweep",
-          title: `Zyra found ${count} archive candidate${count === 1 ? "" : "s"}`,
-          body: `${count} test case${count === 1 ? "" : "s"}${label} ${count === 1 ? "has" : "have"} a linked Jira/Linear ticket that looks done. Review before archiving on the Zyra task board.`,
+          title,
+          body,
           linkEntityType: "zyra_task_board",
           linkEntityId: projectId,
           dedupeKey: `archive_sweep:${projectId}:${dedupeDate}`
@@ -200,6 +201,24 @@ export class ZyraArchiveSweepService {
         summary.notifyFailures++;
         this.logger.error(`Archive sweep: notification failed for project ${projectId} — ${err instanceof Error ? err.message : String(err)}`);
       }
+    }
+  }
+
+  /**
+   * Sweep tasks still waiting on a human in this project — the same "unresolved" predicate
+   * loadAlreadyStagedTestcaseIds uses (task_status <> 'done'), so the number matches the task board,
+   * including proposals carried over from earlier sweeps. Never below what this run just staged, and
+   * that staged count is the fallback if the lookup fails: a cosmetic number must not skip the notice.
+   */
+  private async loadPendingReviewCount(projectId: string, staged: number): Promise<number> {
+    try {
+      const res = await this.db.query<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM ai_generation_requests WHERE project_id = $1 AND provider = 'zyra_archive_sweep' AND task_status <> 'done'",
+        [projectId]
+      );
+      return Math.max(staged, Number(res.rows[0]?.count) || 0);
+    } catch {
+      return staged;
     }
   }
 

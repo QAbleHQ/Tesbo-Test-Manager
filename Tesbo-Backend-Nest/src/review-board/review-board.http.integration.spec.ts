@@ -181,6 +181,9 @@ suite("review board over HTTP + real BullMQ worker", () => {
     const pro = await call("POST", url(launch, "/analysis"), launch.owner);
     expect(pro.status).toBe(403);
     expect(pro.json.error).toMatch(/Pro plan/);
+    expect((await call("GET", url(w, "/history"), w.qa)).status).toBe(403);
+    expect((await call("GET", url(launch, "/history"), launch.owner)).status).toBe(403);
+    expect((await call("GET", url(w, "/history"), w.outsider)).status).toBe(404);
     expect((await call("GET", url(w, "/analysis"), w.outsider)).status).toBe(404);
     expect((await call("GET", url(w, "/nope"), w.owner)).status).toBe(404);
   });
@@ -234,7 +237,10 @@ suite("review board over HTTP + real BullMQ worker", () => {
     expect((await call("POST", url(w, `/recommendations/${rec.id}/edit`), w.owner, { testcaseId: "00000000-0000-4000-8000-000000000000", title: "x", confirm: true })).status).toBe(400);
     // edit
     const edited = await call("POST", url(w, `/recommendations/${rec.id}/edit`), w.owner, { testcaseId: a, title: "Edited over HTTP", confirm: true });
-    expect(edited).toEqual({ status: 200, json: { id: rec.id, reviewStatus: "edited", editedTestcaseId: a } });
+    expect(edited).toEqual({
+      status: 200,
+      json: { id: rec.id, reviewStatus: "edited", editedTestcaseId: a, classification: expect.stringMatching(/^(exact_duplicate|similar)$/), similarity: expect.any(Number) }
+    });
     expect((await one("SELECT title FROM testcases WHERE id = $1", [a])).title).toBe("Edited over HTTP");
     // already reviewed -> 409 { error }
     const again = await call("POST", url(w, `/recommendations/${rec.id}/keep`), w.owner);
@@ -270,6 +276,13 @@ suite("review board over HTTP + real BullMQ worker", () => {
     const ok = await call("POST", url(w2, `/recommendations/${rec.id}/remove`), w2.owner, { testcaseId: b, confirm: true });
     expect(ok).toEqual({ status: 200, json: { id: rec.id, reviewStatus: "removed", removedTestcaseId: b, keptTestcaseId: a } });
     expect((await one("SELECT deleted_at IS NOT NULL AS gone FROM testcases WHERE id = $1", [b])).gone).toBe(true);
+
+    // History over HTTP: 200, newest removal first, with who/what/match
+    const history = await call("GET", url(w2, "/history"), w2.owner);
+    expect(history.status).toBe(200);
+    expect(history.json.total).toBe(1);
+    expect(history.json.counts.removed).toBe(1);
+    expect(history.json.items[0]).toMatchObject({ id: rec.id, removed: { id: b, stillDeleted: true }, kept: { id: a, deleted: false }, similarity: expect.any(Number) });
     void k1;
   });
 

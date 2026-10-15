@@ -7,6 +7,7 @@ import {
   DIFFERENCE_LABEL,
   editReviewRecommendation,
   parseSteps,
+  type ReviewEditResult,
   type ReviewRecommendation,
   type Step,
 } from "@/lib/reviewBoard";
@@ -45,7 +46,7 @@ export default function ReviewEditModal({
   projectId: string;
   recommendation: ReviewRecommendation | null;
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: (result: ReviewEditResult) => void;
 }) {
   const [saving, setSaving] = useState(false);
   return (
@@ -71,7 +72,7 @@ function EditBody({
   saving: boolean;
   setSaving: (value: boolean) => void;
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: (result: ReviewEditResult) => void;
 }) {
   const [targetId, setTargetId] = useState(rec.testcaseA.id);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
@@ -120,8 +121,8 @@ function EditBody({
     setSaving(true);
     setSaveError(null);
     try {
-      await editReviewRecommendation(projectId, rec.id, targetId, changes);
-      onSaved();
+      const result = await editReviewRecommendation(projectId, rec.id, targetId, changes);
+      onSaved(result);
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : "Failed to save the changes.");
       setConfirming(false);

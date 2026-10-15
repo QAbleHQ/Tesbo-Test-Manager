@@ -7,6 +7,8 @@ import { McpError, RpcCode, type McpTool, type McpToolContext } from "./mcp.type
 const MAX_BULK_EXECUTIONS = 200;
 const MAX_CLONE_SUITES = 100;
 const MAX_CLONE_TESTCASES = 500;
+/** The run lifecycle the app's Start Execution / Mark Completed / Reopen buttons move through. */
+const RUN_STATUSES = ["Planning", "In Progress", "Completed"] as const;
 
 /**
  * Tesbo MCP — tool registry.
@@ -950,6 +952,45 @@ export function buildMcpTools(): McpTool[] {
           testcasesAdded: addResult.added,
           invalidTestcaseIds: invalidIds
         };
+      }
+    },
+    {
+      /*
+       * "[Test Run] Automated Test Run Remains in Planning Status After Completion". A run created
+       * here starts in Planning, and recording results never moves it — completing a run is a
+       * deliberate act (the Start Execution / Mark Completed buttons), not something inferred from
+       * 100% executed. An MCP client had no equivalent of those buttons, so every run it created
+       * sat in Planning forever. This is that button: the same updateCycle call, so start/end
+       * stamping, the "no cases" guard and the run lifecycle notifications all behave as in the app.
+       */
+      name: "update_test_cycle_status",
+      description:
+        "Move a test cycle (test run) in the token's project through its lifecycle — the same as the app's Start Execution, Mark Completed and Reopen buttons. Required: cycleId, status (Planning/In Progress/Completed). In Progress stamps the run's start time (first time only); Completed stamps its end time; Planning or In Progress clears the end time. Recording results does not change a run's status, so call this with Completed once a run's results are in. A run with no test cases cannot be started or completed.",
+      requiredScope: "write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          cycleId: { type: "string" },
+          status: { type: "string", enum: [...RUN_STATUSES] }
+        },
+        required: ["cycleId", "status"],
+        additionalProperties: false
+      },
+      handler: async (args, ctx) => {
+        const cycleId = requireString(args, "cycleId");
+        const status = requireString(args, "status");
+        // updateCycle writes status verbatim, so an unknown value would be stored and then match
+        // none of the product's exact-string status checks.
+        if (!(RUN_STATUSES as readonly string[]).includes(status)) {
+          throw new McpError(RpcCode.ToolExecutionError, `"status" must be one of: ${RUN_STATUSES.join(", ")}`);
+        }
+        await requireProjectOwnedRow(ctx, "cycles", cycleId, "Test cycle");
+        // updateCycle runs requireCycleAccess, which needs a real user — same reasoning as
+        // record_execution_result.
+        await ctx.legacy.updateCycle(cycleId, ctx.userId, { status });
+        const cycle = (await ctx.legacy.listCycles(ctx.projectId)).find((c) => c.id === cycleId);
+        if (!cycle) throw new McpError(RpcCode.ToolExecutionError, "Test cycle not found");
+        return cycle;
       }
     },
     {

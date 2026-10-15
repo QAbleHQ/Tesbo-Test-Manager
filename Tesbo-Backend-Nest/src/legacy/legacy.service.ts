@@ -19,7 +19,7 @@ import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
 import { writeNotifications } from "./notification-writer";
-import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, type NotificationLink, type NotificationType } from "./notification-events";
+import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
 import {
@@ -18959,19 +18959,53 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
    */
   private async notifyZyraTask(projectId: string, taskId: string, kind: "ready" | "failed" | "reviewed", actorId: string | null = null): Promise<void> {
     try {
-      const res = await this.db.query<{ requested_by: string | null }>("SELECT requested_by FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
-      const requester = res.rows[0]?.requested_by;
+      const res = await this.db.query<{ requested_by: string | null; generated_count: number | null; user_story: string | null; jira_issue_keys: unknown; linear_issue_keys: unknown; notion_page_ids: unknown }>(
+        "SELECT requested_by, generated_count, user_story, jira_issue_keys, linear_issue_keys, notion_page_ids FROM ai_generation_requests WHERE id = $1 AND project_id = $2",
+        [taskId, projectId]
+      );
+      const row = res.rows[0];
+      const requester = row?.requested_by;
       if (!requester) return;
-      const [type, title] =
-        kind === "ready"
-          ? (["zyra_generation_ready", notificationMessages.zyraGenerationReady()] as const)
-          : kind === "failed"
-            ? (["zyra_generation_failed", notificationMessages.zyraGenerationFailed()] as const)
-            : (["zyra_review_completed", notificationMessages.zyraReviewCompleted()] as const);
-      await this.notifyUsers([requester], { type, title, link: notificationLinks.zyraTask(projectId, taskId), actorId, memberOf: { projectId } });
+      const link = notificationLinks.zyraTask(projectId, taskId);
+      if (kind === "reviewed") {
+        await this.notifyUsers([requester], { type: "zyra_review_completed", title: notificationMessages.zyraReviewCompleted(), link, actorId, memberOf: { projectId } });
+        return;
+      }
+      const subject = await this.zyraTaskSubject(projectId, row);
+      const { title, body } = kind === "ready" ? notificationMessages.zyraGenerationReady(Number(row.generated_count) || 0, subject) : notificationMessages.zyraGenerationFailed(subject);
+      await this.notifyUsers([requester], { type: kind === "ready" ? "zyra_generation_ready" : "zyra_generation_failed", title, body, link, actorId, memberOf: { projectId } });
     } catch (err) {
       this.logger.error(`Zyra notification failed — ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * The ticket(s) a task was generated for, as a notification names them ("PROJ-123 – Login Flow").
+   * A ticket's title is only looked up when there is exactly one (several are listed by key), and a
+   * missing or unsynced ticket just drops the title — the notification must still go out.
+   */
+  private async zyraTaskSubject(
+    projectId: string,
+    row: { user_story?: string | null; jira_issue_keys?: unknown; linear_issue_keys?: unknown; notion_page_ids?: unknown }
+  ): Promise<string> {
+    const list = (value: unknown) => (Array.isArray(value) ? value.map((v) => String(v ?? "").trim()).filter(Boolean) : []);
+    const jira = list(row.jira_issue_keys);
+    const linear = list(row.linear_issue_keys);
+    const notion = list(row.notion_page_ids);
+    const tickets = [
+      ...jira.map((key) => ({ key, table: "jira_tickets", keyColumn: "jira_issue_key" })),
+      ...linear.map((key) => ({ key, table: "linear_tickets", keyColumn: "linear_issue_key" })),
+      ...notion.map((id) => ({ key: id, table: "notion_pages", keyColumn: "notion_page_id" }))
+    ];
+    const named = tickets.map((t) => ({ key: t.table === "notion_pages" ? notionPageKey(t.key) : t.key, title: null as string | null }));
+    if (tickets.length === 1) {
+      const [t] = tickets;
+      const found = await this.db
+        .query<{ summary: string | null }>(`SELECT summary FROM ${t.table} WHERE project_id = $1 AND ${t.keyColumn} = $2 LIMIT 1`, [projectId, t.key])
+        .catch(() => ({ rows: [] as Array<{ summary: string | null }> }));
+      named[0].title = found.rows[0]?.summary ?? null;
+    }
+    return zyraSubject(named, row.user_story);
   }
 
   private async markZyraTaskFailed(projectId: string, taskId: string, detail: string) {
@@ -21501,6 +21535,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     opts: {
       type: NotificationType;
       title: string;
+      body?: string | null;
       link?: NotificationLink | null;
       dedupeKey?: string;
       actorId?: string | null;

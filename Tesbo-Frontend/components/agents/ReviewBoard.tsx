@@ -5,21 +5,26 @@ import { IconAlertTriangle, IconArrowsLeftRight, IconCheck, IconChecklist, IconC
 import { getBillingInfo, type BillingInfo } from "@/lib/api";
 import { Button, Card, Modal, PageLoader, StatusChip } from "@/components/ui";
 import PricingModal from "@/components/PricingModal";
+import { formatDateTime } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import ReviewCompareModal from "@/components/agents/ReviewCompareModal";
 import ReviewEditModal from "@/components/agents/ReviewEditModal";
 import {
   DIFFERENCE_LABEL,
+  EDITED_FIELD_LABEL,
   STALE_HINT,
   getReviewAnalysis,
   keepReviewRecommendation,
+  listReviewHistory,
   listReviewRecommendations,
   removeReviewRecommendation,
   RUN_ACTIVE,
   startReviewAnalysis,
   type AnalysisRun,
   type RecommendationList,
+  type ReviewHistory,
+  type ReviewHistoryItem,
   type ReviewRecommendation,
   type ReviewStatus,
 } from "@/lib/reviewBoard";
@@ -27,14 +32,14 @@ import {
 const PAGE_SIZE = 25;
 const POLL_MS = 2500;
 
-// "Removed" is deliberately not a filter: the API only lists findings whose two test cases both still
-// exist, and a removed finding by definition has a deleted case.
+// Open findings only. Removed ones live in the History tab, which has its own list (a removed finding by
+// definition has a deleted test case, so the findings list cannot show it).
 const FILTERS: Array<{ key: ReviewStatus; label: string }> = [
   { key: "pending", label: "To review" },
   { key: "kept", label: "Kept" },
   { key: "edited", label: "Edited" },
-  { key: "obsolete", label: "No longer matching" },
 ];
+type TabKey = ReviewStatus | "history";
 
 const STATUS_LABEL: Record<ReviewStatus, string> = {
   pending: "To review",
@@ -59,7 +64,8 @@ function normalizeRole(role: string): "owner" | "manager" | "qa_engineer" {
   return "qa_engineer";
 }
 
-const fmtDate = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : "");
+// Sitewide format from lib/date.ts ("05 Oct 2026, 06:21 PM") — the same one every other page uses.
+const fmtDate = (iso: string | null) => (iso ? formatDateTime(iso) : "");
 const errText = (err: unknown, fallback: string) => (err instanceof Error ? err.message : fallback);
 
 const errorBox = "rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]";
@@ -121,7 +127,10 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
   // undefined = first load in flight; null = this project has never been analysed.
   const [analysis, setAnalysis] = useState<AnalysisRun | null | undefined>(undefined);
   const [data, setData] = useState<RecommendationList | null>(null);
-  const [filter, setFilter] = useState<ReviewStatus>("pending");
+  const [history, setHistory] = useState<ReviewHistory | null>(null);
+  // Tab counts come from whichever list was loaded last, so they stay right on every tab.
+  const [counts, setCounts] = useState<Record<ReviewStatus, number> | null>(null);
+  const [filter, setFilter] = useState<TabKey>("pending");
   const [offset, setOffset] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -150,8 +159,15 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
 
   const loadList = useCallback(async () => {
     try {
-      const res = await listReviewRecommendations(projectId, { status: [filter], limit: PAGE_SIZE, offset });
-      setData(res);
+      if (filter === "history") {
+        const res = await listReviewHistory(projectId, { limit: PAGE_SIZE, offset });
+        setHistory(res);
+        setCounts(res.counts);
+      } else {
+        const res = await listReviewRecommendations(projectId, { status: [filter], limit: PAGE_SIZE, offset });
+        setData(res);
+        setCounts(res.counts);
+      }
       setLoadError(null);
     } catch (err) {
       setLoadError(errText(err, "Failed to load recommendations."));
@@ -222,8 +238,10 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
     }
   }
 
-  const empty = !!data && data.total === 0;
-  const neverFound = !!data && Object.values(data.counts).every((n) => n === 0);
+  const onHistory = filter === "history";
+  const activeTotal = onHistory ? (history?.total ?? 0) : (data?.total ?? 0);
+  const empty = onHistory ? !!history && history.total === 0 : !!data && data.total === 0;
+  const neverFound = !!counts && Object.values(counts).every((n) => n === 0);
   const busyRun = starting || active;
 
   return (
@@ -314,7 +332,7 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
 
       {analysis !== undefined && analysis !== null && (
         <div role="tablist" aria-label="Filter findings" className="flex flex-wrap gap-1 border-b border-[var(--border)]">
-          {FILTERS.map((f) => (
+          {[...FILTERS, { key: "history" as const, label: "History" }].map((f) => (
             <button
               key={f.key}
               type="button"
@@ -323,15 +341,18 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
               onClick={() => {
                 setFilter(f.key);
                 setOffset(0);
+                // Drop the previous tab's rows so another tab's findings never flash under this one.
+                setData(null);
+                setHistory(null);
               }}
               className={`flex items-center gap-2 border-b-2 px-3.5 py-2.5 text-sm font-medium transition-colors ${
                 filter === f.key ? "border-[var(--brand-primary)] text-[var(--accent-light)]" : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]"
               }`}
             >
               {f.label}
-              {data && (
+              {counts && (
                 <span className={`rounded-full px-1.5 py-0.5 text-[11px] leading-none ${filter === f.key ? "bg-[var(--surface-secondary)] text-[var(--foreground)]" : "bg-[var(--surface-secondary)] text-[var(--muted)]"}`}>
-                  {data.counts[f.key]}
+                  {f.key === "history" ? counts.removed : counts[f.key]}
                 </span>
               )}
             </button>
@@ -339,19 +360,35 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      {empty && analysis?.status === "completed" && (
+      {empty && (onHistory || analysis?.status === "completed") && (
         <section className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface)] p-10 text-center">
           <IconChecklist size={30} stroke={1.5} className="mx-auto text-[var(--muted-soft)]" />
           <h3 className="mt-3 text-sm font-semibold text-[var(--foreground)]">
-            {neverFound ? "No duplicate or similar test cases found" : `Nothing in “${FILTERS.find((f) => f.key === filter)?.label}”`}
+            {onHistory
+              ? "No test cases removed yet"
+              : neverFound
+                ? "No duplicate or similar test cases found"
+                : `Nothing in “${FILTERS.find((f) => f.key === filter)?.label}”`}
           </h3>
           <p className="mx-auto mt-1 max-w-md text-sm text-[var(--muted)]">
-            {neverFound ? "Every test case in this project looks distinct. Analyse again after adding or changing test cases." : "Use the tabs above to look at the other groups."}
+            {onHistory
+              ? "Test cases you remove through the Review Board are recorded here, with who removed them and when."
+              : neverFound
+                ? "Every test case in this project looks distinct. Analyse again after adding or changing test cases."
+                : "Use the tabs above to look at the other groups."}
           </p>
         </section>
       )}
 
-      {data && data.items.length > 0 && (
+      {onHistory && history && history.items.length > 0 && (
+        <div className="space-y-4">
+          {history.items.map((item) => (
+            <HistoryRow key={item.id} item={item} />
+          ))}
+        </div>
+      )}
+
+      {!onHistory && data && data.items.length > 0 && (
         <div className="space-y-4">
           {data.items.map((rec) => (
             <RecommendationRow
@@ -369,14 +406,14 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         </div>
       )}
 
-      {data && data.total > PAGE_SIZE && (
+      {activeTotal > PAGE_SIZE && (
         <div className="flex items-center justify-between text-sm text-[var(--muted)]">
           <span>
-            Showing {offset + 1}–{Math.min(offset + PAGE_SIZE, data.total)} of {data.total}
+            Showing {offset + 1}–{Math.min(offset + PAGE_SIZE, activeTotal)} of {activeTotal}
           </span>
           <div className="flex gap-2">
             <Button type="button" size="sm" variant="secondary" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>Previous</Button>
-            <Button type="button" size="sm" variant="secondary" disabled={offset + PAGE_SIZE >= data.total} onClick={() => setOffset(offset + PAGE_SIZE)}>Next</Button>
+            <Button type="button" size="sm" variant="secondary" disabled={offset + PAGE_SIZE >= activeTotal} onClick={() => setOffset(offset + PAGE_SIZE)}>Next</Button>
           </div>
         </div>
       )}
@@ -386,8 +423,15 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         projectId={projectId}
         recommendation={editFor}
         onClose={() => setEditFor(null)}
-        onSaved={() => {
-          setNotice("Saved. Re-run the analysis to refresh the findings.");
+        onSaved={(result) => {
+          // The server recalculated this pair from the edited content; say what the match is now. The finding
+          // moves out of "To review", so also say where it went.
+          const pct = Math.round(result.similarity * 100);
+          setNotice(
+            result.classification === "exact_duplicate"
+              ? "Saved. The two test cases are now identical (100% match, exact duplicate). Find this finding under the Edited tab."
+              : `Saved. The match for this pair is now ${pct}%. Find this finding under the Edited tab.`
+          );
           setEditFor(null);
           void loadList();
         }}
@@ -397,7 +441,7 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         recommendation={removeFor}
         onClose={() => setRemoveFor(null)}
         onRemoved={(label) => {
-          setNotice(`${label} was removed from the project. The removal is recorded in the audit log.`);
+          setNotice(`${label} was removed from the project. You can see it under the History tab.`);
           setRemoveFor(null);
           void loadList();
         }}
@@ -408,6 +452,113 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         }}
       />
     </section>
+  );
+}
+
+/**
+ * The Edited tab's before/after: which test case was edited, by whom and when, how the match moved, and every changed
+ * field with its Before and After side by side. The record is a snapshot taken when the edit was saved, so it still shows
+ * the original even if the test case is changed again later.
+ */
+function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
+  const edit = rec.edit;
+  if (!edit) return null;
+  const edited = edit.testcaseId === rec.testcaseA.id ? rec.testcaseA : edit.testcaseId === rec.testcaseB.id ? rec.testcaseB : null;
+  const moved = edit.similarityBefore !== null && edit.similarityAfter !== null;
+  const cell = "min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere]";
+  return (
+    <section aria-label="What was edited" className="space-y-3 rounded-lg border border-[var(--border)] p-3.5">
+      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <IconPencil size={15} stroke={1.9} className="text-[var(--accent-light)]" />
+          <h4 className="text-sm font-semibold text-[var(--foreground)]">What was edited</h4>
+          {edited && <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]">{edited.externalId}</span>}
+        </div>
+        <p className="text-xs text-[var(--muted)]">
+          {edit.editedBy ? (<>by <span className="font-medium text-[var(--foreground)]">{edit.editedBy}</span> </>) : null}on {fmtDate(edit.editedAt) || "—"}
+          {moved && (
+            <span className="ml-3 font-medium text-[var(--foreground)]">
+              Match {Math.round((edit.similarityBefore as number) * 100)}% → {Math.round((edit.similarityAfter as number) * 100)}%
+            </span>
+          )}
+        </p>
+      </header>
+
+      {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
+      {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
+
+      {edit.changes.length > 0 && (
+        <div className="space-y-2">
+          <div className="hidden gap-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)] md:grid md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+            <span />
+            <span>Before</span>
+            <span>After</span>
+          </div>
+          {edit.changes.map((c) => (
+            <div key={c.field} className="grid gap-2 md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+              <div className="pt-1 text-xs font-semibold text-[var(--foreground)]">{EDITED_FIELD_LABEL[c.field]}</div>
+              <div className={`${cell} bg-[var(--error-soft)] text-[var(--foreground)]`}>
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)] md:hidden">Before</span>
+                {c.before.trim() ? c.before : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+              </div>
+              <div className={`${cell} bg-[var(--success-soft)] text-[var(--foreground)]`}>
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--success-foreground)] md:hidden">After</span>
+                {c.after.trim() ? c.after : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** One removal in the History tab. Read-only: it records what happened, it offers no actions. */
+function HistoryRow({ item }: { item: ReviewHistoryItem }) {
+  const exact = item.classification === "exact_duplicate";
+  const pct = Math.round(item.similarity * 100);
+  return (
+    <article className="space-y-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <StatusChip tone="error">
+            <span className="inline-flex items-center gap-1.5">
+              <IconTrash size={13} stroke={2} />
+              {item.removed.stillDeleted ? "Removed" : "Removed — since restored"}
+            </span>
+          </StatusChip>
+          <StatusChip tone={exact ? "error" : "ai"}>{exact ? "Exact duplicate" : "Similar"}</StatusChip>
+          <span className="text-sm font-semibold text-[var(--foreground)]">{pct}% match</span>
+        </div>
+        <p className="text-xs text-[var(--muted)]">
+          Removed {item.removedBy ? (<>by <span className="font-medium text-[var(--foreground)]">{item.removedBy}</span> </>) : null}on {fmtDate(item.removedAt) || "—"}
+        </p>
+      </header>
+
+      <div className="grid items-stretch gap-3 md:grid-cols-2">
+        <div className="min-w-0 rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] p-3.5">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)]">Removed test case</p>
+          <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="rounded bg-[var(--surface)] px-1.5 py-0.5 font-mono text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]">{item.removed.externalId}</span>
+            <span className="min-w-0 truncate text-xs text-[var(--muted)]">{item.repositoryName}</span>
+          </div>
+          <p className="mt-2 line-clamp-3 break-words text-sm font-semibold leading-snug text-[var(--foreground)]">{item.removed.title}</p>
+        </div>
+        <div className="min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3.5">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Kept test case{item.kept.deleted ? " (deleted since)" : ""}</p>
+          <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="rounded bg-[var(--surface)] px-1.5 py-0.5 font-mono text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]">{item.kept.externalId}</span>
+            <span className="min-w-0 truncate text-xs text-[var(--muted)]">{item.repositoryName}</span>
+          </div>
+          <p className="mt-2 line-clamp-3 break-words text-sm font-semibold leading-snug text-[var(--foreground)]">{item.kept.title}</p>
+        </div>
+      </div>
+
+      <div className="rounded-lg border-l-2 border-[var(--brand-primary)] bg-[var(--surface-secondary)] px-3.5 py-2.5">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Why they matched</p>
+        <p className="mt-0.5 text-sm leading-relaxed text-[var(--foreground)]">{item.explanation}</p>
+      </div>
+    </article>
   );
 }
 
@@ -479,6 +630,11 @@ function RecommendationRow({
             </span>
           </StatusChip>
           <MatchMeter value={rec.similarity} />
+          {rec.stepAgreement.total > 0 && (
+            <span className="text-xs text-[var(--muted)]">
+              <span className="font-medium text-[var(--foreground)]">{rec.stepAgreement.identical} of {rec.stepAgreement.total}</span> step{rec.stepAgreement.total === 1 ? "" : "s"} identical
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {rec.reviewStatus !== "pending" && <StatusChip tone={STATUS_TONE[rec.reviewStatus]}>{STATUS_LABEL[rec.reviewStatus]}</StatusChip>}
@@ -493,6 +649,8 @@ function RecommendationRow({
         </div>
         <TestcaseCard label="Test case B" t={rec.testcaseB} />
       </div>
+
+      {rec.reviewStatus === "edited" && rec.edit && <EditedPanel rec={rec} />}
 
       <div className="rounded-lg border-l-2 border-[var(--brand-primary)] bg-[var(--surface-secondary)] px-3.5 py-2.5">
         <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Why they match</p>
