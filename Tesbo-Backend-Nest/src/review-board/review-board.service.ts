@@ -16,6 +16,7 @@ import { TestcasesListCacheService } from "../cache/testcases-list-cache.service
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
+import { changesBetween, type FieldChange } from "./review-board.edit-diff";
 import { analyse, rescorePair, stepAgreement, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
 import {
   MAX_TESTCASES_PER_RUN,
@@ -27,10 +28,22 @@ import {
 
 type Row = Record<string, any>;
 
+/**
+ * When a re-analysis sends an existing finding back to "To review": it had stopped matching (obsolete), or a decision of
+ * 'kept' no longer applies because either test case's content changed. An EDITED finding is never reopened — the
+ * reviewer already acted on it, it belongs in the Edited tab with its before/after, and further changes to those test
+ * cases are simply reflected in its refreshed match.
+ */
+const REOPENS_FINDING = `(review_recommendations.review_status = 'obsolete'
+               OR (review_recommendations.review_status <> 'edited'
+                   AND (review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
+                     OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b)))`;
+
 const REVIEW_STATUSES = ["pending", "kept", "edited", "removed", "obsolete"] as const;
 const EDITABLE_TEXT_FIELDS = ["title", "description", "preconditions", "postconditions", "testData"] as const;
 const MAX_STEPS_ON_EDIT = 200;
 const MAX_STEP_FIELD_CHARS = 5000;
+const EDIT_SNAPSHOT_COLUMNS = "title, description, preconditions, postconditions, test_data, steps";
 
 /** a.col AS a_col, … for every column a TestcaseSource needs, so each query selects exactly what the type requires. */
 const selectSide = (alias: "a" | "b") => TESTCASE_SOURCE_COLUMNS.map((c) => `${alias}.${c} AS ${alias}_${c}`).join(", ");
@@ -283,21 +296,9 @@ export class ReviewBoardService {
              similarity     = EXCLUDED.similarity,
              explanation    = EXCLUDED.explanation,
              differences    = EXCLUDED.differences,
-             review_status  = CASE
-               WHEN review_recommendations.review_status = 'obsolete' THEN 'pending'
-               WHEN review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
-                 OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b THEN 'pending'
-               ELSE review_recommendations.review_status END,
-             reviewed_by    = CASE
-               WHEN review_recommendations.review_status = 'obsolete'
-                 OR review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
-                 OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b THEN NULL
-               ELSE review_recommendations.reviewed_by END,
-             reviewed_at    = CASE
-               WHEN review_recommendations.review_status = 'obsolete'
-                 OR review_recommendations.fingerprint_a <> EXCLUDED.fingerprint_a
-                 OR review_recommendations.fingerprint_b <> EXCLUDED.fingerprint_b THEN NULL
-               ELSE review_recommendations.reviewed_at END,
+             review_status  = CASE WHEN ${REOPENS_FINDING} THEN 'pending' ELSE review_recommendations.review_status END,
+             reviewed_by    = CASE WHEN ${REOPENS_FINDING} THEN NULL ELSE review_recommendations.reviewed_by END,
+             reviewed_at    = CASE WHEN ${REOPENS_FINDING} THEN NULL ELSE review_recommendations.reviewed_at END,
              fingerprint_a  = EXCLUDED.fingerprint_a,
              fingerprint_b  = EXCLUDED.fingerprint_b,
              -- Re-describes the finding from the current facts. Refreshing these never touches review_status above:
@@ -369,6 +370,7 @@ export class ReviewBoardService {
       this.loadCounts(projectId)
     ]);
 
+    const edits = await this.loadEdits(rows.rows.filter((r) => r.review_status === "edited").map((r) => r.id));
     const items = rows.rows.map((r) => {
       const caseA = toComparable(sourceOf(r, "a"));
       const caseB = toComparable(sourceOf(r, "b"));
@@ -387,6 +389,8 @@ export class ReviewBoardService {
         // How many steps the two cases share RIGHT NOW (same action and expected result), so the number next to the
         // match percentage is never out of date, even after an edit.
         stepAgreement: stepAgreement(caseA, caseB),
+        // For an edited finding: which test case was edited and what changed (before / after). Null for everything else.
+        edit: edits.get(r.id) ?? null,
         reviewedBy: r.reviewed_by,
         reviewedAt: r.reviewed_at,
         lastAnalysis: { runId: r.last_run_id, status: r.run_status, finishedAt: r.run_finished_at },
@@ -395,6 +399,54 @@ export class ReviewBoardService {
       };
     });
     return { items, total: Number(total.rows[0].n), counts };
+  }
+
+  /**
+   * The before/after of each edited finding, from the audit entry written when the edit was saved. Edits saved before the
+   * Review Board recorded its own before/after are recovered from the standard `testcase_updated` entry of the same save
+   * (same test case, written moments earlier); if neither exists, `recorded` is false and the UI says so.
+   */
+  private async loadEdits(recommendationIds: string[]) {
+    const out = new Map<
+      string,
+      { testcaseId: string | null; editedAt: string; editedBy: string | null; similarityBefore: number | null; similarityAfter: number | null; recorded: boolean; changes: FieldChange[] }
+    >();
+    if (recommendationIds.length === 0) return out;
+    const parse = (v: unknown): Row => ((typeof v === "string" ? JSON.parse(v) : v) ?? {}) as Row;
+    const res = await this.db.query(
+      `SELECT DISTINCT ON (a.entity_id) a.entity_id AS rec_id, a.created_at, a.diff, u.name AS actor_name
+         FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
+        WHERE a.action = 'review_board_edited' AND a.entity_id = ANY($1::text[])
+        ORDER BY a.entity_id, a.created_at DESC`,
+      [recommendationIds]
+    );
+    await Promise.all(
+      res.rows.map(async (row) => {
+        const diff = parse(row.diff);
+        let changes: FieldChange[] | null = Array.isArray(diff.changes) ? (diff.changes as FieldChange[]) : null;
+        if (changes === null && typeof diff.editedTestcaseId === "string") {
+          const legacy = await this.db.query(
+            `SELECT diff FROM audit_logs
+              WHERE action = 'testcase_updated' AND entity_id = $1
+                AND created_at <= $2 AND created_at >= $2::timestamptz - interval '2 minutes'
+              ORDER BY created_at DESC LIMIT 1`,
+            [diff.editedTestcaseId, row.created_at]
+          );
+          const before = parse(legacy.rows[0]?.diff);
+          if (before.before && before.after) changes = changesBetween(before.before as Row, before.after as Row);
+        }
+        out.set(row.rec_id, {
+          testcaseId: typeof diff.editedTestcaseId === "string" ? diff.editedTestcaseId : null,
+          editedAt: row.created_at,
+          editedBy: row.actor_name ?? null,
+          similarityBefore: typeof diff.similarityBefore === "number" ? diff.similarityBefore : null,
+          similarityAfter: typeof diff.similarityAfter === "number" ? diff.similarityAfter : null,
+          recorded: changes !== null,
+          changes: changes ?? []
+        });
+      })
+    );
+    return out;
   }
 
   /**
@@ -693,13 +745,17 @@ export class ReviewBoardService {
     if (body.steps !== undefined) changes.steps = this.validateEditedSteps(body.steps);
     if (Object.keys(changes).length === 0) throw new BadRequestException({ error: "No editable fields were provided." });
 
-    const current = await this.db.query("SELECT suite_id, owner_id FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [testcaseId, projectId]);
+    const current = await this.db.query(`SELECT suite_id, owner_id, ${EDIT_SNAPSHOT_COLUMNS} FROM testcases WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`, [testcaseId, projectId]);
     if (!current.rows[0]) throw new NotFoundException({ error: "Test case not found" });
     await this.legacy.updateTestCaseForUser(userId, projectId, testcaseId, {
       ...changes,
       suiteId: current.rows[0].suite_id,
       ownerId: current.rows[0].owner_id
     });
+    // What the test case looked like before and after, kept in the (append-only) audit entry written below, so the
+    // Edited tab can show the reviewer exactly what changed even after further edits elsewhere.
+    const afterRow = await this.db.query(`SELECT ${EDIT_SNAPSHOT_COLUMNS} FROM testcases WHERE id = $1 AND project_id = $2`, [testcaseId, projectId]);
+    const fieldChanges: FieldChange[] = afterRow.rows[0] ? changesBetween(current.rows[0], afterRow.rows[0]) : [];
 
     const rescored = await this.db.transaction(async (client) => {
       await this.markReviewed(client, recommendationId, userId, "edited");
@@ -707,6 +763,7 @@ export class ReviewBoardService {
       await this.audit(client, projectId, userId, "review_board_edited", "review_recommendation", recommendationId, null, {
         editedTestcaseId: testcaseId,
         fields: Object.keys(changes),
+        changes: fieldChanges,
         ...(result ? { similarityBefore: Number(rec.similarity), similarityAfter: result.similarity } : {})
       });
       return result;

@@ -47,6 +47,32 @@ export interface ReviewTestcaseRef {
   repositoryName: string;
 }
 
+export type EditedField = "title" | "description" | "preconditions" | "steps" | "testData" | "postconditions";
+
+export const EDITED_FIELD_LABEL: Record<EditedField, string> = {
+  title: "Title",
+  description: "Description",
+  preconditions: "Preconditions",
+  steps: "Steps",
+  testData: "Test data",
+  postconditions: "Postconditions",
+};
+
+/** What a reviewer changed when they edited a test case from a finding, kept at the moment of the edit. */
+export interface ReviewEditSummary {
+  /** The test case that was edited (one of the finding's two). */
+  testcaseId: string | null;
+  editedAt: string;
+  editedBy: string | null;
+  /** The finding's match before and after the edit (null for edits saved before this was recorded). */
+  similarityBefore: number | null;
+  similarityAfter: number | null;
+  /** False when neither the before/after nor a record to recover it from exists. */
+  recorded: boolean;
+  /** Only the fields that changed, in reading order. */
+  changes: Array<{ field: EditedField; before: string; after: string }>;
+}
+
 export interface ReviewRecommendation {
   id: string;
   classification: ReviewClassification;
@@ -59,6 +85,8 @@ export interface ReviewRecommendation {
   staleReason: StaleReason | null;
   /** Steps the two test cases share right now (same action and expected result); the match % alone cannot show this. */
   stepAgreement: { identical: number; total: number };
+  /** Set only on edited findings: what was changed, before and after. */
+  edit: ReviewEditSummary | null;
   reviewedBy: string | null;
   reviewedAt: string | null;
   lastAnalysis: { runId: string | null; status: RunStatus | null; finishedAt: string | null };

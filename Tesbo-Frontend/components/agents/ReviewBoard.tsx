@@ -12,6 +12,7 @@ import ReviewCompareModal from "@/components/agents/ReviewCompareModal";
 import ReviewEditModal from "@/components/agents/ReviewEditModal";
 import {
   DIFFERENCE_LABEL,
+  EDITED_FIELD_LABEL,
   STALE_HINT,
   getReviewAnalysis,
   keepReviewRecommendation,
@@ -454,6 +455,64 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
   );
 }
 
+/**
+ * The Edited tab's before/after: which test case was edited, by whom and when, how the match moved, and every changed
+ * field with its Before and After side by side. The record is a snapshot taken when the edit was saved, so it still shows
+ * the original even if the test case is changed again later.
+ */
+function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
+  const edit = rec.edit;
+  if (!edit) return null;
+  const edited = edit.testcaseId === rec.testcaseA.id ? rec.testcaseA : edit.testcaseId === rec.testcaseB.id ? rec.testcaseB : null;
+  const moved = edit.similarityBefore !== null && edit.similarityAfter !== null;
+  const cell = "min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere]";
+  return (
+    <section aria-label="What was edited" className="space-y-3 rounded-lg border border-[var(--border)] p-3.5">
+      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <IconPencil size={15} stroke={1.9} className="text-[var(--accent-light)]" />
+          <h4 className="text-sm font-semibold text-[var(--foreground)]">What was edited</h4>
+          {edited && <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]">{edited.externalId}</span>}
+        </div>
+        <p className="text-xs text-[var(--muted)]">
+          {edit.editedBy ? (<>by <span className="font-medium text-[var(--foreground)]">{edit.editedBy}</span> </>) : null}on {fmtDate(edit.editedAt) || "—"}
+          {moved && (
+            <span className="ml-3 font-medium text-[var(--foreground)]">
+              Match {Math.round((edit.similarityBefore as number) * 100)}% → {Math.round((edit.similarityAfter as number) * 100)}%
+            </span>
+          )}
+        </p>
+      </header>
+
+      {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
+      {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
+
+      {edit.changes.length > 0 && (
+        <div className="space-y-2">
+          <div className="hidden gap-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)] md:grid md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+            <span />
+            <span>Before</span>
+            <span>After</span>
+          </div>
+          {edit.changes.map((c) => (
+            <div key={c.field} className="grid gap-2 md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+              <div className="pt-1 text-xs font-semibold text-[var(--foreground)]">{EDITED_FIELD_LABEL[c.field]}</div>
+              <div className={`${cell} bg-[var(--error-soft)] text-[var(--foreground)]`}>
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)] md:hidden">Before</span>
+                {c.before.trim() ? c.before : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+              </div>
+              <div className={`${cell} bg-[var(--success-soft)] text-[var(--foreground)]`}>
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--success-foreground)] md:hidden">After</span>
+                {c.after.trim() ? c.after : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 /** One removal in the History tab. Read-only: it records what happened, it offers no actions. */
 function HistoryRow({ item }: { item: ReviewHistoryItem }) {
   const exact = item.classification === "exact_duplicate";
@@ -590,6 +649,8 @@ function RecommendationRow({
         </div>
         <TestcaseCard label="Test case B" t={rec.testcaseB} />
       </div>
+
+      {rec.reviewStatus === "edited" && rec.edit && <EditedPanel rec={rec} />}
 
       <div className="rounded-lg border-l-2 border-[var(--brand-primary)] bg-[var(--surface-secondary)] px-3.5 py-2.5">
         <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Why they match</p>
