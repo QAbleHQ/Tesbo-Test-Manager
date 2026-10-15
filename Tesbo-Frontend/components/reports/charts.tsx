@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 /* ═══════════════════ Shared chart primitives for Reports & Insights ═══════════════════ */
 
 export const STATUS_COLORS: Record<string, string> = {
@@ -105,6 +107,32 @@ export function HorizontalBarChart({ data }: { data: { label: string; value: num
   );
 }
 
+/* Row label that shows its full text in a tooltip on hover — only when the name is actually
+   cut off, so short names behave exactly as before. Replaces the native `title`, whose ~1s
+   delay and OS styling made it easy to miss. */
+function TruncatedLabel({ text }: { text: string }) {
+  const [tooltip, setTooltip] = useState(false);
+  return (
+    <span className="relative w-32 shrink-0">
+      <span
+        className="block truncate text-right text-[12px] text-[var(--muted)]"
+        onMouseEnter={(e) => setTooltip(e.currentTarget.scrollWidth > e.currentTarget.clientWidth)}
+        onMouseLeave={() => setTooltip(false)}
+      >
+        {text}
+      </span>
+      {tooltip && (
+        <span
+          role="tooltip"
+          className="pointer-events-none absolute bottom-full left-0 z-20 mb-1 w-max max-w-xs break-words rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-[12px] text-[var(--foreground)] shadow-md"
+        >
+          {text}
+        </span>
+      )}
+    </span>
+  );
+}
+
 export function StackedBarChart<T extends { groupId: string; groupName: string; total: number }>({
   rows,
   statusKeys = STATUS_KEYS as unknown as string[],
@@ -119,9 +147,7 @@ export function StackedBarChart<T extends { groupId: string; groupName: string; 
     <div className="space-y-3">
       {rows.map((row) => (
         <div key={row.groupId} className="flex items-center gap-3">
-          <span className="w-32 shrink-0 truncate text-right text-[12px] text-[var(--muted)]" title={row.groupName}>
-            {row.groupName}
-          </span>
+          <TruncatedLabel text={row.groupName} />
           <div className="flex h-6 flex-1 overflow-hidden rounded-full bg-[var(--surface-secondary)]">
             {statusKeys.map((status) => {
               const val = Number((row as unknown as Record<string, number | string>)[status]) || 0;
