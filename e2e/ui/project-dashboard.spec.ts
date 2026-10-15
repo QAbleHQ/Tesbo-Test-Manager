@@ -157,6 +157,32 @@ test.describe("project dashboard — the stat cards", () => {
     }
   });
 
+  test("DSH-U-07b the test case card leaves out an archived case, matching the repository list", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id);
+      await createTestCase(api, project.id);
+      const archived = await createTestCase(api, project.id);
+      const patched = await api.patch(`/api/projects/${project.id}/testcases/${archived.id}`, {
+        data: { status: "Archived" },
+        failOnStatusCode: false,
+      });
+      expect(patched.status(), `archiving — ${await patched.text()}`).toBeLessThan(300);
+      const listTotal = Number(
+        (await api.get(`/api/projects/${project.id}/testcases`, { params: { limit: 1 } })).headers()["x-total-count"],
+      );
+      expect(listTotal).toBe(2);
+
+      await page.goto(`/projects/${project.id}/dashboard`);
+      const card = statCard(page, "Test cases");
+      await expect(card).toBeVisible();
+      expect(await statValue(card), "the card is still counting the archived case").toBe(String(listTotal));
+      await expect(card).toContainText("+2 this week");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
   test("DSH-U-09 the pass rate card shows a percentage and a proportional bar", { tag: '@tesbo.testId("TES-TC-730")' }, async ({ page }) => {
     const project = await createProject(api);
     try {
@@ -893,6 +919,50 @@ test.describe("project dashboard — loading, errors and navigation", () => {
         );
         expect(overflows, `the dashboard scrolls horizontally at ${width}px`).toBe(false);
       }
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("ACT-U-01 a failed activity load says so and Retry recovers, instead of claiming 'No activity yet'", async ({ page }) => {
+    /*
+     * The feed endpoint failing (the 500s a very large project used to get) was rendered as the empty
+     * state, which reads as "nothing has happened in this project". Failing the request in the browser
+     * is the only way to drive that deterministically; the real feed is served again for the retry.
+     */
+    const project = await createProject(api);
+    const suite = await createSuite(api, project.id);
+    let failing = true;
+    const feedCalls: string[] = [];
+    await page.route(/\/api\/projects\/[^/]+\/activity(\?|$)/, async (route) => {
+      feedCalls.push(route.request().url());
+      if (failing) return route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' });
+      return route.continue();
+    });
+    try {
+      await page.goto(`/projects/${project.id}/activity`);
+      await expect(page.getByText("Couldn't load activity")).toBeVisible();
+      await expect(page.getByText("No activity yet")).toHaveCount(0);
+
+      failing = false;
+      await page.getByRole("button", { name: "Retry" }).click();
+      await expect(page.getByText("Couldn't load activity")).toHaveCount(0);
+      // The persisted outcome: the real feed's row for the suite, not merely the absence of the error.
+      await expect(page.getByText(suite.name).first()).toBeVisible();
+      expect(feedCalls.length, "Retry must issue a fresh request").toBeGreaterThanOrEqual(2);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("ACT-U-02 a project that really has no activity still shows the empty state, not the error", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await page.goto(`/projects/${project.id}/activity`);
+      // A brand-new project has its own creation event, so search for something nothing has produced.
+      await page.getByPlaceholder("Search activity…").fill(`no-such-event-${Date.now()}`);
+      await expect(page.getByText("No activity yet")).toBeVisible();
+      await expect(page.getByText("Couldn't load activity")).toHaveCount(0);
     } finally {
       await deleteProjects(api, [project.id]);
     }

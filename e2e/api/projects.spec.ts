@@ -18,6 +18,7 @@ import {
   seedRun,
   softDeleteExecutions,
   uniqueSuffix,
+  type ExecStatus,
 } from "../utils/screens-tenant";
 
 test.describe("project CRUD", () => {
@@ -605,6 +606,55 @@ test.describe("project dashboard summary", () => {
     }
   });
 
+
+  test("DSH-A-08b executions older than 14 days never move deltaThisWeek, but still count toward the all-time pass rate", async () => {
+    /*
+     * The delta is read from the last 14 days only, so the query is bounded to that window (and indexed on
+     * executed_at). That bound must not change the answer: older history is invisible to the delta, and
+     * the boundary sits at exactly 14 days.
+     */
+    test.skip(!dbControlAvailable(), "needs psql access to place executions in the comparison windows");
+    const project = await createProject(api);
+    try {
+      // Recent window: 2 of 2 passed = 100%.
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed"] });
+      // Just inside the prior window (13d 23h): 1 of 2 passed = 50%. Delta = +50.
+      const inside = await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+      backdate("executions", "executed_at", inside.executionIds, "13 days 23 hours");
+      expect((await getDashboard(api, project.id)).passRate.deltaThisWeek).toBe(50);
+
+      // Just outside it (14d 1h), a month back, and over a year back: all failures, none of them in either window.
+      const justOutside = await seedRun(api, project.id, { statuses: ["Failed", "Failed"] });
+      backdate("executions", "executed_at", justOutside.executionIds, "14 days 1 hour");
+      const monthOld = await seedRun(api, project.id, { statuses: ["Failed", "Failed", "Failed"] });
+      backdate("executions", "executed_at", monthOld.executionIds, "30 days");
+      const yearOld = await seedRun(api, project.id, { statuses: ["Failed"] });
+      backdate("executions", "executed_at", yearOld.executionIds, "400 days");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.deltaThisWeek, "history older than 14 days leaked into a comparison window").toBe(50);
+      // All-time pass rate still sees every execution: 3 passed of 9 settled.
+      expect(Math.round(summary.passRate.value ?? -1)).toBe(33);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-08c a project whose executions are all older than 14 days has a null delta and a real pass rate", async () => {
+    test.skip(!dbControlAvailable(), "needs psql access to place executions outside the comparison windows");
+    const project = await createProject(api);
+    try {
+      const old = await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Failed", "Failed"] });
+      backdate("executions", "executed_at", old.executionIds, "60 days");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.deltaThisWeek).toBeNull();
+      expect(summary.passRate.value).toBe(50);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
   test("DSH-A-09 openBugs counts Open and Reopened, and nothing else", { tag: '@tesbo.testId("TES-TC-419")' }, async () => {
     const project = await createProject(api);
     try {
@@ -857,6 +907,154 @@ test.describe("project dashboard summary", () => {
       // the run list, and a plan holding one no longer reports more untested cases than it has
       // cases. That was the "Overall progress percentage not matching" report.
       expect(listed.untested).toBe(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * testCases.total is the "Test cases" card, which links to the repository table — so it has to be
+   * the number that table reports. Archiving sets status = 'Archived' rather than soft-deleting, and
+   * listTestCases leaves those out by default (Basecamp 10212766570); the dashboard read the shared
+   * analytics() count, which does not, so any project with an archived case showed a higher total
+   * than its own list and its projects-list card. DSH-A-03 only ever soft-deleted, so it never saw it.
+   */
+  async function listTotal(projectId: string): Promise<number> {
+    const res = await api.get(`/api/projects/${projectId}/testcases`, { params: { limit: 1 } });
+    return Number(res.headers()["x-total-count"]);
+  }
+
+  async function setStatus(projectId: string, testcaseId: string, status: string): Promise<void> {
+    const res = await api.patch(`/api/projects/${projectId}/testcases/${testcaseId}`, {
+      data: { status },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `setting status ${status} — ${await res.text()}`).toBeLessThan(300);
+  }
+
+  test("DSH-A-23 an archived case leaves the total, matching the repository list", async () => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id, { title: `E2E Dash Live ${uniqueSuffix()}` });
+      const archived = await createTestCase(api, project.id, { title: `E2E Dash Archived ${uniqueSuffix()}` });
+      expect((await getDashboard(api, project.id)).testCases.total).toBe(2);
+
+      await setStatus(project.id, archived.id, "Archived");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total, "an archived case is still being counted").toBe(1);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+      // Created this week but archived: the badge must not claim an addition the card does not count.
+      expect(summary.testCases.addedThisWeek).toBe(1);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-24 restoring an archived case brings it back into the total", async () => {
+    const project = await createProject(api);
+    try {
+      const restored = await createTestCase(api, project.id);
+      await createTestCase(api, project.id);
+      await setStatus(project.id, restored.id, "Archived");
+      expect((await getDashboard(api, project.id)).testCases.total).toBe(1);
+
+      // Restore resets an archived case to Draft — the repository's own restore does the same.
+      await setStatus(project.id, restored.id, "Draft");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(2);
+      expect(summary.testCases.addedThisWeek).toBe(2);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-25 archived and deleted cases are both excluded, each counted once", async () => {
+    const project = await createProject(api);
+    try {
+      const live = await createTestCase(api, project.id);
+      const archived = await createTestCase(api, project.id);
+      const removed = await createTestCase(api, project.id);
+      await setStatus(project.id, archived.id, "Archived");
+      await api.delete(`/api/projects/${project.id}/testcases/${removed.id}`);
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(1);
+      expect(summary.testCases.addedThisWeek).toBe(1);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+      expect(live.id).toBeTruthy();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-26 cases across root, nested and no suite are each counted exactly once", async () => {
+    const project = await createProject(api);
+    try {
+      const root = await createSuite(api, project.id, `E2E Dash Root ${uniqueSuffix()}`);
+      const other = await createSuite(api, project.id, `E2E Dash Other ${uniqueSuffix()}`);
+      // Posted directly: createSuite takes a name only, and the nesting is what is under test.
+      const childRes = await api.post(`/api/projects/${project.id}/suites`, {
+        data: { name: `E2E Dash Child ${uniqueSuffix()}`, parentId: root.id },
+        failOnStatusCode: false,
+      });
+      expect(childRes.status(), `nesting a suite — ${await childRes.text()}`).toBeLessThan(300);
+      const child = await childRes.json();
+
+      await createTestCase(api, project.id, { suiteId: root.id });
+      await createTestCase(api, project.id, { suiteId: child.id });
+      await createTestCase(api, project.id, { suiteId: other.id });
+      await createTestCase(api, project.id);
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(4);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-27 another project's cases never reach this project's total", async () => {
+    const project = await createProject(api);
+    const neighbour = await createProject(api);
+    try {
+      await createTestCase(api, project.id);
+      await createTestCase(api, neighbour.id);
+      await createTestCase(api, neighbour.id);
+      const neighbourArchived = await createTestCase(api, neighbour.id);
+      await setStatus(neighbour.id, neighbourArchived.id, "Archived");
+
+      expect((await getDashboard(api, project.id)).testCases.total).toBe(1);
+      expect((await getDashboard(api, neighbour.id)).testCases.total).toBe(2);
+    } finally {
+      await deleteProjects(api, [project.id, neighbour.id]);
+    }
+  });
+
+  test("DSH-A-28 the dashboard total equals the projects-list card's count", async () => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id);
+      const archived = await createTestCase(api, project.id);
+      await setStatus(project.id, archived.id, "Archived");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(1);
+      // Polled, not read once: the overview caches each project's counts for 10s
+      // (ProjectOverviewCacheService) with no invalidation on write, and another worker on this
+      // shared tenant can list projects between the seeding above and this read, caching a
+      // pre-archive count. 15s outlasts that TTL; the dashboard side is uncached and read once.
+      await expect
+        .poll(
+          async () => {
+            const list = await (await api.get("/api/projects/overview")).json();
+            return list.find((p: { id: string }) => p.id === project.id)?.testCaseCount;
+          },
+          { timeout: 15_000, message: "the projects-list card disagrees with the dashboard" },
+        )
+        .toBe(summary.testCases.total);
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -1240,6 +1438,174 @@ test.describe("projects overview", () => {
       ).toBeLessThan(new Date(before.lastActivityAt!).getTime());
     } finally {
       await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * Which run the card's passed/failed/blocked breakdown describes.
+   *
+   * The card reports ONE run: the newest (by creation) that has at least one settled result —
+   * Passed, Failed, Blocked or Skipped. PVW-A-08 pins the half of that rule that keeps an unstarted
+   * run from displacing a finished one; these pin the other half, which a report of the card
+   * "reflecting only the first run" said was broken: a newer run that HAS results must replace an
+   * older one. A test case is counted once per run it is in (one execution per run item), never
+   * once per execution attempt, and never pooled across runs.
+   */
+
+  type RunCounts = NonNullable<Overview["runCounts"]>;
+
+  /**
+   * A run over test cases that already exist, so the same case can be followed across runs —
+   * seedRun always creates fresh cases. statuses[i] is recorded against testcaseIds[i]; "Untested"
+   * is what adding a case already produces, so it is not patched.
+   */
+  async function runWith(projectId: string, testcaseIds: string[], statuses: ExecStatus[]): Promise<string> {
+    const cycleRes = await api.post(`/api/projects/${projectId}/cycles`, {
+      data: { name: `E2E Overview Rerun ${uniqueSuffix()}` },
+      failOnStatusCode: false,
+    });
+    expect(cycleRes.status(), `creating a run — ${await cycleRes.text()}`).toBeLessThan(300);
+    const cycle = await cycleRes.json();
+    const added = await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds }, failOnStatusCode: false });
+    expect(added.status(), `adding cases to the run — ${await added.text()}`).toBeLessThan(300);
+    const executions: { id: string; testcaseId: string }[] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+    for (let i = 0; i < testcaseIds.length; i++) {
+      if (statuses[i] === "Untested") continue;
+      const execution = executions.find((e) => e.testcaseId === testcaseIds[i]);
+      expect(execution, `the run has no execution for case ${i + 1}`).toBeTruthy();
+      const res = await api.patch(`/api/cycles/${cycle.id}/executions/${execution!.id}`, {
+        data: { status: statuses[i] },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `recording ${statuses[i]} — ${await res.text()}`).toBeLessThan(300);
+    }
+    return cycle.id;
+  }
+
+  async function newCases(projectId: string, count: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) ids.push((await createTestCase(api, projectId, { status: "Approved" })).id);
+    return ids;
+  }
+
+  /**
+   * Polled rather than read once: the overview caches each project for 10s with no invalidation on
+   * write (ProjectOverviewCacheService), and another worker on this shared tenant can list projects
+   * mid-seed, caching a snapshot from before the last run was recorded. 15s outlasts that TTL.
+   */
+  async function expectRunCounts(projectId: string, expected: RunCounts | null, message: string): Promise<void> {
+    await expect
+      .poll(async () => (await overviewFor(projectId)).runCounts, { timeout: 15_000, message })
+      .toEqual(expected);
+  }
+
+  test("PVW-A-16 a newer run with results replaces the first run on the card", async () => {
+    const project = await createProject(api);
+    try {
+      const cases = await newCases(project.id, 3);
+      await runWith(project.id, cases, ["Passed", "Passed", "Passed"]);
+      await expectRunCounts(project.id, { passed: 3, failed: 0, blocked: 0, skipped: 0, total: 3 }, "the first run");
+
+      await runWith(project.id, cases, ["Passed", "Failed", "Blocked"]);
+      await expectRunCounts(
+        project.id,
+        { passed: 1, failed: 1, blocked: 1, skipped: 0, total: 3 },
+        "the card is still reporting the first run after a newer run recorded results",
+      );
+      await expect.poll(async () => (await overviewFor(project.id)).currentPassRate, { timeout: 15_000 }).toBe(33);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-17 a case that changes status between runs is counted once, under its status in the newer run", async () => {
+    const project = await createProject(api);
+    try {
+      const [flaky, steady] = await newCases(project.id, 2);
+      await runWith(project.id, [flaky, steady], ["Failed", "Passed"]);
+      await runWith(project.id, [flaky, steady], ["Passed", "Passed"]);
+      // 2, not 4: the earlier run's Failed is not pooled in alongside the newer Passed.
+      await expectRunCounts(project.id, { passed: 2, failed: 0, blocked: 0, skipped: 0, total: 2 }, "the earlier run leaked in");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-18 cases that only exist in a later run are counted", async () => {
+    const project = await createProject(api);
+    try {
+      const [first] = await newCases(project.id, 1);
+      await runWith(project.id, [first], ["Passed"]);
+      const later = await newCases(project.id, 2);
+      await runWith(project.id, [first, ...later], ["Passed", "Failed", "Blocked"]);
+      await expectRunCounts(
+        project.id,
+        { passed: 1, failed: 1, blocked: 1, skipped: 0, total: 3 },
+        "the cases added in the later run are missing",
+      );
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-19 a newer run that is only partly executed still replaces the older one", async () => {
+    const project = await createProject(api);
+    try {
+      const cases = await newCases(project.id, 3);
+      await runWith(project.id, cases, ["Passed", "Passed", "Passed"]);
+      // One settled result is enough for the run to count as executed; the rest stay Untested.
+      await runWith(project.id, cases, ["Failed", "Untested", "Untested"]);
+      await expectRunCounts(project.id, { passed: 0, failed: 1, blocked: 0, skipped: 0, total: 3 }, "a partly executed run was skipped");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-20 a newer run marked entirely Retest does not displace the last settled run", async () => {
+    const project = await createProject(api);
+    try {
+      const cases = await newCases(project.id, 2);
+      await runWith(project.id, cases, ["Passed", "Failed"]);
+      // Retest is "needs running again", grouped with Untested in EXECUTION_BUCKET_COUNTS and left
+      // out of "executed" by computeExecutionMetrics — the same reason PVW-A-08's unstarted run is
+      // passed over.
+      await runWith(project.id, cases, ["Retest", "Retest"]);
+      await expectRunCounts(project.id, { passed: 1, failed: 1, blocked: 0, skipped: 0, total: 2 }, "an all-Retest run displaced the settled one");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-21 a project with no runs, or runs with no results, reports no breakdown", async () => {
+    const empty = await createProject(api);
+    const unexecuted = await createProject(api);
+    try {
+      await newCases(empty.id, 1);
+      const cases = await newCases(unexecuted.id, 2);
+      await runWith(unexecuted.id, cases, ["Untested", "Untested"]);
+      await runWith(unexecuted.id, cases, ["Retest", "Untested"]);
+
+      await expectRunCounts(empty.id, null, "a project with no runs invented a breakdown");
+      await expectRunCounts(unexecuted.id, null, "a project with no settled result invented a breakdown");
+      expect((await overviewFor(unexecuted.id)).currentPassRate).toBeNull();
+    } finally {
+      await deleteProjects(api, [empty.id, unexecuted.id]);
+    }
+  });
+
+  test("PVW-A-22 another project's runs never reach this project's breakdown", async () => {
+    const project = await createProject(api);
+    const neighbour = await createProject(api);
+    try {
+      await runWith(project.id, await newCases(project.id, 2), ["Passed", "Passed"]);
+      // Newer than this project's run: if the per-project pick leaked across projects, this is the
+      // run it would take.
+      await runWith(neighbour.id, await newCases(neighbour.id, 3), ["Failed", "Blocked", "Failed"]);
+
+      await expectRunCounts(project.id, { passed: 2, failed: 0, blocked: 0, skipped: 0, total: 2 }, "the neighbour's run leaked in");
+      await expectRunCounts(neighbour.id, { passed: 0, failed: 2, blocked: 1, skipped: 0, total: 3 }, "the neighbour lost its own run");
+    } finally {
+      await deleteProjects(api, [project.id, neighbour.id]);
     }
   });
 });

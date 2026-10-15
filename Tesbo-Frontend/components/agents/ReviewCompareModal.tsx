@@ -5,29 +5,34 @@ import { getTestCase } from "@/lib/api";
 import { buildCompareRows, buildContextRows, formatPercent, type CompareRow, type ReviewRecommendation } from "@/lib/reviewBoard";
 import { Button, Modal, PageLoader, StatusChip } from "@/components/ui";
 
-function Cell({ value, differs }: { value: string; differs: boolean }) {
+function Cell({ value, differs, caption }: { value: string; differs: boolean; caption: string }) {
   return (
     <div
-      className={`whitespace-pre-wrap break-words rounded-md px-2.5 py-2 text-sm ${
-        differs ? "bg-[var(--warning-soft)] text-[var(--foreground)]" : "text-[var(--muted)]"
+      className={`min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere] ${
+        differs ? "bg-[var(--warning-soft)] text-[var(--foreground)]" : "bg-[var(--surface-secondary)] text-[var(--muted)]"
       }`}
     >
+      {/* Only shown when the two columns stack on a narrow screen, where position no longer says which is which. */}
+      <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)] md:hidden">{caption}</span>
       {value.trim() ? value : <span className="text-[var(--muted-soft)]">—</span>}
     </div>
   );
 }
 
+// One template for the header cards and every row, so the columns always line up.
+const COLUMNS = "md:grid-cols-[150px_minmax(0,1fr)_minmax(0,1fr)]";
+
 function Rows({ rows }: { rows: CompareRow[] }) {
   return (
     <div className="divide-y divide-[var(--border)] rounded-lg border border-[var(--border)]">
       {rows.map((r) => (
-        <div key={r.key} className="grid gap-2 p-2 md:grid-cols-[120px_1fr_1fr]">
-          <div className="flex items-start gap-2 px-1 pt-2 text-xs font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">
-            {r.label}
+        <div key={r.key} className={`grid gap-2 p-3 ${COLUMNS}`}>
+          <div className="flex min-w-0 flex-row flex-wrap items-center gap-x-2 gap-y-1.5 pt-0.5 md:flex-col md:items-start md:pt-2.5">
+            <span className="break-words text-xs font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">{r.label}</span>
             {r.differs && <StatusChip tone="warning">Differs</StatusChip>}
           </div>
-          <Cell value={r.a} differs={r.differs} />
-          <Cell value={r.b} differs={r.differs} />
+          <Cell value={r.a} differs={r.differs} caption="Test case A" />
+          <Cell value={r.b} differs={r.differs} caption="Test case B" />
         </div>
       ))}
     </div>
@@ -91,7 +96,7 @@ function CompareBody({ projectId, rec, onClose }: { projectId: string; rec: Revi
           </div>
           <p className="text-xs text-[var(--muted)]">{rec.explanation}</p>
 
-          <div className="grid gap-2 md:grid-cols-[120px_1fr_1fr]">
+          <div className={`grid gap-2 ${COLUMNS}`}>
             <div />
             {[rec.testcaseA, rec.testcaseB].map((t) => (
               <div key={t.id} className="min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">

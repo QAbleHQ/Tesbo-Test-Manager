@@ -773,4 +773,211 @@ test.describe("activity feed", () => {
     const ws = (await workspaceFeed({ search: tag, limit: 100 })).list.map((i) => `${i.entityName!.slice(tag.length + 1)}:${i.action}`).sort();
     expect(ws).toEqual(await seen());
   });
+
+  // ─── Paging at the seams: the page query reads only the newest offset+limit rows of each source ───
+
+  type SeedRow = [suffix: string, action: string, actorId: string | null, createdAtSql: string, entityType: string];
+
+  /** Inserts audit rows at chosen instants; every row is named `${tag}-${suffix}`. */
+  function seedAudit(tag: string, rows: SeedRow[]): void {
+    const proj = literal(tenant!.mainProjectId);
+    const org = literal(tenant!.organizationId);
+    exec(
+      `INSERT INTO audit_logs (actor_id, action, entity_type, entity_id, entity_name, project_id, organization_id, created_at) VALUES ` +
+        rows
+          .map(
+            ([e, action, actor, at, type]) =>
+              `(${actor ? literal(actor) : "NULL"}, ${literal(action)}, ${literal(type)}, ${literal(`${tag}-${e}`)}, ${literal(`${tag}-${e}`)}, ${proj}, ${org}, ${at})`,
+          )
+          .join(", ") +
+        ";",
+    );
+  }
+
+  test("ACT-A-21 walking the feed page by page returns every row exactly once, across sources and timestamp ties", async () => {
+    /*
+     * The feed is read newest-first from several sources (audit rows, and rows derived from suites,
+     * plans, runs and bugs), and each page only reads the newest offset+limit rows of each source. A
+     * page boundary that lands between sources, or inside a group of rows sharing one timestamp (a bulk
+     * action writes many rows in one transaction, so they tie), must neither repeat nor skip a row.
+     */
+    const tag = stamp("PageWalk");
+    const owner = tenant!.owner.userId;
+    const tie = `now() - interval '3 hours'`;
+    // Seven audit rows at the SAME instant, two older ones, and three derived suite rows that are newer.
+    seedAudit(tag, [
+      ...["a", "b", "c", "d", "e", "f", "g"].map((e): SeedRow => [e, "testcase_created", owner, tie, "testcase"]),
+      ["old1", "testcase_updated", owner, `now() - interval '5 hours'`, "testcase"],
+      ["old2", "testcase_updated", owner, `now() - interval '6 hours'`, "testcase"],
+    ]);
+    for (let i = 0; i < 3; i++) await createSuite(`${tag} suite ${i}`);
+
+    const readers: [string, (p: Record<string, string | number>) => Promise<{ list: ActivityItem[]; total: number }>][] = [
+      ["project", (p) => feed({ search: tag, ...p })],
+      ["workspace", (p) => workspaceFeed({ search: tag, ...p })],
+    ];
+    for (const [label, read] of readers) {
+      const all = await read({ limit: 100 });
+      expect(all.list, `${label}: every seeded and derived row is in the full read`).toHaveLength(12);
+      expect(all.total, `${label}: total counts them all`).toBe(12);
+
+      for (const size of [1, 2, 3, 5]) {
+        const walked: string[] = [];
+        for (let offset = 0; offset < 14; offset += size) {
+          const page = await read({ limit: size, offset });
+          expect(page.total, `${label}: total is the same on every page`).toBe(12);
+          walked.push(...page.list.map((i) => i.id));
+        }
+        expect(walked, `${label}: page size ${size} walked the feed in a different order, or lost or repeated rows`).toEqual(
+          all.list.map((i) => i.id),
+        );
+      }
+    }
+  });
+
+  test("ACT-A-22 total is exact under de-duplication and every filter, and agrees with the rows", async () => {
+    const tag = stamp("TotalExact");
+    const owner = tenant!.owner.userId;
+    const base = `now() - interval '2 hours'`;
+    seedAudit(tag, [
+      // e1: the plain row has a zyra sibling 2s later -> dropped, the zyra row stays (actor NULL).
+      ["e1", "testcase_updated", owner, base, "testcase"],
+      ["e1", "zyra_updated", null, `${base} + interval '2 seconds'`, "testcase"],
+      // e2: nothing nearby -> stays.
+      ["e2", "testcase_created", owner, base, "testcase"],
+      // e3: a zyra row alone.
+      ["e3", "zyra_created", null, base, "testcase"],
+    ]);
+    const names = (r: { list: ActivityItem[] }) =>
+      r.list.map((i) => `${i.entityName!.slice(tag.length + 1)}:${i.action}`).sort();
+
+    const all3 = ["e1:zyra_updated", "e2:testcase_created", "e3:zyra_created"];
+    const cases: [string, Record<string, string | number>, string[]][] = [
+      ["no filter", {}, all3],
+      ["entityType", { entityType: "testcase" }, all3],
+      ["entityType that matches nothing", { entityType: "bug" }, []],
+      // e1's plain row is dropped even though its sibling (actor NULL) is hidden by this filter.
+      ["actorId", { actorId: owner }, ["e2:testcase_created"]],
+      ["since in the future", { since: new Date(Date.now() + 3_600_000).toISOString() }, []],
+      ["since before the rows", { since: new Date(Date.now() - 3 * 3_600_000).toISOString() }, all3],
+    ];
+    for (const [label, params, expected] of cases) {
+      const res = await feed({ search: tag, limit: 100, ...params });
+      expect(names(res), label).toEqual(expected);
+      expect(res.total, `${label}: total must equal the rows the filter lets through`).toBe(expected.length);
+    }
+  });
+
+  test("ACT-A-23 paging parameters at the edges answer a well-formed page, never an error", async () => {
+    const tag = stamp("PagingEdges");
+    seedAudit(tag, [
+      ["a", "testcase_created", tenant!.owner.userId, `now() - interval '1 hour'`, "testcase"],
+      ["b", "testcase_created", tenant!.owner.userId, `now() - interval '2 hours'`, "testcase"],
+    ]);
+
+    // limit=0 is a valid "just the total" read.
+    const none = await feed({ search: tag, limit: 0 });
+    expect(none.list).toEqual([]);
+    expect(none.total).toBe(2);
+
+    // Past the end, and absurdly far past it: empty, with the real total.
+    for (const offset of [2, 50, 9007199254740991]) {
+      const past = await feed({ search: tag, limit: 10, offset });
+      expect(past.list, `offset ${offset}`).toEqual([]);
+      expect(past.total, `offset ${offset}`).toBe(2);
+    }
+
+    // An oversized limit is capped, not rejected and not honoured.
+    const capped = await feed({ limit: 100000 });
+    expect(capped.list.length).toBeLessThanOrEqual(100);
+
+    // An entity's own history (Bug Details) pages through the same query.
+    const entity = await feed({ entityId: `${tag}-a`, limit: 10 });
+    expect(entity.list.map((i) => i.entityId)).toEqual([`${tag}-a`]);
+    expect(entity.total).toBe(1);
+  });
+
+  test("ACT-A-24 the three requests the Activity screen makes at once all answer within the page-load budget", async () => {
+    /*
+     * The screen fires the dashboard's limit=10 feed, its own limit=30 feed and the summary together.
+     * Each used to read the project's whole history, so together they saturated the connection pool and
+     * timed out for a large project. The wall time of all three at once is what a person waits for.
+     */
+    test.setTimeout(120_000);
+    seedBulkTestcaseAudit(8000);
+
+    const url = `/api/projects/${tenant!.mainProjectId}/activity`;
+    const t0 = Date.now();
+    const [dash, page, summary] = await Promise.all([
+      asOwner.get(url, { params: { limit: 10 }, failOnStatusCode: false }),
+      asOwner.get(url, { params: { limit: 30, offset: 0 }, failOnStatusCode: false }),
+      asOwner.get(`${url}/summary`, { failOnStatusCode: false }),
+    ]);
+    const wall = Date.now() - t0;
+
+    expect(dash.status(), await dash.text()).toBe(200);
+    expect(page.status(), await page.text()).toBe(200);
+    expect(summary.status(), await summary.text()).toBe(200);
+    expect((await page.json()).list).toHaveLength(30);
+    expect(wall, `the Activity screen's three requests took ${wall}ms together with 8000 testcase audit rows`).toBeLessThan(5000);
+  });
+
+  test("ACT-A-25 workspace-level events (no project) reach the workspace feed and its total, and never a project feed", async () => {
+    /*
+     * Invites and membership changes are audit rows with project_id NULL. The workspace feed reads them
+     * through its own branch (the project feed has none), which is also the branch that has to find them
+     * without reading every tenant's history. They must page and count like any other row.
+     */
+    const tag = stamp("OrgEvents");
+    const owner = tenant!.owner.userId;
+    const org = literal(tenant!.organizationId);
+    exec(
+      `INSERT INTO audit_logs (actor_id, action, entity_type, entity_id, entity_name, project_id, organization_id, created_at) VALUES ` +
+        ["a", "b", "c"]
+          .map(
+            (e, i) =>
+              `(${literal(owner)}, 'member_invited', 'invitation', ${literal(`${tag}-${e}`)}, ${literal(`${tag}-${e}`)}, NULL, ${org}, now() - interval '${i + 1} hours')`,
+          )
+          .join(", ") +
+        ";",
+    );
+
+    const all = await workspaceFeed({ search: tag, limit: 100 });
+    expect(all.list.map((i) => i.entityName).sort(), "all three workspace-level rows are in the workspace feed").toEqual(
+      [`${tag}-a`, `${tag}-b`, `${tag}-c`],
+    );
+    expect(all.total).toBe(3);
+    expect(all.list.every((i) => !i.entityType || i.entityType === "invitation")).toBe(true);
+
+    // Paged one at a time they come back newest first, each once.
+    const walked: string[] = [];
+    for (let offset = 0; offset < 4; offset++) {
+      const page = await workspaceFeed({ search: tag, limit: 1, offset });
+      expect(page.total).toBe(3);
+      walked.push(...page.list.map((i) => i.entityName!));
+    }
+    expect(walked).toEqual([`${tag}-a`, `${tag}-b`, `${tag}-c`]);
+
+    // A project feed has no such branch: these rows must not leak into it.
+    const project = await feed({ search: tag, limit: 100 });
+    expect(project.list, "a workspace-level event leaked into a project feed").toEqual([]);
+    expect(project.total).toBe(0);
+  });
+
+  test("ACT-A-26 the workspace Activity screen's two requests answer within the page-load budget at volume", async () => {
+    test.setTimeout(120_000);
+    seedBulkTestcaseAudit(8000);
+
+    const t0 = Date.now();
+    const [feedRes, summaryRes] = await Promise.all([
+      asOwner.get("/api/workspace/activity", { params: { limit: 30, offset: 0 }, failOnStatusCode: false }),
+      asOwner.get("/api/workspace/activity/summary", { failOnStatusCode: false }),
+    ]);
+    const wall = Date.now() - t0;
+
+    expect(feedRes.status(), await feedRes.text()).toBe(200);
+    expect(summaryRes.status(), await summaryRes.text()).toBe(200);
+    expect((await feedRes.json()).list).toHaveLength(30);
+    expect(wall, `the workspace Activity screen's requests took ${wall}ms together with 8000 testcase audit rows`).toBeLessThan(5000);
+  });
 });

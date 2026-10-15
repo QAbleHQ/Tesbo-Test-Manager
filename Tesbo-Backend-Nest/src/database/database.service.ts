@@ -70,6 +70,46 @@ export class DatabaseService {
     }
   }
 
+  // Analytical reads (dashboards, the activity feed, reports) can each hold a connection for seconds.
+  // Unbounded, a few page loads take every connection and the light requests that follow (opening a
+  // project, recording a result) wait in the pool queue behind them: the app looks hung while the
+  // database is merely busy. So only a quarter of the pool may run these at once; the rest wait here,
+  // in Node, in arrival order, and the remaining connections stay free for everything else.
+  private heavyActive = 0;
+  private readonly heavyQueue: Array<() => void> = [];
+
+  private get heavyLimit(): number {
+    return Math.max(1, Math.floor((this.pool.options?.max ?? 10) / 4));
+  }
+
+  private async acquireHeavy(): Promise<void> {
+    if (this.heavyActive < this.heavyLimit) {
+      this.heavyActive++;
+      return;
+    }
+    // The permit is handed straight to the waiter by releaseHeavy, so heavyActive is not touched here.
+    await new Promise<void>((resolve) => this.heavyQueue.push(resolve));
+  }
+
+  private releaseHeavy(): void {
+    const next = this.heavyQueue.shift();
+    if (next) next();
+    else this.heavyActive--;
+  }
+
+  /** Same as query(), for reads that scan a project's history; see the note above. */
+  async heavyQuery<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values: unknown[] = []
+  ): Promise<QueryResult<T>> {
+    await this.acquireHeavy();
+    try {
+      return await this.query<T>(text, values);
+    } finally {
+      this.releaseHeavy();
+    }
+  }
+
   async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     let client: PoolClient;
     try {

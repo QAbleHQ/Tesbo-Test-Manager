@@ -422,12 +422,31 @@ type ZyraTurnSources = {
 // asked again: `ticketScope` turns the create into a plan over exactly those named tickets
 // (startZyraTicketScopedPlan); `scopeDecided` alone is "all the tickets", which the existing paged
 // plan already walks page by page.
+/*
+ * What a create request is FOR, as the router read it — the scope half of "how much work is this",
+ * read semantically like requestedCount/exhaustive rather than from keywords:
+ *   named        tickets the message itself names
+ *   referenced   tickets earlier in the conversation or selected ("all of them", "the selected ones")
+ *   all_tickets  every synced ticket / requirement / story in the project
+ *   project      the whole project or "everything" without naming tickets (treated like all_tickets)
+ *   feature      one feature, area, page, document or folder
+ *   unspecified  the user did not say what it is for ("write all test cases")
+ */
+const ZYRA_ROUTED_SCOPES = ["named", "referenced", "all_tickets", "project", "feature", "unspecified"] as const;
+type ZyraRoutedScope = (typeof ZYRA_ROUTED_SCOPES)[number];
+
 type ZyraRoutedCount = {
   requestedCount?: unknown;
   exhaustive?: boolean;
+  scope?: ZyraRoutedScope;
   ticketScope?: { ticketKeys: string[] | null; perTicket?: number };
   scopeDecided?: boolean;
 };
+
+// zyraTicketScope's answer when a create is worth asking about: the tickets (null: every synced
+// one), the estimate's two factors, the per-generation limit it was held to (the project's setting),
+// and whether the user left the scope unstated (the clarifying variant of the question).
+type ZyraTicketScopeEstimate = { ticketKeys: string[] | null; ticketCount: number; perTicket: number; limit: number; unspecified: boolean };
 
 // What a ticket-scoped plan pages through (zyraPlanScopedTicketRound): those tickets (null: every
 // synced ticket), each planned against `perTicket` scenarios of its own.
@@ -3438,7 +3457,7 @@ export class LegacyService implements OnModuleInit {
       this.db.query<{ project_id: string; count: number }>(
         `SELECT project_id, COUNT(*)::int AS count
            FROM testcases
-          WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND status IS DISTINCT FROM 'Archived'
+          WHERE project_id = ANY($1::uuid[]) AND ${LegacyService.countedTestcase()}
           GROUP BY project_id`,
         [ids]
       ),
@@ -4030,7 +4049,7 @@ export class LegacyService implements OnModuleInit {
        recursive_counts AS (
          SELECT d.root_id, COUNT(t.id)::int AS recursive_test_case_count
          FROM descendants d
-         LEFT JOIN testcases t ON t.suite_id = d.node_id AND t.deleted_at IS NULL
+         LEFT JOIN testcases t ON t.suite_id = d.node_id AND ${LegacyService.countedTestcase("t")}
          GROUP BY d.root_id
        )
        SELECT s.id, s.parent_id, s.name, s.description, s.preconditions, s.position, s.created_at,
@@ -4040,7 +4059,7 @@ export class LegacyService implements OnModuleInit {
                 0
               )::int AS recursive_test_case_count
        FROM suites s
-       LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
+       LEFT JOIN testcases t ON t.suite_id = s.id AND ${LegacyService.countedTestcase("t")}
        WHERE s.project_id = $1 AND s.deleted_at IS NULL
        GROUP BY s.id
        ORDER BY s.position, s.name`,
@@ -6009,7 +6028,7 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(userId, projectId);
     const [res, tasks] = await Promise.all([
       this.db.query(
-        "SELECT jira_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND jira_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY jira_issue_key",
+        `SELECT jira_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND jira_issue_key IS NOT NULL AND ${LegacyService.countedTestcase()} GROUP BY jira_issue_key`,
         [projectId]
       ),
       this.zyraTaskStatusesByIssueKey(projectId, "jira_issue_keys")
@@ -6023,7 +6042,7 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(userId, projectId);
     const [res, tasks] = await Promise.all([
       this.db.query(
-        "SELECT notion_page_id, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND notion_page_id IS NOT NULL AND deleted_at IS NULL GROUP BY notion_page_id",
+        `SELECT notion_page_id, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND notion_page_id IS NOT NULL AND ${LegacyService.countedTestcase()} GROUP BY notion_page_id`,
         [projectId]
       ),
       this.zyraTaskStatusesByIssueKey(projectId, "notion_page_ids")
@@ -6036,7 +6055,7 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(userId, projectId);
     const [res, tasks] = await Promise.all([
       this.db.query(
-        "SELECT linear_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND linear_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY linear_issue_key",
+        `SELECT linear_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND linear_issue_key IS NOT NULL AND ${LegacyService.countedTestcase()} GROUP BY linear_issue_key`,
         [projectId]
       ),
       this.zyraTaskStatusesByIssueKey(projectId, "linear_issue_keys")
@@ -6073,6 +6092,24 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(itemId)) throw new NotFoundException({ error: "Plan item not found" });
     const res = await this.db.query("SELECT id FROM plan_items WHERE id = $1 AND plan_id = $2 AND deleted_at IS NULL", [itemId, planId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan item not found" });
+  }
+
+  /**
+   * The one rule for "this test case counts": live (not soft-deleted) and not Archived — the same
+   * set the repository list shows by default (listTestCases). Every user-visible test case total,
+   * per-suite badge, report count and coverage check uses this.
+   *
+   * Before it existed, most of those read `testcases_active`, which drops only soft-deleted rows, so
+   * Archived cases stayed in some numbers and not others: Project 2 read 514 on its card and
+   * dashboard but 517 in the repository header, and the workspace tile exceeded the sum of the
+   * project cards. Archived cases are still reported, separately, where a screen names them (the
+   * repository's byStatus "Archived" bucket behind its "N archived" chip).
+   *
+   * `alias` qualifies both columns for joined queries (e.g. "t"); usable in a WHERE or a JOIN ... ON.
+   */
+  static countedTestcase(alias = ""): string {
+    const p = alias ? `${alias}.` : "";
+    return `${p}deleted_at IS NULL AND ${p}status IS DISTINCT FROM 'Archived'`;
   }
 
   /**
@@ -6369,7 +6406,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT c.*,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        WHERE c.project_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
@@ -9144,7 +9181,8 @@ export class LegacyService implements OnModuleInit {
       return { rows: res.rows.map(toCamel) };
     }
 
-    const limit = Math.min(Math.max(Math.trunc(opts.limit) || 50, 1), 200);
+    // No upper bound: a caller that asks for more cases per page gets them.
+    const limit = Math.max(Math.trunc(opts.limit) || 50, 1);
     const offset = Math.max(Math.trunc(opts.offset ?? 0) || 0, 0);
     // The cases on the page / in the result. Without a search no cycle joins are needed to pick them.
     const matched = term
@@ -9201,11 +9239,14 @@ export class LegacyService implements OnModuleInit {
     const values = projectId ? [projectId] : organizationId ? [organizationId, userId] : [];
     const [projects, testcases, suites, plans, cycles, statuses] = await Promise.all([
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM projects${projectsWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM testcases_active${childWhere}`, values),
+      this.db.query<{ count: string }>(
+        `SELECT COUNT(*) AS count FROM testcases${childWhere ? `${childWhere} AND` : " WHERE"} ${LegacyService.countedTestcase()}`,
+        values
+      ),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM suites_active${childWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM plans${plansWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM cycles${cyclesWhere}`, values),
-      this.db.query<{ status: string; count: string }>(
+      this.db.heavyQuery<{ status: string; count: string }>(
         // ci/c both gain deleted_at IS NULL: executions_active already excludes soft-deleted
         // executions, but a run or a removed cycle_item surviving underneath it (hard-delete
         // remediation Phase 1/2) must not keep inflating this breakdown just because its execution
@@ -9270,15 +9311,24 @@ export class LegacyService implements OnModuleInit {
     // concurrently. Built as thunks rather than started immediately so the kill switch can still
     // genuinely run them one at a time (each query only starts once its thunk is invoked), not just
     // await already-started promises in sequence.
+    // Every count here follows countedTestcase() (live, not Archived), so totalTestCases, byStatus,
+    // byPriority and bySuite all sum to the same number the repository list shows. The Archived
+    // cases are counted on their own, for the "N archived" chip, rather than folded into the total.
+    const counted = LegacyService.countedTestcase();
     const totalQuery = () =>
-      this.db.query<{ count: string }>("SELECT COUNT(*) AS count FROM testcases_active WHERE project_id = $1", [projectId]);
+      this.db.query<{ count: string; archived: string }>(
+        `SELECT COUNT(*) FILTER (WHERE ${counted}) AS count,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND status = 'Archived') AS archived
+           FROM testcases WHERE project_id = $1`,
+        [projectId]
+      );
     const byStatusQuery = () => this.groupTestcases(projectId, "status");
     const byPriorityQuery = () => this.groupTestcases(projectId, "priority");
     const bySuiteQuery = () =>
       this.db.query<{ name: string; count: string }>(
         `SELECT COALESCE(s.name, 'Unassigned') AS name, COUNT(t.id) AS count
-       FROM testcases_active t LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
-       WHERE t.project_id = $1 GROUP BY s.name ORDER BY s.name`,
+       FROM testcases t LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")} GROUP BY s.name ORDER BY s.name`,
         [projectId]
       );
     const updatedCountsQuery = () =>
@@ -9287,7 +9337,7 @@ export class LegacyService implements OnModuleInit {
          COUNT(*) FILTER (WHERE updated_at >= now() - interval '1 day')::int AS today,
          COUNT(*) FILTER (WHERE updated_at >= date_trunc('week', now()))::int AS this_week,
          COUNT(*) FILTER (WHERE updated_at >= date_trunc('month', now()))::int AS this_month
-       FROM testcases_active WHERE project_id = $1`,
+       FROM testcases WHERE project_id = $1 AND ${counted}`,
         [projectId]
       );
     const addedByDateQuery = () =>
@@ -9296,7 +9346,7 @@ export class LegacyService implements OnModuleInit {
        FROM generate_series((now()::date - interval '29 days'), now()::date, interval '1 day') AS d
        LEFT JOIN (
          SELECT date_trunc('day', created_at) AS day, COUNT(*) AS cnt
-         FROM testcases_active WHERE project_id = $1 AND created_at >= now() - interval '30 days'
+         FROM testcases WHERE project_id = $1 AND ${counted} AND created_at >= now() - interval '30 days'
          GROUP BY 1
        ) t ON t.day = d
        ORDER BY d`,
@@ -9328,6 +9378,7 @@ export class LegacyService implements OnModuleInit {
     }
     return {
       totalTestCases: Number(total.rows[0]?.count || 0),
+      archivedTestCases: Number(total.rows[0]?.archived || 0),
       bySuite: bySuite.rows.map((r) => ({ name: r.name, count: Number(r.count) })),
       byStatus,
       byPriority,
@@ -9389,7 +9440,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async suiteHealth(projectId: string) {
-    const res = await this.db.query<{
+    const res = await this.db.heavyQuery<{
       suite_name: string;
       total_cases: string;
       passed: string;
@@ -9401,9 +9452,12 @@ export class LegacyService implements OnModuleInit {
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM testcases t
        LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
-       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
+       -- Only items still in a live run of this project. The cycles join used to be a LEFT JOIN
+       -- that filtered nothing, so results from deleted runs and removed items kept counting here.
+       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
+         AND EXISTS (SELECT 1 FROM cycles c WHERE c.id = ci.cycle_id AND c.project_id = t.project_id AND c.deleted_at IS NULL)
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
+       WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")}
        GROUP BY s.name
        ORDER BY s.name`,
       [projectId]
@@ -9432,7 +9486,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async coverageBySuite(projectId: string) {
-    const res = await this.db.query<{ suite_name: string; total_cases: string; covered_cases: string }>(
+    const res = await this.db.heavyQuery<{ suite_name: string; total_cases: string; covered_cases: string }>(
       `SELECT COALESCE(s.name, 'Unassigned') AS suite_name,
               COUNT(DISTINCT t.id)::int AS total_cases,
               COUNT(DISTINCT covered.testcase_id)::int AS covered_cases
@@ -9442,10 +9496,11 @@ export class LegacyService implements OnModuleInit {
          SELECT ci.testcase_id
          FROM cycle_items ci
          JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+         JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
          WHERE ci.testcase_id = t.id AND ci.deleted_at IS NULL AND e.status IS NOT NULL AND e.status <> 'Untested'
          LIMIT 1
        ) covered ON true
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
+       WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")}
        GROUP BY s.name
        ORDER BY s.name`,
       [projectId]
@@ -9459,16 +9514,19 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async untestedP1Count(projectId: string) {
-    const res = await this.db.query<{ count: string }>(
+    const res = await this.db.heavyQuery<{ count: string }>(
       // NOT EXISTS stops at the first settled execution per P1 case instead of joining and grouping
       // every execution the case ever had.
       `SELECT COUNT(*)::int AS count
          FROM testcases t
-        WHERE t.project_id = $1 AND t.deleted_at IS NULL AND t.priority = 'P1'
+        WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")} AND t.priority = 'P1'
           AND NOT EXISTS (
             SELECT 1 FROM cycle_items ci
-              JOIN executions e ON e.cycle_item_id = ci.id
+              -- A soft-deleted result is not a result; it used to make an untested P1 read as tested.
+              JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
              WHERE ci.testcase_id = t.id AND ci.deleted_at IS NULL
+               -- Only items still in a live run: a deleted run's results don't make a case tested.
+               AND EXISTS (SELECT 1 FROM cycles c WHERE c.id = ci.cycle_id AND c.deleted_at IS NULL)
                AND e.status IS NOT NULL AND e.status <> 'Untested'
           )`,
       [projectId]
@@ -9492,7 +9550,7 @@ export class LegacyService implements OnModuleInit {
     // settled results and more than one distinct status; flips = status changes between consecutive
     // runs, oldest first) and fetch run-by-run detail for those 20 alone. This used to ship every
     // settled execution in the project to Node and walk them there.
-    const ranked = await this.db.query<{ testcase_id: string; flips: number; results: number }>(
+    const ranked = await this.db.heavyQuery<{ testcase_id: string; flips: number; results: number }>(
       `SELECT testcase_id, COUNT(*) FILTER (WHERE prev IS NOT NULL AND prev <> status)::int AS flips, COUNT(*)::int AS results
          FROM (
            SELECT ci.testcase_id, e.status,
@@ -9647,8 +9705,9 @@ export class LegacyService implements OnModuleInit {
 
   async projectDashboardSummary(userId: string | null | undefined, projectId: string) {
     await this.requireProjectAccess(userId, projectId);
-    const [counts, requirements, bugSeverity, activeRuns, addedThisWeek, passRateWindows] = await Promise.all([
-      this.analytics(projectId),
+    const [counts, requirements, bugSeverity, activeRuns, testCaseTotals, passRateWindows] = await Promise.all([
+      // Concurrent loads of the same project's dashboard (two tabs, a refresh, a retry) share one read.
+      this.dedupe(`analytics:${projectId}`, () => this.analytics(projectId)),
       this.requirementsSummary(projectId, userId),
       this.db.query<{ severity: string | null; count: string }>(
         `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND deleted_at IS NULL AND status IN ('Open', 'Reopened') GROUP BY severity`,
@@ -9658,15 +9717,24 @@ export class LegacyService implements OnModuleInit {
         `SELECT COUNT(*)::int AS count FROM cycles WHERE project_id = $1 AND status = 'In Progress' AND deleted_at IS NULL`,
         [projectId]
       ),
-      this.db.query<{ count: string }>(
-        `SELECT COUNT(*)::int AS count FROM testcases_active WHERE project_id = $1 AND created_at >= now() - interval '7 days'`,
+      // The "Test cases" card links to the repository table, so it counts what that table lists by
+      // default: live rows, and not Archived (see countedTestcase). analytics().testCaseCount now
+      // applies the same rule; this query stays separate only because it also needs addedThisWeek.
+      this.db.query<{ total: number; added_this_week: number }>(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days')::int AS added_this_week
+           FROM testcases
+          WHERE project_id = $1 AND ${LegacyService.countedTestcase()}`,
         [projectId]
       ),
       // Compares the pass rate of executions recorded in the last 7 days against the 7 days
       // before that, so the dashboard's "+N% this week" badge reflects real execution activity
       // rather than an all-time trend. Settled statuses only (Passed/Failed/Blocked) — matching
       // computeExecutionMetrics' Pass Rate, Skipped and Retest are not part of this denominator.
-      this.db.query<{ passed_recent: string; settled_recent: string; passed_prior: string; settled_prior: string }>(
+      // Every FILTER below needs executed_at inside the last 14 days, so that bound also goes in the WHERE:
+      // with it only the recent rows are read (idx_executions_executed_at); without it every execution in
+      // the project (~700k on the largest tenant) was joined just to be counted by none of the filters.
+      this.db.heavyQuery<{ passed_recent: string; settled_recent: string; passed_prior: string; settled_prior: string }>(
         `SELECT
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '7 days')::int AS passed_recent,
            COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '7 days')::int AS settled_recent,
@@ -9675,7 +9743,7 @@ export class LegacyService implements OnModuleInit {
          FROM executions e
          JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
          JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
-         WHERE c.project_id = $1`,
+         WHERE c.project_id = $1 AND e.executed_at >= now() - interval '14 days'`,
         [projectId]
       )
     ]);
@@ -9711,7 +9779,10 @@ export class LegacyService implements OnModuleInit {
     const coveragePct = totalRequirements > 0 ? Math.round((coveredRequirements / totalRequirements) * 100) : null;
 
     return {
-      testCases: { total: counts.testCaseCount, addedThisWeek: Number(addedThisWeek.rows[0]?.count || 0) },
+      testCases: {
+        total: Number(testCaseTotals.rows[0]?.total || 0),
+        addedThisWeek: Number(testCaseTotals.rows[0]?.added_this_week || 0)
+      },
       passRate: { value: metrics.passRate, deltaThisWeek: passRateDeltaThisWeek },
       executionProgress: { value: metrics.executionProgress },
       openBugs: { total: openBugsTotal, bySeverity, noSeverity: openBugsNoSeverity },
@@ -9801,19 +9872,35 @@ export class LegacyService implements OnModuleInit {
     const filters = ["ae.project_id = $1"];
     this.activityFeedFilters(query, values, filters, { withProject: false });
     const where = filters.join(" AND ");
+    return this.pageActivity(where, values, limit, offset, "project_id = $1", null);
+  }
 
-    const eventsSql = this.activityEventsSql(where);
-
-    const total = await this.db.query<{ count: string }>(
-      `SELECT COUNT(*) AS count FROM (${eventsSql}) counted`,
-      values
-    );
-    values.push(limit, offset);
-    const res = await this.db.query(
-      `${eventsSql} ORDER BY created_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
-      values
-    );
-    return { list: res.rows.map(toCamel), total: Number(total.rows[0]?.count || 0) };
+  /**
+   * One page of the feed plus its exact total, shared by the project and workspace feeds.
+   *
+   * The two queries are independent, so they run side by side. `$n` is bound once per statement and
+   * the filter values are copied per query: a shared array that one query is still reading while the
+   * other pushes its LIMIT/OFFSET onto it would corrupt both.
+   */
+  private async pageActivity(
+    where: string,
+    filterValues: any[],
+    limit: number,
+    offset: number,
+    projectScopeSql: string,
+    orgOnlySql: string | null
+  ) {
+    const n = filterValues.length;
+    // The newest `offset + limit` rows of each branch are all a page can be made of (see activityUnionSql).
+    const eventsSql = this.activityEventsSql(where, projectScopeSql, orgOnlySql, { branchLimit: `$${n + 1}` });
+    const [total, page] = await Promise.all([
+      this.db.heavyQuery<{ count: string }>(this.activityCountSql(where, projectScopeSql, orgOnlySql), [...filterValues]),
+      this.db.heavyQuery(
+        `${eventsSql} ORDER BY created_at DESC, id DESC LIMIT $${n + 2} OFFSET $${n + 3}`,
+        [...filterValues, offset + limit, limit, offset]
+      )
+    ]);
+    return { list: page.rows.map(toCamel), total: Number(total.rows[0]?.count || 0) };
   }
 
   // Testcase created/updated/deleted are intentionally NOT synthesized from the `testcases`
@@ -9832,10 +9919,79 @@ export class LegacyService implements OnModuleInit {
   // changes) — these can never match projectScopeSql since project_id IS NULL, so the
   // workspace rollup needs this extra branch to include them; the per-project feed omits it
   // (default null) since those events aren't relevant to a single project's own history.
-  private activityEventsSql(outerWhere: string, projectScopeSql: string = "project_id = $1", orgOnlySql: string | null = null): string {
+  // The columns every branch below produces, in order. Branches are wrapped one by one (see
+  // activityUnionSql), and only the first branch of a UNION names its columns, so each wrapper
+  // names them explicitly.
+  private static readonly ACTIVITY_COLUMNS =
+    "project_id, id, actor_id, actor_email, actor_name, actor_kind, action, entity_type, entity_id, entity_name, diff, created_at";
+
+  // The audit_logs rows a zyra_* sibling makes redundant: testcase_created/testcase_updated rows with a
+  // zyra_* row for the same entity within 5 seconds (see activityEventsSql).
+  //
+  // Driven from the zyra_* rows (a small slice of the table, served by idx_audit_logs_zyra_sibling) and
+  // matched to their testcase_* rows through idx_audit_logs_entity, so the cost follows the number of
+  // Zyra actions in scope and not the size of the history, and not the filters on the request. A
+  // per-row "does a sibling exist" probe was tried first: it is fast only while a LIMIT stops the scan
+  // early, and it ran once per testcase_* row whenever a filter, an empty search or a deep offset
+  // stopped that from happening.
+  private zyraDroppedIdsSql(projectScopeSql: string): string {
+    return `
+      SELECT a2.id
+      FROM (
+        SELECT project_id, entity_id, created_at FROM audit_logs
+        WHERE ${projectScopeSql} AND action IN ('zyra_created', 'zyra_updated', 'zyra_archived')
+      ) z
+      JOIN audit_logs a2
+        ON a2.entity_type = 'testcase' AND a2.entity_id = z.entity_id AND a2.project_id = z.project_id
+      WHERE a2.action IN ('testcase_created', 'testcase_updated')
+        AND abs(extract(epoch FROM z.created_at - a2.created_at)) < 5`;
+  }
+
+  // The audit_logs branch: the only one with real actors, and the only one that can be big (one row
+  // per mutation, forever). `dedupZyra` drops the rows zyraDroppedIdsSql names, as an anti-join, so it
+  // applies before a branch's LIMIT and a dropped row never takes a page slot.
+  private activityAuditBranch(projectScopeSql: string, dedupZyra: boolean): string {
+    const dedup = dedupZyra
+      ? `AND NOT EXISTS (SELECT 1 FROM (${this.zyraDroppedIdsSql(projectScopeSql)}) dropped WHERE dropped.id = a.id)`
+      : "";
+    return `
+        SELECT
+          a.project_id, a.id::text, a.actor_id, u.email, COALESCE(u.name, g.display_name),
+          CASE WHEN g.id IS NOT NULL THEN 'agent' WHEN u.id IS NOT NULL THEN 'user' END,
+          a.action::text, a.entity_type::text, a.entity_id::text, a.entity_name::text, a.diff::text, a.created_at
+        FROM audit_logs a
+        LEFT JOIN users u ON u.id = a.actor_id
+        LEFT JOIN agents g ON g.id = a.actor_id
+        WHERE a.project_id IS NOT NULL AND ${projectScopeSql}
+        ${dedup}`;
+  }
+
+  /**
+   * Every event, as a UNION ALL of independently filtered branches.
+   *
+   * `outerWhere` is applied INSIDE each branch rather than once on top of the union. The previous shape
+   * was one `WITH activity_events AS (...)` read twice (once for the rows, once for the zyra sibling
+   * check), which Postgres must materialize: every filter and the LIMIT ran over the whole history of
+   * the project (hundreds of thousands of rows for a large tenant) on every request, and the Activity
+   * screen fires three of those at once. Per branch, the filters narrow each table first.
+   *
+   * `branchLimit` (a `$n` placeholder) additionally keeps only each branch's newest N rows. A page of
+   * `limit` rows at `offset` can only be made of the newest `offset + limit` rows of each branch, so
+   * the caller passes that sum and the final sort handles a few hundred rows however large the
+   * history is. The tie-break on id keeps a page boundary stable when rows share a timestamp (a bulk
+   * action writes many rows in one transaction, so they carry the same now()).
+   *
+   * The Zyra de-duplication lives in the audit branch only, so it applies before a branch's LIMIT and a
+   * dropped row never takes a page slot.
+   */
+  private activityUnionSql(
+    outerWhere: string,
+    projectScopeSql: string,
+    orgOnlySql: string | null,
+    opts: { branchLimit?: string; dedupZyra: boolean }
+  ): string {
     const orgOnlyBranch = orgOnlySql
       ? `
-        UNION ALL
         SELECT
           NULL::uuid AS project_id, a.id::text, a.actor_id, u.email, COALESCE(u.name, g.display_name),
           CASE WHEN g.id IS NOT NULL THEN 'agent' WHEN u.id IS NOT NULL THEN 'user' END,
@@ -9845,7 +10001,7 @@ export class LegacyService implements OnModuleInit {
         LEFT JOIN agents g ON g.id = a.actor_id
         WHERE a.project_id IS NULL AND ${orgOnlySql}
       `
-      : "";
+      : null;
     // Bugs filed since bug mutations started writing audit rows (bug_created onwards) have a real,
     // actor-attributed history in audit_logs, so the synthetic created/updated rows below — which
     // credit every edit to the reporter — are only kept for older bugs that have nothing else.
@@ -9853,8 +10009,8 @@ export class LegacyService implements OnModuleInit {
           SELECT 1 FROM audit_logs bx
           WHERE bx.entity_type = 'bug' AND bx.entity_id = b.id::text AND bx.action = 'bug_created'
         )`;
-    return `
-      WITH activity_events AS (
+    const branches: string[] = [
+      `
         SELECT
           project_id,
           ('suite-created-' || id::text) AS id,
@@ -9875,8 +10031,8 @@ export class LegacyService implements OnModuleInit {
           created_at
         FROM suites
         WHERE ${projectScopeSql}
-
-        UNION ALL
+      `,
+      `
         SELECT
           project_id, ('suite-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
           'updated'::text, 'suite'::text, id::text,
@@ -9884,8 +10040,8 @@ export class LegacyService implements OnModuleInit {
           NULL::text, updated_at
         FROM suites
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
-
-        UNION ALL
+      `,
+      `
         SELECT
           p.project_id, ('plan-created-' || p.id::text), p.owner_id, u.email, u.name,
           CASE WHEN p.owner_id IS NOT NULL THEN 'user' END,
@@ -9895,8 +10051,8 @@ export class LegacyService implements OnModuleInit {
         FROM plans p
         LEFT JOIN users u ON u.id = p.owner_id
         WHERE ${projectScopeSql}
-
-        UNION ALL
+      `,
+      `
         SELECT
           project_id, ('plan-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
           'updated'::text, 'plan'::text, id::text,
@@ -9904,8 +10060,8 @@ export class LegacyService implements OnModuleInit {
           NULL::text, updated_at
         FROM plans
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
-
-        UNION ALL
+      `,
+      `
         SELECT
           c.project_id, ('cycle-created-' || c.id::text), c.owner_id, u.email, u.name,
           CASE WHEN c.owner_id IS NOT NULL THEN 'user' END,
@@ -9918,8 +10074,8 @@ export class LegacyService implements OnModuleInit {
         FROM cycles c
         LEFT JOIN users u ON u.id = c.owner_id
         WHERE ${projectScopeSql}
-
-        UNION ALL
+      `,
+      `
         SELECT
           project_id, ('cycle-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
           'updated'::text, 'cycle'::text, id::text,
@@ -9927,8 +10083,8 @@ export class LegacyService implements OnModuleInit {
           NULL::text, updated_at
         FROM cycles
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
-
-        UNION ALL
+      `,
+      `
         SELECT
           b.project_id, ('bug-created-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
@@ -9938,8 +10094,8 @@ export class LegacyService implements OnModuleInit {
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql} AND ${bugHasNoAuditTrail}
-
-        UNION ALL
+      `,
+      `
         SELECT
           b.project_id, ('bug-updated-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
@@ -9949,91 +10105,112 @@ export class LegacyService implements OnModuleInit {
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second' AND ${bugHasNoAuditTrail}
+      `,
+      this.activityAuditBranch(projectScopeSql, opts.dedupZyra)
+    ];
+    if (orgOnlyBranch) branches.push(orgOnlyBranch);
 
-        UNION ALL
-        SELECT
-          a.project_id, a.id::text, a.actor_id, u.email, COALESCE(u.name, g.display_name),
-          CASE WHEN g.id IS NOT NULL THEN 'agent' WHEN u.id IS NOT NULL THEN 'user' END,
-          a.action::text, a.entity_type::text, a.entity_id::text, a.entity_name::text, a.diff::text, a.created_at
-        FROM audit_logs a
-        LEFT JOIN users u ON u.id = a.actor_id
-        LEFT JOIN agents g ON g.id = a.actor_id
-        WHERE a.project_id IS NOT NULL AND ${projectScopeSql}
-        ${orgOnlyBranch}
-      )
-      -- The Zyra chat flow calls the shared createTestCase/patchTestCaseFromZyra helpers (which
-      -- already log testcase_created/testcase_updated) and then logs a second zyra_created/
-      -- zyra_updated/zyra_archived row for the same entity a moment later, so both would render
-      -- as duplicate feed rows for the same mutation. Drop the plain testcase_* row whenever a
-      -- zyra_* sibling exists for the same entity within a few seconds; the zyra_* row carries
-      -- the AI-specific action label and reason, and actor attribution already says who/what did it.
-      --
-      -- Shape matters for speed: this must stay a top-level AND NOT EXISTS whose only correlation
-      -- to ae is z.entity_id = ae.entity_id. Postgres then plans a hash anti-join (linear). The
-      -- earlier NOT (action IN (...) AND EXISTS (...)) put the sublink under an OR, which cannot be
-      -- pulled up, so it ran as a correlated SubPlan that full-scanned the (unindexed, materialized)
-      -- CTE once per testcase_* row: O(testcase rows x all rows), 30s+ on a project with thousands
-      -- of test cases, which the 30s statement_timeout turned into a 500 on the project dashboard.
-      -- The action guard sits inside the subquery (outer-only qual): for any other action the
-      -- subquery is empty, so NOT EXISTS stays true and the row is kept, as before.
-      -- z is deliberately NOT narrowed by outerWhere: a sibling hidden by a filter must still dedup.
+    const limit = opts.branchLimit ? ` ORDER BY ae.created_at DESC, ae.id DESC LIMIT ${opts.branchLimit}` : "";
+    return branches
+      .map((branch) => `(SELECT * FROM (${branch}) ae(${LegacyService.ACTIVITY_COLUMNS}) WHERE ${outerWhere}${limit})`)
+      .join("\n        UNION ALL\n        ");
+  }
+
+  // The rows of the feed, newest-first once the caller appends its ORDER BY.
+  //
+  // Testcase created/updated/deleted are not synthesized (see above), and the Zyra chat flow logs a
+  // second zyra_created/zyra_updated/zyra_archived row for the same entity a moment later through the
+  // shared createTestCase/patchTestCaseFromZyra helpers, which already log testcase_created/
+  // testcase_updated. Both would render as duplicate feed rows for the same mutation, so the plain
+  // testcase_* row is dropped whenever a zyra_* sibling exists for the same entity within a few
+  // seconds; the zyra_* row carries the AI-specific action label and reason, and actor attribution
+  // already says who/what did it. The sibling is deliberately NOT narrowed by outerWhere: a sibling
+  // hidden by a filter must still dedup.
+  private activityEventsSql(
+    outerWhere: string,
+    projectScopeSql: string = "project_id = $1",
+    orgOnlySql: string | null = null,
+    opts: { branchLimit?: string } = {}
+  ): string {
+    const union = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, { ...opts, dedupZyra: true });
+    return `
       SELECT ae.*, pr.name AS project_name
-      FROM activity_events ae
+      FROM (${union}) ae
       LEFT JOIN projects pr ON pr.id = ae.project_id
-      WHERE ${outerWhere}
-        AND NOT EXISTS (
-          SELECT 1 FROM activity_events z
-          WHERE ae.action IN ('testcase_created', 'testcase_updated')
-            AND z.entity_id = ae.entity_id
-            AND z.action IN ('zyra_created', 'zyra_updated', 'zyra_archived')
-            AND abs(extract(epoch FROM z.created_at - ae.created_at)) < 5
-        )
     `;
+  }
+
+  /**
+   * How many rows activityEventsSql would return for `outerWhere`, without building them.
+   *
+   * Counting the de-duplicated rows directly would mean probing for a zyra sibling on every
+   * testcase_* row, i.e. once per row of a history that can run to hundreds of thousands. So it is
+   * counted as (every row) - (the testcase_* rows that have a zyra sibling): the second term is driven
+   * from the zyra_* rows, which are few, and each is matched to its testcase_* rows through
+   * idx_audit_logs_entity. Same rows, same filters, so the total always agrees with the list.
+   */
+  private activityCountSql(outerWhere: string, projectScopeSql: string, orgOnlySql: string | null): string {
+    const everyRow = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, { dedupZyra: false });
+    const droppedRows = `
+      SELECT 1
+      FROM (${this.activityAuditBranch(projectScopeSql, false)}) ae(${LegacyService.ACTIVITY_COLUMNS})
+      WHERE ${outerWhere}
+        AND ae.action IN ('testcase_created', 'testcase_updated')
+        AND ae.id IN (SELECT dropped.id::text FROM (${this.zyraDroppedIdsSql(projectScopeSql)}) dropped)
+    `;
+    return `SELECT (SELECT COUNT(*) FROM (${everyRow}) every_row) - (SELECT COUNT(*) FROM (${droppedRows}) dropped_row) AS count`;
   }
 
   // Powers the Activity screen's right-hand summary panel: this-week action-category counts,
   // an actor leaderboard, and a per-entity-type breakdown — all scoped to the same trailing
   // 7-day window so the three widgets read as one consistent "this week" snapshot.
   async activitySummary(projectId: string) {
-    const eventsSql = this.activityEventsSql(
-      "ae.project_id = $1 AND ae.created_at >= now() - interval '7 days'"
-    );
-    const [weekly, leaderboard, byEntityType] = await Promise.all([
-      this.db.query(
-        `
-        SELECT
-          COUNT(*) FILTER (WHERE action ILIKE 'zyra%')::int AS ai_actions,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%creat%')::int AS created,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%updat%')::int AS updated,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%delet%')::int AS deleted,
-          COUNT(*)::int AS total
-        FROM (${eventsSql}) e
-        `,
-        [projectId]
-      ),
-      this.db.query(
-        `
-        SELECT actor_id, actor_name, actor_email, actor_kind, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        WHERE actor_id IS NOT NULL
-        GROUP BY actor_id, actor_name, actor_email, actor_kind
-        ORDER BY count DESC
-        LIMIT 6
-        `,
-        [projectId]
-      ),
-      this.db.query(
-        `
-        SELECT entity_type, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        GROUP BY entity_type
-        ORDER BY count DESC
-        `,
+    return this.dedupe(`activitySummary:${projectId}`, () =>
+      this.activitySummaryFrom(
+        this.activityEventsSql("ae.project_id = $1 AND ae.created_at >= now() - interval '7 days'"),
         [projectId]
       )
-    ]);
+    );
+  }
 
-    const w = weekly.rows[0] || {};
+  /**
+   * The three summary widgets (this-week counts, actor leaderboard, per-entity-type breakdown) from one
+   * read of the 7-day event set. They used to build that set three times, in parallel, so one Activity
+   * page load cost three full builds and three connections. MATERIALIZED makes the single build explicit:
+   * the three aggregates below all read the same rows.
+   */
+  private async activitySummaryFrom(eventsSql: string, values: unknown[]) {
+    const res = await this.db.heavyQuery<{ weekly: Body; leaderboard: Body[]; by_entity_type: Body[] }>(
+      `
+      WITH e AS MATERIALIZED (${eventsSql})
+      SELECT
+        (SELECT row_to_json(w) FROM (
+           SELECT
+             COUNT(*) FILTER (WHERE action ILIKE 'zyra%')::int AS ai_actions,
+             COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%creat%')::int AS created,
+             COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%updat%')::int AS updated,
+             COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%delet%')::int AS deleted,
+             COUNT(*)::int AS total
+           FROM e
+         ) w) AS weekly,
+        (SELECT COALESCE(json_agg(l ORDER BY l.count DESC), '[]'::json) FROM (
+           SELECT actor_id, actor_name, actor_email, actor_kind, COUNT(*)::int AS count
+           FROM e
+           WHERE actor_id IS NOT NULL
+           GROUP BY actor_id, actor_name, actor_email, actor_kind
+           ORDER BY count DESC
+           LIMIT 6
+         ) l) AS leaderboard,
+        (SELECT COALESCE(json_agg(t ORDER BY t.count DESC), '[]'::json) FROM (
+           SELECT entity_type, COUNT(*)::int AS count
+           FROM e
+           GROUP BY entity_type
+         ) t) AS by_entity_type
+      `,
+      values
+    );
+    const row = res.rows[0];
+    const w = (row?.weekly || {}) as Body;
     return {
       weekly: {
         created: Number(w.created || 0),
@@ -10042,8 +10219,8 @@ export class LegacyService implements OnModuleInit {
         deleted: Number(w.deleted || 0),
         total: Number(w.total || 0)
       },
-      activeMembers: leaderboard.rows.map(toCamel),
-      byEntityType: byEntityType.rows.map(toCamel)
+      activeMembers: (row?.leaderboard || []).map(toCamel),
+      byEntityType: (row?.by_entity_type || []).map(toCamel)
     };
   }
 
@@ -10075,78 +10252,27 @@ export class LegacyService implements OnModuleInit {
     const filters = ["true"];
     this.activityFeedFilters(query, values, filters, { withProject: true });
     const where = filters.join(" AND ");
-
-    const eventsSql = this.activityEventsSql(
+    return this.pageActivity(
       where,
+      values,
+      limit,
+      offset,
       "project_id IN (SELECT id FROM projects WHERE organization_id = $1)",
       "organization_id = $1"
     );
-
-    const total = await this.db.query<{ count: string }>(
-      `SELECT COUNT(*) AS count FROM (${eventsSql}) counted`,
-      values
-    );
-    values.push(limit, offset);
-    const res = await this.db.query(
-      `${eventsSql} ORDER BY created_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
-      values
-    );
-    return { list: res.rows.map(toCamel), total: Number(total.rows[0]?.count || 0) };
   }
 
   private async workspaceActivitySummary(organizationId: string) {
-    const eventsSql = this.activityEventsSql(
-      "ae.created_at >= now() - interval '7 days'",
-      "project_id IN (SELECT id FROM projects WHERE organization_id = $1)",
-      "organization_id = $1"
-    );
-    const [weekly, leaderboard, byEntityType] = await Promise.all([
-      this.db.query(
-        `
-        SELECT
-          COUNT(*) FILTER (WHERE action ILIKE 'zyra%')::int AS ai_actions,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%creat%')::int AS created,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%updat%')::int AS updated,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%delet%')::int AS deleted,
-          COUNT(*)::int AS total
-        FROM (${eventsSql}) e
-        `,
-        [organizationId]
-      ),
-      this.db.query(
-        `
-        SELECT actor_id, actor_name, actor_email, actor_kind, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        WHERE actor_id IS NOT NULL
-        GROUP BY actor_id, actor_name, actor_email, actor_kind
-        ORDER BY count DESC
-        LIMIT 6
-        `,
-        [organizationId]
-      ),
-      this.db.query(
-        `
-        SELECT entity_type, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        GROUP BY entity_type
-        ORDER BY count DESC
-        `,
+    return this.dedupe(`workspaceActivitySummary:${organizationId}`, () =>
+      this.activitySummaryFrom(
+        this.activityEventsSql(
+          "ae.created_at >= now() - interval '7 days'",
+          "project_id IN (SELECT id FROM projects WHERE organization_id = $1)",
+          "organization_id = $1"
+        ),
         [organizationId]
       )
-    ]);
-
-    const w = weekly.rows[0] || {};
-    return {
-      weekly: {
-        created: Number(w.created || 0),
-        updated: Number(w.updated || 0),
-        aiActions: Number(w.ai_actions || 0),
-        deleted: Number(w.deleted || 0),
-        total: Number(w.total || 0)
-      },
-      activeMembers: leaderboard.rows.map(toCamel),
-      byEntityType: byEntityType.rows.map(toCamel)
-    };
+    );
   }
 
   /*
@@ -12178,35 +12304,46 @@ export class LegacyService implements OnModuleInit {
 
   async adminCustomers(userId: string | null | undefined) {
     await this.requirePlatformAdmin(userId);
-    const summary = await this.analytics();
-    const customers = await this.db.query(
-      `SELECT o.id, o.name, o.slug, o.created_at,
-              COUNT(DISTINCT om.user_id)::int AS member_count,
-              COUNT(DISTINCT p.id)::int AS project_count,
-              COUNT(DISTINCT t.id)::int AS test_case_count,
-              COUNT(DISTINCT t.id) FILTER (WHERE t.automation_status NOT IN ('Not Automated', 'To Be Automated'))::int AS automated_count,
-              MAX(GREATEST(o.updated_at, p.updated_at, t.updated_at)) AS last_activity_at
-       FROM organizations o
-       LEFT JOIN organization_members om ON om.organization_id = o.id
-       LEFT JOIN projects p ON p.organization_id = o.id
-       LEFT JOIN testcases t ON t.project_id = p.id
-       GROUP BY o.id ORDER BY o.created_at DESC`
-    );
+    // Archived projects and deleted/Archived cases are excluded like every other count (the joins used
+    // to have no filter at all), and the summary is derived from these same rows instead of a mix of
+    // analytics() and hardcoded zeros — it reported the project count as totalOrganizations, and 0
+    // for members, automated cases and coverage regardless of the data.
+    const [customers, members] = await Promise.all([
+      this.db.query(
+        `SELECT o.id, o.name, o.slug, o.created_at,
+                COUNT(DISTINCT om.user_id)::int AS member_count,
+                COUNT(DISTINCT p.id)::int AS project_count,
+                COUNT(DISTINCT t.id)::int AS test_case_count,
+                COUNT(DISTINCT t.id) FILTER (WHERE t.automation_status NOT IN ('Not Automated', 'To Be Automated'))::int AS automated_count,
+                MAX(GREATEST(o.updated_at, p.updated_at, t.updated_at)) AS last_activity_at
+         FROM organizations o
+         LEFT JOIN organization_members om ON om.organization_id = o.id
+         LEFT JOIN projects p ON p.organization_id = o.id AND p.archived_at IS NULL
+         LEFT JOIN testcases t ON t.project_id = p.id AND ${LegacyService.countedTestcase("t")}
+         GROUP BY o.id ORDER BY o.created_at DESC`
+      ),
+      // Distinct across workspaces: summing member_count would count a user in two workspaces twice.
+      this.db.query<{ count: number }>("SELECT COUNT(DISTINCT user_id)::int AS count FROM organization_members")
+    ]);
+    const rows = customers.rows.map((row) => {
+      const item = toCamel(row);
+      const total = Number(item.testCaseCount || 0);
+      const automated = Number(item.automatedCount || 0);
+      return { ...item, automationCoverage: total ? Math.round((automated / total) * 100) : 0 };
+    });
+    const sum = (key: string) => rows.reduce((acc, row) => acc + Number((row as Body)[key] || 0), 0);
+    const totalTestCases = sum("testCaseCount");
+    const totalAutomated = sum("automatedCount");
     return {
       summary: {
-        totalOrganizations: summary.projectCount,
-        totalMembers: 0,
-        totalProjects: summary.projectCount,
-        totalTestCases: summary.testCaseCount,
-        totalAutomated: 0,
-        overallAutomationCoverage: 0
+        totalOrganizations: rows.length,
+        totalMembers: Number(members.rows[0]?.count || 0),
+        totalProjects: sum("projectCount"),
+        totalTestCases,
+        totalAutomated,
+        overallAutomationCoverage: totalTestCases ? Math.round((totalAutomated / totalTestCases) * 100) : 0
       },
-      customers: customers.rows.map((row) => {
-        const item = toCamel(row);
-        const total = Number(item.testCaseCount || 0);
-        const automated = Number(item.automatedCount || 0);
-        return { ...item, automationCoverage: total ? Math.round((automated / total) * 100) : 0 };
-      })
+      customers: rows
     };
   }
 
@@ -12880,7 +13017,7 @@ export class LegacyService implements OnModuleInit {
       filters.push(`status = $${values.length}`);
     }
     if (query.coverage === "covered" || query.coverage === "uncovered") {
-      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL)`;
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND ${LegacyService.countedTestcase("t")})`;
       filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
     }
     const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM jira_tickets WHERE ${filters.join(" AND ")}`, values);
@@ -13488,7 +13625,7 @@ export class LegacyService implements OnModuleInit {
       filters.push(`status = $${values.length}`);
     }
     if (query.coverage === "covered" || query.coverage === "uncovered") {
-      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL)`;
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND ${LegacyService.countedTestcase("t")})`;
       filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
     }
     const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM linear_tickets WHERE ${filters.join(" AND ")}`, values);
@@ -13515,7 +13652,7 @@ export class LegacyService implements OnModuleInit {
       SELECT id, 'jira' AS source, jira_issue_key AS key, jira_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, jira_created_at AS created_at, jira_updated_at AS updated_at,
              jira_url AS url, synced_at,
-             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL) AS has_coverage
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND ${LegacyService.countedTestcase("t")}) AS has_coverage
       FROM jira_tickets
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
@@ -13523,7 +13660,7 @@ export class LegacyService implements OnModuleInit {
       SELECT id, 'linear' AS source, linear_issue_key AS key, linear_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, linear_created_at AS created_at, linear_updated_at AS updated_at,
              linear_url AS url, synced_at,
-             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL) AS has_coverage
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND ${LegacyService.countedTestcase("t")}) AS has_coverage
       FROM linear_tickets
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
@@ -13532,7 +13669,7 @@ export class LegacyService implements OnModuleInit {
       SELECT id, 'notion' AS source, notion_page_key AS key, notion_page_id AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, notion_created_at AS created_at, notion_updated_at AS updated_at,
              notion_url AS url, synced_at,
-             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL) AS has_coverage
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND ${LegacyService.countedTestcase("t")}) AS has_coverage
       FROM notion_pages
       WHERE project_id = $1 AND archived = false
         AND mapped_remote_id = (SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
@@ -13585,7 +13722,7 @@ export class LegacyService implements OnModuleInit {
       const stats = await this.db.query(
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE EXISTS (
-                  SELECT 1 FROM testcases t WHERE t.project_id = src.project_id AND t.${keyColumn} = src.${keyColumn} AND t.deleted_at IS NULL
+                  SELECT 1 FROM testcases t WHERE t.project_id = src.project_id AND t.${keyColumn} = src.${keyColumn} AND ${LegacyService.countedTestcase("t")}
                 ))::int AS covered
          FROM ${table} src WHERE ${scope}`,
         [projectId]
@@ -13898,7 +14035,7 @@ export class LegacyService implements OnModuleInit {
       filters.push(`status = $${values.length}`);
     }
     if (query.coverage === "covered" || query.coverage === "uncovered") {
-      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL)`;
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND ${LegacyService.countedTestcase("t")})`;
       filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
     }
     const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM notion_pages WHERE ${filters.join(" AND ")}`, values);
@@ -14251,7 +14388,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query<{ count: string }>(
       `SELECT COUNT(DISTINCT a.entity_id) AS count
          FROM audit_logs a
-         JOIN testcases_active t ON t.id::text = a.entity_id
+         JOIN testcases t ON t.id::text = a.entity_id AND ${LegacyService.countedTestcase("t")}
         WHERE a.project_id = $1 AND a.action = 'zyra_created' AND a.entity_type = 'testcase'`,
       [projectId]
     );
@@ -14691,7 +14828,17 @@ export class LegacyService implements OnModuleInit {
         routedSuite,
         routedCount: ticketKeys
           ? { exhaustive: true, scopeDecided: true, ticketScope: { ticketKeys, perTicket: Number(context.perTicket) || undefined } }
-          : { exhaustive: true, scopeDecided: true }
+          : // Every ticket, stated explicitly: the original message may never have said "tickets"
+            // ("write all test cases"), and the paged plan reads this rather than the wording.
+            { exhaustive: true, scopeDecided: true, scope: "all_tickets" }
+      }, undefined, onStage);
+    }
+    // "Just what this request matched" (offered when the scope was unstated): the narrow reading, the
+    // plan built from what the search matched — decided, so not asked again.
+    if (kind === "ticket_scope" && answer.choice.id === "matched") {
+      return this.buildZyraChatDecision(projectId, uid, sessionId, String(context.originalMessage || message), userMessageId, {
+        routedSuite,
+        routedCount: { exhaustive: context.exhaustive === true, scopeDecided: true, scope: "feature" }
       }, undefined, onStage);
     }
     if (kind === "ticket_scope") return this.zyraTicketSelectionPrompt(projectId, context);
@@ -15722,8 +15869,9 @@ export class LegacyService implements OnModuleInit {
       "A hypothetical or exploratory question ('what would happen if…', 'should we remove…', 'how many could we archive') is always action 'answer' with empty operations. Only act when the user is asking for the action itself.",
       "You are the only thing that decides what this request means — there is no keyword matcher behind you, and an 'answer' costs the user their request. Read the whole conversation: resolve pronouns ('it', 'those', 'them'), confirmations ('yes', 'go ahead', 'please start generating'), and follow-ups ('now put them in a suite') against what was actually said and done. Each assistant turn in the transcript below is annotated with what it actually persisted, so use those annotations — not your own earlier wording — to decide whether testcases the user is referring to already exist.",
       "For a create request also report how many testcases the user asked for: set requestedCount to that number when they named one (in digits or words, e.g. 'fifteen' -> 15), and set exhaustive=true when they asked for everything ('all possible cases', 'as many as you can', 'full coverage'). Leave requestedCount null and exhaustive false when they did not say — the project's configured range is used then.",
+      "For a create request also report its scope — what the test cases are FOR, judged from the meaning of the message and the conversation, not its exact words: \"named\" when this message names specific tickets; \"referenced\" when it points at tickets named earlier in the conversation or selected (\"all of them\", \"those tickets\", \"the selected ones\"); \"all_tickets\" when it means every ticket, requirement, issue or story in the project; \"project\" when it means the whole project or everything without naming tickets; \"feature\" when it is about one feature, area, page, document or folder; \"unspecified\" when it does not say what the test cases are for (e.g. just \"write all test cases\"). \"All\" means all of whatever the user refers to — do not widen it to every ticket unless they mean that.",
       "Return ONLY a single valid JSON object — no markdown fences, no text before or after the JSON:",
-      "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer|list|jira_pending_testcases|create|update|archive|create_suite|move_to_suite\",\"actionType\":\"answer|create|update|archive|suite|mixed\",\"requestedCount\":null,\"exhaustive\":false,\"operations\":[{\"type\":\"create|update|archive|create_suite|move_to_suite\",\"testcaseId\":\"\",\"externalId\":\"\",\"externalIds\":[],\"allExisting\":false,\"fromLastPlan\":false,\"suiteName\":\"\",\"suiteId\":\"\",\"draft\":{},\"fields\":{},\"reason\":\"\"}],\"testcases\":[{}]}",
+      "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer|list|jira_pending_testcases|create|update|archive|create_suite|move_to_suite\",\"actionType\":\"answer|create|update|archive|suite|mixed\",\"requestedCount\":null,\"exhaustive\":false,\"scope\":\"named|referenced|all_tickets|project|feature|unspecified\",\"operations\":[{\"type\":\"create|update|archive|create_suite|move_to_suite\",\"testcaseId\":\"\",\"externalId\":\"\",\"externalIds\":[],\"allExisting\":false,\"fromLastPlan\":false,\"suiteName\":\"\",\"suiteId\":\"\",\"draft\":{},\"fields\":{},\"reason\":\"\"}],\"testcases\":[{}]}",
       "REPLY FIELD RULES — reply is rendered as markdown in a chat UI, must be human-readable:",
       "  - Use ## for main headings, ### for subsections, **bold** for emphasis, - for bullets, 1. for numbered steps.",
       "  - For comparisons or tabular data use markdown table syntax: | Heading | Heading |\\n|---|---|\\n| value | value |",
@@ -15931,7 +16079,7 @@ export class LegacyService implements OnModuleInit {
           suites: projectSnapshot.suites,
           conversation: this.zyraTranscript(chronologicalHistory),
           routedSuite: this.routedZyraSuite(raw, projectSnapshot.suites),
-          routedCount: { requestedCount: raw.requestedCount, exhaustive: raw.exhaustive === true },
+          routedCount: { requestedCount: raw.requestedCount, exhaustive: raw.exhaustive === true, scope: LegacyService.zyraRoutedScope(raw.scope) },
           mentionedJira,
           capabilities,
           bugsForChat,
@@ -17508,6 +17656,13 @@ export class LegacyService implements OnModuleInit {
     // Own keys only: a range read from stored settings must not resolve through Object.prototype ("constructor").
     return Object.hasOwn(LegacyService.ZYRA_BATCH_BY_RANGE, range) ? LegacyService.ZYRA_BATCH_BY_RANGE[range] : LegacyService.ZYRA_BATCH_BY_RANGE["30-50"];
   }
+
+  /** One generation's size under the project's "Test cases per task" setting (zyraAgent.testcaseRange). */
+  private async zyraProjectBatchSize(projectId: string): Promise<number> {
+    const project = await this.getProject(projectId);
+    const settings = (this.parseProjectSettings(project.settings).zyraAgent || {}) as Body;
+    return LegacyService.zyraBatchSize(String(settings.testcaseRange || "30-50"));
+  }
   // Scenarios planned per round: one planner call (planZyraChatScenarios), and the cap on one ticket
   // page's plan. A paged plan (see zyraPlanTicketPage) runs many rounds, so the total is not bounded by it.
   private static readonly ZYRA_PLAN_MAX_SCENARIOS = 100;
@@ -17875,6 +18030,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     projectTestcaseRange?: string;
     // Set once the user chose "Generate all tickets in batches" — see startZyraTicketScopedPlan.
     ticketScope?: { ticketKeys: string[] | null; perTicket?: number };
+    // The router's reading of what the request is for — decides the paged all-tickets plan below.
+    routedScope?: ZyraRoutedScope;
   }): Promise<ZyraChatDecision> {
     const batchSize = LegacyService.zyraBatchSize(String(params.projectTestcaseRange || "30-50"));
     if (params.ticketScope) return this.startZyraTicketScopedPlan(params, params.ticketScope, batchSize);
@@ -17887,11 +18044,16 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     try {
       // Paged only for a request about the tickets as a whole: nothing named outright, no confident
       // search match. A named ticket or folder, or one feature, plans from what it matched.
-      const wantsAllTickets = params.knowledgeConfidence !== "strong"
+      // The router's scope decides when it reported one ("all_tickets"/"project" page through every
+      // ticket, whatever the wording); the keyword test is only the fallback for a router that did not.
+      const routedAllTickets = params.routedScope
+        ? params.routedScope === "all_tickets" || params.routedScope === "project"
+        : params.knowledgeConfidence !== "strong"
+          && !this.extractQuotedPhrases(params.message).length
+          && LegacyService.ZYRA_ALL_TICKETS_RE.test(`${params.message}\n${params.conversation || ""}`);
+      const wantsAllTickets = routedAllTickets
         && !params.jiraIssueKeys.length
         && !this.extractJiraIssueKeys(params.message).length
-        && !this.extractQuotedPhrases(params.message).length
-        && LegacyService.ZYRA_ALL_TICKETS_RE.test(`${params.message}\n${params.conversation || ""}`)
         && (await this.zyraProjectCapabilities(params.projectId)).knowledgeBase;
       if (wantsAllTickets) {
         const filled = await this.zyraPlanFill({
@@ -24167,12 +24329,17 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
    * "all N scenarios are now covered" read as full coverage. Thirty tickets came back as ~98 test
    * cases, about three per ticket, and nothing said so.
    *
-   * So when the estimate — tickets × the project's per-task count — is above
-   * ZYRA_TICKET_SCOPE_THRESHOLD, Zyra asks first: narrow to a ticket or two at a time, or work through
-   * every ticket in batches (a ticket-scoped plan, see startZyraChatPlan). An explicit count ("20 test
-   * cases for …") is the user's own budget and is never second-guessed; one ticket is never asked about.
+   * So when the estimate — tickets × test cases per ticket — is above what one generation holds under
+   * the project's own "Test cases per task" setting (zyraBatchSize of it, no fixed threshold), Zyra
+   * asks first: narrow to a ticket or two at a time, or work through every ticket in batches (a
+   * ticket-scoped plan, see startZyraChatPlan). An explicit count ("20 test cases for …") is the user's
+   * own budget and is never second-guessed; one ticket is never asked about.
+   *
+   * Scope is the router's semantic reading (ZyraRoutedScope), not keywords: "write all test cases"
+   * and "… for all tickets" used to split on whether the message happened to contain a ticket word
+   * (ZYRA_EVERY_TICKET_RE) — the first skipped this question and silently planned from whatever the
+   * search matched. The regex remains only as the fallback for a router that reported no scope.
    */
-  private static readonly ZYRA_TICKET_SCOPE_THRESHOLD = 60;
   /** "Generate in smaller batches" offers at most this many ticket groups to pick from. */
   private static readonly ZYRA_TICKET_GROUP_OPTIONS = 10;
   /** Unprocessed tickets listed by name in a plan's final message; the rest are counted. */
@@ -24224,19 +24391,40 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     return Number(res.rows[0]?.count || 0);
   }
 
-  // How many tickets this create spans, and whether that is enough to ask about. Null: just generate.
+  /**
+   * How many tickets this create spans, and whether that is enough to ask about. Null: just generate.
+   *
+   * One decision for every wording: scope from the router (`routedScope`, falling back to the old
+   * keyword test only when the router reported none), workload = tickets × test cases per ticket,
+   * limit = what one generation holds under the project's configured range. Asks when the workload is
+   * over the limit, or when an "all possible" request does not say what it is for (`unspecified`)
+   * and the project has tickets it could mean — a focused question instead of silently planning from
+   * whatever the search matched.
+   */
   private async zyraTicketScope(
     projectId: string,
     message: string,
     plan: { requestedCount: number; testcaseRange?: string },
-    knowledgeConfidence?: RagRetrievalConfidence
-  ): Promise<{ ticketKeys: string[] | null; ticketCount: number; perTicket: number } | null> {
+    options: {
+      projectTestcaseRange: string;
+      knowledgeConfidence?: RagRetrievalConfidence;
+      routedScope?: ZyraRoutedScope;
+      // Tickets this turn references: named in the message or carried from earlier in the conversation.
+      referencedKeys?: string[];
+    }
+  ): Promise<ZyraTicketScopeEstimate | null> {
     if (!plan.testcaseRange) return null;
+    const { routedScope, knowledgeConfidence } = options;
     // What one ticket gets: its range's batch ceiling (ZYRA_BATCH_BY_RANGE) — 100 for "all possible",
     // the project's 10/30/50 otherwise. Not requestedCount, which for "all" is the single-call cap of 50:
     // two tickets asked for in full used to share one batch of 100, about 50 each.
     const perTicket = LegacyService.zyraBatchSize(plan.testcaseRange);
-    let named = this.extractJiraIssueKeys(message);
+    // What one generation holds under the project's own setting — the limit the workload is held to.
+    const limit = LegacyService.zyraBatchSize(options.projectTestcaseRange);
+    // "All of them" points at tickets named earlier: carried keys count when the router says the
+    // request refers to tickets; otherwise only the ones this message names (the old behavior).
+    const carried = routedScope === "named" || routedScope === "referenced" ? options.referencedKeys ?? [] : [];
+    let named = [...new Set([...this.extractJiraIssueKeys(message), ...carried.map((key) => key.toUpperCase())])];
     // Key-shaped words are not all tickets ("UTF-8 and ISO-8859"): a key counts when its project prefix
     // is one this project has synced tickets under. One not synced itself still counts — it is reported.
     if (named.length >= 2) {
@@ -24254,38 +24442,69 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     }
     let ticketKeys: string[] | null = named;
     let ticketCount = named.length;
+    let unspecified = false;
     if (!named.length) {
-      // "All the tickets": the same preconditions as startZyraChatPlan's paged plan, plus an explicit
-      // "all/every", so "tests for the login requirement" is never mistaken for every ticket there is.
-      if (this.extractQuotedPhrases(message).length || !LegacyService.ZYRA_EVERY_TICKET_RE.test(message) || knowledgeConfidence === "strong") return null;
+      const everyTicket = routedScope
+        ? // The router's reading. "all_tickets"/"project" mean every ticket; an exhaustive request with
+          // no stated scope might, so it is asked about rather than assumed either way.
+          routedScope === "all_tickets" || routedScope === "project" || (routedScope === "unspecified" && plan.testcaseRange === "all")
+        : // Fallback, no router scope: the same preconditions as startZyraChatPlan's paged plan, plus an
+          // explicit "all/every", so "tests for the login requirement" is never mistaken for every ticket.
+          !this.extractQuotedPhrases(message).length && LegacyService.ZYRA_EVERY_TICKET_RE.test(message) && knowledgeConfidence !== "strong";
+      if (!everyTicket) return null;
       if (!(await this.zyraProjectCapabilities(projectId)).knowledgeBase) return null;
       ticketKeys = null;
       ticketCount = await this.zyraSyncedTicketCount(projectId, null);
+      unspecified = routedScope === "unspecified";
     }
-    if (ticketCount < 2 || ticketCount * perTicket <= LegacyService.ZYRA_TICKET_SCOPE_THRESHOLD) return null;
-    return { ticketKeys, ticketCount, perTicket };
+    if (ticketCount < 2 || ticketCount * perTicket <= limit) return null;
+    return { ticketKeys, ticketCount, perTicket, limit, unspecified };
+  }
+
+  /** The router's scope, if it is one this code knows; anything else is treated as not reported. */
+  static zyraRoutedScope(raw: unknown): ZyraRoutedScope | undefined {
+    return typeof raw === "string" && (ZYRA_ROUTED_SCOPES as readonly string[]).includes(raw) ? (raw as ZyraRoutedScope) : undefined;
   }
 
   private zyraTicketScopeQuestion(
     message: string,
-    scope: { ticketKeys: string[] | null; ticketCount: number; perTicket: number },
+    scope: ZyraTicketScopeEstimate,
     exhaustive: boolean,
     routedSuite: { id?: string; name?: string } | null
   ): ZyraChatDecision {
     const ru = zyraReplyLanguage() === "ru";
     const keys = scope.ticketKeys || [];
     const preview = keys.length ? ` (${keys.slice(0, 5).join(", ")}${keys.length > 5 ? ", …" : ""})` : "";
+    const estimate = scope.ticketCount * scope.perTicket;
+    // Every number here is the project's own: per-ticket and per-generation sizes come from its
+    // "Test cases per task" setting (zyraBatchSize), never a fixed 100.
+    const reply = scope.unspecified
+      ? ru
+        ? ZYRA_RU.scopeUnspecifiedQuestion(scope.ticketCount, scope.perTicket, scope.limit)
+        : `“All test cases” could mean all ${scope.ticketCount} synced tickets in this project, or just what this request matched. All tickets at about ${scope.perTicket} test cases each is roughly ${estimate} test cases — more than one generation of ${scope.limit}, so it would run in batches. Which do you mean?`
+      : ru
+        ? ZYRA_RU.scopeQuestion(scope.ticketCount, scope.perTicket, preview, scope.limit)
+        : `This request covers ${scope.ticketCount} tickets${preview}. At about ${scope.perTicket} test cases per ticket that is roughly ${estimate} test cases, and one generation holds ${scope.limit} under this project's settings — doing them all at once would spread thin coverage across every ticket. How would you like to proceed?`;
     return {
-      reply: ru
-        ? ZYRA_RU.scopeQuestion(scope.ticketCount, scope.perTicket, preview)
-        : `This request covers ${scope.ticketCount} tickets${preview}. At about ${scope.perTicket} test cases per ticket that is roughly ${scope.ticketCount * scope.perTicket} test cases, and one generation stays within 100 — doing them all at once would spread thin coverage across every ticket. How would you like to proceed?`,
-      reasoningSummary: ru ? ZYRA_RU.scopeReasoning : "The request spans more tickets than one generation covers well, so I asked how to proceed before generating.",
+      reply,
+      reasoningSummary: scope.unspecified
+        ? ru ? ZYRA_RU.scopeUnspecifiedReasoning : "The request asked for all test cases without saying what for, and every ticket would exceed one generation, so I asked which scope was meant before generating."
+        : ru ? ZYRA_RU.scopeReasoning : "The request spans more tickets than one generation covers well, so I asked how to proceed before generating.",
       actionType: "answer",
       operations: [],
       testcases: [],
       options: {
         kind: "ticket_scope",
         choices: [
+          // Only when the scope was not stated: the narrow reading, planned from what the search
+          // matched — what this request used to do without asking.
+          ...(scope.unspecified
+            ? [{
+                id: "matched",
+                label: ru ? ZYRA_RU.scopeMatchedLabel : "Just what this request matched",
+                description: ru ? ZYRA_RU.scopeMatchedDescription(scope.limit) : `Plan up to ${scope.limit} test cases from the knowledge this request matched.`
+              }]
+            : []),
           {
             id: "smaller",
             label: ru ? ZYRA_RU.scopeSmallerLabel : "Generate in smaller batches",
@@ -24295,12 +24514,12 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
             id: "all",
             label: ru ? ZYRA_RU.scopeAllLabel : "Generate all tickets in batches",
             description: ru
-              ? ZYRA_RU.scopeAllDescription(scope.ticketCount)
-              : `Zyra works through all ${scope.ticketCount} tickets in batches of up to 100 test cases and posts progress as it goes.`
+              ? ZYRA_RU.scopeAllDescription(scope.ticketCount, scope.limit)
+              : `Zyra works through all ${scope.ticketCount} tickets in batches of up to ${scope.limit} test cases and posts progress as it goes.`
           }
         ],
         answeredId: null,
-        context: { originalMessage: message, ticketKeys: scope.ticketKeys, ticketCount: scope.ticketCount, perTicket: scope.perTicket, exhaustive, routedSuite }
+        context: { originalMessage: message, ticketKeys: scope.ticketKeys, ticketCount: scope.ticketCount, perTicket: scope.perTicket, limit: scope.limit, exhaustive, routedSuite }
       }
     };
   }
@@ -24323,6 +24542,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     const perBatch = Math.max(1, Math.floor(LegacyService.ZYRA_PLAN_MAX_SCENARIOS / perTicket));
     const named = Array.isArray(context.ticketKeys) ? (context.ticketKeys as unknown[]).map(String) : null;
     const total = named ? named.length : await this.zyraSyncedTicketCount(projectId, null);
+    // The batch size the plan will use — carried from the question; a question asked before it carried
+    // one reads the project's setting now rather than assuming a number.
+    const limit = Number(context.limit) || (await this.zyraProjectBatchSize(projectId));
     const base = { reasoningSummary: ru ? ZYRA_RU.selectionReasoning : "Asked which tickets to generate for.", actionType: "answer" as const, operations: [], testcases: [] };
     if (!total) {
       return { ...base, reply: ru ? ZYRA_RU.selectionNoTickets : "None of these tickets is synced to Tesbo yet, so there is nothing to choose from. Sync them and ask again." };
@@ -24351,7 +24573,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         choices: [{
           id: "all",
           label: ru ? ZYRA_RU.scopeAllLabel : "Generate all tickets in batches",
-          description: ru ? ZYRA_RU.scopeAllDescription(total) : `Zyra works through all ${total} tickets in batches of up to 100 test cases and posts progress as it goes.`
+          description: ru ? ZYRA_RU.scopeAllDescription(total, limit) : `Zyra works through all ${total} tickets in batches of up to ${limit} test cases and posts progress as it goes.`
         }],
         answeredId: null,
         context
@@ -24422,7 +24644,12 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     const ticketScope = params.routedCount?.ticketScope;
     // Asked once: answering it (zyraDecisionForChoice) sets ticketScope or scopeDecided.
     if (!ticketScope && !params.routedCount?.scopeDecided) {
-      const scope = await this.zyraTicketScope(params.projectId, params.message, plan, params.knowledgeConfidence);
+      const scope = await this.zyraTicketScope(params.projectId, params.message, plan, {
+        projectTestcaseRange: params.projectTestcaseRange,
+        knowledgeConfidence: params.knowledgeConfidence,
+        routedScope: params.routedCount?.scope,
+        referencedKeys: params.jiraIssueKeys
+      });
       if (scope) return this.zyraTicketScopeQuestion(params.message, scope, plan.testcaseRange === "all", params.routedSuite ?? null);
     }
     // Read here rather than threaded down from the turn: this is the one function every interactive
@@ -24450,7 +24677,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         contextRefs: params.contextRefs,
         language,
         projectTestcaseRange: params.projectTestcaseRange,
-        ticketScope
+        ticketScope,
+        routedScope: params.routedCount?.scope
       });
     }
     return this.generateZyraChatTestcasesWithAi({
@@ -24556,7 +24784,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
            FROM testcases
            WHERE project_id = $1
              AND jira_issue_key IS NOT NULL
-             AND COALESCE(status, '') <> 'Archived'
+             -- Was only the Archived half: a soft-deleted case still marked its ticket covered.
+             AND ${LegacyService.countedTestcase()}
            GROUP BY jira_issue_key
          )
          SELECT COUNT(j.id)::int AS pending_jira_ticket_count
@@ -25094,7 +25323,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
 
   private async groupTestcases(projectId: string, column: string) {
     const res = await this.db.query<{ name: string; count: string }>(
-      `SELECT COALESCE(${column}, 'Unspecified') AS name, COUNT(*) AS count FROM testcases_active WHERE project_id = $1 GROUP BY ${column}`,
+      // Counted cases only (see countedTestcase), so byStatus has no "Archived" bucket and every
+      // grouping sums to repositorySummary's totalTestCases; archivedTestCases carries that count.
+      `SELECT COALESCE(${column}, 'Unspecified') AS name, COUNT(*) AS count FROM testcases WHERE project_id = $1 AND ${LegacyService.countedTestcase()} GROUP BY ${column}`,
       [projectId]
     );
     return res.rows.map((r) => ({ name: r.name, count: Number(r.count) }));

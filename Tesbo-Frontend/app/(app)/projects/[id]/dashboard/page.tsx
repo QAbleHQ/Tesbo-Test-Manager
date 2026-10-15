@@ -330,7 +330,9 @@ export default function ProjectDashboardPage() {
               "—"
             )
           }
-          label="Pass rate"
+          // "All runs" because the project card's figure is the latest run's — two numbers that are
+          // both right but differ (0% vs 3% on one project) read as a bug under one label.
+          label="Pass rate · all runs"
           bar={
             summary.passRate.value !== null ? (
               <ThinBar>
