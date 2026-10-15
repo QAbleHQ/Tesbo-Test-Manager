@@ -160,6 +160,8 @@ export default function ProjectDashboardPage() {
   // later visit renders the last-known data immediately while the effect below revalidates
   // it in the background, instead of blocking behind the spinner on every single click.
   const [loading, setLoading] = useState(!cached);
+  // The runs and activity panels fill in after the summary has already put the page on screen.
+  const [panelsLoading, setPanelsLoading] = useState(!cached);
 
   useEffect(() => {
     // Reset for the new projectId — otherwise navigating from one project's dashboard straight
@@ -178,8 +180,10 @@ export default function ProjectDashboardPage() {
         setRuns(existing.runs);
         setActivities(existing.activities);
         setLoading(false);
+        setPanelsLoading(false);
       } else {
         setLoading(true);
+        setPanelsLoading(true);
         setSummary(null);
       }
       if (!currentUser) {
@@ -187,30 +191,43 @@ export default function ProjectDashboardPage() {
         return;
       }
       try {
-        // Only the summary gates the page. Recent runs and recent activity are side panels: when one
-        // fails (the activity feed timing out was a 500 that bounced users off the project) the
-        // dashboard still renders with that panel empty instead of redirecting away.
-        const [summaryRes, cyclesRes, activityRes] = await Promise.allSettled([
-          getProjectDashboardSummary(projectId),
-          listCycles(projectId),
-          listActivity(projectId, { limit: 10 }),
-        ]);
+        // Only the summary gates the page. Recent runs and recent activity are side panels: they load
+        // alongside it but never hold it back, and when one fails (the activity feed timing out was a 500
+        // that bounced users off the project) the dashboard still renders with that panel empty instead of
+        // redirecting away. Each failure is absorbed here so it cannot surface as an unhandled rejection
+        // while the summary is still being awaited.
+        const runsRes = listCycles(projectId, { limit: 4 }).then(
+          (value) => value,
+          () => null
+        );
+        const activityRes = listActivity(projectId, { limit: 10 }).then(
+          (value) => value,
+          () => null
+        );
+        const summaryRes = await getProjectDashboardSummary(projectId);
         if (cancelled) return;
-        if (summaryRes.status === "rejected") throw summaryRes.reason;
+        setSummary(summaryRes);
+        setLoading(false);
+
+        const [cyclesValue, activityValue] = await Promise.all([runsRes, activityRes]);
+        if (cancelled) return;
         const next: DashboardData = {
-          summary: summaryRes.value,
-          runs: cyclesRes.status === "fulfilled" ? cyclesRes.value.slice(0, 4) : [],
-          activities: activityRes.status === "fulfilled" ? activityRes.value.list : [],
+          summary: summaryRes,
+          runs: cyclesValue ? cyclesValue.slice(0, 4) : [],
+          activities: activityValue ? activityValue.list : [],
         };
         // A degraded result is shown but not cached, so the next visit retries the failed panel.
-        if (cyclesRes.status === "fulfilled" && activityRes.status === "fulfilled") setPageCache(key, next);
-        setSummary(next.summary);
+        if (cyclesValue && activityValue) setPageCache(key, next);
         setRuns(next.runs);
         setActivities(next.activities);
+        setPanelsLoading(false);
       } catch {
         if (!cancelled) router.replace("/projects");
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+          setPanelsLoading(false);
+        }
       }
     })();
     return () => {
@@ -479,7 +496,7 @@ export default function ProjectDashboardPage() {
               </Link>
             </div>
             {runs.length === 0 ? (
-              <div className="px-4 py-10 text-center text-[13px] text-[var(--muted-soft)]">No test runs yet.</div>
+              <div className="px-4 py-10 text-center text-[13px] text-[var(--muted-soft)]">{panelsLoading ? "Loading runs…" : "No test runs yet."}</div>
             ) : (
               runs.map((run) => {
                 // A cycle with zero cycle_items still yields one all-NULL row from the backend's
@@ -567,7 +584,7 @@ export default function ProjectDashboardPage() {
           </div>
           <div className="flex-1 overflow-y-auto">
             {activities.length === 0 ? (
-              <div className="px-4 py-10 text-center text-[13px] text-[var(--muted-soft)]">No activity yet.</div>
+              <div className="px-4 py-10 text-center text-[13px] text-[var(--muted-soft)]">{panelsLoading ? "Loading activity…" : "No activity yet."}</div>
             ) : (
               activities.map((item) => (
                 <div key={item.id} className="flex items-start gap-2.5 border-b border-[var(--border-subtle)] px-4 py-3 last:border-b-0">

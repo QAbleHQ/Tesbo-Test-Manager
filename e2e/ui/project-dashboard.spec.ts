@@ -967,4 +967,38 @@ test.describe("project dashboard — loading, errors and navigation", () => {
       await deleteProjects(api, [project.id]);
     }
   });
+
+  test("DSH-U-16 the project home appears when its summary is ready, without waiting for a slow activity feed or run list", async ({ page }) => {
+    /*
+     * The page used to hold everything back until the summary, the run list AND the activity feed had all
+     * answered, so one slow side panel kept "Loading project..." on screen for as long as it took. Only the
+     * summary gates the page; the two panels say they are loading and fill in when they arrive.
+     */
+    const project = await createProject(api);
+    const delayMs = 6_000;
+    try {
+      await seedRun(api, project.id, { statuses: ["Passed", "Failed"], status: "Completed" });
+      await page.route(/\/api\/projects\/[^/]+\/(activity|cycles)(\?|$)/, async (route) => {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await route.continue();
+      });
+
+      const t0 = Date.now();
+      await page.goto(`/projects/${project.id}/dashboard`);
+      // The summary-driven content is up well before the delayed panels can have answered.
+      await expect(page.getByText("Recent test runs")).toBeVisible({ timeout: delayMs - 1_500 });
+      const shownAfter = Date.now() - t0;
+      expect(shownAfter, `the page took ${shownAfter}ms to appear behind a ${delayMs}ms side panel`).toBeLessThan(delayMs);
+      await expect(page.getByText("Loading activity…")).toBeVisible();
+      // Not mistaken for an empty project while it loads.
+      await expect(page.getByText("No activity yet.")).toHaveCount(0);
+
+      // And both panels do fill in once their requests answer: the seeded run's card, and the activity feed.
+      await expect(page.getByText("Loading activity…")).toHaveCount(0, { timeout: delayMs + 15_000 });
+      await expect(page.getByText("Loading runs…")).toHaveCount(0);
+      await expect(page.getByText("No test runs yet.")).toHaveCount(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
 });
