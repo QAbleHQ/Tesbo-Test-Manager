@@ -168,6 +168,80 @@ test.describe("reports export controls", () => {
 });
 
 /*
+ * "[Insights] Execution Report — Show Full Run Name on Hover". The chart's run-name labels are a
+ * fixed w-32 and truncate with an ellipsis; the only way to read a long name was the native `title`,
+ * whose ~1s delay made it look absent. A styled tooltip now shows the full name on hover — only
+ * when the label is actually cut off, so short names behave as before.
+ */
+test.describe("execution report run-name tooltip", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  const stamp = Date.now();
+  const longName = `E2E Tooltip Long Run Name That Cannot Fit In The Chart Label Column ${stamp}`;
+  const shortName = `R${stamp % 100000}`;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    projectId = (await createProject(api)).id;
+    await seedRun(api, projectId, { name: longName, statuses: ["Passed", "Failed"], status: "Completed" });
+    await seedRun(api, projectId, { name: shortName, statuses: ["Passed"], status: "Completed" });
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(async ({ page }) => {
+    test.skip(skipReason !== null, skipReason ?? "");
+    await page.goto(`/projects/${projectId}/reports`);
+    await page.getByRole("button", { name: /Execution Report/i }).first().click();
+    await expect(page.getByRole("heading", { name: /Execution status by/i })).toBeVisible();
+  });
+
+  test("RPT-U-TIP-1 hovering a truncated run name shows the full name, and leaving hides it", async ({ page }) => {
+    const label = page.getByText(longName, { exact: true });
+    await expect(label).toHaveCount(1);
+    // Precondition: the label really is truncated, otherwise this test proves nothing.
+    expect(await label.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+    // The native title is gone, so the browser doesn't stack a second tooltip on top.
+    await expect(label).not.toHaveAttribute("title", /.*/);
+
+    const tooltip = page.getByRole("tooltip");
+    await expect(tooltip).toHaveCount(0);
+    await label.hover();
+    await expect(tooltip).toBeVisible();
+    await expect(tooltip).toHaveText(longName);
+
+    // Truncation and the row layout are unchanged while the tooltip is up.
+    expect(await label.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+
+    await page.mouse.move(5, 5);
+    await expect(tooltip).toHaveCount(0);
+  });
+
+  test("RPT-U-TIP-2 a short run name that fits shows no tooltip", async ({ page }) => {
+    const label = page.getByText(shortName, { exact: true });
+    await expect(label).toBeVisible();
+    expect(await label.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(false);
+    await label.hover();
+    // Give a would-be tooltip the chance to render before asserting it did not.
+    await page.waitForTimeout(300);
+    await expect(page.getByRole("tooltip")).toHaveCount(0);
+  });
+
+  test("RPT-U-TIP-3 the bars and totals still render beside the labels", async ({ page }) => {
+    const row = page.getByText(longName, { exact: true }).locator("xpath=ancestor::div[contains(@class,'items-center')][1]");
+    await expect(row.locator('[title="Passed: 1"]')).toBeVisible();
+    await expect(row.locator('[title="Failed: 1"]')).toBeVisible();
+    await expect(row.getByText("2", { exact: true })).toBeVisible();
+  });
+});
+
+/*
  * "[Insights] UI issue in Priority and status labels". On the Traceability table the Priority and
  * Status columns were 70px / 90px in a fixed-layout table, so a "Medium" or "Approved" chip spilled
  * into the next column. A priority outside P0-P3 also rendered with no tone at all.
