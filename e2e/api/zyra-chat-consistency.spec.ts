@@ -546,7 +546,56 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     return Number(scalar(`SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND deleted_at IS NULL;`));
   }
 
-  function reviewRequestFor(sessionId: string): { taskStatus: string; generatedCount: number; payloadLength: number } | null {
+  /**
+   * Task-board generation notifications (zyra_generation_ready / zyra_generation_failed): a short
+   * title plus a body naming how many test cases were made and what for. Driven through the real
+   * POST /agents/zyra/tasks → processZyraTask against the fake provider. No Jira ticket is seeded (that
+   * needs a connection), so the subject is the quoted user story; the ticket form ("PROJ-123 – Login
+   * Flow") is pinned at unit level in notification-events.spec.ts.
+   */
+  const ownerNotifications = async (type: string): Promise<Array<{ title: string; body: string | null; link_entity_type: string; link_entity_id: string }>> =>
+    (await (await asOwner.get("/api/notifications")).json()).filter((n: { type: string }) => n.type === type);
+
+  test("ZCC-NOTIF-01 a finished task-board generation tells the requester how many test cases are ready, and for what", async () => {
+    await allocateFakeAiKey();
+    exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    const story = `E2E login flow ${Date.now()}`;
+    const draft = (n: number) => ({ title: `E2E draft ${n}`, preconditions: "", stepsJson: JSON.stringify([{ stepNumber: 1, action: "open", expectedResult: "opens" }]), testData: "", expectedSummary: "ok", priority: "P2", severity: "Medium", component: "Auth", tags: [], sourceRefs: [], techniques: ["general"] });
+    ai.queueReply({ drafts: [draft(1), draft(2), draft(3)] });
+    try {
+      const res = await asOwner.post(url("/tasks"), { data: { userStory: story }, failOnStatusCode: false });
+      expect(res.status(), await res.text()).toBe(201);
+      const taskId = (await res.json()).task.id as string;
+      await expect.poll(async () => (await ownerNotifications("zyra_generation_ready")).length, { timeout: 30_000 }).toBe(1);
+      const [row] = await ownerNotifications("zyra_generation_ready");
+      expect(row.title).toBe("Test Cases Ready for Review");
+      expect(row.body).toBe(`Zyra generated 3 test cases for "${story}". Review and save the test cases.`);
+      expect(row).toMatchObject({ link_entity_type: "zyra_task", link_entity_id: `${tenant!.mainProjectId}:${taskId}` });
+      expect(await ownerNotifications("zyra_generation_failed")).toHaveLength(0);
+    } finally {
+      exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    }
+  });
+
+  test("ZCC-NOTIF-02 a generation that yields no drafts tells the requester it failed, with the same subject and no 'ready' notice", async () => {
+    await allocateFakeAiKey();
+    exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    const story = `E2E failing flow ${Date.now()}`;
+    // Nothing queued: the fake's default reply carries no `drafts`, which processZyraTask treats as a failed generation.
+    try {
+      const res = await asOwner.post(url("/tasks"), { data: { userStory: story }, failOnStatusCode: false });
+      expect(res.status(), await res.text()).toBe(201);
+      await expect.poll(async () => (await ownerNotifications("zyra_generation_failed")).length, { timeout: 30_000 }).toBe(1);
+      const [row] = await ownerNotifications("zyra_generation_failed");
+      expect(row.title).toBe("Test Case Generation Failed");
+      expect(row.body).toBe(`Zyra could not generate test cases for "${story}". Open the task to see what went wrong and try again.`);
+      expect(await ownerNotifications("zyra_generation_ready")).toHaveLength(0);
+    } finally {
+      exec(`DELETE FROM notifications WHERE user_id = ${literal(tenant!.owner.userId)};`);
+    }
+  });
+
+  function reviewRequestFor(sessionId: string):{ taskStatus: string; generatedCount: number; payloadLength: number } | null {
     const row = scalar(
       `SELECT task_status || '|' || generated_count || '|' || jsonb_array_length(generated_payload) ` +
         `FROM ai_generation_requests WHERE chat_session_id = ${literal(sessionId)} ORDER BY created_at DESC LIMIT 1;`,
