@@ -181,12 +181,16 @@ export function ExecutionReportTab({
                 <h3 className="mb-4 text-[13px] font-semibold text-[var(--foreground)]">
                   Execution status by {FILTER_OPTIONS.find((o) => o.value === filterBy)?.label.replace("By ", "").replace("Overall (by Test Run)", "test run")}
                 </h3>
-                <StackedBarChart rows={rows} />
+                {/* Scrolls on its own beside Distribution: one row per run, so hundreds of runs used to
+                    stretch the grid row and push the Distribution chart far down the page. */}
+                <div data-testid="execution-status-list" className="lg:max-h-[480px] lg:overflow-y-auto lg:pr-1">
+                  <StackedBarChart rows={rows} />
+                </div>
                 <div className="mt-4 border-t border-[var(--border-subtle)] pt-4">
                   <Legend items={STATUS_KEYS.map((s) => ({ label: s, color: STATUS_COLORS[s] }))} />
                 </div>
               </div>
-              <div className="flex flex-col items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+              <div className="flex flex-col items-center justify-center rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5 lg:self-start">
                 <h3 className="mb-4 self-start text-[13px] font-semibold text-[var(--foreground)]">Distribution</h3>
                 <DonutChart data={STATUS_KEYS.map((s) => ({ label: s, value: totals[s], color: STATUS_COLORS[s] }))} size={160} />
                 <div className="mt-4">
