@@ -204,6 +204,50 @@ test.describe("team members", () => {
     }
   });
 
+  test("an invitation scoped to several projects folds the extras into a +N chip instead of wrapping the column", async ({ browser }) => {
+    const page = await pageAs(browser, "owner");
+    const email = uniqueEmail("multi");
+    const stamp = Date.now();
+    const api = await loginAs(tenant!.owner);
+    const projectIds: string[] = [];
+    let inviteId = "";
+    try {
+      for (let i = 1; i <= 3; i++) {
+        const res = await api.post("/api/projects", {
+          data: { name: `E2E Multi Invite ${i} ${stamp}`, key: `MI${i}${String(stamp).slice(-4)}`, description: "", projectType: "tesbox" },
+        });
+        projectIds.push((await res.json()).id);
+      }
+      const created = await (
+        await api.post("/api/workspace/invitations", { data: { email, role: "qa_engineer", projectIds } })
+      ).json();
+      inviteId = created.id;
+
+      await page.goto(WORKSPACE_MEMBERS_URL);
+      const cell = rowFor(invitesTable(page), email).getByTestId("invite-projects");
+      // Two names as chips, the third folded; the full list stays reachable via the chip's title.
+      await expect(cell).toContainText("E2E Multi Invite");
+      await expect(cell.getByText("+1 more")).toBeVisible();
+      await expect(cell.getByText(`E2E Multi Invite 3 ${stamp}`)).toHaveCount(0);
+      // Names are shown in full, never cut with an ellipsis.
+      const chip = cell.getByText(`E2E Multi Invite 1 ${stamp}`);
+      expect(await chip.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(false);
+      // The old comma list wrapped word-by-word into a column taller than 100px.
+      const box = await rowFor(invitesTable(page), email).boundingBox();
+      expect(box!.height).toBeLessThan(100);
+
+      // Clicking the chip reveals the hidden project, and "Show less" folds it again.
+      await cell.getByRole("button", { name: "+1 more" }).click();
+      await expect(cell.getByText(`E2E Multi Invite 3 ${stamp}`)).toBeVisible();
+      await cell.getByRole("button", { name: "Show less" }).click();
+      await expect(cell.getByText(`E2E Multi Invite 3 ${stamp}`)).toHaveCount(0);
+    } finally {
+      if (inviteId) await api.delete(`/api/workspace/invitations/${inviteId}`, { failOnStatusCode: false });
+      for (const id of projectIds) await api.delete(`/api/projects/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
   test("a rejected invite is explained in the modal instead of vanishing", { tag: '@tesbo.testId("TES-TC-674")' }, async ({ browser }) => {
     // The failure path: inviting an existing member is refused by the API, and the modal has to
     // stay open and say why. A silent close would read as success.
