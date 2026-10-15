@@ -221,6 +221,7 @@ export default function MembersTab() {
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const [actionId, setActionId] = useState<string | null>(null);
+  const [expandedInviteIds, setExpandedInviteIds] = useState<Set<string>>(new Set());
   const [pendingRemoval, setPendingRemoval] = useState<{ userId: string; label: string } | null>(null);
 
   const load = useCallback(async () => {
@@ -461,18 +462,50 @@ export default function MembersTab() {
                           <td>
                             <span className={roleBadgeClass(inv.role)}>{roleLabel(inv.role)}</span>
                           </td>
-                          <td className="text-[var(--ink-400)]">
-                            {inv.projects.length > 0
-                              ? inv.projects.map((p) => p.name).join(", ")
-                              : <span className="text-[var(--ink-300)]">—</span>}
+                          <td className="min-w-[200px] max-w-[280px]" data-testid="invite-projects">
+                            {inv.projects.length > 0 ? (
+                              // Chips instead of a comma list: with several projects the text used to
+                              // wrap word-by-word into a tall, narrow column. Show two, fold the rest.
+                              <div className="flex flex-wrap items-center gap-1">
+                                {(expandedInviteIds.has(inv.id) ? inv.projects : inv.projects.slice(0, 2)).map((p) => (
+                                  <span
+                                    key={p.id}
+                                    title={p.name}
+                                    className="max-w-full break-words rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 text-xs text-[var(--ink-600)]"
+                                  >
+                                    {p.name}
+                                  </span>
+                                ))}
+                                {inv.projects.length > 2 && (
+                                  <button
+                                    type="button"
+                                    aria-expanded={expandedInviteIds.has(inv.id)}
+                                    title={inv.projects.slice(2).map((p) => p.name).join(", ")}
+                                    onClick={() =>
+                                      setExpandedInviteIds((prev) => {
+                                        const next = new Set(prev);
+                                        if (next.has(inv.id)) next.delete(inv.id);
+                                        else next.add(inv.id);
+                                        return next;
+                                      })
+                                    }
+                                    className="rounded-full bg-[var(--brand-soft)] px-2 py-0.5 text-xs font-medium text-[var(--accent-light)] hover:underline"
+                                  >
+                                    {expandedInviteIds.has(inv.id) ? "Show less" : `+${inv.projects.length - 2} more`}
+                                  </button>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="text-[var(--ink-300)]">—</span>
+                            )}
                           </td>
                           <td className="text-[var(--ink-400)]">
                             {inv.invitedByName || inv.invitedByEmail || "—"}
                           </td>
-                          <td className="text-[var(--ink-400)]">
+                          <td className="whitespace-nowrap text-[var(--ink-400)]">
                             {formatDate(inv.createdAt)}
                           </td>
-                          <td className="text-[var(--ink-400)]">
+                          <td className="whitespace-nowrap text-[var(--ink-400)]">
                             {formatDate(inv.expiresAt)}
                           </td>
                           <td>

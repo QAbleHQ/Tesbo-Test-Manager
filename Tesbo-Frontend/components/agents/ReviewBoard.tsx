@@ -227,7 +227,7 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
   const busyRun = starting || active;
 
   return (
-    <section aria-label="Review Board" className="space-y-5">
+    <section aria-label="Review Board" className="min-w-0 space-y-5">
       <Card className="space-y-4 p-5">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="flex min-w-0 items-start gap-3">

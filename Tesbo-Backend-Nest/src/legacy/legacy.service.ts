@@ -3438,7 +3438,7 @@ export class LegacyService implements OnModuleInit {
       this.db.query<{ project_id: string; count: number }>(
         `SELECT project_id, COUNT(*)::int AS count
            FROM testcases
-          WHERE project_id = ANY($1::uuid[]) AND deleted_at IS NULL AND status IS DISTINCT FROM 'Archived'
+          WHERE project_id = ANY($1::uuid[]) AND ${LegacyService.countedTestcase()}
           GROUP BY project_id`,
         [ids]
       ),
@@ -4030,7 +4030,7 @@ export class LegacyService implements OnModuleInit {
        recursive_counts AS (
          SELECT d.root_id, COUNT(t.id)::int AS recursive_test_case_count
          FROM descendants d
-         LEFT JOIN testcases t ON t.suite_id = d.node_id AND t.deleted_at IS NULL
+         LEFT JOIN testcases t ON t.suite_id = d.node_id AND ${LegacyService.countedTestcase("t")}
          GROUP BY d.root_id
        )
        SELECT s.id, s.parent_id, s.name, s.description, s.preconditions, s.position, s.created_at,
@@ -4040,7 +4040,7 @@ export class LegacyService implements OnModuleInit {
                 0
               )::int AS recursive_test_case_count
        FROM suites s
-       LEFT JOIN testcases t ON t.suite_id = s.id AND t.deleted_at IS NULL
+       LEFT JOIN testcases t ON t.suite_id = s.id AND ${LegacyService.countedTestcase("t")}
        WHERE s.project_id = $1 AND s.deleted_at IS NULL
        GROUP BY s.id
        ORDER BY s.position, s.name`,
@@ -6009,7 +6009,7 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(userId, projectId);
     const [res, tasks] = await Promise.all([
       this.db.query(
-        "SELECT jira_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND jira_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY jira_issue_key",
+        `SELECT jira_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND jira_issue_key IS NOT NULL AND ${LegacyService.countedTestcase()} GROUP BY jira_issue_key`,
         [projectId]
       ),
       this.zyraTaskStatusesByIssueKey(projectId, "jira_issue_keys")
@@ -6023,7 +6023,7 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(userId, projectId);
     const [res, tasks] = await Promise.all([
       this.db.query(
-        "SELECT notion_page_id, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND notion_page_id IS NOT NULL AND deleted_at IS NULL GROUP BY notion_page_id",
+        `SELECT notion_page_id, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND notion_page_id IS NOT NULL AND ${LegacyService.countedTestcase()} GROUP BY notion_page_id`,
         [projectId]
       ),
       this.zyraTaskStatusesByIssueKey(projectId, "notion_page_ids")
@@ -6036,7 +6036,7 @@ export class LegacyService implements OnModuleInit {
     await this.requireProjectAccess(userId, projectId);
     const [res, tasks] = await Promise.all([
       this.db.query(
-        "SELECT linear_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND linear_issue_key IS NOT NULL AND deleted_at IS NULL GROUP BY linear_issue_key",
+        `SELECT linear_issue_key, COUNT(*)::int AS count FROM testcases WHERE project_id = $1 AND linear_issue_key IS NOT NULL AND ${LegacyService.countedTestcase()} GROUP BY linear_issue_key`,
         [projectId]
       ),
       this.zyraTaskStatusesByIssueKey(projectId, "linear_issue_keys")
@@ -6073,6 +6073,24 @@ export class LegacyService implements OnModuleInit {
     if (!isUuid(itemId)) throw new NotFoundException({ error: "Plan item not found" });
     const res = await this.db.query("SELECT id FROM plan_items WHERE id = $1 AND plan_id = $2 AND deleted_at IS NULL", [itemId, planId]);
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan item not found" });
+  }
+
+  /**
+   * The one rule for "this test case counts": live (not soft-deleted) and not Archived — the same
+   * set the repository list shows by default (listTestCases). Every user-visible test case total,
+   * per-suite badge, report count and coverage check uses this.
+   *
+   * Before it existed, most of those read `testcases_active`, which drops only soft-deleted rows, so
+   * Archived cases stayed in some numbers and not others: Project 2 read 514 on its card and
+   * dashboard but 517 in the repository header, and the workspace tile exceeded the sum of the
+   * project cards. Archived cases are still reported, separately, where a screen names them (the
+   * repository's byStatus "Archived" bucket behind its "N archived" chip).
+   *
+   * `alias` qualifies both columns for joined queries (e.g. "t"); usable in a WHERE or a JOIN ... ON.
+   */
+  static countedTestcase(alias = ""): string {
+    const p = alias ? `${alias}.` : "";
+    return `${p}deleted_at IS NULL AND ${p}status IS DISTINCT FROM 'Archived'`;
   }
 
   /**
@@ -6369,7 +6387,7 @@ export class LegacyService implements OnModuleInit {
       `SELECT c.*,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
-       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id
+       LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
        WHERE c.project_id = $1 AND c.deleted_at IS NULL
        GROUP BY c.id
@@ -9202,7 +9220,10 @@ export class LegacyService implements OnModuleInit {
     const values = projectId ? [projectId] : organizationId ? [organizationId, userId] : [];
     const [projects, testcases, suites, plans, cycles, statuses] = await Promise.all([
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM projects${projectsWhere}`, values),
-      this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM testcases_active${childWhere}`, values),
+      this.db.query<{ count: string }>(
+        `SELECT COUNT(*) AS count FROM testcases${childWhere ? `${childWhere} AND` : " WHERE"} ${LegacyService.countedTestcase()}`,
+        values
+      ),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM suites_active${childWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM plans${plansWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM cycles${cyclesWhere}`, values),
@@ -9271,15 +9292,24 @@ export class LegacyService implements OnModuleInit {
     // concurrently. Built as thunks rather than started immediately so the kill switch can still
     // genuinely run them one at a time (each query only starts once its thunk is invoked), not just
     // await already-started promises in sequence.
+    // Every count here follows countedTestcase() (live, not Archived), so totalTestCases, byStatus,
+    // byPriority and bySuite all sum to the same number the repository list shows. The Archived
+    // cases are counted on their own, for the "N archived" chip, rather than folded into the total.
+    const counted = LegacyService.countedTestcase();
     const totalQuery = () =>
-      this.db.query<{ count: string }>("SELECT COUNT(*) AS count FROM testcases_active WHERE project_id = $1", [projectId]);
+      this.db.query<{ count: string; archived: string }>(
+        `SELECT COUNT(*) FILTER (WHERE ${counted}) AS count,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL AND status = 'Archived') AS archived
+           FROM testcases WHERE project_id = $1`,
+        [projectId]
+      );
     const byStatusQuery = () => this.groupTestcases(projectId, "status");
     const byPriorityQuery = () => this.groupTestcases(projectId, "priority");
     const bySuiteQuery = () =>
       this.db.query<{ name: string; count: string }>(
         `SELECT COALESCE(s.name, 'Unassigned') AS name, COUNT(t.id) AS count
-       FROM testcases_active t LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
-       WHERE t.project_id = $1 GROUP BY s.name ORDER BY s.name`,
+       FROM testcases t LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
+       WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")} GROUP BY s.name ORDER BY s.name`,
         [projectId]
       );
     const updatedCountsQuery = () =>
@@ -9288,7 +9318,7 @@ export class LegacyService implements OnModuleInit {
          COUNT(*) FILTER (WHERE updated_at >= now() - interval '1 day')::int AS today,
          COUNT(*) FILTER (WHERE updated_at >= date_trunc('week', now()))::int AS this_week,
          COUNT(*) FILTER (WHERE updated_at >= date_trunc('month', now()))::int AS this_month
-       FROM testcases_active WHERE project_id = $1`,
+       FROM testcases WHERE project_id = $1 AND ${counted}`,
         [projectId]
       );
     const addedByDateQuery = () =>
@@ -9297,7 +9327,7 @@ export class LegacyService implements OnModuleInit {
        FROM generate_series((now()::date - interval '29 days'), now()::date, interval '1 day') AS d
        LEFT JOIN (
          SELECT date_trunc('day', created_at) AS day, COUNT(*) AS cnt
-         FROM testcases_active WHERE project_id = $1 AND created_at >= now() - interval '30 days'
+         FROM testcases WHERE project_id = $1 AND ${counted} AND created_at >= now() - interval '30 days'
          GROUP BY 1
        ) t ON t.day = d
        ORDER BY d`,
@@ -9329,6 +9359,7 @@ export class LegacyService implements OnModuleInit {
     }
     return {
       totalTestCases: Number(total.rows[0]?.count || 0),
+      archivedTestCases: Number(total.rows[0]?.archived || 0),
       bySuite: bySuite.rows.map((r) => ({ name: r.name, count: Number(r.count) })),
       byStatus,
       byPriority,
@@ -9402,9 +9433,12 @@ export class LegacyService implements OnModuleInit {
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM testcases t
        LEFT JOIN suites s ON s.id = t.suite_id AND s.deleted_at IS NULL
-       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id
+       -- Only items still in a live run of this project. The cycles join used to be a LEFT JOIN
+       -- that filtered nothing, so results from deleted runs and removed items kept counting here.
+       LEFT JOIN cycle_items ci ON ci.testcase_id = t.id AND ci.deleted_at IS NULL
+         AND EXISTS (SELECT 1 FROM cycles c WHERE c.id = ci.cycle_id AND c.project_id = t.project_id AND c.deleted_at IS NULL)
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
+       WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")}
        GROUP BY s.name
        ORDER BY s.name`,
       [projectId]
@@ -9443,10 +9477,11 @@ export class LegacyService implements OnModuleInit {
          SELECT ci.testcase_id
          FROM cycle_items ci
          JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
+         JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
          WHERE ci.testcase_id = t.id AND ci.deleted_at IS NULL AND e.status IS NOT NULL AND e.status <> 'Untested'
          LIMIT 1
        ) covered ON true
-       WHERE t.project_id = $1 AND t.deleted_at IS NULL
+       WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")}
        GROUP BY s.name
        ORDER BY s.name`,
       [projectId]
@@ -9465,11 +9500,14 @@ export class LegacyService implements OnModuleInit {
       // every execution the case ever had.
       `SELECT COUNT(*)::int AS count
          FROM testcases t
-        WHERE t.project_id = $1 AND t.deleted_at IS NULL AND t.priority = 'P1'
+        WHERE t.project_id = $1 AND ${LegacyService.countedTestcase("t")} AND t.priority = 'P1'
           AND NOT EXISTS (
             SELECT 1 FROM cycle_items ci
-              JOIN executions e ON e.cycle_item_id = ci.id
+              -- A soft-deleted result is not a result; it used to make an untested P1 read as tested.
+              JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
              WHERE ci.testcase_id = t.id AND ci.deleted_at IS NULL
+               -- Only items still in a live run: a deleted run's results don't make a case tested.
+               AND EXISTS (SELECT 1 FROM cycles c WHERE c.id = ci.cycle_id AND c.deleted_at IS NULL)
                AND e.status IS NOT NULL AND e.status <> 'Untested'
           )`,
       [projectId]
@@ -9648,7 +9686,7 @@ export class LegacyService implements OnModuleInit {
 
   async projectDashboardSummary(userId: string | null | undefined, projectId: string) {
     await this.requireProjectAccess(userId, projectId);
-    const [counts, requirements, bugSeverity, activeRuns, addedThisWeek, passRateWindows] = await Promise.all([
+    const [counts, requirements, bugSeverity, activeRuns, testCaseTotals, passRateWindows] = await Promise.all([
       // Concurrent loads of the same project's dashboard (two tabs, a refresh, a retry) share one read.
       this.dedupe(`analytics:${projectId}`, () => this.analytics(projectId)),
       this.requirementsSummary(projectId, userId),
@@ -9660,8 +9698,14 @@ export class LegacyService implements OnModuleInit {
         `SELECT COUNT(*)::int AS count FROM cycles WHERE project_id = $1 AND status = 'In Progress' AND deleted_at IS NULL`,
         [projectId]
       ),
-      this.db.query<{ count: string }>(
-        `SELECT COUNT(*)::int AS count FROM testcases_active WHERE project_id = $1 AND created_at >= now() - interval '7 days'`,
+      // The "Test cases" card links to the repository table, so it counts what that table lists by
+      // default: live rows, and not Archived (see countedTestcase). analytics().testCaseCount now
+      // applies the same rule; this query stays separate only because it also needs addedThisWeek.
+      this.db.query<{ total: number; added_this_week: number }>(
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE created_at >= now() - interval '7 days')::int AS added_this_week
+           FROM testcases
+          WHERE project_id = $1 AND ${LegacyService.countedTestcase()}`,
         [projectId]
       ),
       // Compares the pass rate of executions recorded in the last 7 days against the 7 days
@@ -9716,7 +9760,10 @@ export class LegacyService implements OnModuleInit {
     const coveragePct = totalRequirements > 0 ? Math.round((coveredRequirements / totalRequirements) * 100) : null;
 
     return {
-      testCases: { total: counts.testCaseCount, addedThisWeek: Number(addedThisWeek.rows[0]?.count || 0) },
+      testCases: {
+        total: Number(testCaseTotals.rows[0]?.total || 0),
+        addedThisWeek: Number(testCaseTotals.rows[0]?.added_this_week || 0)
+      },
       passRate: { value: metrics.passRate, deltaThisWeek: passRateDeltaThisWeek },
       executionProgress: { value: metrics.executionProgress },
       openBugs: { total: openBugsTotal, bySeverity, noSeverity: openBugsNoSeverity },
@@ -12238,35 +12285,46 @@ export class LegacyService implements OnModuleInit {
 
   async adminCustomers(userId: string | null | undefined) {
     await this.requirePlatformAdmin(userId);
-    const summary = await this.analytics();
-    const customers = await this.db.query(
-      `SELECT o.id, o.name, o.slug, o.created_at,
-              COUNT(DISTINCT om.user_id)::int AS member_count,
-              COUNT(DISTINCT p.id)::int AS project_count,
-              COUNT(DISTINCT t.id)::int AS test_case_count,
-              COUNT(DISTINCT t.id) FILTER (WHERE t.automation_status NOT IN ('Not Automated', 'To Be Automated'))::int AS automated_count,
-              MAX(GREATEST(o.updated_at, p.updated_at, t.updated_at)) AS last_activity_at
-       FROM organizations o
-       LEFT JOIN organization_members om ON om.organization_id = o.id
-       LEFT JOIN projects p ON p.organization_id = o.id
-       LEFT JOIN testcases t ON t.project_id = p.id
-       GROUP BY o.id ORDER BY o.created_at DESC`
-    );
+    // Archived projects and deleted/Archived cases are excluded like every other count (the joins used
+    // to have no filter at all), and the summary is derived from these same rows instead of a mix of
+    // analytics() and hardcoded zeros — it reported the project count as totalOrganizations, and 0
+    // for members, automated cases and coverage regardless of the data.
+    const [customers, members] = await Promise.all([
+      this.db.query(
+        `SELECT o.id, o.name, o.slug, o.created_at,
+                COUNT(DISTINCT om.user_id)::int AS member_count,
+                COUNT(DISTINCT p.id)::int AS project_count,
+                COUNT(DISTINCT t.id)::int AS test_case_count,
+                COUNT(DISTINCT t.id) FILTER (WHERE t.automation_status NOT IN ('Not Automated', 'To Be Automated'))::int AS automated_count,
+                MAX(GREATEST(o.updated_at, p.updated_at, t.updated_at)) AS last_activity_at
+         FROM organizations o
+         LEFT JOIN organization_members om ON om.organization_id = o.id
+         LEFT JOIN projects p ON p.organization_id = o.id AND p.archived_at IS NULL
+         LEFT JOIN testcases t ON t.project_id = p.id AND ${LegacyService.countedTestcase("t")}
+         GROUP BY o.id ORDER BY o.created_at DESC`
+      ),
+      // Distinct across workspaces: summing member_count would count a user in two workspaces twice.
+      this.db.query<{ count: number }>("SELECT COUNT(DISTINCT user_id)::int AS count FROM organization_members")
+    ]);
+    const rows = customers.rows.map((row) => {
+      const item = toCamel(row);
+      const total = Number(item.testCaseCount || 0);
+      const automated = Number(item.automatedCount || 0);
+      return { ...item, automationCoverage: total ? Math.round((automated / total) * 100) : 0 };
+    });
+    const sum = (key: string) => rows.reduce((acc, row) => acc + Number((row as Body)[key] || 0), 0);
+    const totalTestCases = sum("testCaseCount");
+    const totalAutomated = sum("automatedCount");
     return {
       summary: {
-        totalOrganizations: summary.projectCount,
-        totalMembers: 0,
-        totalProjects: summary.projectCount,
-        totalTestCases: summary.testCaseCount,
-        totalAutomated: 0,
-        overallAutomationCoverage: 0
+        totalOrganizations: rows.length,
+        totalMembers: Number(members.rows[0]?.count || 0),
+        totalProjects: sum("projectCount"),
+        totalTestCases,
+        totalAutomated,
+        overallAutomationCoverage: totalTestCases ? Math.round((totalAutomated / totalTestCases) * 100) : 0
       },
-      customers: customers.rows.map((row) => {
-        const item = toCamel(row);
-        const total = Number(item.testCaseCount || 0);
-        const automated = Number(item.automatedCount || 0);
-        return { ...item, automationCoverage: total ? Math.round((automated / total) * 100) : 0 };
-      })
+      customers: rows
     };
   }
 
@@ -12940,7 +12998,7 @@ export class LegacyService implements OnModuleInit {
       filters.push(`status = $${values.length}`);
     }
     if (query.coverage === "covered" || query.coverage === "uncovered") {
-      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL)`;
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND ${LegacyService.countedTestcase("t")})`;
       filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
     }
     const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM jira_tickets WHERE ${filters.join(" AND ")}`, values);
@@ -13548,7 +13606,7 @@ export class LegacyService implements OnModuleInit {
       filters.push(`status = $${values.length}`);
     }
     if (query.coverage === "covered" || query.coverage === "uncovered") {
-      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL)`;
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND ${LegacyService.countedTestcase("t")})`;
       filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
     }
     const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM linear_tickets WHERE ${filters.join(" AND ")}`, values);
@@ -13575,7 +13633,7 @@ export class LegacyService implements OnModuleInit {
       SELECT id, 'jira' AS source, jira_issue_key AS key, jira_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, jira_created_at AS created_at, jira_updated_at AS updated_at,
              jira_url AS url, synced_at,
-             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND t.deleted_at IS NULL) AS has_coverage
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = jira_tickets.project_id AND t.jira_issue_key = jira_tickets.jira_issue_key AND ${LegacyService.countedTestcase("t")}) AS has_coverage
       FROM jira_tickets
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT jira_project_id FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
@@ -13583,7 +13641,7 @@ export class LegacyService implements OnModuleInit {
       SELECT id, 'linear' AS source, linear_issue_key AS key, linear_issue_key AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, linear_created_at AS created_at, linear_updated_at AS updated_at,
              linear_url AS url, synced_at,
-             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND t.deleted_at IS NULL) AS has_coverage
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = linear_tickets.project_id AND t.linear_issue_key = linear_tickets.linear_issue_key AND ${LegacyService.countedTestcase("t")}) AS has_coverage
       FROM linear_tickets
       WHERE project_id = $1
         AND mapped_remote_id = (SELECT linear_team_id FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
@@ -13592,7 +13650,7 @@ export class LegacyService implements OnModuleInit {
       SELECT id, 'notion' AS source, notion_page_key AS key, notion_page_id AS external_id, summary, description, issue_type, status, priority,
              assignee, reporter, labels, notion_created_at AS created_at, notion_updated_at AS updated_at,
              notion_url AS url, synced_at,
-             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL) AS has_coverage
+             EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND ${LegacyService.countedTestcase("t")}) AS has_coverage
       FROM notion_pages
       WHERE project_id = $1 AND archived = false
         AND mapped_remote_id = (SELECT notion_database_id FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1)
@@ -13645,7 +13703,7 @@ export class LegacyService implements OnModuleInit {
       const stats = await this.db.query(
         `SELECT COUNT(*)::int AS total,
                 COUNT(*) FILTER (WHERE EXISTS (
-                  SELECT 1 FROM testcases t WHERE t.project_id = src.project_id AND t.${keyColumn} = src.${keyColumn} AND t.deleted_at IS NULL
+                  SELECT 1 FROM testcases t WHERE t.project_id = src.project_id AND t.${keyColumn} = src.${keyColumn} AND ${LegacyService.countedTestcase("t")}
                 ))::int AS covered
          FROM ${table} src WHERE ${scope}`,
         [projectId]
@@ -13958,7 +14016,7 @@ export class LegacyService implements OnModuleInit {
       filters.push(`status = $${values.length}`);
     }
     if (query.coverage === "covered" || query.coverage === "uncovered") {
-      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND t.deleted_at IS NULL)`;
+      const exists = `EXISTS (SELECT 1 FROM testcases t WHERE t.project_id = notion_pages.project_id AND t.notion_page_id = notion_pages.notion_page_id AND ${LegacyService.countedTestcase("t")})`;
       filters.push(query.coverage === "covered" ? exists : `NOT ${exists}`);
     }
     const count = await this.db.query(`SELECT COUNT(*)::int AS count FROM notion_pages WHERE ${filters.join(" AND ")}`, values);
@@ -14311,7 +14369,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query<{ count: string }>(
       `SELECT COUNT(DISTINCT a.entity_id) AS count
          FROM audit_logs a
-         JOIN testcases_active t ON t.id::text = a.entity_id
+         JOIN testcases t ON t.id::text = a.entity_id AND ${LegacyService.countedTestcase("t")}
         WHERE a.project_id = $1 AND a.action = 'zyra_created' AND a.entity_type = 'testcase'`,
       [projectId]
     );
@@ -24616,7 +24674,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
            FROM testcases
            WHERE project_id = $1
              AND jira_issue_key IS NOT NULL
-             AND COALESCE(status, '') <> 'Archived'
+             -- Was only the Archived half: a soft-deleted case still marked its ticket covered.
+             AND ${LegacyService.countedTestcase()}
            GROUP BY jira_issue_key
          )
          SELECT COUNT(j.id)::int AS pending_jira_ticket_count
@@ -25154,7 +25213,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
 
   private async groupTestcases(projectId: string, column: string) {
     const res = await this.db.query<{ name: string; count: string }>(
-      `SELECT COALESCE(${column}, 'Unspecified') AS name, COUNT(*) AS count FROM testcases_active WHERE project_id = $1 GROUP BY ${column}`,
+      // Counted cases only (see countedTestcase), so byStatus has no "Archived" bucket and every
+      // grouping sums to repositorySummary's totalTestCases; archivedTestCases carries that count.
+      `SELECT COALESCE(${column}, 'Unspecified') AS name, COUNT(*) AS count FROM testcases WHERE project_id = $1 AND ${LegacyService.countedTestcase()} GROUP BY ${column}`,
       [projectId]
     );
     return res.rows.map((r) => ({ name: r.name, count: Number(r.count) }));

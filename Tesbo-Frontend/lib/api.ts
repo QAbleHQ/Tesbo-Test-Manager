@@ -3166,7 +3166,10 @@ export async function getRequirementMatrix(
 
 // ── Report: Repository Summary ──
 export interface RepositorySummary {
+  /** Live, non-Archived cases — the same set the repository list shows. byStatus/bySuite sum to it. */
   totalTestCases: number;
+  /** Live Archived cases, counted separately from totalTestCases (the "N archived" chip). */
+  archivedTestCases: number;
   bySuite: { name: string; count: number }[];
   byStatus: { name: string; count: number }[];
   addedByDate: { date: string; count: number }[];

@@ -1393,14 +1393,18 @@ test.describe("pagination", () => {
       // 3. Another status filter must not accidentally re-admit archived rows.
       expect((await list({ status: "Draft" })).ids).toEqual(new Set(live));
 
-      // 4. Still counted by the summary — the DEPRECATED tile is Deprecated + Archived, so hiding the
-      //    rows must not remove them from the repository's own accounting.
+      // 4. Still accounted for, separately. The rule changed with "[Global Data Consistency]": an
+      //    Archived case is no longer in totalTestCases or any byStatus bucket (that is what put the
+      //    repository at 517 against the card's 514), but the summary still reports it, as
+      //    archivedTestCases, so hiding the rows never makes them disappear from the repository's books.
       const summary = await (
         await request.get(`/api/projects/${ctx.projectId}/reports/repository-summary`)
       ).json();
-      const archivedBucket = summary.byStatus.find((b: { name: string }) => b.name === "Archived");
-      expect(archivedBucket, "the summary lost its Archived bucket").toBeTruthy();
-      expect(archivedBucket.count).toBeGreaterThanOrEqual(1);
+      expect(summary.archivedTestCases, "the summary stopped reporting archived cases").toBeGreaterThanOrEqual(1);
+      expect(
+        summary.byStatus.find((b: { name: string }) => b.name === "Archived"),
+        "Archived is back inside the counted buckets",
+      ).toBeUndefined();
     } finally {
       for (const id of [...live, archived].filter(Boolean)) await deleteCase(request, id);
     }
