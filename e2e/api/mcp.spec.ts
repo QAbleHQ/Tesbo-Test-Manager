@@ -2112,6 +2112,194 @@ test.describe("MCP list_test_cycles and get_test_cycle", () => {
 });
 
 /*
+ * "[Test Run] Automated Test Run Remains in Planning Status After Completion". A run created over
+ * MCP starts in Planning and recording results never moves it — completion is a deliberate act (the
+ * app's Start Execution / Mark Completed buttons). MCP had no equivalent, so every run a pipeline
+ * created sat in Planning at 22/22 executed. update_test_cycle_status is that button.
+ */
+test.describe("MCP update_test_cycle_status", () => {
+  async function writeToken(request: APIRequestContext, label: string, scopes: string[] = ["write"]) {
+    const res = await request.post(`/api/projects/${ctx.projectId}/apikeys`, {
+      data: { name: `E2E MCP run status ${label} ${Date.now()}`, scopes },
+    });
+    expect(res.ok()).toBeTruthy();
+    const body = await res.json();
+    return { tokenId: body.id as string, token: body.token as string };
+  }
+
+  async function getCycleRest(request: APIRequestContext, cycleId: string) {
+    const res = await request.get(`/api/cycles/${cycleId}`);
+    expect(res.ok()).toBeTruthy();
+    return res.json();
+  }
+
+  test("an MCP-created run stays Planning after its results are recorded, then moves Planning → In Progress → Completed and back", async ({
+    request,
+  }) => {
+    const stamp = Date.now();
+    const caseIds: string[] = [];
+    let cycleId: string | undefined;
+    let tokenId: string | undefined;
+    const mcpApi = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+
+    try {
+      for (const i of [1, 2]) caseIds.push((await createCase(request, { title: `E2E MCP Run Status Case ${i} ${stamp}` })).id);
+      const t = await writeToken(request, "lifecycle");
+      tokenId = t.tokenId;
+
+      // The pipeline's path, exactly as on the card: create the run, then record every result.
+      const created = await callMcpTool(mcpApi, t.token, "create_cycle_from_testcases", {
+        name: `E2E MCP API_Regression_Build ${stamp}`,
+        testcaseIds: caseIds,
+      });
+      cycleId = created.cycle.id as string;
+      const executions = (await getCycleExecutionsRest(request, cycleId)) as Array<{ id: string }>;
+      expect(executions).toHaveLength(2);
+      const recorded = await callMcpTool(mcpApi, t.token, "bulk_record_execution_results", {
+        results: [
+          { executionId: executions[0].id, status: "Passed" },
+          { executionId: executions[1].id, status: "Failed" },
+        ],
+      });
+      expect(recorded.succeeded).toBe(2);
+
+      // Fully executed, still Planning: recording results deliberately does not complete a run.
+      // This is the state the card's screenshot shows, and it must stay this way — the fix is an
+      // explicit transition, not an inferred one.
+      const afterResults = await getCycleRest(request, cycleId);
+      expect(afterResults.status).toBe("Planning");
+      expect(afterResults.startedAt ?? null).toBeNull();
+
+      const started = await callMcpTool(mcpApi, t.token, "update_test_cycle_status", { cycleId, status: "In Progress" });
+      expect(started.id).toBe(cycleId);
+      expect(started.status).toBe("In Progress");
+      expect(started.startedAt).toBeTruthy();
+      expect(started.endedAt ?? null).toBeNull();
+
+      const completed = await callMcpTool(mcpApi, t.token, "update_test_cycle_status", { cycleId, status: "Completed" });
+      expect(completed.status).toBe("Completed");
+      expect(completed.endedAt).toBeTruthy();
+      // Starting again must not move the original start: In Progress stamps it the first time only.
+      expect(completed.startedAt).toBe(started.startedAt);
+
+      // Persisted, not just echoed: a fresh read through the app's own REST endpoint (what a page
+      // refresh or reopening the run does) agrees, and the results are untouched.
+      const reread = await getCycleRest(request, cycleId);
+      expect(reread.status).toBe("Completed");
+      expect(reread.endedAt).toBeTruthy();
+      const listed = (await (await request.get(`/api/projects/${ctx.projectId}/cycles`)).json()) as Array<Record<string, unknown>>;
+      const row = listed.find((c) => c.id === cycleId)!;
+      expect(row.status).toBe("Completed");
+      expect(Number(row.passed)).toBe(1);
+      expect(Number(row.failed)).toBe(1);
+
+      // Re-sending Completed (a retried CI step) is harmless.
+      expect((await callMcpTool(mcpApi, t.token, "update_test_cycle_status", { cycleId, status: "Completed" })).status).toBe("Completed");
+
+      // Reopen clears the end time; back to Planning keeps the original start.
+      const reopened = await callMcpTool(mcpApi, t.token, "update_test_cycle_status", { cycleId, status: "In Progress" });
+      expect(reopened.status).toBe("In Progress");
+      expect(reopened.endedAt ?? null).toBeNull();
+      const planning = await callMcpTool(mcpApi, t.token, "update_test_cycle_status", { cycleId, status: "Planning" });
+      expect(planning.status).toBe("Planning");
+      expect(planning.startedAt).toBe(started.startedAt);
+    } finally {
+      if (tokenId) await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      if (cycleId) await deleteCycleRest(request, cycleId);
+      for (const id of caseIds) await deleteCase(request, id);
+      await mcpApi.dispose();
+    }
+  });
+
+  test("rejects a missing or unknown status, an empty run, a missing/deleted/other-project run, and a read-only token — without changing the run", async ({
+    request,
+  }) => {
+    const stamp = Date.now();
+    const ghostId = "00000000-0000-0000-0000-000000000000";
+    const asB = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: path.join(__dirname, "../.auth/state-b.json"),
+    });
+    const mcpApi = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    const tokenIds: string[] = [];
+    let caseId: string | undefined;
+    let cycleId: string | undefined;
+    let emptyCycleId: string | undefined;
+    let deletedCycleId: string | undefined;
+    let bCycleId: string | undefined;
+
+    try {
+      caseId = (await createCase(request, { title: `E2E MCP Run Status Guard Case ${stamp}` })).id;
+      cycleId = (await createCycleRest(request, { name: `E2E MCP Run Status Guard ${stamp}` })).id as string;
+      await addCycleTestCaseRest(request, cycleId, caseId!);
+      emptyCycleId = (await createCycleRest(request, { name: `E2E MCP Run Status Empty ${stamp}` })).id as string;
+      deletedCycleId = (await createCycleRest(request, { name: `E2E MCP Run Status Deleted ${stamp}` })).id as string;
+      await deleteCycleRest(request, deletedCycleId);
+      const bRes = await asB.post(`/api/projects/${ctxB.projectId}/cycles`, { data: { name: `E2E MCP Run Status B ${stamp}` } });
+      expect(bRes.ok()).toBeTruthy();
+      bCycleId = (await bRes.json()).id;
+
+      const w = await writeToken(request, "guards");
+      tokenIds.push(w.tokenId);
+      const r = await writeToken(request, "read-only", ["read"]);
+      tokenIds.push(r.tokenId);
+
+      const err = (args: Record<string, unknown>, token = w.token) =>
+        callMcpToolExpectError(mcpApi, token, "update_test_cycle_status", args);
+
+      expect((await err({ status: "Completed" })).message).toMatch(/"cycleId"/i);
+      expect((await err({ cycleId })).message).toMatch(/"status"/i);
+      expect((await err({ cycleId, status: "   " })).message).toMatch(/"status"/i);
+      // Exact vocabulary only: anything else would be stored verbatim and match none of the
+      // product's status checks.
+      for (const bad of ["Done", "completed", "COMPLETED", "In progress", "Passed"]) {
+        expect((await err({ cycleId, status: bad })).message, bad).toMatch(/must be one of: Planning, In Progress, Completed/);
+      }
+      expect((await err({ cycleId: emptyCycleId, status: "Completed" })).message).toMatch(/at least one test case/i);
+      expect((await err({ cycleId: emptyCycleId, status: "In Progress" })).message).toMatch(/at least one test case/i);
+      expect((await err({ cycleId: ghostId, status: "Completed" })).message).toMatch(/not found/i);
+      expect((await err({ cycleId: deletedCycleId, status: "Completed" })).message).toMatch(/not found/i);
+      expect((await err({ cycleId: bCycleId, status: "Completed" })).code).toBe(-32001); // RpcCode.ProjectScopeDenied
+      expect((await err({ cycleId, status: "Completed" }, r.token)).code).toBe(-32002); // RpcCode.ScopeDenied
+
+      // None of the refusals moved anything.
+      expect((await (await request.get(`/api/cycles/${cycleId}`)).json()).status).toBe("Planning");
+      expect((await (await request.get(`/api/cycles/${emptyCycleId}`)).json()).status).toBe("Planning");
+      expect((await (await asB.get(`/api/cycles/${bCycleId}`)).json()).status).toBe("Planning");
+    } finally {
+      for (const id of tokenIds) await request.delete(`/api/projects/${ctx.projectId}/apikeys/${id}`, { failOnStatusCode: false });
+      for (const id of [cycleId, emptyCycleId]) if (id) await deleteCycleRest(request, id);
+      if (caseId) await deleteCase(request, caseId);
+      if (bCycleId) await asB.delete(`/api/cycles/${bCycleId}`, { failOnStatusCode: false });
+      await asB.dispose();
+      await mcpApi.dispose();
+    }
+  });
+
+  test("tools/list advertises update_test_cycle_status with its three statuses", async ({ request }) => {
+    const mcpApi = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    let tokenId: string | undefined;
+    try {
+      const t = await writeToken(request, "list");
+      tokenId = t.tokenId;
+      const res = await mcpApi.post(`/api/projects/${ctx.projectId}/mcp`, {
+        headers: { Authorization: `Bearer ${t.token}` },
+        data: { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} },
+      });
+      expect(res.ok()).toBeTruthy();
+      const tools = (await res.json()).result.tools as Array<{ name: string; inputSchema: any }>;
+      const tool = tools.find((x) => x.name === "update_test_cycle_status");
+      expect(tool).toBeTruthy();
+      expect(tool!.inputSchema.required).toEqual(["cycleId", "status"]);
+      expect(tool!.inputSchema.properties.status.enum).toEqual(["Planning", "In Progress", "Completed"]);
+    } finally {
+      if (tokenId) await request.delete(`/api/projects/${ctx.projectId}/apikeys/${tokenId}`, { failOnStatusCode: false });
+      await mcpApi.dispose();
+    }
+  });
+});
+
+/*
  * MCP read/write access to executions: list_executions, get_execution, update_execution_result.
  * list_executions/get_execution close a read-only gap — MCP could record a result
  * (record_execution_result) but never list or inspect an execution first to find its id or see its

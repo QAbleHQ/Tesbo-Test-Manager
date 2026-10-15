@@ -232,6 +232,7 @@ describe("McpService", () => {
           "get_test_cycle",
           "create_cycle_from_plan",
           "create_cycle_from_testcases",
+          "update_test_cycle_status",
           "record_execution_result",
           "list_executions",
           "get_execution",

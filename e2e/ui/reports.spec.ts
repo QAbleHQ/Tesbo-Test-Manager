@@ -242,6 +242,79 @@ test.describe("execution report run-name tooltip", () => {
 });
 
 /*
+ * "[Insights] Keep Execution Distribution Visible When Scrolling". The status list renders one row
+ * per run, and the Distribution card sat in the same grid row with its content centred — so 300+
+ * runs stretched the row and left the donut hundreds of pixels down, behind a wall of blank space.
+ * The list now scrolls inside its own card and Distribution keeps its natural height at the top.
+ * Seeds more runs than fit the list's height, so the scrolling is actually exercised.
+ */
+test.describe("execution report distribution stays in view", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  const RUNS = 15;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    test.setTimeout(240_000);
+    api = await screensApi();
+    projectId = (await createProject(api)).id;
+    for (let i = 0; i < RUNS; i++) {
+      await seedRun(api, projectId, { name: `E2E Distribution Run ${i + 1}`, statuses: [i % 2 ? "Passed" : "Failed"], status: "Completed" });
+    }
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(async ({ page }) => {
+    test.skip(skipReason !== null, skipReason ?? "");
+    // Wide enough for the side-by-side (lg) layout the fix applies to.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/projects/${projectId}/reports`);
+    await page.getByRole("button", { name: /Execution Report/i }).first().click();
+    await expect(page.getByRole("heading", { name: /Execution status by/i })).toBeVisible();
+  });
+
+  test("RPT-U-DIST-1 the list scrolls on its own and Distribution sits at the top beside it, in view", async ({ page }) => {
+    const list = page.getByTestId("execution-status-list");
+    const distribution = page.getByRole("heading", { name: "Distribution", exact: true });
+    const listHeading = page.getByRole("heading", { name: /Execution status by/i });
+
+    // Precondition: more rows than the list shows, otherwise there is nothing to prove.
+    expect(await list.evaluate((el) => el.scrollHeight > el.clientHeight), "the list overflows its own height").toBe(true);
+    expect(await list.evaluate((el) => getComputedStyle(el).overflowY)).toBe("auto");
+
+    // Both cards' headings line up at the top, and Distribution is on screen without scrolling.
+    const [d, l] = [await distribution.boundingBox(), await listHeading.boundingBox()];
+    expect(Math.abs(d!.y - l!.y), "Distribution starts level with the list").toBeLessThan(4);
+    await expect(distribution).toBeInViewport();
+    await expect(page.getByText("Passed (7)")).toBeInViewport();
+
+    // Scrolling the list moves its rows, not the page — Distribution stays exactly where it was.
+    const pageScrollBefore = await page.evaluate(() => document.scrollingElement?.scrollTop ?? 0);
+    await list.evaluate((el) => el.scrollTo(0, el.scrollHeight));
+    await expect(page.getByText(`E2E Distribution Run ${RUNS}`, { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => document.scrollingElement?.scrollTop ?? 0)).toBe(pageScrollBefore);
+    expect((await distribution.boundingBox())!.y).toBeCloseTo(d!.y, 0);
+    // Every run is still in the chart — the fix only changes how it scrolls.
+    for (let i = 1; i <= RUNS; i++) await expect(page.getByText(`E2E Distribution Run ${i}`, { exact: true })).toHaveCount(1);
+  });
+
+  test("RPT-U-DIST-2 on a narrow screen the cards still stack, with the list at full height", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    const list = page.getByTestId("execution-status-list");
+    // Below lg nothing changed: no inner scrolling, and Distribution comes after the list.
+    expect(await list.evaluate((el) => getComputedStyle(el).overflowY)).toBe("visible");
+    const [d, l] = [await page.getByRole("heading", { name: "Distribution", exact: true }).boundingBox(), await list.boundingBox()];
+    expect(d!.y).toBeGreaterThan(l!.y + l!.height);
+  });
+});
+
+/*
  * "[Insights] UI issue in Priority and status labels". On the Traceability table the Priority and
  * Status columns were 70px / 90px in a fixed-layout table, so a "Medium" or "Approved" chip spilled
  * into the next column. A priority outside P0-P3 also rendered with no tone at all.
