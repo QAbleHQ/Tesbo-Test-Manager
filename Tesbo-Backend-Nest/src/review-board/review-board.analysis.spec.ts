@@ -1,4 +1,5 @@
-import { analyse, parseSteps, rescorePair, stateFingerprintOf, toComparable, type TestcaseSource } from "./review-board.analysis";
+import { analyse, parseSteps, rescorePair, stateFingerprintOf, stepAgreement, toComparable, type TestcaseSource } from "./review-board.analysis";
+import { SIMILAR_THRESHOLD } from "./review-board.constants";
 
 let n = 0;
 function tc(over: Partial<TestcaseSource> & { steps?: unknown }): TestcaseSource {
@@ -248,5 +249,94 @@ describe("rescorePair (match after an edit)", () => {
     const f = rescorePair(a, b);
     expect([f.fingerprintA, f.fingerprintB].sort()).toEqual([a.fingerprint, b.fingerprint].sort());
     expect(f.aId < f.bId).toBe(true);
+  });
+});
+
+describe("match score: wording similarity blended with identical steps", () => {
+  const S = (action: string, expectedResult: string) => ({ action, expectedResult });
+
+  // Reported from the Review Board: shown as 79% although only 1 of the 4 steps is the same.
+  const decimal = () =>
+    tc({
+      title: "Verify minimum rating field rejects decimal/floating-point values if only integers are expected",
+      preconditions: "User is logged in as an HR manager. Navigate to the KPI configuration form with a valid job title and KPI title. Assumption: rating fields expect integer values.",
+      test_data: "KPI title: 'Creativity', Min rating: 1.5, Max rating: 5",
+      steps: [
+        S("Select a valid job title and enter KPI title 'Creativity'.", "Fields are populated."),
+        S("Enter 1.5 in the minimum rating field.", "Field accepts or flags the decimal value."),
+        S("Enter 5 in the maximum rating field.", "Max rating is set to 5."),
+        S("Click Save.", "If decimal values are not allowed, a validation error is displayed indicating only integer values are accepted. If decimals are allowed, KPI is saved — document actual behaviour.")
+      ]
+    });
+  const negative = () =>
+    tc({
+      title: "Verify minimum rating field rejects negative values",
+      preconditions: "User is logged in as an HR manager. Navigate to the KPI configuration form with a valid job title and KPI title.",
+      test_data: "KPI title: 'Adaptability', Min rating: -1, Max rating: 5",
+      steps: [
+        S("Select a valid job title and enter KPI title 'Adaptability'.", "Fields are populated."),
+        S("Enter -1 in the minimum rating field.", "Field accepts or flags the negative value."),
+        S("Enter 5 in the maximum rating field.", "Max rating is set to 5."),
+        S("Click Save.", "If negative ratings are not allowed, a validation error is displayed. If negative ratings are permitted, the KPI is saved — note expected behaviour as per business rules.")
+      ]
+    });
+
+  it("reported case: same wording but 1 of 4 steps identical is no longer shown as ~79%", () => {
+    const a = toComparable(decimal());
+    const b = toComparable(negative());
+    expect(stepAgreement(a, b)).toEqual({ identical: 1, total: 4 });
+    const f = rescorePair(a, b);
+    expect(f.similarity).toBeLessThan(0.6);
+    expect(f.similarity).toBeGreaterThan(0.45);
+    expect(f.explanation).toMatch(/1 of 4 steps identical/);
+    expect(f.explanation).toMatch(/wording similarity/);
+  });
+
+  it("a pair that low is not listed by the analysis (below the cut-off)", () => {
+    expect(SIMILAR_THRESHOLD).toBe(0.6);
+    expect(analyse([toComparable(decimal()), toComparable(negative())]).findings).toEqual([]);
+  });
+
+  it("counts shared steps regardless of order, so one inserted step does not zero the rest", () => {
+    const steps = [S("Open the page", "It loads"), S("Click Save", "Saved"), S("Log out", "Signed out")];
+    const a = toComparable(tc({ steps }));
+    const b = toComparable(tc({ steps: [S("A brand new first step", "Something"), ...steps] }));
+    expect(stepAgreement(a, b)).toEqual({ identical: 3, total: 4 });
+    const reordered = toComparable(tc({ steps: [steps[2], steps[0], steps[1]] }));
+    expect(stepAgreement(a, reordered)).toEqual({ identical: 3, total: 3 });
+  });
+
+  it("a step is shared only when BOTH action and expected result match", () => {
+    const a = toComparable(tc({ steps: [S("Click Save", "Saved")] }));
+    expect(stepAgreement(a, toComparable(tc({ steps: [S("Click Save", "An error is shown")] })))).toEqual({ identical: 0, total: 1 });
+    expect(stepAgreement(a, toComparable(tc({ steps: [S("click  SAVE!", "saved.")] })))).toEqual({ identical: 1, total: 1 }); // case/punctuation are not differences
+  });
+
+  it("repeated identical steps count by multiplicity", () => {
+    const s = S("Click Next", "The next page opens");
+    expect(stepAgreement(toComparable(tc({ steps: [s, s] })), toComparable(tc({ steps: [s] })))).toEqual({ identical: 1, total: 2 });
+  });
+
+  it("one changed step out of ten keeps a high score, so true near-duplicates stay listed", () => {
+    const steps = Array.from({ length: 10 }, (_, i) => S(`Do the numbered action ${i + 1}`, `Result number ${i + 1} is shown`));
+    const a = toComparable(tc({ steps }));
+    const changed = steps.map((x, i) => (i === 4 ? S("Do a different thing entirely", "Something else happens") : x));
+    const b = toComparable(tc({ steps: changed }));
+    const f = analyse([a, b]).findings[0];
+    expect(f.classification).toBe("similar");
+    expect(f.similarity).toBeGreaterThan(0.85);
+    expect(f.explanation).toMatch(/9 of 10 steps identical/);
+  });
+
+  it("exact duplicates are still 100%, and cases with no steps are scored on wording only", () => {
+    expect(rescorePair(toComparable(tc({})), toComparable(tc({})))).toMatchObject({ classification: "exact_duplicate", similarity: 1 });
+    const stubA = toComparable(tc({ steps: [], test_data: null, preconditions: null }));
+    const stubB = toComparable(tc({ steps: [], test_data: null, preconditions: null }));
+    expect(stepAgreement(stubA, stubB)).toEqual({ identical: 0, total: 0 });
+    expect(rescorePair(stubA, stubB).similarity).toBe(1);
+  });
+
+  it("a case with steps against one without shares none of them", () => {
+    expect(stepAgreement(toComparable(tc({})), toComparable(tc({ steps: [] })))).toEqual({ identical: 0, total: 2 });
   });
 });

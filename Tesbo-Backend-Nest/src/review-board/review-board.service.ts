@@ -16,7 +16,7 @@ import { TestcasesListCacheService } from "../cache/testcases-list-cache.service
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
-import { analyse, rescorePair, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
+import { analyse, rescorePair, stepAgreement, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
 import {
   MAX_TESTCASES_PER_RUN,
   REVIEW_BOARD_JOB,
@@ -387,6 +387,9 @@ export class ReviewBoardService {
         // stale finding are refused by the API, not just disabled in the UI.
         stale: staleReason !== null,
         staleReason,
+        // How many steps the two cases share RIGHT NOW (same action and expected result), so the number next to the
+        // match percentage is never out of date, even after an edit.
+        stepAgreement: stepAgreement(caseA, caseB),
         reviewedBy: r.reviewed_by,
         reviewedAt: r.reviewed_at,
         lastAnalysis: { runId: r.last_run_id, status: r.run_status, finishedAt: r.run_finished_at },

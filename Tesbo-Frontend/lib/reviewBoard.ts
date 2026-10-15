@@ -57,6 +57,8 @@ export interface ReviewRecommendation {
   /** Either test case changed after the analysis that produced this finding; the API refuses every action on it. */
   stale: boolean;
   staleReason: StaleReason | null;
+  /** Steps the two test cases share right now (same action and expected result); the match % alone cannot show this. */
+  stepAgreement: { identical: number; total: number };
   reviewedBy: string | null;
   reviewedAt: string | null;
   lastAnalysis: { runId: string | null; status: RunStatus | null; finishedAt: string | null };

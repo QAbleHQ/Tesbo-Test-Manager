@@ -298,6 +298,39 @@ function orderedPair(x: ComparableCase, y: ComparableCase): [ComparableCase, Com
   return x.id < y.id ? [x, y] : [y, x];
 }
 
+export interface StepAgreement {
+  /** Steps present in BOTH cases with the same action AND expected result (after normalisation), matched regardless of order. */
+  identical: number;
+  /** The larger of the two cases' step counts. */
+  total: number;
+}
+
+/**
+ * How many steps two cases really share. Word overlap alone cannot see this: two cases whose steps read almost the same
+ * but differ in the values that matter ("1.5" vs "-1", "Creativity" vs "Adaptability") overlap on nearly every word yet
+ * share no step at all. Matching is by multiset, so inserting one step does not make every later step look different.
+ */
+export function stepAgreement(a: ComparableCase, b: ComparableCase): StepAgreement {
+  const key = (s: Step) => `${normalizeText(s.action)}\u0001${normalizeText(s.expected)}`;
+  const pool = new Map<string, number>();
+  for (const s of a.steps) pool.set(key(s), (pool.get(key(s)) ?? 0) + 1);
+  let identical = 0;
+  for (const s of b.steps) {
+    const left = pool.get(key(s)) ?? 0;
+    if (left > 0) {
+      pool.set(key(s), left - 1);
+      identical += 1;
+    }
+  }
+  return { identical, total: Math.max(a.steps.length, b.steps.length) };
+}
+
+/** Half wording similarity, half the share of identical steps — only when there are steps to compare. */
+function blendedScore(wording: number, agreement: StepAgreement): number {
+  if (agreement.total === 0) return wording;
+  return 0.5 * wording + 0.5 * (agreement.identical / agreement.total);
+}
+
 function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = SIMILAR_THRESHOLD): Finding | null {
   const [a, b] = orderedPair(x, y);
   const differences = diffCases(a, b);
@@ -320,7 +353,9 @@ function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = S
     };
   }
 
-  const { score, parts } = scoreFields(a, b);
+  const { score: wording, parts } = scoreFields(a, b);
+  const agreement = stepAgreement(a, b);
+  const score = blendedScore(wording, agreement);
   if (score < minScore) return null;
 
   const breakdown = (Object.keys(parts) as ScoredField[])
@@ -332,7 +367,8 @@ function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = S
     explanation = "Identical title and details, but at least one of the two has no steps, so their behaviour cannot be compared. Not treated as an exact duplicate.";
   } else {
     const differing = differences.map((d) => FIELD_LABEL[d.field]).join(", ");
-    explanation = `${pct(score)} similar overall (${breakdown}). Differs in: ${differing}.`;
+    const stepsNote = agreement.total > 0 ? `${agreement.identical} of ${agreement.total} step${agreement.total === 1 ? "" : "s"} identical; ` : "";
+    explanation = `${pct(score)} match (${stepsNote}wording similarity: ${breakdown}). Differs in: ${differing}.`;
   }
   return {
     aId: a.id,

@@ -855,6 +855,25 @@ suite("review board (real Postgres)", () => {
       });
     });
 
+    it("the step agreement shown with the match is live: editing a step lowers 'N of M identical' and the % together", async () => {
+      const w = await world();
+      const a = await mkCase(w.projectId);
+      await mkCase(w.projectId, { test_data: "user=bob" });
+      await analyseNow(w);
+      const rec = (await list(w)).items[0];
+      expect(rec.stepAgreement).toEqual({ identical: 2, total: 2 });
+      const out = await svc.edit(w.owner, w.projectId, rec.id, {
+        testcaseId: a,
+        steps: [LOGIN_STEPS[0], { action: "Submit valid credentials", expectedResult: "An error banner appears" }],
+        confirm: true
+      });
+      const after = (await list(w, { status: "edited" })).items[0];
+      expect(after.stepAgreement).toEqual({ identical: 1, total: 2 });
+      expect(after.similarity).toBe(out.similarity);
+      expect(after.similarity).toBeLessThan(rec.similarity);
+      expect(after.explanation).toMatch(/1 of 2 steps identical/);
+    });
+
     it("after an edit, the finding it came from can no longer be used to delete anything", async () => {
       const { w, a, rec } = await withPair();
       await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Login (edited)", confirm: true });
@@ -1237,10 +1256,11 @@ suite("review board (real Postgres)", () => {
       expect(sorted(res)).toEqual(["counts", "items", "total"]);
       expect(sorted(res.counts)).toEqual(["edited", "kept", "obsolete", "pending", "removed"]);
       expect(sorted(rec)).toEqual(
-        sorted({ id: 1, classification: 1, similarity: 1, explanation: 1, differences: 1, reviewStatus: 1, stale: 1, staleReason: 1, reviewedBy: 1, reviewedAt: 1, lastAnalysis: 1, testcaseA: 1, testcaseB: 1 })
+        sorted({ id: 1, classification: 1, similarity: 1, explanation: 1, differences: 1, reviewStatus: 1, stale: 1, staleReason: 1, stepAgreement: 1, reviewedBy: 1, reviewedAt: 1, lastAnalysis: 1, testcaseA: 1, testcaseB: 1 })
       );
       expect(sorted(rec.testcaseA)).toEqual(["externalId", "id", "repositoryName", "title"]);
       expect(sorted(rec.lastAnalysis)).toEqual(["finishedAt", "runId", "status"]);
+      expect(rec.stepAgreement).toEqual({ identical: 2, total: 2 }); // an exact duplicate shares every step
       expect(typeof rec.similarity).toBe("number");
       expect(rec.staleReason).toBeNull();
 

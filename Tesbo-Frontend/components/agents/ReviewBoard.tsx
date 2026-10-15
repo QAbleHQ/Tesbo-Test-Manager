@@ -488,6 +488,11 @@ function RecommendationRow({
             </span>
           </StatusChip>
           <MatchMeter value={rec.similarity} />
+          {rec.stepAgreement.total > 0 && (
+            <span className="text-xs text-[var(--muted)]">
+              <span className="font-medium text-[var(--foreground)]">{rec.stepAgreement.identical} of {rec.stepAgreement.total}</span> step{rec.stepAgreement.total === 1 ? "" : "s"} identical
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {rec.reviewStatus !== "pending" && <StatusChip tone={STATUS_TONE[rec.reviewStatus]}>{STATUS_LABEL[rec.reviewStatus]}</StatusChip>}
