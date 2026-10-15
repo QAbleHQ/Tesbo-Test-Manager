@@ -47,6 +47,32 @@ export interface ReviewTestcaseRef {
   repositoryName: string;
 }
 
+export type EditedField = "title" | "description" | "preconditions" | "steps" | "testData" | "postconditions";
+
+export const EDITED_FIELD_LABEL: Record<EditedField, string> = {
+  title: "Title",
+  description: "Description",
+  preconditions: "Preconditions",
+  steps: "Steps",
+  testData: "Test data",
+  postconditions: "Postconditions",
+};
+
+/** What a reviewer changed when they edited a test case from a finding, kept at the moment of the edit. */
+export interface ReviewEditSummary {
+  /** The test case that was edited (one of the finding's two). */
+  testcaseId: string | null;
+  editedAt: string;
+  editedBy: string | null;
+  /** The finding's match before and after the edit (null for edits saved before this was recorded). */
+  similarityBefore: number | null;
+  similarityAfter: number | null;
+  /** False when neither the before/after nor a record to recover it from exists. */
+  recorded: boolean;
+  /** Only the fields that changed, in reading order. */
+  changes: Array<{ field: EditedField; before: string; after: string }>;
+}
+
 export interface ReviewRecommendation {
   id: string;
   classification: ReviewClassification;
@@ -57,6 +83,10 @@ export interface ReviewRecommendation {
   /** Either test case changed after the analysis that produced this finding; the API refuses every action on it. */
   stale: boolean;
   staleReason: StaleReason | null;
+  /** Steps the two test cases share right now (same action and expected result); the match % alone cannot show this. */
+  stepAgreement: { identical: number; total: number };
+  /** Set only on edited findings: what was changed, before and after. */
+  edit: ReviewEditSummary | null;
   reviewedBy: string | null;
   reviewedAt: string | null;
   lastAnalysis: { runId: string | null; status: RunStatus | null; finishedAt: string | null };
@@ -106,12 +136,51 @@ export async function listReviewRecommendations(
   return api<RecommendationList>(`${base(projectId)}/recommendations${qs ? `?${qs}` : ""}`);
 }
 
+/** One removal recorded by the Review Board (GET …/review-board/history). */
+export interface ReviewHistoryItem {
+  id: string;
+  classification: ReviewClassification;
+  /** The match at the moment of removal. */
+  similarity: number;
+  explanation: string;
+  removedAt: string | null;
+  removedBy: string | null;
+  repositoryName: string;
+  /** The test case that was removed; `stillDeleted` is false if something restored it since. */
+  removed: { id: string; externalId: string; title: string; stillDeleted: boolean };
+  /** The test case that stayed; `deleted` is true if it was deleted later. */
+  kept: { id: string; externalId: string; title: string; deleted: boolean };
+}
+
+export interface ReviewHistory {
+  items: ReviewHistoryItem[];
+  total: number;
+  counts: Record<ReviewStatus, number>;
+}
+
+export async function listReviewHistory(projectId: string, params: { limit?: number; offset?: number } = {}): Promise<ReviewHistory> {
+  const sp = new URLSearchParams();
+  if (params.limit) sp.set("limit", String(params.limit));
+  if (params.offset) sp.set("offset", String(params.offset));
+  const qs = sp.toString();
+  return api<ReviewHistory>(`${base(projectId)}/history${qs ? `?${qs}` : ""}`);
+}
+
 export async function keepReviewRecommendation(projectId: string, id: string): Promise<void> {
   await api(`${base(projectId)}/recommendations/${id}/keep`, { method: "POST" });
 }
 
-export async function editReviewRecommendation(projectId: string, id: string, testcaseId: string, fields: ReviewEditFields): Promise<void> {
-  await api(`${base(projectId)}/recommendations/${id}/edit`, { method: "POST", body: { testcaseId, confirm: true, ...fields } });
+/** What the server answers after an edit: the finding's match is recalculated from the edited content. */
+export interface ReviewEditResult {
+  id: string;
+  reviewStatus: ReviewStatus;
+  editedTestcaseId: string;
+  classification: ReviewClassification;
+  similarity: number;
+}
+
+export async function editReviewRecommendation(projectId: string, id: string, testcaseId: string, fields: ReviewEditFields): Promise<ReviewEditResult> {
+  return api<ReviewEditResult>(`${base(projectId)}/recommendations/${id}/edit`, { method: "POST", body: { testcaseId, confirm: true, ...fields } });
 }
 
 export async function removeReviewRecommendation(projectId: string, id: string, testcaseId: string): Promise<void> {
