@@ -9206,7 +9206,7 @@ export class LegacyService implements OnModuleInit {
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM suites_active${childWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM plans${plansWhere}`, values),
       this.db.query<{ count: string }>(`SELECT COUNT(*) AS count FROM cycles${cyclesWhere}`, values),
-      this.db.query<{ status: string; count: string }>(
+      this.db.heavyQuery<{ status: string; count: string }>(
         // ci/c both gain deleted_at IS NULL: executions_active already excludes soft-deleted
         // executions, but a run or a removed cycle_item surviving underneath it (hard-delete
         // remediation Phase 1/2) must not keep inflating this breakdown just because its execution
@@ -9390,7 +9390,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async suiteHealth(projectId: string) {
-    const res = await this.db.query<{
+    const res = await this.db.heavyQuery<{
       suite_name: string;
       total_cases: string;
       passed: string;
@@ -9433,7 +9433,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async coverageBySuite(projectId: string) {
-    const res = await this.db.query<{ suite_name: string; total_cases: string; covered_cases: string }>(
+    const res = await this.db.heavyQuery<{ suite_name: string; total_cases: string; covered_cases: string }>(
       `SELECT COALESCE(s.name, 'Unassigned') AS suite_name,
               COUNT(DISTINCT t.id)::int AS total_cases,
               COUNT(DISTINCT covered.testcase_id)::int AS covered_cases
@@ -9460,7 +9460,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async untestedP1Count(projectId: string) {
-    const res = await this.db.query<{ count: string }>(
+    const res = await this.db.heavyQuery<{ count: string }>(
       // NOT EXISTS stops at the first settled execution per P1 case instead of joining and grouping
       // every execution the case ever had.
       `SELECT COUNT(*)::int AS count
@@ -9493,7 +9493,7 @@ export class LegacyService implements OnModuleInit {
     // settled results and more than one distinct status; flips = status changes between consecutive
     // runs, oldest first) and fetch run-by-run detail for those 20 alone. This used to ship every
     // settled execution in the project to Node and walk them there.
-    const ranked = await this.db.query<{ testcase_id: string; flips: number; results: number }>(
+    const ranked = await this.db.heavyQuery<{ testcase_id: string; flips: number; results: number }>(
       `SELECT testcase_id, COUNT(*) FILTER (WHERE prev IS NOT NULL AND prev <> status)::int AS flips, COUNT(*)::int AS results
          FROM (
            SELECT ci.testcase_id, e.status,
@@ -9649,7 +9649,8 @@ export class LegacyService implements OnModuleInit {
   async projectDashboardSummary(userId: string | null | undefined, projectId: string) {
     await this.requireProjectAccess(userId, projectId);
     const [counts, requirements, bugSeverity, activeRuns, addedThisWeek, passRateWindows] = await Promise.all([
-      this.analytics(projectId),
+      // Concurrent loads of the same project's dashboard (two tabs, a refresh, a retry) share one read.
+      this.dedupe(`analytics:${projectId}`, () => this.analytics(projectId)),
       this.requirementsSummary(projectId, userId),
       this.db.query<{ severity: string | null; count: string }>(
         `SELECT severity, COUNT(*)::int AS count FROM bugs WHERE project_id = $1 AND deleted_at IS NULL AND status IN ('Open', 'Reopened') GROUP BY severity`,
@@ -9667,7 +9668,10 @@ export class LegacyService implements OnModuleInit {
       // before that, so the dashboard's "+N% this week" badge reflects real execution activity
       // rather than an all-time trend. Settled statuses only (Passed/Failed/Blocked) — matching
       // computeExecutionMetrics' Pass Rate, Skipped and Retest are not part of this denominator.
-      this.db.query<{ passed_recent: string; settled_recent: string; passed_prior: string; settled_prior: string }>(
+      // Every FILTER below needs executed_at inside the last 14 days, so that bound also goes in the WHERE:
+      // with it only the recent rows are read (idx_executions_executed_at); without it every execution in
+      // the project (~700k on the largest tenant) was joined just to be counted by none of the filters.
+      this.db.heavyQuery<{ passed_recent: string; settled_recent: string; passed_prior: string; settled_prior: string }>(
         `SELECT
            COUNT(*) FILTER (WHERE e.status = 'Passed' AND e.executed_at >= now() - interval '7 days')::int AS passed_recent,
            COUNT(*) FILTER (WHERE e.status IN ('Passed', 'Failed', 'Blocked') AND e.executed_at >= now() - interval '7 days')::int AS settled_recent,
@@ -9676,7 +9680,7 @@ export class LegacyService implements OnModuleInit {
          FROM executions e
          JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
          JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
-         WHERE c.project_id = $1`,
+         WHERE c.project_id = $1 AND e.executed_at >= now() - interval '14 days'`,
         [projectId]
       )
     ]);
@@ -9802,19 +9806,35 @@ export class LegacyService implements OnModuleInit {
     const filters = ["ae.project_id = $1"];
     this.activityFeedFilters(query, values, filters, { withProject: false });
     const where = filters.join(" AND ");
+    return this.pageActivity(where, values, limit, offset, "project_id = $1", null);
+  }
 
-    const eventsSql = this.activityEventsSql(where);
-
-    const total = await this.db.query<{ count: string }>(
-      `SELECT COUNT(*) AS count FROM (${eventsSql}) counted`,
-      values
-    );
-    values.push(limit, offset);
-    const res = await this.db.query(
-      `${eventsSql} ORDER BY created_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
-      values
-    );
-    return { list: res.rows.map(toCamel), total: Number(total.rows[0]?.count || 0) };
+  /**
+   * One page of the feed plus its exact total, shared by the project and workspace feeds.
+   *
+   * The two queries are independent, so they run side by side. `$n` is bound once per statement and
+   * the filter values are copied per query: a shared array that one query is still reading while the
+   * other pushes its LIMIT/OFFSET onto it would corrupt both.
+   */
+  private async pageActivity(
+    where: string,
+    filterValues: any[],
+    limit: number,
+    offset: number,
+    projectScopeSql: string,
+    orgOnlySql: string | null
+  ) {
+    const n = filterValues.length;
+    // The newest `offset + limit` rows of each branch are all a page can be made of (see activityUnionSql).
+    const eventsSql = this.activityEventsSql(where, projectScopeSql, orgOnlySql, { branchLimit: `$${n + 1}` });
+    const [total, page] = await Promise.all([
+      this.db.heavyQuery<{ count: string }>(this.activityCountSql(where, projectScopeSql, orgOnlySql), [...filterValues]),
+      this.db.heavyQuery(
+        `${eventsSql} ORDER BY created_at DESC, id DESC LIMIT $${n + 2} OFFSET $${n + 3}`,
+        [...filterValues, offset + limit, limit, offset]
+      )
+    ]);
+    return { list: page.rows.map(toCamel), total: Number(total.rows[0]?.count || 0) };
   }
 
   // Testcase created/updated/deleted are intentionally NOT synthesized from the `testcases`
@@ -9833,10 +9853,79 @@ export class LegacyService implements OnModuleInit {
   // changes) — these can never match projectScopeSql since project_id IS NULL, so the
   // workspace rollup needs this extra branch to include them; the per-project feed omits it
   // (default null) since those events aren't relevant to a single project's own history.
-  private activityEventsSql(outerWhere: string, projectScopeSql: string = "project_id = $1", orgOnlySql: string | null = null): string {
+  // The columns every branch below produces, in order. Branches are wrapped one by one (see
+  // activityUnionSql), and only the first branch of a UNION names its columns, so each wrapper
+  // names them explicitly.
+  private static readonly ACTIVITY_COLUMNS =
+    "project_id, id, actor_id, actor_email, actor_name, actor_kind, action, entity_type, entity_id, entity_name, diff, created_at";
+
+  // The audit_logs rows a zyra_* sibling makes redundant: testcase_created/testcase_updated rows with a
+  // zyra_* row for the same entity within 5 seconds (see activityEventsSql).
+  //
+  // Driven from the zyra_* rows (a small slice of the table, served by idx_audit_logs_zyra_sibling) and
+  // matched to their testcase_* rows through idx_audit_logs_entity, so the cost follows the number of
+  // Zyra actions in scope and not the size of the history, and not the filters on the request. A
+  // per-row "does a sibling exist" probe was tried first: it is fast only while a LIMIT stops the scan
+  // early, and it ran once per testcase_* row whenever a filter, an empty search or a deep offset
+  // stopped that from happening.
+  private zyraDroppedIdsSql(projectScopeSql: string): string {
+    return `
+      SELECT a2.id
+      FROM (
+        SELECT project_id, entity_id, created_at FROM audit_logs
+        WHERE ${projectScopeSql} AND action IN ('zyra_created', 'zyra_updated', 'zyra_archived')
+      ) z
+      JOIN audit_logs a2
+        ON a2.entity_type = 'testcase' AND a2.entity_id = z.entity_id AND a2.project_id = z.project_id
+      WHERE a2.action IN ('testcase_created', 'testcase_updated')
+        AND abs(extract(epoch FROM z.created_at - a2.created_at)) < 5`;
+  }
+
+  // The audit_logs branch: the only one with real actors, and the only one that can be big (one row
+  // per mutation, forever). `dedupZyra` drops the rows zyraDroppedIdsSql names, as an anti-join, so it
+  // applies before a branch's LIMIT and a dropped row never takes a page slot.
+  private activityAuditBranch(projectScopeSql: string, dedupZyra: boolean): string {
+    const dedup = dedupZyra
+      ? `AND NOT EXISTS (SELECT 1 FROM (${this.zyraDroppedIdsSql(projectScopeSql)}) dropped WHERE dropped.id = a.id)`
+      : "";
+    return `
+        SELECT
+          a.project_id, a.id::text, a.actor_id, u.email, COALESCE(u.name, g.display_name),
+          CASE WHEN g.id IS NOT NULL THEN 'agent' WHEN u.id IS NOT NULL THEN 'user' END,
+          a.action::text, a.entity_type::text, a.entity_id::text, a.entity_name::text, a.diff::text, a.created_at
+        FROM audit_logs a
+        LEFT JOIN users u ON u.id = a.actor_id
+        LEFT JOIN agents g ON g.id = a.actor_id
+        WHERE a.project_id IS NOT NULL AND ${projectScopeSql}
+        ${dedup}`;
+  }
+
+  /**
+   * Every event, as a UNION ALL of independently filtered branches.
+   *
+   * `outerWhere` is applied INSIDE each branch rather than once on top of the union. The previous shape
+   * was one `WITH activity_events AS (...)` read twice (once for the rows, once for the zyra sibling
+   * check), which Postgres must materialize: every filter and the LIMIT ran over the whole history of
+   * the project (hundreds of thousands of rows for a large tenant) on every request, and the Activity
+   * screen fires three of those at once. Per branch, the filters narrow each table first.
+   *
+   * `branchLimit` (a `$n` placeholder) additionally keeps only each branch's newest N rows. A page of
+   * `limit` rows at `offset` can only be made of the newest `offset + limit` rows of each branch, so
+   * the caller passes that sum and the final sort handles a few hundred rows however large the
+   * history is. The tie-break on id keeps a page boundary stable when rows share a timestamp (a bulk
+   * action writes many rows in one transaction, so they carry the same now()).
+   *
+   * The Zyra de-duplication lives in the audit branch only, so it applies before a branch's LIMIT and a
+   * dropped row never takes a page slot.
+   */
+  private activityUnionSql(
+    outerWhere: string,
+    projectScopeSql: string,
+    orgOnlySql: string | null,
+    opts: { branchLimit?: string; dedupZyra: boolean }
+  ): string {
     const orgOnlyBranch = orgOnlySql
       ? `
-        UNION ALL
         SELECT
           NULL::uuid AS project_id, a.id::text, a.actor_id, u.email, COALESCE(u.name, g.display_name),
           CASE WHEN g.id IS NOT NULL THEN 'agent' WHEN u.id IS NOT NULL THEN 'user' END,
@@ -9846,7 +9935,7 @@ export class LegacyService implements OnModuleInit {
         LEFT JOIN agents g ON g.id = a.actor_id
         WHERE a.project_id IS NULL AND ${orgOnlySql}
       `
-      : "";
+      : null;
     // Bugs filed since bug mutations started writing audit rows (bug_created onwards) have a real,
     // actor-attributed history in audit_logs, so the synthetic created/updated rows below — which
     // credit every edit to the reporter — are only kept for older bugs that have nothing else.
@@ -9854,8 +9943,8 @@ export class LegacyService implements OnModuleInit {
           SELECT 1 FROM audit_logs bx
           WHERE bx.entity_type = 'bug' AND bx.entity_id = b.id::text AND bx.action = 'bug_created'
         )`;
-    return `
-      WITH activity_events AS (
+    const branches: string[] = [
+      `
         SELECT
           project_id,
           ('suite-created-' || id::text) AS id,
@@ -9876,8 +9965,8 @@ export class LegacyService implements OnModuleInit {
           created_at
         FROM suites
         WHERE ${projectScopeSql}
-
-        UNION ALL
+      `,
+      `
         SELECT
           project_id, ('suite-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
           'updated'::text, 'suite'::text, id::text,
@@ -9885,8 +9974,8 @@ export class LegacyService implements OnModuleInit {
           NULL::text, updated_at
         FROM suites
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
-
-        UNION ALL
+      `,
+      `
         SELECT
           p.project_id, ('plan-created-' || p.id::text), p.owner_id, u.email, u.name,
           CASE WHEN p.owner_id IS NOT NULL THEN 'user' END,
@@ -9896,8 +9985,8 @@ export class LegacyService implements OnModuleInit {
         FROM plans p
         LEFT JOIN users u ON u.id = p.owner_id
         WHERE ${projectScopeSql}
-
-        UNION ALL
+      `,
+      `
         SELECT
           project_id, ('plan-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
           'updated'::text, 'plan'::text, id::text,
@@ -9905,8 +9994,8 @@ export class LegacyService implements OnModuleInit {
           NULL::text, updated_at
         FROM plans
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
-
-        UNION ALL
+      `,
+      `
         SELECT
           c.project_id, ('cycle-created-' || c.id::text), c.owner_id, u.email, u.name,
           CASE WHEN c.owner_id IS NOT NULL THEN 'user' END,
@@ -9919,8 +10008,8 @@ export class LegacyService implements OnModuleInit {
         FROM cycles c
         LEFT JOIN users u ON u.id = c.owner_id
         WHERE ${projectScopeSql}
-
-        UNION ALL
+      `,
+      `
         SELECT
           project_id, ('cycle-updated-' || id::text), NULL::uuid, NULL::text, NULL::text, NULL::text,
           'updated'::text, 'cycle'::text, id::text,
@@ -9928,8 +10017,8 @@ export class LegacyService implements OnModuleInit {
           NULL::text, updated_at
         FROM cycles
         WHERE ${projectScopeSql} AND updated_at > created_at + interval '1 second'
-
-        UNION ALL
+      `,
+      `
         SELECT
           b.project_id, ('bug-created-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
@@ -9939,8 +10028,8 @@ export class LegacyService implements OnModuleInit {
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql} AND ${bugHasNoAuditTrail}
-
-        UNION ALL
+      `,
+      `
         SELECT
           b.project_id, ('bug-updated-' || b.id::text), b.reported_by, u.email, u.name,
           CASE WHEN b.reported_by IS NOT NULL THEN 'user' END,
@@ -9950,91 +10039,112 @@ export class LegacyService implements OnModuleInit {
         FROM bugs b
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second' AND ${bugHasNoAuditTrail}
+      `,
+      this.activityAuditBranch(projectScopeSql, opts.dedupZyra)
+    ];
+    if (orgOnlyBranch) branches.push(orgOnlyBranch);
 
-        UNION ALL
-        SELECT
-          a.project_id, a.id::text, a.actor_id, u.email, COALESCE(u.name, g.display_name),
-          CASE WHEN g.id IS NOT NULL THEN 'agent' WHEN u.id IS NOT NULL THEN 'user' END,
-          a.action::text, a.entity_type::text, a.entity_id::text, a.entity_name::text, a.diff::text, a.created_at
-        FROM audit_logs a
-        LEFT JOIN users u ON u.id = a.actor_id
-        LEFT JOIN agents g ON g.id = a.actor_id
-        WHERE a.project_id IS NOT NULL AND ${projectScopeSql}
-        ${orgOnlyBranch}
-      )
-      -- The Zyra chat flow calls the shared createTestCase/patchTestCaseFromZyra helpers (which
-      -- already log testcase_created/testcase_updated) and then logs a second zyra_created/
-      -- zyra_updated/zyra_archived row for the same entity a moment later, so both would render
-      -- as duplicate feed rows for the same mutation. Drop the plain testcase_* row whenever a
-      -- zyra_* sibling exists for the same entity within a few seconds; the zyra_* row carries
-      -- the AI-specific action label and reason, and actor attribution already says who/what did it.
-      --
-      -- Shape matters for speed: this must stay a top-level AND NOT EXISTS whose only correlation
-      -- to ae is z.entity_id = ae.entity_id. Postgres then plans a hash anti-join (linear). The
-      -- earlier NOT (action IN (...) AND EXISTS (...)) put the sublink under an OR, which cannot be
-      -- pulled up, so it ran as a correlated SubPlan that full-scanned the (unindexed, materialized)
-      -- CTE once per testcase_* row: O(testcase rows x all rows), 30s+ on a project with thousands
-      -- of test cases, which the 30s statement_timeout turned into a 500 on the project dashboard.
-      -- The action guard sits inside the subquery (outer-only qual): for any other action the
-      -- subquery is empty, so NOT EXISTS stays true and the row is kept, as before.
-      -- z is deliberately NOT narrowed by outerWhere: a sibling hidden by a filter must still dedup.
+    const limit = opts.branchLimit ? ` ORDER BY ae.created_at DESC, ae.id DESC LIMIT ${opts.branchLimit}` : "";
+    return branches
+      .map((branch) => `(SELECT * FROM (${branch}) ae(${LegacyService.ACTIVITY_COLUMNS}) WHERE ${outerWhere}${limit})`)
+      .join("\n        UNION ALL\n        ");
+  }
+
+  // The rows of the feed, newest-first once the caller appends its ORDER BY.
+  //
+  // Testcase created/updated/deleted are not synthesized (see above), and the Zyra chat flow logs a
+  // second zyra_created/zyra_updated/zyra_archived row for the same entity a moment later through the
+  // shared createTestCase/patchTestCaseFromZyra helpers, which already log testcase_created/
+  // testcase_updated. Both would render as duplicate feed rows for the same mutation, so the plain
+  // testcase_* row is dropped whenever a zyra_* sibling exists for the same entity within a few
+  // seconds; the zyra_* row carries the AI-specific action label and reason, and actor attribution
+  // already says who/what did it. The sibling is deliberately NOT narrowed by outerWhere: a sibling
+  // hidden by a filter must still dedup.
+  private activityEventsSql(
+    outerWhere: string,
+    projectScopeSql: string = "project_id = $1",
+    orgOnlySql: string | null = null,
+    opts: { branchLimit?: string } = {}
+  ): string {
+    const union = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, { ...opts, dedupZyra: true });
+    return `
       SELECT ae.*, pr.name AS project_name
-      FROM activity_events ae
+      FROM (${union}) ae
       LEFT JOIN projects pr ON pr.id = ae.project_id
-      WHERE ${outerWhere}
-        AND NOT EXISTS (
-          SELECT 1 FROM activity_events z
-          WHERE ae.action IN ('testcase_created', 'testcase_updated')
-            AND z.entity_id = ae.entity_id
-            AND z.action IN ('zyra_created', 'zyra_updated', 'zyra_archived')
-            AND abs(extract(epoch FROM z.created_at - ae.created_at)) < 5
-        )
     `;
+  }
+
+  /**
+   * How many rows activityEventsSql would return for `outerWhere`, without building them.
+   *
+   * Counting the de-duplicated rows directly would mean probing for a zyra sibling on every
+   * testcase_* row, i.e. once per row of a history that can run to hundreds of thousands. So it is
+   * counted as (every row) - (the testcase_* rows that have a zyra sibling): the second term is driven
+   * from the zyra_* rows, which are few, and each is matched to its testcase_* rows through
+   * idx_audit_logs_entity. Same rows, same filters, so the total always agrees with the list.
+   */
+  private activityCountSql(outerWhere: string, projectScopeSql: string, orgOnlySql: string | null): string {
+    const everyRow = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, { dedupZyra: false });
+    const droppedRows = `
+      SELECT 1
+      FROM (${this.activityAuditBranch(projectScopeSql, false)}) ae(${LegacyService.ACTIVITY_COLUMNS})
+      WHERE ${outerWhere}
+        AND ae.action IN ('testcase_created', 'testcase_updated')
+        AND ae.id IN (SELECT dropped.id::text FROM (${this.zyraDroppedIdsSql(projectScopeSql)}) dropped)
+    `;
+    return `SELECT (SELECT COUNT(*) FROM (${everyRow}) every_row) - (SELECT COUNT(*) FROM (${droppedRows}) dropped_row) AS count`;
   }
 
   // Powers the Activity screen's right-hand summary panel: this-week action-category counts,
   // an actor leaderboard, and a per-entity-type breakdown — all scoped to the same trailing
   // 7-day window so the three widgets read as one consistent "this week" snapshot.
   async activitySummary(projectId: string) {
-    const eventsSql = this.activityEventsSql(
-      "ae.project_id = $1 AND ae.created_at >= now() - interval '7 days'"
-    );
-    const [weekly, leaderboard, byEntityType] = await Promise.all([
-      this.db.query(
-        `
-        SELECT
-          COUNT(*) FILTER (WHERE action ILIKE 'zyra%')::int AS ai_actions,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%creat%')::int AS created,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%updat%')::int AS updated,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%delet%')::int AS deleted,
-          COUNT(*)::int AS total
-        FROM (${eventsSql}) e
-        `,
-        [projectId]
-      ),
-      this.db.query(
-        `
-        SELECT actor_id, actor_name, actor_email, actor_kind, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        WHERE actor_id IS NOT NULL
-        GROUP BY actor_id, actor_name, actor_email, actor_kind
-        ORDER BY count DESC
-        LIMIT 6
-        `,
-        [projectId]
-      ),
-      this.db.query(
-        `
-        SELECT entity_type, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        GROUP BY entity_type
-        ORDER BY count DESC
-        `,
+    return this.dedupe(`activitySummary:${projectId}`, () =>
+      this.activitySummaryFrom(
+        this.activityEventsSql("ae.project_id = $1 AND ae.created_at >= now() - interval '7 days'"),
         [projectId]
       )
-    ]);
+    );
+  }
 
-    const w = weekly.rows[0] || {};
+  /**
+   * The three summary widgets (this-week counts, actor leaderboard, per-entity-type breakdown) from one
+   * read of the 7-day event set. They used to build that set three times, in parallel, so one Activity
+   * page load cost three full builds and three connections. MATERIALIZED makes the single build explicit:
+   * the three aggregates below all read the same rows.
+   */
+  private async activitySummaryFrom(eventsSql: string, values: unknown[]) {
+    const res = await this.db.heavyQuery<{ weekly: Body; leaderboard: Body[]; by_entity_type: Body[] }>(
+      `
+      WITH e AS MATERIALIZED (${eventsSql})
+      SELECT
+        (SELECT row_to_json(w) FROM (
+           SELECT
+             COUNT(*) FILTER (WHERE action ILIKE 'zyra%')::int AS ai_actions,
+             COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%creat%')::int AS created,
+             COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%updat%')::int AS updated,
+             COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%delet%')::int AS deleted,
+             COUNT(*)::int AS total
+           FROM e
+         ) w) AS weekly,
+        (SELECT COALESCE(json_agg(l ORDER BY l.count DESC), '[]'::json) FROM (
+           SELECT actor_id, actor_name, actor_email, actor_kind, COUNT(*)::int AS count
+           FROM e
+           WHERE actor_id IS NOT NULL
+           GROUP BY actor_id, actor_name, actor_email, actor_kind
+           ORDER BY count DESC
+           LIMIT 6
+         ) l) AS leaderboard,
+        (SELECT COALESCE(json_agg(t ORDER BY t.count DESC), '[]'::json) FROM (
+           SELECT entity_type, COUNT(*)::int AS count
+           FROM e
+           GROUP BY entity_type
+         ) t) AS by_entity_type
+      `,
+      values
+    );
+    const row = res.rows[0];
+    const w = (row?.weekly || {}) as Body;
     return {
       weekly: {
         created: Number(w.created || 0),
@@ -10043,8 +10153,8 @@ export class LegacyService implements OnModuleInit {
         deleted: Number(w.deleted || 0),
         total: Number(w.total || 0)
       },
-      activeMembers: leaderboard.rows.map(toCamel),
-      byEntityType: byEntityType.rows.map(toCamel)
+      activeMembers: (row?.leaderboard || []).map(toCamel),
+      byEntityType: (row?.by_entity_type || []).map(toCamel)
     };
   }
 
@@ -10076,78 +10186,27 @@ export class LegacyService implements OnModuleInit {
     const filters = ["true"];
     this.activityFeedFilters(query, values, filters, { withProject: true });
     const where = filters.join(" AND ");
-
-    const eventsSql = this.activityEventsSql(
+    return this.pageActivity(
       where,
+      values,
+      limit,
+      offset,
       "project_id IN (SELECT id FROM projects WHERE organization_id = $1)",
       "organization_id = $1"
     );
-
-    const total = await this.db.query<{ count: string }>(
-      `SELECT COUNT(*) AS count FROM (${eventsSql}) counted`,
-      values
-    );
-    values.push(limit, offset);
-    const res = await this.db.query(
-      `${eventsSql} ORDER BY created_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`,
-      values
-    );
-    return { list: res.rows.map(toCamel), total: Number(total.rows[0]?.count || 0) };
   }
 
   private async workspaceActivitySummary(organizationId: string) {
-    const eventsSql = this.activityEventsSql(
-      "ae.created_at >= now() - interval '7 days'",
-      "project_id IN (SELECT id FROM projects WHERE organization_id = $1)",
-      "organization_id = $1"
-    );
-    const [weekly, leaderboard, byEntityType] = await Promise.all([
-      this.db.query(
-        `
-        SELECT
-          COUNT(*) FILTER (WHERE action ILIKE 'zyra%')::int AS ai_actions,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%creat%')::int AS created,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%updat%')::int AS updated,
-          COUNT(*) FILTER (WHERE action NOT ILIKE 'zyra%' AND action ILIKE '%delet%')::int AS deleted,
-          COUNT(*)::int AS total
-        FROM (${eventsSql}) e
-        `,
-        [organizationId]
-      ),
-      this.db.query(
-        `
-        SELECT actor_id, actor_name, actor_email, actor_kind, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        WHERE actor_id IS NOT NULL
-        GROUP BY actor_id, actor_name, actor_email, actor_kind
-        ORDER BY count DESC
-        LIMIT 6
-        `,
-        [organizationId]
-      ),
-      this.db.query(
-        `
-        SELECT entity_type, COUNT(*)::int AS count
-        FROM (${eventsSql}) e
-        GROUP BY entity_type
-        ORDER BY count DESC
-        `,
+    return this.dedupe(`workspaceActivitySummary:${organizationId}`, () =>
+      this.activitySummaryFrom(
+        this.activityEventsSql(
+          "ae.created_at >= now() - interval '7 days'",
+          "project_id IN (SELECT id FROM projects WHERE organization_id = $1)",
+          "organization_id = $1"
+        ),
         [organizationId]
       )
-    ]);
-
-    const w = weekly.rows[0] || {};
-    return {
-      weekly: {
-        created: Number(w.created || 0),
-        updated: Number(w.updated || 0),
-        aiActions: Number(w.ai_actions || 0),
-        deleted: Number(w.deleted || 0),
-        total: Number(w.total || 0)
-      },
-      activeMembers: leaderboard.rows.map(toCamel),
-      byEntityType: byEntityType.rows.map(toCamel)
-    };
+    );
   }
 
   /*
