@@ -5,6 +5,7 @@ import { IconAlertTriangle, IconArrowsLeftRight, IconCheck, IconChecklist, IconC
 import { getBillingInfo, type BillingInfo } from "@/lib/api";
 import { Button, Card, Modal, PageLoader, StatusChip } from "@/components/ui";
 import PricingModal from "@/components/PricingModal";
+import { formatDateTime } from "@/lib/date";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import ReviewCompareModal from "@/components/agents/ReviewCompareModal";
@@ -59,7 +60,8 @@ function normalizeRole(role: string): "owner" | "manager" | "qa_engineer" {
   return "qa_engineer";
 }
 
-const fmtDate = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : "");
+// Sitewide format from lib/date.ts ("05 Oct 2026, 06:21 PM") — the same one every other page uses.
+const fmtDate = (iso: string | null) => (iso ? formatDateTime(iso) : "");
 const errText = (err: unknown, fallback: string) => (err instanceof Error ? err.message : fallback);
 
 const errorBox = "rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]";
