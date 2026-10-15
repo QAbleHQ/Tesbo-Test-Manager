@@ -497,6 +497,11 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     exec(`DELETE FROM zyra_chat_sessions WHERE project_id = ${project};`);
     exec(`DELETE FROM testcases WHERE project_id = ${project};`);
     exec(`DELETE FROM suites WHERE project_id = ${project};`);
+    // The ticket tests seed "E2EZ-<n>: ..." documents (seedTickets). Without this they outlived the
+    // test, so "every synced ticket" counted whatever earlier tests had left — the scope tests assert
+    // an exact count, so each must start from none.
+    exec(`DELETE FROM knowledge_document_versions WHERE document_id IN (SELECT id FROM knowledge_documents WHERE project_id = ${project} AND title LIKE 'E2EZ-%');`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id = ${project} AND title LIKE 'E2EZ-%';`);
     // This describe block, unlike the one above, mints its own AI key per test (it needs one
     // pointed at the fake server's baseUrl) — clean up so a re-run doesn't accumulate rows in this
     // tenant's org, and so a stale key never gets picked over the one the next test allocates.
@@ -2391,20 +2396,30 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     expect(storedStep).toBe("Type adminx in Username");
   });
 
-  test("ZCC-T-04 small requests are unchanged: one ticket, or few tickets on a small range, generate straight away", async () => {
+  /*
+   * Updated for "[Zyra] Semantic Intent Detection and Consistent Batch Confirmation": the limit is now
+   * the project's own setting (one generation under "Test cases per task"), not a fixed 60. Two
+   * tickets on 1-10 are 20 test cases against one generation of 10, so they are asked about now —
+   * the deliberate consequence of that decision. What stays unchanged: a request that fits one
+   * generation (one ticket) generates straight away, and key-shaped words are never tickets.
+   */
+  test("ZCC-T-04 a request that fits one generation is unchanged: one ticket generates straight away", async () => {
     await allocateFakeAiKey();
     await seedTickets(2);
     const sessionId = await newSession("E2E ZCC small request");
-    // 1-10 is 10 per ticket: two tickets is 20, well under 60.
     await setRange("1-10");
     ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false });
     ai.queueReply({ drafts: [scenarioDraft(`E2E small request case ${Date.now()}`)] });
     ai.queueReply("Noted.");
-    const turn = await sendMessage(sessionId, "Generate test cases for E2EZ-1 and E2EZ-2.");
+    const turn = await sendMessage(sessionId, "Generate test cases for E2EZ-1.");
     expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
     const reply = await latestReply(sessionId);
     expect(reply.options ?? null).toBeNull();
     expect((reply.testcases as unknown[]).length).toBe(1);
+    // Two tickets on the same 1-10 range are over one generation of 10: asked, nothing generated.
+    ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false });
+    await sendMessage(sessionId, "Generate test cases for E2EZ-1 and E2EZ-2.");
+    expect(String((await latestReply(sessionId)).content || "")).toContain("one generation holds 10 under this project's settings");
     // Key-shaped words that are not this project's tickets never count as tickets.
     ai.queueReply({ reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, exhaustive: false });
     ai.queueReply({ drafts: [scenarioDraft(`E2E encoding case ${Date.now()}`)] });
@@ -2437,5 +2452,116 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
 
     // The first question is no longer the latest reply, so clicking it now is refused.
     expect((await post({ message: "Generate all tickets in batches", choice: { messageId: question.id, optionId: "all" } })).status(), "stale").toBe(409);
+  });
+
+  /*
+   * "[Zyra] Semantic Intent Detection and Consistent Batch Confirmation".
+   *
+   * "write all test cases" generated straight away (planning from whatever the search matched) while
+   * "write all test cases for all tickets" asked first: the scope check was a keyword test on the
+   * message. The router now reports scope semantically, and these drive real turns with the router's
+   * reply scripted on the fake provider — so what is under test is everything after the model's
+   * reading: estimate, the project's limit, the question, and acting on the answer.
+   */
+  const routerCreate = (extra: Record<string, unknown>) => ({
+    reply: "", reasoningSummary: "Generating test cases.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: null, ...extra,
+  });
+
+  async function askUnspecifiedAll(tickets: number): Promise<{ sessionId: string; question: Record<string, unknown> }> {
+    await allocateFakeAiKey();
+    await setRange("all");
+    await seedTickets(tickets);
+    const sessionId = await newSession("E2E ZCC unspecified all");
+    ai.queueReply(routerCreate({ exhaustive: true, scope: "unspecified" }));
+    const turn = await sendMessage(sessionId, "write all test cases");
+    expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+    return { sessionId, question: await latestReply(sessionId) };
+  }
+
+  test("ZCC-T-30 regression: 'write all test cases' asks which scope it means instead of generating", async () => {
+    const { sessionId, question } = await askUnspecifiedAll(4);
+    const content = String(question.content || "");
+    expect(content).toContain("could mean all 4 synced tickets");
+    expect(content, "the estimate and the project's own limit are stated").toContain("roughly 400 test cases — more than one generation of 100");
+    const options = question.options as { kind: string; choices: ChatOption[]; answeredId: string | null };
+    expect(options.kind).toBe("ticket_scope");
+    expect(options.choices.map((c) => c.id)).toEqual(["matched", "smaller", "all"]);
+    expect(ai.requests, "only the router ran — nothing planned or generated before the answer").toHaveLength(1);
+    expect(stagedDraftCount(sessionId)).toBe(0);
+    expect(activePlan(sessionId)).toBeNull();
+  });
+
+  test("ZCC-T-31 equivalent phrasings with the same scope and settings get the same question", async () => {
+    await allocateFakeAiKey();
+    await setRange("all");
+    await seedTickets(4);
+    for (const message of ["write all test cases for all tickets", "create test cases for every ticket", "cover all tickets with test cases", "generate test cases for everything"]) {
+      const sessionId = await newSession(`E2E ZCC phrasing ${message}`);
+      ai.queueReply(routerCreate({ exhaustive: true, scope: message.includes("everything") ? "project" : "all_tickets" }));
+      const turn = await sendMessage(sessionId, message);
+      expect(turn.status, `${message}: ${JSON.stringify(turn.body)}`).toBeLessThan(300);
+      await expectScopeQuestion(sessionId, 4);
+    }
+  });
+
+  test("ZCC-T-32 the question states the project's configured limit, not a fixed 100", async () => {
+    await allocateFakeAiKey();
+    await setRange("10-30");
+    await seedTickets(2);
+    const sessionId = await newSession("E2E ZCC configured limit");
+    ai.queueReply(routerCreate({ exhaustive: false, scope: "all_tickets" }));
+    await sendMessage(sessionId, "generate test cases for all tickets");
+    const question = await expectScopeQuestion(sessionId, 2);
+    expect(String(question.content)).toContain("roughly 60 test cases, and one generation holds 30 under this project's settings");
+    const all = (question.options as { choices: ChatOption[] }).choices.find((c) => c.id === "all")!;
+    expect(all.description).toContain("batches of up to 30 test cases");
+    expect(JSON.stringify(question.options)).not.toMatch(/\b100\b/);
+  });
+
+  test("ZCC-T-33 answering 'just what this request matched' generates from the match and is not asked again", async () => {
+    test.setTimeout(120_000);
+    const { sessionId } = await askUnspecifiedAll(4);
+    // The answer re-runs the original request, routed: planner, its top-up round, one batch, memory.
+    ai.queueReply({ scenarios: ["Matched scenario 1", "Matched scenario 2", "Matched scenario 3"] });
+    ai.queueReply({ scenarios: [] });
+    queueBatchDrafts(3);
+    ai.queueReply("Noted.");
+    const answered = await answerQuestion(sessionId, "matched");
+    expect(answered.status, JSON.stringify(answered.body)).toBeLessThan(300);
+    const reply = await latestReply(sessionId);
+    expect(reply.options ?? null, "an approved scope is respected — no second question").toBeNull();
+    expect(reviewRequestFor(sessionId)?.payloadLength).toBe(3);
+    // Planned from the match, not paged through the tickets: the planner never saw the ticket list.
+    expect(plannerPrompts().flatMap(distinctTickets)).toEqual([]);
+  });
+
+  test("ZCC-T-34 answering 'all tickets in batches' walks every ticket though the message never said 'tickets'", async () => {
+    test.setTimeout(120_000);
+    const { sessionId } = await askUnspecifiedAll(4);
+    ai.queueReply({ scenarios: ["Ticket scenario 1", "Ticket scenario 2"] });
+    ai.queueReply({ scenarios: [] });
+    queueBatchDrafts(2);
+    ai.queueReply("Noted.");
+    const answered = await answerQuestion(sessionId, "all");
+    expect(answered.status, JSON.stringify(answered.body)).toBeLessThan(300);
+    // The paged all-tickets plan: the planner is handed the synced tickets themselves.
+    const planned = plannerPrompts();
+    expect(planned.length, "the paged plan ran").toBeGreaterThan(0);
+    expect(distinctTickets(planned[0]).sort()).toEqual(["E2EZ-1:", "E2EZ-2:", "E2EZ-3:", "E2EZ-4:"]);
+  });
+
+  test("ZCC-T-35 'all of them' means the tickets named earlier in the conversation, not every ticket", async () => {
+    await allocateFakeAiKey();
+    await seedTickets(6);
+    const sessionId = await newSession("E2E ZCC referenced tickets");
+    // Turn 1 names two tickets; nothing is generated.
+    ai.queueReply({ reply: "Both are about gift card balances.", reasoningSummary: "Answered.", action: "answer", actionType: "answer", operations: [], testcases: [] });
+    await sendMessage(sessionId, "What are E2EZ-1 and E2EZ-2 about?");
+    // Turn 2 refers back to them.
+    ai.queueReply(routerCreate({ exhaustive: false, scope: "referenced" }));
+    await sendMessage(sessionId, "write test cases for all of them");
+    // 2 referenced tickets — not the 6 synced in the project.
+    const question = await expectScopeQuestion(sessionId, 2);
+    expect(String(question.content)).toContain("E2EZ-1, E2EZ-2");
   });
 });

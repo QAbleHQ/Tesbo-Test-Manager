@@ -61,11 +61,17 @@ function makeLegacy(query: Query = jest.fn(() => Promise.resolve({ rows: [] })) 
 
 type Options = { kind: string; choices: Array<{ id: string; label: string; description?: string; message?: string }>; answeredId?: string | null; context?: Body };
 type Decision = { reply: string; actionType: string; operations: unknown[]; options?: Options };
-type Scope = { ticketKeys: string[] | null; ticketCount: number; perTicket: number } | null;
+type Scope = { ticketKeys: string[] | null; ticketCount: number; perTicket: number; limit: number; unspecified: boolean } | null;
 
 type Internals = {
   chatTestcasePlan: (message: string, range: string, routed?: Body) => { requestedCount: number; testcaseRange?: string };
-  zyraTicketScope: (projectId: string, message: string, plan: { requestedCount: number; testcaseRange?: string }, confidence?: string) => Promise<Scope>;
+  zyraTicketScope: (
+    projectId: string,
+    message: string,
+    plan: { requestedCount: number; testcaseRange?: string },
+    options: { projectTestcaseRange: string; knowledgeConfidence?: string; routedScope?: string; referencedKeys?: string[] }
+  ) => Promise<Scope>;
+  getProject: (projectId: string) => Promise<Body>;
   zyraTicketScopeQuestion: (message: string, scope: NonNullable<Scope>, exhaustive: boolean, routedSuite: Body | null) => Decision;
   zyraTicketSelectionPrompt: (projectId: string, context: Body, problem?: Body) => Promise<Decision>;
   zyraParseTicketSelection: (message: string) => { keys: string[]; oversizedRange?: { from: string; to: string; size: number } };
@@ -87,6 +93,7 @@ type Internals = {
 const internals = (svc: LegacyService) => svc as unknown as Internals;
 const statics = LegacyService as unknown as {
   zyraPublicOptions: (raw: unknown) => Body | null;
+  zyraRoutedScope: (raw: unknown) => string | undefined;
   zyraTicketPlanSummary: (plan: Body, final: boolean) => string;
   zyraBatchTicketKeys: (batch: string[]) => string[];
 };
@@ -97,8 +104,17 @@ const keys = (count: number) => Array.from({ length: count }, (_, i) => `QAB-${i
 // When to ask
 // ---------------------------------------------------------------------------------------------------
 
-describe("zyraTicketScope — asks only above an estimate of 60 test cases", () => {
-  const scopeFor = async (message: string, range: string, opts: { synced?: number; knowledgeBase?: boolean; confidence?: string; prefixes?: string[] } = {}) => {
+/*
+ * "[Zyra] Semantic Intent Detection and Consistent Batch Confirmation" — the limit is the project's
+ * own setting (one generation under "Test cases per task": 10 / 30 / 50 / 100), not the fixed 60 this
+ * used to compare against, and the scope is the router's semantic reading (`routedScope`), so
+ * "write all test cases" and "… for all tickets" reach the same decision. The keyword test survives
+ * only as the fallback when the router reports no scope, which the older cases below still exercise.
+ */
+type ScopeOpts = { synced?: number; knowledgeBase?: boolean; confidence?: string; prefixes?: string[]; routedScope?: string; exhaustive?: boolean; requestedCount?: number; referencedKeys?: string[] };
+
+describe("zyraTicketScope — asks when the workload is over one generation under the project's setting", () => {
+  const scopeFor = async (message: string, range: string, opts: ScopeOpts = {}) => {
     const query = jest.fn((sql: string, params: unknown[] = []) => {
       // Prefixes this project has synced tickets under — QAB unless a test says otherwise.
       if (sql.includes("AS prefix")) return Promise.resolve({ rows: (opts.prefixes ?? ["QAB"]).filter((p) => (params[1] as string[]).includes(p)).map((prefix) => ({ prefix })) });
@@ -106,21 +122,41 @@ describe("zyraTicketScope — asks only above an estimate of 60 test cases", () 
     }) as unknown as Query;
     const svc = makeLegacy(query);
     jest.spyOn(internals(svc), "zyraProjectCapabilities").mockResolvedValue({ knowledgeBase: opts.knowledgeBase ?? true });
-    const plan = internals(svc).chatTestcasePlan(message, range);
-    return internals(svc).zyraTicketScope("p1", message, plan, opts.confidence);
+    // The router's reading — exhaustive and scope — as the real turn passes it in.
+    const plan = internals(svc).chatTestcasePlan(message, range, opts.exhaustive || opts.requestedCount ? { exhaustive: opts.exhaustive, requestedCount: opts.requestedCount } : undefined);
+    return internals(svc).zyraTicketScope("p1", message, plan, {
+      projectTestcaseRange: range,
+      knowledgeConfidence: opts.confidence,
+      routedScope: opts.routedScope,
+      referencedKeys: opts.referencedKeys
+    });
   };
 
-  it("asks for two named tickets at 50 per ticket (100 > 60)", async () => {
-    expect(await scopeFor("Generate test cases for QAB-1 and QAB-2", "30-50")).toEqual({ ticketKeys: ["QAB-1", "QAB-2"], ticketCount: 2, perTicket: 50 });
+  it("asks for two named tickets at 50 per ticket — 100 is over one generation of 50", async () => {
+    expect(await scopeFor("Generate test cases for QAB-1 and QAB-2", "30-50")).toEqual({
+      ticketKeys: ["QAB-1", "QAB-2"], ticketCount: 2, perTicket: 50, limit: 50, unspecified: false
+    });
   });
 
-  it("does not ask for two tickets at 30 per ticket — 60 is not above the threshold", async () => {
-    expect(await scopeFor("Generate test cases for QAB-1 and QAB-2", "10-30")).toBeNull();
+  it("the limit follows the configured setting, with no code change between them", async () => {
+    const message = "Generate test cases for QAB-1 and QAB-2";
+    for (const [range, limit] of [["1-10", 10], ["10-30", 30], ["30-50", 50], ["all", 100]] as const) {
+      expect({ range, limit: (await scopeFor(message, range))?.limit }).toEqual({ range, limit });
+    }
   });
 
-  it("at 10 per ticket asks from 7 tickets, not 6", async () => {
-    expect(await scopeFor(`Generate test cases for ${keys(6).join(", ")}`, "1-10")).toBeNull();
-    expect((await scopeFor(`Generate test cases for ${keys(7).join(", ")}`, "1-10"))?.ticketCount).toBe(7);
+  it("is held to the setting, not a fixed 60: two tickets at 30 each (60) are over one generation of 30", async () => {
+    // Under the old fixed threshold of 60 this was exactly at it and never asked.
+    expect((await scopeFor("Generate test cases for QAB-1 and QAB-2", "10-30"))?.ticketCount).toBe(2);
+  });
+
+  it("below, at and over the limit: what fits one generation is not asked about", async () => {
+    // Below: one ticket at the project's own size is one generation's worth.
+    expect(await scopeFor("Generate test cases for QAB-1", "1-10")).toBeNull();
+    // At: every ticket of a project that only has one fits exactly — still one generation.
+    expect(await scopeFor("Generate test cases for all the tickets", "1-10", { routedScope: "all_tickets", synced: 1 })).toBeNull();
+    // Over: two tickets at the same size need two generations.
+    expect((await scopeFor("Generate test cases for all the tickets", "1-10", { routedScope: "all_tickets", synced: 2 }))?.ticketCount).toBe(2);
   });
 
   it("an 'all possible' request budgets each ticket at the 'all' range's full batch, not the single-call cap", async () => {
@@ -147,7 +183,9 @@ describe("zyraTicketScope — asks only above an estimate of 60 test cases", () 
   });
 
   it("counts every synced ticket for 'all the tickets'", async () => {
-    expect(await scopeFor("Generate test cases for all the Jira tickets", "30-50", { synced: 12 })).toEqual({ ticketKeys: null, ticketCount: 12, perTicket: 50 });
+    expect(await scopeFor("Generate test cases for all the Jira tickets", "30-50", { synced: 12 })).toEqual({
+      ticketKeys: null, ticketCount: 12, perTicket: 50, limit: 50, unspecified: false
+    });
   });
 
   it("does not read 'the login requirement' as every ticket there is", async () => {
@@ -160,13 +198,105 @@ describe("zyraTicketScope — asks only above an estimate of 60 test cases", () 
   });
 });
 
+describe("zyraTicketScope — the router's scope decides, whatever the wording", () => {
+  const scopeFor = async (message: string, range: string, opts: ScopeOpts = {}) => {
+    const query = jest.fn((sql: string, params: unknown[] = []) => {
+      if (sql.includes("AS prefix")) return Promise.resolve({ rows: (opts.prefixes ?? ["QAB"]).filter((p) => (params[1] as string[]).includes(p)).map((prefix) => ({ prefix })) });
+      return Promise.resolve({ rows: [{ count: String(opts.synced ?? 0) }] });
+    }) as unknown as Query;
+    const svc = makeLegacy(query);
+    jest.spyOn(internals(svc), "zyraProjectCapabilities").mockResolvedValue({ knowledgeBase: opts.knowledgeBase ?? true });
+    const plan = internals(svc).chatTestcasePlan(message, range, opts.exhaustive || opts.requestedCount ? { exhaustive: opts.exhaustive, requestedCount: opts.requestedCount } : undefined);
+    return internals(svc).zyraTicketScope("p1", message, plan, {
+      projectTestcaseRange: range,
+      knowledgeConfidence: opts.confidence,
+      routedScope: opts.routedScope,
+      referencedKeys: opts.referencedKeys
+    });
+  };
+
+  // The issue's own examples. The router reads each one; given the same reading and settings, the
+  // decision must be identical — none of the words below may change it.
+  const everyTicketPhrasings = [
+    "write all test cases for all tickets",
+    "generate test cases for everything",
+    "create test cases for every ticket",
+    "cover all tickets with test cases",
+    "create test cases for the entire project",
+    "please make sure each story has its tests"
+  ];
+
+  it("equivalent requests with the same scope and settings reach the same decision", async () => {
+    const decisions = await Promise.all(
+      everyTicketPhrasings.map((message) => scopeFor(message, "all", { routedScope: "all_tickets", exhaustive: true, synced: 243 }))
+    );
+    for (const [i, decision] of decisions.entries()) {
+      expect({ message: everyTicketPhrasings[i], decision }).toEqual({
+        message: everyTicketPhrasings[i],
+        decision: { ticketKeys: null, ticketCount: 243, perTicket: 100, limit: 100, unspecified: false }
+      });
+    }
+  });
+
+  it("regression: 'write all test cases' (no ticket word) no longer skips the question — it asks which scope", async () => {
+    // Before: no ticket word, so the keyword test returned null and Zyra planned silently from
+    // whatever the search matched. Now an unstated scope that every ticket would overflow is asked.
+    expect(await scopeFor("write all test cases", "all", { routedScope: "unspecified", exhaustive: true, synced: 243 })).toEqual({
+      ticketKeys: null, ticketCount: 243, perTicket: 100, limit: 100, unspecified: true
+    });
+  });
+
+  it("regression: 'write all test cases for all tickets' still asks, from the router's reading or the fallback", async () => {
+    const expected = { ticketKeys: null, ticketCount: 243, perTicket: 100, limit: 100, unspecified: false };
+    expect(await scopeFor("write all test cases for all tickets", "all", { routedScope: "all_tickets", exhaustive: true, synced: 243 })).toEqual(expected);
+    expect(await scopeFor("write all test cases for all tickets", "all", { exhaustive: true, synced: 243 })).toEqual(expected);
+  });
+
+  it("does not force a question on small, unambiguous or ordinary requests", async () => {
+    // An unstated scope that is not 'all possible' is an ordinary request: generate as before.
+    expect(await scopeFor("write test cases", "30-50", { routedScope: "unspecified", synced: 243 })).toBeNull();
+    // One feature, even worded with "all … requirements".
+    expect(await scopeFor("write all test cases for the login requirements", "all", { routedScope: "feature", exhaustive: true, synced: 243 })).toBeNull();
+    // Every ticket in a project that has none synced — nothing to estimate, nothing to ask.
+    expect(await scopeFor("write all test cases", "all", { routedScope: "unspecified", exhaustive: true, synced: 0 })).toBeNull();
+    // An explicit count is the user's own budget, whatever the scope.
+    expect(await scopeFor("generate 100 test cases", "all", { routedScope: "all_tickets", requestedCount: 100, synced: 243 })).toBeNull();
+  });
+
+  it("'all' means all of what the user refers to: tickets named earlier, not every ticket", async () => {
+    const referenced = { routedScope: "referenced", referencedKeys: ["QAB-1", "QAB-2", "QAB-3"], synced: 243 };
+    expect(await scopeFor("write test cases for all of them", "30-50", referenced)).toEqual({
+      ticketKeys: ["QAB-1", "QAB-2", "QAB-3"], ticketCount: 3, perTicket: 50, limit: 50, unspecified: false
+    });
+    // The same carried keys do not widen a request the router read as one feature.
+    expect(await scopeFor("write test cases for the login page", "30-50", { ...referenced, routedScope: "feature" })).toBeNull();
+    // And with no router scope (the fallback), only the tickets this message names count, as before.
+    expect(await scopeFor("write test cases for all of them", "30-50", { ...referenced, routedScope: undefined })).toBeNull();
+  });
+
+  it("the router's reading wins over a strong search match that used to suppress the question", async () => {
+    expect((await scopeFor("generate test cases for everything", "all", { routedScope: "project", exhaustive: true, synced: 20, confidence: "strong" }))?.ticketCount).toBe(20);
+  });
+
+  it("an unknown scope from the router is ignored, falling back to the old reading", () => {
+    expect(statics.zyraRoutedScope("all_tickets")).toBe("all_tickets");
+    expect(statics.zyraRoutedScope("galaxy")).toBeUndefined();
+    expect(statics.zyraRoutedScope(null)).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------
 // The question and its options
 // ---------------------------------------------------------------------------------------------------
 
 describe("zyraTicketScopeQuestion — the two options, and what the client sees of them", () => {
   const question = () =>
-    internals(makeLegacy()).zyraTicketScopeQuestion("Generate test cases for QAB-1 … QAB-30", { ticketKeys: keys(30), ticketCount: 30, perTicket: 50 }, false, { id: "s1", name: "Login" });
+    internals(makeLegacy()).zyraTicketScopeQuestion(
+      "Generate test cases for QAB-1 … QAB-30",
+      { ticketKeys: keys(30), ticketCount: 30, perTicket: 50, limit: 50, unspecified: false },
+      false,
+      { id: "s1", name: "Login" }
+    );
 
   it("is an answer that writes nothing, says why, and offers both options", () => {
     const decision = question();
@@ -178,9 +308,29 @@ describe("zyraTicketScopeQuestion — the two options, and what the client sees 
     expect(decision.options?.choices[0].description).toMatch(/1–2 tickets at a time/);
   });
 
+  it("states the project's own limit, never a fixed 100", () => {
+    const at30 = internals(makeLegacy()).zyraTicketScopeQuestion("x", { ticketKeys: keys(4), ticketCount: 4, perTicket: 30, limit: 30, unspecified: false }, false, null);
+    expect(at30.reply).toMatch(/one generation holds 30 under this project's settings/);
+    expect(at30.options?.choices.find((c) => c.id === "all")?.description).toMatch(/batches of up to 30 test cases/);
+    expect(JSON.stringify(at30)).not.toMatch(/\b100\b/);
+  });
+
+  it("an unstated scope gets the clarifying variant: what 'all' could mean, the estimate, and the narrow reading as an option", () => {
+    const decision = internals(makeLegacy()).zyraTicketScopeQuestion(
+      "write all test cases",
+      { ticketKeys: null, ticketCount: 243, perTicket: 100, limit: 100, unspecified: true },
+      true,
+      null
+    );
+    expect(decision.reply).toMatch(/could mean all 243 synced tickets/);
+    expect(decision.reply).toMatch(/roughly 24300 test cases — more than one generation of 100/);
+    expect(decision.options?.choices.map((c) => c.id)).toEqual(["matched", "smaller", "all"]);
+    expect(decision.options?.context).toMatchObject({ originalMessage: "write all test cases", ticketKeys: null, limit: 100, exhaustive: true });
+  });
+
   it("keeps what acting on it needs server-side only", () => {
     const options = question().options!;
-    expect(options.context).toMatchObject({ ticketKeys: keys(30), perTicket: 50, routedSuite: { id: "s1", name: "Login" } });
+    expect(options.context).toMatchObject({ ticketKeys: keys(30), perTicket: 50, limit: 50, routedSuite: { id: "s1", name: "Login" } });
     const visible = statics.zyraPublicOptions(options);
     expect(visible).toEqual({ kind: "ticket_scope", choices: options.choices, answeredId: null });
     expect(JSON.stringify(visible)).not.toContain("originalMessage");
@@ -193,7 +343,7 @@ describe("zyraTicketScopeQuestion — the two options, and what the client sees 
 
 describe("zyraTicketSelectionPrompt — 'smaller batches' asks which tickets, it does not list them", () => {
   it("asks for ids or a range, with real examples, how many fit a batch, and 'all' one click away", async () => {
-    const decision = await internals(makeLegacy()).zyraTicketSelectionPrompt("p1", { ticketKeys: keys(30), perTicket: 50, exhaustive: true });
+    const decision = await internals(makeLegacy()).zyraTicketSelectionPrompt("p1", { ticketKeys: keys(30), perTicket: 50, limit: 50, exhaustive: true });
     expect(decision.reply).toMatch(/Type the ticket IDs or a range — for example `QAB-1, QAB-2` or `QAB-1 to QAB-2`/);
     expect(decision.reply).toMatch(/30 tickets are in scope; for the best coverage name up to 2 at a time/);
     expect(decision.options?.kind).toBe("ticket_selection");
@@ -207,7 +357,7 @@ describe("zyraTicketSelectionPrompt — 'smaller batches' asks which tickets, it
     const query = jest.fn((sql: string) => Promise.resolve({
       rows: sql.includes("count(*)") ? [{ count: "10000" }] : [{ ticket_key: "KAN-1" }, { ticket_key: "KAN-2" }]
     })) as unknown as Query;
-    const decision = await internals(makeLegacy(query)).zyraTicketSelectionPrompt("p1", { ticketKeys: null, perTicket: 10 });
+    const decision = await internals(makeLegacy(query)).zyraTicketSelectionPrompt("p1", { ticketKeys: null, perTicket: 10, limit: 10 });
     expect(decision.reply).toMatch(/10000 tickets are in scope; for the best coverage name up to 10 at a time/);
     expect(decision.reply).toMatch(/`KAN-1 to KAN-10`/);
     expect(decision.options?.choices).toHaveLength(1);
@@ -218,15 +368,22 @@ describe("zyraTicketSelectionPrompt — 'smaller batches' asks which tickets, it
 
   it("says why it is asking again: nothing typed was a synced ticket, or the range was too large", async () => {
     const svc = makeLegacy();
-    const unknown = await internals(svc).zyraTicketSelectionPrompt("p1", { ticketKeys: keys(3), perTicket: 50 }, { unknown: ["KAN-999"] });
+    const unknown = await internals(svc).zyraTicketSelectionPrompt("p1", { ticketKeys: keys(3), perTicket: 50, limit: 50 }, { unknown: ["KAN-999"] });
     expect(unknown.reply).toMatch(/^None of KAN-999 is a synced ticket in this project\./);
     expect(unknown.options?.kind).toBe("ticket_selection");
-    const tooLarge = await internals(svc).zyraTicketSelectionPrompt("p1", { ticketKeys: keys(3), perTicket: 50 }, { oversizedRange: { from: "KAN-1", to: "KAN-9000", size: 9000 } });
+    const tooLarge = await internals(svc).zyraTicketSelectionPrompt("p1", { ticketKeys: keys(3), perTicket: 50, limit: 50 }, { oversizedRange: { from: "KAN-1", to: "KAN-9000", size: 9000 } });
     expect(tooLarge.reply).toMatch(/^KAN-1 to KAN-9000 covers 9000 tickets — name at most 500 at a time/);
   });
 
+  it("a question asked before it carried a limit reads the project's setting, not a fixed 100", async () => {
+    const svc = makeLegacy();
+    jest.spyOn(internals(svc), "getProject").mockResolvedValue({ settings: { zyraAgent: { testcaseRange: "10-30" } } });
+    const decision = await internals(svc).zyraTicketSelectionPrompt("p1", { ticketKeys: keys(4), perTicket: 30 });
+    expect(decision.options?.choices[0].description).toMatch(/batches of up to 30 test cases/);
+  });
+
   it("with nothing synced for 'all tickets', says so and asks nothing", async () => {
-    const decision = await internals(makeLegacy(jest.fn(() => Promise.resolve({ rows: [{ count: "0" }] })) as unknown as Query)).zyraTicketSelectionPrompt("p1", { ticketKeys: null, perTicket: 50 });
+    const decision = await internals(makeLegacy(jest.fn(() => Promise.resolve({ rows: [{ count: "0" }] })) as unknown as Query)).zyraTicketSelectionPrompt("p1", { ticketKeys: null, perTicket: 50, limit: 50 });
     expect(decision.options).toBeUndefined();
     expect(decision.reply).toMatch(/None of these tickets is synced/);
   });
@@ -504,7 +661,7 @@ describe("zyraDecisionForChoice — what each answer runs", () => {
     kind: "ticket_scope",
     choices: [{ id: "smaller", label: "Generate in smaller batches" }, { id: "all", label: "Generate all tickets in batches" }],
     answeredId: "all",
-    context: { originalMessage: "Generate test cases for the tickets", ticketKeys, perTicket: 50, exhaustive: false, routedSuite: { id: "s9", name: "Checkout" } }
+    context: { originalMessage: "Generate test cases for the tickets", ticketKeys, perTicket: 50, limit: 50, exhaustive: false, routedSuite: { id: "s9", name: "Checkout" } }
   });
   function setup() {
     const svc = makeLegacy();
@@ -527,7 +684,7 @@ describe("zyraDecisionForChoice — what each answer runs", () => {
   it("'all' for all the tickets is the paged plan — decided, with no ticket scope", async () => {
     const { svc, build } = setup();
     await internals(svc).zyraDecisionForChoice(turn, { options: scopeOptions(null), choice: { id: "all", label: "Generate all tickets in batches" } });
-    expect((build.mock.calls[0][5] as Body).routedCount).toEqual({ exhaustive: true, scopeDecided: true });
+    expect((build.mock.calls[0][5] as Body).routedCount).toEqual({ exhaustive: true, scopeDecided: true, scope: "all_tickets" });
   });
 
   it("'smaller batches' asks which tickets, without calling the model", async () => {
@@ -537,11 +694,26 @@ describe("zyraDecisionForChoice — what each answer runs", () => {
     expect(decision.options?.kind).toBe("ticket_selection");
   });
 
+  it("'just what this request matched' re-runs the original request, decided, on the narrow reading", async () => {
+    const { svc, build } = setup();
+    const options: Options = {
+      kind: "ticket_scope",
+      choices: [{ id: "matched", label: "Just what this request matched" }, { id: "smaller", label: "Generate in smaller batches" }, { id: "all", label: "Generate all tickets in batches" }],
+      answeredId: "matched",
+      context: { originalMessage: "write all test cases", ticketKeys: null, perTicket: 100, limit: 100, exhaustive: true, routedSuite: null }
+    };
+    await internals(svc).zyraDecisionForChoice(turn, { options, choice: { id: "matched", label: "Just what this request matched" } });
+    const [, , , message, , resume] = build.mock.calls[0];
+    expect(message).toBe("write all test cases");
+    // scopeDecided: an approved scope is respected — the follow-up turn is not asked again.
+    expect(resume).toEqual({ routedSuite: null, routedCount: { exhaustive: true, scopeDecided: true, scope: "feature" } });
+  });
+
   const selectionOptions = (ticketKeys: string[] | null): Options => ({
     kind: "ticket_selection",
     choices: [{ id: "all", label: "Generate all tickets in batches" }],
     answeredId: "typed",
-    context: { originalMessage: "Generate all possible test cases on all tickets", ticketKeys, perTicket: 50, exhaustive: true, routedSuite: null }
+    context: { originalMessage: "Generate all possible test cases on all tickets", ticketKeys, perTicket: 50, limit: 50, exhaustive: true, routedSuite: null }
   });
   function setupSelection(syncedKeys: string[]) {
     const query = jest.fn((sql: string, params: unknown[] = []) => {
@@ -584,7 +756,7 @@ describe("zyraDecisionForChoice — what each answer runs", () => {
   it("'all' on the which-tickets question is the same as on the first question", async () => {
     const { svc, build } = setupSelection([]);
     await internals(svc).zyraDecisionForChoice(turn, { options: selectionOptions(null), choice: { id: "all", label: "Generate all tickets in batches" } });
-    expect((build.mock.calls[0][5] as Body).routedCount).toEqual({ exhaustive: true, scopeDecided: true });
+    expect((build.mock.calls[0][5] as Body).routedCount).toEqual({ exhaustive: true, scopeDecided: true, scope: "all_tickets" });
   });
 
   it("a ticket group from an older message still runs its own request, not the typed '1'", async () => {

@@ -234,13 +234,18 @@ export const ZYRA_RU = {
     "Jira для этого проекта ещё не подключена, поэтому я не могу посчитать покрытие тест-кейсами. Сначала подключите Jira и синхронизируйте тикеты.",
 
   // zyraTicketScopeQuestion / zyraTicketGroupDecision
-  scopeQuestion: (tickets: number, perTicket: number, preview: string) =>
-    `Этот запрос охватывает ${n(tickets)} тикет(ов)${preview}. При ~${n(perTicket)} тест-кейсах на тикет это около ${n(tickets * perTicket)} тест-кейсов, а одна генерация ограничена 100 — если делать всё сразу, покрытие каждого тикета получится поверхностным. Как продолжим?`,
+  scopeQuestion: (tickets: number, perTicket: number, preview: string, limit: number) =>
+    `Этот запрос охватывает ${n(tickets)} тикет(ов)${preview}. При ~${n(perTicket)} тест-кейсах на тикет это около ${n(tickets * perTicket)} тест-кейсов, а одна генерация по настройкам проекта ограничена ${n(limit)} — если делать всё сразу, покрытие каждого тикета получится поверхностным. Как продолжим?`,
+  scopeUnspecifiedQuestion: (tickets: number, perTicket: number, limit: number) =>
+    `«Все тест-кейсы» может означать все ${n(tickets)} синхронизированных тикет(ов) проекта или только то, что нашлось по этому запросу. Все тикеты при ~${n(perTicket)} тест-кейсах на каждый — это около ${n(tickets * perTicket)} тест-кейсов, больше одной генерации (${n(limit)}), поэтому это пойдёт пакетами. Что вы имеете в виду?`,
+  scopeUnspecifiedReasoning: "Запрос просил все тест-кейсы, не уточнив для чего, а все тикеты не умещаются в одну генерацию, — уточняю область перед генерацией.",
+  scopeMatchedLabel: "Только то, что нашлось по запросу",
+  scopeMatchedDescription: (limit: number) => `Спланировать до ${n(limit)} тест-кейсов по найденным материалам базы знаний.`,
   scopeSmallerLabel: "Генерировать небольшими пакетами",
   scopeSmallerDescription: "Выбирать по 1–2 тикета за раз для лучшего покрытия.",
   scopeAllLabel: "Сгенерировать для всех тикетов пакетами",
-  scopeAllDescription: (tickets: number) =>
-    `Zyra обработает все ${n(tickets)} тикет(ов) пакетами до 100 тест-кейсов и будет сообщать о прогрессе.`,
+  scopeAllDescription: (tickets: number, limit: number) =>
+    `Zyra обработает все ${n(tickets)} тикет(ов) пакетами до ${n(limit)} тест-кейсов и будет сообщать о прогрессе.`,
   scopeReasoning: "Запрос охватывает больше тикетов, чем умещается в одну генерацию, — спрашиваю, как продолжить.",
   selectionPrompt: (total: number, example: string, rangeExample: string, perBatch: number) =>
     `С каких тикетов начать? Напишите ID тикетов или диапазон — например, ${example} или ${rangeExample}. В области запроса ${n(total)} тикет(ов); для лучшего покрытия называйте до ${n(perBatch)} за раз — более длинный список тоже подойдёт, он будет сгенерирован пакетами. Или сгенерируйте для всех:`,
