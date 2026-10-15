@@ -104,7 +104,9 @@ export default function DashboardPage() {
     );
   }
 
-  const statusEntries = Object.entries(analytics.executionStatus).sort((a, b) => b[1] - a[1]);
+  // The API's order is the canonical status order — not re-sorted by count, so each status keeps its
+  // place whatever the data is, and a status at 0 still shows rather than vanishing.
+  const statusEntries = Object.entries(analytics.executionStatus);
   const totalExec = analytics.executionTotal;
 
   return (
@@ -164,7 +166,8 @@ export default function DashboardPage() {
               <div className="grid grid-cols-2 gap-3 border-b border-[var(--border-subtle)] p-4 sm:grid-cols-4">
                 {statusEntries.map(([status, count]) => {
                   const style = statusStyle(status);
-                  const pct = totalExec > 0 ? Math.round((count / totalExec) * 100) : 0;
+                  // Rounded server-side so the buckets sum to exactly 100% (per-bucket Math.round did not).
+                  const pct = analytics.executionStatusPercent[status] ?? 0;
                   return (
                     <div key={status} className="flex flex-col gap-1">
                       <div className="flex items-center justify-between">

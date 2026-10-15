@@ -1286,9 +1286,11 @@ export default function TestCasesPage() {
       // A new suite starts empty (testCaseCount/recursiveTestCaseCount both 0, guaranteed by the
       // backend for a just-created row), so appending it changes no ancestor's rollup count and
       // affects no repoSummary bucket — a full reload bought nothing here beyond this one row.
-      // The currently displayed test-case list is unaffected too (the new suite has no cases and
-      // isn't the active view), so loadSelectedSuiteCases() is correctly skipped as well.
       applyTestCasesPatch({ suites: [...suites, created] });
+      // Open the new suite, the same navigation a click on its tree node makes: the case list is
+      // keyed on ?suiteId, so this also loads its (empty) cases. Only reached on success, so a
+      // failed create never points the view at a suite that does not exist.
+      router.push(`/projects/${projectId}/testcases?suiteId=${created.id}`);
     } catch (err) {
       setNewSuiteNameError(err instanceof Error ? err.message : "Failed to create suite.");
     } finally {

@@ -4455,6 +4455,74 @@ test.describe("zyra / chat send (UI, fake provider)", () => {
     expect(generation?.stream, "the watched turn asked for a streamed reply").toBe(true);
   });
 
+  /*
+   * Regression for "[Zyra] Progressive Test Case Streaming No Longer Works": the live panel depended on
+   * this tab's event stream alone, which the page closes on every conversation switch (and a reload
+   * loses). Switching away mid-generation and back left the step list advancing — it falls back to the
+   * polled trace — while the test cases stayed frozen or missing. The running turn now records its
+   * review batch on its trace, and a generating panel re-reads the batch itself when no event arrives.
+   */
+  test("ZYU-150 the steps and the review panel keep updating after switching conversations and back, and after a reload", async ({ browser }) => {
+    test.setTimeout(150_000);
+    await allocateFakeAiKey();
+    const range = await api.patch(`/api/projects/${tenant!.mainProjectId}/agents/zyra/settings`, { data: { testcaseRange: "10-30" }, failOnStatusCode: false });
+    expect(range.status(), await range.text()).toBeLessThan(300);
+    const page = await openChat(browser);
+    const stamp = Date.now();
+    const prompt = `Switch-away coverage ${stamp}: generate all possible test cases for the login flow.`;
+    ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
+    ai.queueReply({ scenarios: Array.from({ length: 20 }, (_, i) => `Switch scenario ${i + 1}`) });
+    ai.queueReply({ scenarios: [] }); // the planner's top-up round
+    ai.queueReplyMatching("an AI testcase generation agent", {
+      drafts: Array.from({ length: 20 }, (_, i) => ({
+        title: `E2E switch draft ${i + 1} ${stamp}`,
+        preconditions: "",
+        stepsJson: JSON.stringify([{ stepNumber: 1, action: "Do it", expectedResult: "It works" }]),
+        testData: "",
+        expectedSummary: "It works.",
+        priority: "P2",
+        tags: ["zyra"],
+        sourceRefs: [],
+        scenario: i + 1
+      }))
+    });
+    // Slow enough that generation is still running across the switch and the reload below.
+    ai.setStreamChunkDelayMs(900);
+
+    await composer(page).fill(prompt);
+    await composer(page).press("Enter");
+    await expect(page.getByTestId("zyra-review-progress")).toBeVisible({ timeout: 60_000 });
+
+    // Switch to a new conversation (the page closes this turn's event stream), then come back.
+    await page.getByRole("button", { name: "New" }).click();
+    await expect(page.getByTestId("zyra-review-progress")).toHaveCount(0);
+    await page.getByRole("button").filter({ hasText: `Switch-away coverage ${stamp}` }).first().click();
+
+    // Back in the running conversation: the review panel is there and still growing without any event
+    // stream — found from the turn's trace, refreshed by its own re-reads.
+    const progress = page.getByTestId("zyra-review-progress");
+    await expect(progress).toBeVisible({ timeout: 30_000 });
+    // The step list follows the turn's stored trace instead of freezing on the steps its closed stream
+    // had delivered (it used to sit on "Received your request" for the rest of the turn).
+    await expect(page.getByText("Generating your test cases").first()).toBeVisible({ timeout: 15_000 });
+    const rowCount = async () => page.getByTestId("zyra-review-number").count();
+    const before = await rowCount();
+    await expect.poll(rowCount, { message: "the panel must keep filling after the switch", timeout: 45_000 }).toBeGreaterThan(before);
+    await expect(page.getByRole("button", { name: "Discard all" }), "still off while generating").toBeDisabled();
+
+    // A reload loses this tab's turn entirely — the panel still comes back and keeps filling.
+    await page.reload();
+    await expect(page.getByTestId("zyra-review-progress")).toBeVisible({ timeout: 30_000 });
+
+    // Generation finishes: every draft exactly once, nothing staged twice.
+    await expect(page.getByText(/20 of 20 selected/)).toBeVisible({ timeout: 90_000 });
+    await expect(page.getByTestId("zyra-review-progress")).toHaveCount(0);
+    await expect(page.getByTestId("zyra-review-number")).toHaveText(Array.from({ length: 20 }, (_, i) => `${i + 1}.`));
+    for (const n of [1, 10, 20]) await expect(page.getByText(`E2E switch draft ${n} ${stamp}`)).toHaveCount(1);
+    const staged = Number(scalar(`SELECT COALESCE(SUM(jsonb_array_length(generated_payload)), 0) FROM ai_generation_requests WHERE project_id = ${literal(tenant!.mainProjectId)} AND chat_session_id IS NOT NULL;`));
+    expect(staged, "one batch of 20 — none lost, none twice").toBe(20);
+  });
+
   test("ZYU-101 with Knowledge Base access on, the reply still arrives and the model is shown the knowledge base", async ({ browser }) => {
     await allocateFakeAiKey();
     const marker = `Zorblax${Date.now() % 100000}`;

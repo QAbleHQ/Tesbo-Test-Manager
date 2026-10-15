@@ -560,7 +560,7 @@ function MessageBubble({
       <TestcaseTable rows={appliedRows} projectId={projectId} />
       {/* A batch still being generated has its panel from the first draft, before any row is on the message. */}
       {reviewRequestId && (proposedRows.length > 0 || message.status === "generating") && (
-        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={reviewRequestId} initialRows={proposedRows} />
+        <ZyraChatReviewPanel projectId={projectId} reviewRequestId={reviewRequestId} initialRows={proposedRows} generating={message.status === "generating"} />
       )}
       {missingStructuredData && (
         <p className="mt-1 flex items-center gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
@@ -1093,6 +1093,8 @@ export default function ZyraChatPage() {
   // below) — the backend resume/send itself is already detached from any HTTP connection, so
   // closing this early only stops a now-irrelevant live narration stream, never the actual work.
   const openEventSourcesRef = useRef<EventSource[]>([]);
+  // Which turn each open stream narrates — so a stream closed early can drop that turn's live state.
+  const streamTurnIdsRef = useRef(new Map<EventSource, string>());
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(true);
   // Keyed by session id, not a single flag, so an in-flight send in one conversation never shows
@@ -1142,6 +1144,17 @@ export default function ZyraChatPage() {
   const sendingLocally = activeSession ? pendingSessionIds.has(activeSession.id) : false;
   // Derived, not stored: reflects only whether the CURRENTLY VIEWED session has a turn in flight.
   const sending = sendingLocally || hasProcessingMessage;
+  // The review batch the open conversation's running turn is filling: from this tab's live events when
+  // it has them, otherwise from the turn's polled trace (the backend records it on the "generating"
+  // step) — so the batch shows after a conversation switch, a reload, or from another tab.
+  const runningTurnReviewId = useMemo(() => {
+    if (sendingTurnId && turnReviewIds[sendingTurnId]) return turnReviewIds[sendingTurnId];
+    const processing = [...messages].reverse().find((m) => m.role === "user" && m.status === ZYRA_MESSAGE_PROCESSING);
+    for (const step of processing?.trace?.steps ?? []) {
+      if (typeof step.meta?.reviewRequestId === "string") return step.meta.reviewRequestId;
+    }
+    return null;
+  }, [messages, sendingTurnId, turnReviewIds]);
   const latestAssistantId = [...messages].reverse().find((m) => m.role === "assistant")?.id ?? null;
   // The running turn's steps: this tab's live stream when it has one, otherwise the trace the
   // backend writes onto the processing message as each step happens (a reload mid-turn, another
@@ -1371,9 +1384,28 @@ export default function ZyraChatPage() {
   // itself is unaffected (already detached from any HTTP connection by the time this component
   // could react to it), this only stops a now-irrelevant live narration stream from lingering.
   useEffect(() => {
+    const streamTurns = streamTurnIdsRef.current;
     return () => {
-      openEventSourcesRef.current.forEach((source) => source.close());
+      const closedTurnIds: string[] = [];
+      openEventSourcesRef.current.forEach((source) => {
+        source.close();
+        const turnId = streamTurns.get(source);
+        streamTurns.delete(source);
+        if (turnId) closedTurnIds.push(turnId);
+      });
       openEventSourcesRef.current = [];
+      // A turn whose stream this closes is still running: its live steps and batch would freeze where
+      // they are, shadowing the turn's own stored trace, which the page keeps polling — so drop them.
+      if (closedTurnIds.length) {
+        const withoutClosed = <T,>(prev: Record<string, T>) => {
+          if (!closedTurnIds.some((id) => id in prev)) return prev;
+          const next = { ...prev };
+          for (const id of closedTurnIds) delete next[id];
+          return next;
+        };
+        setTurnBacklogs(withoutClosed);
+        setTurnReviewIds(withoutClosed);
+      }
     };
   }, [activeSessionId]);
 
@@ -1512,6 +1544,18 @@ export default function ZyraChatPage() {
 
   // Drops a turn's live steps once its settled session (and so its persisted trace) is in hand.
   // Safe to call more than once, and for a turn that never had any.
+  // Forgets a running turn's live state when its stream closes before the turn ends — the polled
+  // session (its stored trace, and the batch recorded on it) then shows the turn instead.
+  function dropLiveTurn(turnId: string) {
+    finishTurn(turnId);
+    setTurnReviewIds((prev) => {
+      if (!(turnId in prev)) return prev;
+      const next = { ...prev };
+      delete next[turnId];
+      return next;
+    });
+  }
+
   function finishTurn(turnId: string) {
     setTurnBacklogs((prev) => {
       if (!(turnId in prev)) return prev;
@@ -1531,9 +1575,11 @@ export default function ZyraChatPage() {
   function watchZyraTurnProgress(sessionId: string, turnId: string) {
     const source = openZyraTurnProgress(projectId, sessionId, turnId);
     openEventSourcesRef.current.push(source);
+    streamTurnIdsRef.current.set(source, turnId);
     const stop = () => {
       source.close();
       openEventSourcesRef.current = openEventSourcesRef.current.filter((s) => s !== source);
+      streamTurnIdsRef.current.delete(source);
     };
     source.onmessage = (evt) => {
       let event: ZyraTurnProgressEvent;
@@ -1595,7 +1641,11 @@ export default function ZyraChatPage() {
           .catch(() => undefined);
       }
     };
-    source.onerror = stop;
+    // A stream lost mid-turn hands over to the polled trace rather than freezing on its last step.
+    source.onerror = () => {
+      stop();
+      dropLiveTurn(turnId);
+    };
   }
 
   function onSubmit(event: FormEvent) {
@@ -1870,8 +1920,8 @@ export default function ZyraChatPage() {
                     );
                   })}
                   {sending && <ZyraBacklog steps={liveSendSteps} />}
-                  {sending && sendingTurnId && turnReviewIds[sendingTurnId] && (
-                    <ZyraChatReviewPanel projectId={projectId} reviewRequestId={turnReviewIds[sendingTurnId]} initialRows={[]} />
+                  {sending && runningTurnReviewId && (
+                    <ZyraChatReviewPanel projectId={projectId} reviewRequestId={runningTurnReviewId} initialRows={[]} generating />
                   )}
                   {!sending && isPlanRunning && activeSession?.activePlan && <PlanProgressBubble plan={activeSession.activePlan} />}
                   <div ref={endRef} />

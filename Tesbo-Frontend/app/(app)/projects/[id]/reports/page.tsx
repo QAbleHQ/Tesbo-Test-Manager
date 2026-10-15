@@ -69,6 +69,8 @@ interface ReportsExecFiltersData {
  * Named per view because the export is per view — the file says which report it is, and the menu
  * says which one it is about to hand over. Same six ids as ReportsNav.
  */
+const MATRIX_PAGE_SIZE = 50; // test cases per page of the Traceability tab
+
 const REPORT_VIEW_LABELS: Record<ReportView, string> = {
   overview: "Overview",
   execution: "Execution Report",
@@ -134,6 +136,8 @@ export default function ReportsPage() {
   const [matrixRows, setMatrixRows] = useState<RequirementMatrixRow[]>([]);
   const [matrixLoading, setMatrixLoading] = useState(false);
   const [matrixSearch, setMatrixSearch] = useState("");
+  const [matrixTotal, setMatrixTotal] = useState(0);
+  const [matrixOffset, setMatrixOffset] = useState(0);
 
   // Repository state
   const [repoSummary, setRepoSummary] = useState<RepositorySummary | null>(null);
@@ -239,13 +243,34 @@ export default function ReportsPage() {
     if (auth && activeView === "execution") loadExecReport();
   }, [auth, activeView, loadExecReport]);
 
+  // The matrix is paged by test case and searched on the server: a large project has one row per
+  // case-per-run (hundreds of thousands), which cannot be sent or rendered whole. The timer debounces
+  // typing; `cancelled` drops a slow response that a newer page or search has already replaced.
   useEffect(() => {
-    if (auth && activeView === "matrix" && matrixRows.length === 0 && !matrixLoading) {
+    if (!auth || activeView !== "matrix") return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
       setMatrixLoading(true);
-      getRequirementMatrix(projectId).then((res) => setMatrixRows(res.rows)).catch(() => setMatrixRows([])).finally(() => setMatrixLoading(false));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auth, activeView, projectId]);
+      getRequirementMatrix(projectId, { limit: MATRIX_PAGE_SIZE, offset: matrixOffset, search: matrixSearch.trim() })
+        .then((res) => {
+          if (cancelled) return;
+          setMatrixRows(res.rows);
+          setMatrixTotal(res.total);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setMatrixRows([]);
+          setMatrixTotal(0);
+        })
+        .finally(() => {
+          if (!cancelled) setMatrixLoading(false);
+        });
+    }, matrixSearch ? 300 : 0);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [auth, activeView, projectId, matrixOffset, matrixSearch]);
 
   useEffect(() => {
     if (auth && activeView === "repository" && !repoSummary && !repoLoading) {
@@ -441,7 +466,19 @@ export default function ReportsPage() {
                 filtersLoading={execFiltersLoading}
               />
             )}
-            {activeView === "matrix" && <TraceabilityTab rows={matrixRows} loading={matrixLoading} search={matrixSearch} onSearchChange={setMatrixSearch} />}
+            {activeView === "matrix" && <TraceabilityTab
+              rows={matrixRows}
+              loading={matrixLoading}
+              search={matrixSearch}
+              onSearchChange={(v) => {
+                setMatrixSearch(v);
+                setMatrixOffset(0);
+              }}
+              total={matrixTotal}
+              offset={matrixOffset}
+              pageSize={MATRIX_PAGE_SIZE}
+              onOffsetChange={setMatrixOffset}
+            />}
             {activeView === "repository" && <RepositoryTab summary={repoSummary} loading={repoLoading} />}
             {activeView === "insights" && <AIInsightsTab insights={insights} loading={insightsLoading} />}
             {activeView === "trends" && <TrendsTab trends={trends} loading={trendsLoading} />}

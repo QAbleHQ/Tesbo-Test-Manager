@@ -646,3 +646,54 @@ test.describe("scrollbar styling", () => {
     expect(widths.hidden, ".no-scrollbar no longer hides the scrollbar").toBe(0);
   });
 });
+
+/*
+ * ── THM-18: the brand wordmark follows the theme ──
+ *
+ * The built-in lockup is a CSS background (--brand-logo), so what the user sees is only readable
+ * through computed style. The PNGs must carry real transparency (RGBA) and no blend mode: an opaque
+ * canvas plus mix-blend-mode failed inside the sidebar's backdrop-filter group and showed a black
+ * rectangle on the dark theme.
+ */
+test.describe("brand wordmark", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  for (const [theme, file] of [
+    ["light", "tesbo-wordmark-black-on-white.png"],
+    ["dark", "tesbo-wordmark-white-on-black.png"],
+  ] as const) {
+    test(`THM-18 ${theme} theme shows ${file}, transparent, unblended, and no robot artwork`, async ({ page, request }) => {
+      await setStoredTheme(page, theme);
+      await page.goto("/projects");
+
+      const logo = page.locator(".tesbo-brand-logo").first();
+      await expect(logo).toBeVisible();
+      const style = await logo.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return { image: cs.backgroundImage, blend: cs.mixBlendMode };
+      });
+      expect(style.image).toContain(file);
+      expect(style.image).not.toMatch(/tesbo-(logo-horizontal|mark)/);
+      expect(style.blend, "a blend mode on the logo reintroduces the black box").toBe("normal");
+
+      // The file the CSS points at must actually be served, not just referenced.
+      const url = style.image.match(/url\("?([^")]+)"?\)/)?.[1] ?? "";
+      const res = await request.get(new URL(url, page.url()).toString());
+      expect(res.status()).toBe(200);
+      expect(res.headers()["content-type"]).toContain("image/png");
+      // IHDR: width@16, height@20, colour type@25 (6 = RGBA). An opaque RGB export is the bug.
+      const png = await res.body();
+      expect(png[25], "PNG must have an alpha channel").toBe(6);
+      expect([png.readUInt32BE(16), png.readUInt32BE(20)], "cropped to the artwork; matches aspect-ratio in globals.css").toEqual([1147, 273]);
+    });
+  }
+
+  test("THM-18 the collapsed sidebar still shows a wordmark, not the old bot mark", async ({ page }) => {
+    await setStoredTheme(page, "light");
+    await page.goto("/projects");
+    await page.getByRole("button", { name: "Collapse sidebar" }).click();
+    await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
+    const image = await page.locator(".tesbo-brand-logo").first().evaluate((el) => getComputedStyle(el).backgroundImage);
+    expect(image).toContain("tesbo-wordmark-black-on-white.png");
+  });
+});

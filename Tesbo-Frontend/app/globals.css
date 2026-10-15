@@ -163,8 +163,7 @@
 
   /* Brand lockup — swapped per theme so the wordmark stays legible. Declared as
      custom properties (not two <img> tags) so only the active variant is fetched. */
-  --brand-logo: url("/brand/tesbo-logo-horizontal.svg");
-  --brand-mark: url("/brand/tesbo-mark.svg");
+  --brand-logo: url("/brand/tesbo-wordmark-black-on-white.png");
 
   /* Scrollbar thumb — deep violet on light, pale violet on dark (same pairing as --accent-light).
      Four states so the bar stays quiet at rest and sharpens as the user reaches for it. */
@@ -175,7 +174,7 @@
 }
 
 .dark {
-  --brand-logo: url("/brand/tesbo-logo-horizontal-dark.svg");
+  --brand-logo: url("/brand/tesbo-wordmark-white-on-black.png");
 
   --scrollbar-thumb: rgba(196, 181, 253, 0.22);
   --scrollbar-thumb-near: rgba(196, 181, 253, 0.4);
@@ -576,23 +575,16 @@ a.group:hover > .tesbo-card {
 /* ── Brand lockup ─────────────────────────────────────────────────────────
    Height-driven: set a height (h-9, h-10, …) and the width follows from the
    artwork's aspect ratio, the same way the old <img> behaved. */
-.tesbo-brand-logo,
-.tesbo-brand-mark {
+.tesbo-brand-logo {
   display: inline-block;
+  background-image: var(--brand-logo);
   background-repeat: no-repeat;
   background-size: contain;
-}
-
-.tesbo-brand-logo {
-  background-image: var(--brand-logo);
   background-position: left center;
-  aspect-ratio: 1532 / 480;
-}
-
-.tesbo-brand-mark {
-  background-image: var(--brand-mark);
-  background-position: center;
-  aspect-ratio: 1 / 1;
+  /* Both PNGs are transparent and cropped to the artwork (1147x273), so no blend mode is needed
+     and the box is exactly the letters. mix-blend-mode is unreliable here: inside the sidebar's
+     backdrop-filter group the backdrop is empty and the opaque canvas shows through. */
+  aspect-ratio: 1147 / 273;
 }
 
 .tesbo-glass {

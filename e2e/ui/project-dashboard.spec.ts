@@ -419,6 +419,43 @@ test.describe("project dashboard — the stat cards", () => {
     }
   });
 
+  /*
+   * Basecamp "[Dashboard] Execution Status counts are incorrect". The breakdown dropped any status at
+   * 0 (Blocked, in the reported workspace), re-sorted the buckets by count so they moved between
+   * workspaces, and rounded each percentage alone — 65/35/2/1/1 of 104 read 101%. The screens tenant
+   * is shared, so this asserts the invariants (all six, fixed order, counts and percents that add up)
+   * rather than exact numbers another spec may be moving.
+   */
+  test("DSH-U-18 the workspace execution breakdown shows every status in a fixed order, and adds up", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      // Only Passed is seeded, so at least this project contributes nothing to Blocked/Skipped/Retest.
+      await seedRun(api, project.id, { statuses: ["Passed"], status: "Completed" });
+
+      await page.goto("/dashboard");
+      // .last(): the innermost matching <section>, in case the page layout wraps everything in one too.
+      const section = page.locator("section").filter({ has: page.getByRole("heading", { name: "Execution status" }) }).last();
+      const buckets = section.locator("div.flex.flex-col.gap-1");
+      await expect(buckets).toHaveCount(6);
+
+      const labels = await buckets.locator("span.rounded-full").allTextContents();
+      expect(labels.map((l) => l.trim())).toEqual(["Untested", "Passed", "Failed", "Blocked", "Skipped", "Retest"]);
+
+      const percents = (await buckets.locator("div.flex.items-center > span:last-child").allTextContents()).map((t) =>
+        Number(t.replace("%", "").trim()),
+      );
+      expect(percents.reduce((a, b) => a + b, 0), `percentages ${percents.join(" + ")}`).toBe(100);
+
+      // Each "N of TOTAL" line uses the same TOTAL as the footer, and the Ns add up to it.
+      const lines = (await buckets.locator("p.text-xs").allTextContents()).map((t) => t.match(/^(\d+) of (\d+)$/)!);
+      const footer = Number((await section.getByText(/Total executions across all projects:/).locator("strong").textContent())!.trim());
+      expect(lines.every((m) => Number(m[2]) === footer)).toBe(true);
+      expect(lines.reduce((sum, m) => sum + Number(m[1]), 0)).toBe(footer);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
   test("DSH-U-16 a large count doesn't break the card layout", { tag: '@tesbo.testId("TES-TC-739")' }, async ({ page }) => {
     const project = await createProject(api);
     try {

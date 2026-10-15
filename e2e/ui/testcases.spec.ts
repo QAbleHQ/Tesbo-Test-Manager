@@ -1237,3 +1237,171 @@ test.describe("suite description and preconditions in the repository", () => {
     await expect(page.getByPlaceholder("Enter suite name")).toHaveCount(0);
   });
 });
+
+/*
+ * Add suite opens the suite it just created.
+ *
+ * Before this: a successful create only appended the suite to the tree and closed the modal, leaving
+ * the view on whatever suite was selected before — the user had to find and click the new suite by
+ * hand. The selection is the ?suiteId= URL param (the same one a tree click sets), so every
+ * assertion here pins the URL to the id the API actually stored, never to a name.
+ */
+test.describe("Add suite opens the newly created suite", () => {
+  const suitesUrl = `/api/projects/${ctx.projectId}/suites`;
+  // Neither select is tied to a label (the modal's Select may also sit in a wrapper), so each is
+  // found by the placeholder option only it carries.
+  const statusFilter = (page: Page) => page.locator("select", { has: page.locator("option", { hasText: "All statuses" }) });
+  const parentSelect = (page: Page) => page.locator("select", { has: page.locator("option", { hasText: "No parent (top-level suite)" }) });
+
+  async function createFromModal(page: Page, name: string, parentName?: string) {
+    await page.getByTitle("Add suite").click();
+    await page.getByPlaceholder("Enter suite name").fill(name);
+    if (parentName) await parentSelect(page).selectOption({ label: parentName });
+    await page.getByRole("button", { name: "Create", exact: true }).click();
+  }
+
+  async function liveSuites(api: Awaited<ReturnType<typeof pwRequest.newContext>>) {
+    return (await (await api.get(suitesUrl)).json()) as Array<{ id: string; name: string; parentId: string | null }>;
+  }
+
+  const suiteInUrl = (id: string) => new RegExp(`[?&]suiteId=${id}(&|$)`);
+
+  test("selects the new suite, shows its empty case list, and Back returns to the previous suite", async ({ page }) => {
+    const stamp = Date.now();
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const priorName = `E2E Open New Suite Prior ${stamp}`;
+    const newName = `E2E Open New Suite ${stamp}`;
+    const caseTitle = `E2E Open New Suite case ${stamp}`;
+    const suiteIds: string[] = [];
+    let caseId = "";
+    try {
+      const priorId = (await (await api.post(suitesUrl, { data: { name: priorName } })).json()).id;
+      suiteIds.push(priorId);
+      caseId = (await (await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: caseTitle, suiteId: priorId } })).json()).id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases?suiteId=${priorId}`);
+      await expect(page.getByRole("button", { name: caseTitle })).toBeVisible();
+
+      await createFromModal(page, newName);
+      await expect(page.getByPlaceholder("Enter suite name")).toHaveCount(0);
+
+      const created = (await liveSuites(api)).find((s) => s.name === newName);
+      expect(created, "the suite was persisted").toBeTruthy();
+      suiteIds.push(created!.id);
+      expect(created!.parentId).toBeNull();
+
+      await expect(page).toHaveURL(suiteInUrl(created!.id));
+      await expect(page.getByText(newName, { exact: true }).first()).toBeVisible();
+      // The previous suite's case is gone: the list really reloaded for the new (empty) suite.
+      await expect(page.getByText("This suite has no test cases yet.")).toBeVisible();
+      await expect(page.getByRole("button", { name: caseTitle })).toHaveCount(0);
+
+      // A push, not a replace — the previous suite is one Back away, exactly as after a tree click.
+      await page.goBack();
+      await expect(page).toHaveURL(suiteInUrl(priorId));
+      await expect(page.getByRole("button", { name: caseTitle })).toBeVisible();
+    } finally {
+      if (caseId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${caseId}`, { failOnStatusCode: false });
+      for (const id of suiteIds) await api.delete(`/api/suites/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("selects the new suite by id when an existing suite already has the same name", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const name = `E2E Open New Suite Twin ${Date.now()}`;
+    const suiteIds: string[] = [];
+    try {
+      const existingId = (await (await api.post(suitesUrl, { data: { name } })).json()).id;
+      suiteIds.push(existingId);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await createFromModal(page, name);
+      await expect(page.getByPlaceholder("Enter suite name")).toHaveCount(0);
+
+      const twins = (await liveSuites(api)).filter((s) => s.name === name);
+      expect(twins).toHaveLength(2);
+      const newId = twins.find((s) => s.id !== existingId)!.id;
+      suiteIds.push(newId);
+      await expect(page).toHaveURL(suiteInUrl(newId));
+    } finally {
+      for (const id of suiteIds) await api.delete(`/api/suites/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("selects a new child suite and shows it under its expanded parent", async ({ page }) => {
+    const stamp = Date.now();
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const parentName = `E2E Open New Suite Parent ${stamp}`;
+    const childName = `E2E Open New Suite Child ${stamp}`;
+    let parentId = "";
+    try {
+      parentId = (await (await api.post(suitesUrl, { data: { name: parentName } })).json()).id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await createFromModal(page, childName, parentName);
+      await expect(page.getByPlaceholder("Enter suite name")).toHaveCount(0);
+
+      const child = (await liveSuites(api)).find((s) => s.name === childName);
+      expect(child?.parentId).toBe(parentId);
+      await expect(page).toHaveURL(suiteInUrl(child!.id));
+      await expect(page.getByRole("button", { name: childName, exact: true })).toBeVisible();
+      await expect(page.getByText("This suite has no test cases yet.")).toBeVisible();
+    } finally {
+      // Deleting the parent takes the child with it.
+      if (parentId) await api.delete(`/api/suites/${parentId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("keeps the active list filters when switching to the new suite", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const name = `E2E Open New Suite Filtered ${Date.now()}`;
+    let suiteId = "";
+    try {
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await statusFilter(page).selectOption("Draft");
+
+      await createFromModal(page, name);
+      await expect(page.getByPlaceholder("Enter suite name")).toHaveCount(0);
+
+      suiteId = (await liveSuites(api)).find((s) => s.name === name)!.id;
+      await expect(page).toHaveURL(suiteInUrl(suiteId));
+      await expect(statusFilter(page)).toHaveValue("Draft");
+      await expect(page.getByText("No test cases match your current filters.")).toBeVisible();
+    } finally {
+      if (suiteId) await api.delete(`/api/suites/${suiteId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("a failed create keeps the modal open with the error and does not change the selected suite", async ({ page }) => {
+    const stamp = Date.now();
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const priorName = `E2E Open New Suite Fail Prior ${stamp}`;
+    const failedName = `E2E Open New Suite Fail ${stamp}`;
+    const createRoute = `**/api/projects/${ctx.projectId}/suites`;
+    let priorId = "";
+    try {
+      priorId = (await (await api.post(suitesUrl, { data: { name: priorName } })).json()).id;
+      await page.goto(`/projects/${ctx.projectId}/testcases?suiteId=${priorId}`);
+
+      await page.route(createRoute, (route) =>
+        route.request().method() === "POST"
+          ? route.fulfill({ status: 500, json: { error: "Simulated suite create failure" } })
+          : route.continue(),
+      );
+      await createFromModal(page, failedName);
+
+      await expect(page.getByText("Simulated suite create failure")).toBeVisible();
+      await expect(page.getByPlaceholder("Enter suite name")).toHaveValue(failedName);
+      await expect(page).toHaveURL(suiteInUrl(priorId));
+      expect((await liveSuites(api)).some((s) => s.name === failedName)).toBe(false);
+    } finally {
+      await page.unroute(createRoute);
+      if (priorId) await api.delete(`/api/suites/${priorId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});

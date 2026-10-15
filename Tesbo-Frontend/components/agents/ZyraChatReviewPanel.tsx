@@ -75,6 +75,9 @@ const TECHNIQUE_BADGE_CLASS =
 // The batch's current drafts, as the server holds them now, in the same row shape the chat message
 // carries (formatAiTask normalizes a chat-staged entry through the same chatDraftRow). Each row's
 // draftIndex is its position in that list, which is exactly what discard/edit/save address.
+/** How long a generating panel waits for a live event before re-reading the batch itself. */
+const LIVE_FALLBACK_MS = 4000;
+
 function rowsFromTask(task: ZyraTask): ZyraChatTestcaseRow[] {
   return (task.drafts as unknown as ZyraChatTestcaseRow[]).map((row, index) => ({ ...row, draftIndex: index }));
 }
@@ -114,10 +117,15 @@ export function ZyraChatReviewPanel({
   projectId,
   reviewRequestId,
   initialRows,
+  generating = false,
 }: {
   projectId: string;
   reviewRequestId: string;
   initialRows: ZyraChatTestcaseRow[];
+  // The batch is still being generated, as the caller knows from the session itself — set even when
+  // no live event reaches this panel (its stream was closed by a conversation switch, the page was
+  // reloaded, another tab started the turn), so the panel re-reads the batch on its own meanwhile.
+  generating?: boolean;
 }) {
   const { workspace } = useAppData();
   const [status, setStatus] = useState<"checking" | "in_review" | "resolved">("checking");
@@ -130,6 +138,7 @@ export function ZyraChatReviewPanel({
   const workingRef = useRef(false);
   const closedRef = useRef(false);
   const resyncPendingRef = useRef(false);
+  const lastEventAtRef = useRef(0);
   useEffect(() => {
     rowsRef.current = rows;
   }, [rows]);
@@ -164,6 +173,7 @@ export function ZyraChatReviewPanel({
           setLive(null);
           return;
         }
+        lastEventAtRef.current = Date.now();
         setLive({ staged: event.staged, total: event.total });
         // "Discard all" closed the batch — the server takes nothing more into it.
         if (closedRef.current) return;
@@ -183,6 +193,20 @@ export function ZyraChatReviewPanel({
       }),
     [reviewRequestId, resync]
   );
+
+  // The fallback: while generating with no live event lately, re-read the batch every few seconds. Live
+  // events stay the fast path; this is what keeps the panel filling when they don't arrive.
+  useEffect(() => {
+    if (!generating) return;
+    const interval = setInterval(() => {
+      if (document.hidden || workingRef.current || closedRef.current || statusRef.current === "checking") return;
+      if (Date.now() - lastEventAtRef.current < LIVE_FALLBACK_MS) return;
+      void resync();
+    }, LIVE_FALLBACK_MS);
+    return () => clearInterval(interval);
+  }, [generating, resync]);
+  // Still generating, whether known from live events or from the caller.
+  const isGenerating = Boolean(live) || generating;
 
   function startWork() {
     workingRef.current = true;
@@ -230,10 +254,10 @@ export function ZyraChatReviewPanel({
     };
   }, [projectId, reviewRequestId, resync]);
 
-  const progressLine = live ? (
+  const progressLine = isGenerating ? (
     <p className="flex items-center gap-2 text-xs text-[var(--muted)]" data-testid="zyra-review-progress">
       <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[var(--brand-primary)]" />
-      {t("review.generating", { staged: live.staged, total: live.total })}
+      {live ? t("review.generating", { staged: live.staged, total: live.total }) : t("review.generatingSoFar", { staged: rows.length })}
     </p>
   ) : null;
 
@@ -241,7 +265,7 @@ export function ZyraChatReviewPanel({
     return <p className="mt-3 text-xs text-[var(--muted)]">{t("review.checking")}</p>;
   }
 
-  if (status === "resolved" && !message && !live) {
+  if (status === "resolved" && !message && !isGenerating) {
     return (
       <p className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
         {t("review.resolved")}
@@ -397,8 +421,8 @@ export function ZyraChatReviewPanel({
               </span>
               {/* Not while generating: closing the batch mid-generation would silently drop every draft still
                   being written. Single-row Discard stays available. */}
-              <span title={live ? t("review.discardAllWhileGenerating") : undefined}>
-                <Button variant="secondary" size="sm" onClick={() => void handleDiscardAll()} disabled={working || Boolean(live)}>{t("review.discardAll")}</Button>
+              <span title={isGenerating ? t("review.discardAllWhileGenerating") : undefined}>
+                <Button variant="secondary" size="sm" onClick={() => void handleDiscardAll()} disabled={working || isGenerating}>{t("review.discardAll")}</Button>
               </span>
               <Button size="sm" onClick={() => void handleSaveSelected()} disabled={working || selected.length === 0}>
                 {working ? t("saving") : t("review.saveToRepo", { n: selected.length || "" })}

@@ -8,14 +8,9 @@ type BrandLogoProps = {
   className?: string;
   alt?: string;
   decorative?: boolean;
-  /**
-   * Render the square bot mark instead of the horizontal lockup — for tight
-   * spots like the collapsed sidebar. Ignored when a custom logo is uploaded.
-   */
-  mark?: boolean;
 };
 
-export function BrandLogo({ className = "h-10 w-auto object-contain", alt, decorative = false, mark = false }: BrandLogoProps) {
+export function BrandLogo({ className = "h-10 w-auto object-contain", alt, decorative = false }: BrandLogoProps) {
   const [branding, setBranding] = useState({ productName: DEFAULT_PRODUCT_NAME, logoUrl: DEFAULT_LOGO_URL });
 
   useEffect(() => {
@@ -37,7 +32,7 @@ export function BrandLogo({ className = "h-10 w-auto object-contain", alt, decor
   if (isBuiltInLogo(branding.logoUrl)) {
     return (
       <span
-        className={`${mark ? "tesbo-brand-mark" : "tesbo-brand-logo"} ${className}`}
+        className={`tesbo-brand-logo ${className}`}
         role={label ? "img" : undefined}
         aria-label={label}
         aria-hidden={label ? undefined : true}
