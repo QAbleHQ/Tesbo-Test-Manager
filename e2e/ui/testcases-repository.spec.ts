@@ -128,11 +128,16 @@ test.describe("test case repository (UI)", () => {
     return id;
   }
 
-  /** The live count straight from the database, as the yardstick every screen number is held to. */
+  /**
+   * The counted cases straight from the database, as the yardstick every screen number is held to:
+   * live and not Archived — the backend's countedTestcase rule, written out independently here so the
+   * test does not just echo the product's own query back at it.
+   */
   function storedCaseCount(): number {
     return Number(
       scalar(
-        `SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} AND deleted_at IS NULL;`,
+        `SELECT COUNT(*) FROM testcases WHERE project_id = ${literal(tenant!.mainProjectId)} ` +
+          "AND deleted_at IS NULL AND status IS DISTINCT FROM 'Archived';",
       ),
     );
   }
@@ -521,8 +526,12 @@ test.describe("test case repository (UI)", () => {
     await expect(chip, "nothing tells the user archived cases are being hidden").toBeVisible();
     await expect(chip).toContainText("1");
 
-    // The DEPRECATED tile still counts it, so the repository's own accounting is unchanged.
-    expect(await statCard(page, "Deprecated"), "the Deprecated tile lost the archived case").toBe(1);
+    // Archived is not Deprecated: the tile used to fold Archived in, which is how Project 2 showed
+    // "3 DEPRECATED" with no Deprecated case at all. It is disclosed by the chip above instead, and
+    // the header agrees with the footer.
+    expect(await statCard(page, "Deprecated"), "the Deprecated tile is counting an archived case").toBe(0);
+    expect(await statCard(page, "Total")).toBe(1);
+    await expect(subtitle(page)).toContainText("1 test case");
 
     // The chip reveals them, and the archived row is visibly distinct from a live one.
     await chip.click();
@@ -531,6 +540,51 @@ test.describe("test case repository (UI)", () => {
     const archivedRow = page.locator('tr[data-archived="true"]');
     await expect(archivedRow, "an archived row is not marked as archived").toHaveCount(1);
     await expect(archivedRow).toContainText(archivedTitle);
+  });
+
+  /*
+   * "[Global Data Consistency]" — the screen half. The repository header, TOTAL tile, status tiles,
+   * suite badge, "All test cases" and footer must all count the same live, non-Archived cases, and
+   * archiving or unarchiving from the panel must move every one of them at once without a reload.
+   * Before the fix the header/TOTAL/badges kept Archived cases while the footer did not (517 vs 514).
+   */
+  test("TCR-21 archiving and unarchiving from the panel moves every counter together", async ({ browser }) => {
+    const suiteName = stamp("ArchiveCountSuite");
+    const suiteId = await seedSuite(suiteName);
+    const [keep, toArchive] = [stamp("ArchKeep"), stamp("ArchMove")];
+    await seedCase(keep, { suiteId, status: "Approved" });
+    await seedCase(toArchive, { suiteId, status: "Approved" });
+    await seedCase(stamp("ArchDeprecated"), { suiteId, status: "Deprecated" });
+    await seedCase(stamp("ArchAlready"), { suiteId, status: "Archived" });
+
+    const page = await openRepository(browser);
+    // The badge is the <span> right after the suite's name button. Read on its own, because the
+    // timestamped suite name is full of digits that would satisfy any match on the whole row.
+    const suiteBadge = page
+      .getByRole("button", { name: suiteName, exact: true })
+      .locator("xpath=following-sibling::span[1]");
+    const chip = page.getByTestId("archived-hidden-chip");
+    const expectCounts = async (counted: number, approved: number, archived: number) => {
+      await expect(pagination(page)).toContainText(`${counted} results`);
+      await expect(subtitle(page)).toContainText(`${counted} test cases`);
+      await expect.poll(() => statCard(page, "Total")).toBe(counted);
+      await expect.poll(() => statCard(page, "Approved")).toBe(approved);
+      await expect.poll(() => statCard(page, "Deprecated")).toBe(1);
+      await expect(suiteBadge, "the suite badge").toHaveText(String(counted));
+      await expect(chip).toContainText(String(archived));
+      expect(storedCaseCount(), "the screen agrees with the database").toBe(counted);
+    };
+
+    await expectCounts(3, 2, 1);
+
+    page.once("dialog", (dialog) => void dialog.accept());
+    await row(page, toArchive).click();
+    await page.getByRole("button", { name: "Archive", exact: true }).click();
+    await expectCounts(2, 1, 2);
+
+    // Unarchive restores to Draft, so it comes back counted but not Approved.
+    await page.getByRole("button", { name: "Unarchive", exact: true }).click();
+    await expectCounts(3, 1, 1);
   });
   /*
    * Basecamp 10194318194 — filed as the question "Can we move Priority and Automation Type

@@ -3,7 +3,7 @@ import path from "node:path";
 import { expect, test, type APIRequestContext } from "@playwright/test";
 import * as XLSX from "xlsx";
 import { setGraceWindow, setProPlan } from "../utils/billing-db";
-import { literal, scalar } from "../utils/psql";
+import { exec, literal, scalar } from "../utils/psql";
 import {
   anonymousContext,
   loginAs,
@@ -1824,5 +1824,185 @@ test.describe("authorization", () => {
     } finally {
       setProPlan(organizationId);
     }
+  });
+});
+
+/*
+ * "[Global Data Consistency] Incorrect and Inconsistent Counts Across Tesbo".
+ *
+ * Project 2 read 514 test cases on its card and dashboard and 517 in the repository: two counting
+ * rules. listTestCases, the project card and the dashboard card counted live, non-Archived cases;
+ * the repository summary, suite badges, workspace dashboard, reports, ticket coverage and Zyra's
+ * counter read `testcases_active`, which keeps Archived. countedTestcase() is now the one rule, and
+ * Archived is reported only where it is named (repositorySummary.archivedTestCases).
+ *
+ * The fixture is chosen so every rule mistake gives a different number: 4 counted cases across a
+ * parent suite, its child and no suite; 2 Archived (one filed, one not); 1 soft-deleted.
+ */
+test.describe("one test case count across every screen", () => {
+  async function post(url: string, data: Record<string, unknown>): Promise<any> {
+    const res = await asOwner.post(url, { data, failOnStatusCode: false });
+    expect(res.ok(), `POST ${url} — ${res.status()} ${await res.text()}`).toBeTruthy();
+    return res.json();
+  }
+
+  /** Every count a screen shows for this project's test cases, read from the endpoint that screen calls. */
+  async function countsFor(projectId: string, suiteIds: { parent: string; child: string }) {
+    const [overview, dashboard, analytics, summary, suites, insights, listRes] = await Promise.all([
+      getJson(asOwner, "/api/projects/overview"),
+      getJson(asOwner, `/api/projects/${projectId}/dashboard`),
+      getJson(asOwner, `/api/projects/${projectId}/analytics`),
+      getJson(asOwner, `/api/projects/${projectId}/reports/repository-summary`),
+      getJson(asOwner, `/api/projects/${projectId}/suites`),
+      getJson(asOwner, `/api/projects/${projectId}/reports/insights`),
+      asOwner.get(`/api/projects/${projectId}/testcases`, { params: { limit: 100 } }),
+    ]);
+    const suite = (id: string) => (suites as any[]).find((s) => s.id === id);
+    const sum = (rows: { count: number }[]) => rows.reduce((a, r) => a + r.count, 0);
+    return {
+      card: (overview as any[]).find((p) => p.id === projectId)?.testCaseCount,
+      dashboard: dashboard.testCases.total,
+      analytics: analytics.testCaseCount,
+      repositoryTotal: summary.totalTestCases,
+      repositoryArchived: summary.archivedTestCases,
+      byStatusSum: sum(summary.byStatus),
+      byPrioritySum: sum(summary.byPriority),
+      bySuiteSum: sum(summary.bySuite),
+      archivedBucket: summary.byStatus.find((b: { name: string }) => b.name === "Archived"),
+      listTotal: Number(listRes.headers()["x-total-count"]),
+      coverageTotal: (insights.coverageBySuite as { total: number }[]).reduce((a, c) => a + c.total, 0),
+      parentOwn: suite(suiteIds.parent).testCaseCount,
+      parentRollup: suite(suiteIds.parent).recursiveTestCaseCount,
+      childOwn: suite(suiteIds.child).testCaseCount,
+    };
+  }
+
+  test("RPT-A-40 card, dashboards, repository, suite badges, list and reports all count the same cases", async () => {
+    await withEmptyProject(async (projectId) => {
+      const stamp = Date.now();
+      const workspaceBefore = (await getJson(asOwner, "/api/workspace/analytics")).testCaseCount;
+
+      const parent = (await post(`/api/projects/${projectId}/suites`, { name: `E2E Count Parent ${stamp}` })).id;
+      const child = (await post(`/api/projects/${projectId}/suites`, { name: `E2E Count Child ${stamp}`, parentId: parent })).id;
+      const seed = (title: string, opts: Record<string, unknown>) => seedTestCase(asOwner, projectId, { title: `${title} ${stamp}`, ...opts });
+
+      const counted = [
+        await seed("E2E Count draft in parent", { suiteId: parent, status: "Draft", priority: "P1" }),
+        await seed("E2E Count approved in child", { suiteId: child, status: "Approved", priority: "P2" }),
+        await seed("E2E Count deprecated in child", { suiteId: child, status: "Deprecated", priority: "P2" }),
+        await seed("E2E Count draft unfiled", { suiteId: null, status: "Draft", priority: "P3" }),
+      ];
+      await seed("E2E Count archived in parent", { suiteId: parent, status: "Archived", priority: "P1" });
+      await seed("E2E Count archived unfiled", { suiteId: null, status: "Archived", priority: "P3" });
+      const deleted = await seed("E2E Count deleted in parent", { suiteId: parent, status: "Draft" });
+      await asOwner.delete(`/api/projects/${projectId}/testcases/${deleted.id}`);
+
+      const c = await countsFor(projectId, { parent, child });
+      // The single number every screen must agree on.
+      for (const [screen, value] of Object.entries({
+        card: c.card,
+        dashboard: c.dashboard,
+        analytics: c.analytics,
+        repositoryTotal: c.repositoryTotal,
+        byStatusSum: c.byStatusSum,
+        byPrioritySum: c.byPrioritySum,
+        bySuiteSum: c.bySuiteSum,
+        listTotal: c.listTotal,
+        coverageTotal: c.coverageTotal,
+      })) {
+        expect(value, `${screen} counts ${value}, not the ${counted.length} live non-Archived cases`).toBe(counted.length);
+      }
+      // Archived is reported, separately, and nowhere else.
+      expect(c.repositoryArchived).toBe(2);
+      expect(c.archivedBucket).toBeUndefined();
+      // Suite badges: parent's own = 1 (its archived and deleted cases excluded), rollup adds the child's 2.
+      expect([c.parentOwn, c.parentRollup, c.childOwn]).toEqual([1, 3, 2]);
+      // The workspace tile moves by the same 4.
+      expect((await getJson(asOwner, "/api/workspace/analytics")).testCaseCount - workspaceBefore).toBe(counted.length);
+
+      // Archive one: every count drops by exactly one, the archived count rises by one.
+      const target = counted[1]; // Approved, in the child suite
+      const put = await asOwner.put(`/api/projects/${projectId}/testcases/${target.id}`, { data: { status: "Archived" }, failOnStatusCode: false });
+      expect(put.ok(), `archiving — ${await put.text()}`).toBeTruthy();
+      const archivedOne = await countsFor(projectId, { parent, child });
+      for (const key of ["dashboard", "analytics", "repositoryTotal", "byStatusSum", "bySuiteSum", "listTotal", "coverageTotal"] as const) {
+        expect(archivedOne[key], `${key} after archiving`).toBe(counted.length - 1);
+      }
+      expect(archivedOne.repositoryArchived).toBe(3);
+      expect([archivedOne.parentRollup, archivedOne.childOwn], "the suite cache must refresh on archive").toEqual([2, 1]);
+      // The project card is served from ProjectOverviewCacheService, TTL-only (10s) by design with no
+      // invalidation, so it is polled rather than read once — it must converge, just not instantly.
+      const cardCount = async () => (await countsFor(projectId, { parent, child })).card;
+      await expect.poll(cardCount, { timeout: 20_000, intervals: [2_000] }).toBe(counted.length - 1);
+
+      // Restore: back to where it started (restoring resets status to Draft).
+      const restore = await asOwner.put(`/api/projects/${projectId}/testcases/${target.id}`, { data: { status: "Draft" }, failOnStatusCode: false });
+      expect(restore.ok(), `restoring — ${await restore.text()}`).toBeTruthy();
+      const restored = await countsFor(projectId, { parent, child });
+      expect([restored.dashboard, restored.repositoryTotal, restored.listTotal, restored.repositoryArchived, restored.childOwn]).toEqual([
+        counted.length, counted.length, counted.length, 2, 2,
+      ]);
+      await expect.poll(cardCount, { timeout: 20_000, intervals: [2_000] }).toBe(counted.length);
+    });
+  });
+
+  test("RPT-A-41 a ticket covered only by an Archived case is not covered, and its case count leaves Archived out", async () => {
+    await withEmptyProject(async (projectId) => {
+      const key = `E2EC-${Date.now() % 100000}`;
+      const liveKey = `${key}L`;
+      // Two cases on liveKey (one Archived), one Archived-only case on key.
+      await post(`/api/projects/${projectId}/testcases`, { title: `E2E Coverage live ${key}`, jiraIssueKey: liveKey });
+      await post(`/api/projects/${projectId}/testcases`, { title: `E2E Coverage archived twin ${key}`, jiraIssueKey: liveKey, status: "Archived" });
+      await post(`/api/projects/${projectId}/testcases`, { title: `E2E Coverage archived only ${key}`, jiraIssueKey: key, status: "Archived" });
+
+      const linked = await getJson(asOwner, `/api/projects/${projectId}/testcases/linked-jira-keys`);
+      expect(linked.counts[liveKey], "the per-ticket count includes the Archived twin").toBe(1);
+      expect(linked.keys, "a ticket with only an Archived case reads as linked").not.toContain(key);
+    });
+  });
+
+  test("RPT-A-42 a run card counts only items still in the run, matching the run's own table", async () => {
+    await withEmptyProject(async (projectId) => {
+      const { run } = await seedRunWithStatuses(projectId, ["Passed", "Failed", "Blocked"]);
+      const [kept, removed] = await listRunExecutions(asOwner, run.id);
+      // A retired item whose execution row survived — the state listCycles used to keep counting.
+      // Not reachable through removeCycleTestCase (it retires both), so arranged directly, in this
+      // disposable project only.
+      exec(`UPDATE cycle_items SET deleted_at = now() WHERE id = (SELECT cycle_item_id FROM executions WHERE id = ${literal(removed.id)});`);
+
+      const table = await listRunExecutions(asOwner, run.id);
+      const card = ((await getJson(asOwner, `/api/projects/${projectId}/cycles`)) as any[]).find((r) => r.id === run.id);
+      expect(table.map((e) => e.id)).not.toContain(removed.id);
+      expect(table.map((e) => e.id)).toContain(kept.id);
+      expect(card.totalCases, "the run card and its table disagree").toBe(table.length);
+    });
+  });
+
+  test("RPT-A-43 Reports ignore deleted runs and deleted results: suite health and untested P1", async () => {
+    await withEmptyProject(async (projectId) => {
+      const stamp = Date.now();
+      const p1 = await seedTestCase(asOwner, projectId, { title: `E2E Report P1 ${stamp}`, priority: "P1" });
+      const run = await seedRun(asOwner, projectId, { name: `E2E Report Run ${stamp}` });
+      await addRunCases(asOwner, run.id, [p1.id]);
+      const [execution] = await listRunExecutions(asOwner, run.id);
+      setExecutionResults([{ executionId: execution.id, status: "Passed" }]);
+
+      const tested = await getJson(asOwner, `/api/projects/${projectId}/reports/overview`);
+      expect(tested.untestedP1Count).toBe(0);
+      expect(tested.suiteHealth.find((s: any) => s.suiteName === "Unassigned")?.executed).toBe(1);
+
+      // A deleted result is not a result: the P1 is untested again.
+      softDeleteExecution(execution.id);
+      expect((await getJson(asOwner, `/api/projects/${projectId}/reports/overview`)).untestedP1Count).toBe(1);
+
+      // A deleted run's results leave suite health. Restore the execution first so only the run's
+      // deletion can explain the change.
+      exec(`UPDATE executions SET deleted_at = NULL WHERE id = ${literal(execution.id)};`);
+      const del = await asOwner.delete(`/api/cycles/${run.id}`, { failOnStatusCode: false });
+      expect(del.ok(), `deleting the run — ${del.status()}`).toBeTruthy();
+      const afterRunDelete = await getJson(asOwner, `/api/projects/${projectId}/reports/overview`);
+      expect(afterRunDelete.suiteHealth.find((s: any) => s.suiteName === "Unassigned")?.executed ?? 0).toBe(0);
+      expect(afterRunDelete.untestedP1Count).toBe(1);
+    });
   });
 });

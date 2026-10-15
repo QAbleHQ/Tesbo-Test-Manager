@@ -212,6 +212,9 @@ function bumpBucket(
  * bySuite buckets. bySuite groups on the suite's own bare `name` (COALESCE(s.name, 'Unassigned') on
  * the backend) — NOT suiteNameMap's "Parent / Child" path — so a same-named bucket is matched here
  * the identical way the backend already computes it.
+ *
+ * An Archived case is in none of those counts (the backend's countedTestcase rule: live and not
+ * Archived), only in repoSummary.archivedTestCases — so that is all it moves.
  */
 function applySingleCaseDelta(
   currentSuites: SuiteNode[],
@@ -220,6 +223,14 @@ function applySingleCaseDelta(
   suiteIdForCase: string | null,
   delta: 1 | -1
 ): { suites: SuiteNode[]; repoSummary: RepositorySummary | null } {
+  if (status === "Archived") {
+    return {
+      suites: currentSuites,
+      repoSummary: currentSummary
+        ? { ...currentSummary, archivedTestCases: Math.max(0, (currentSummary.archivedTestCases ?? 0) + delta) }
+        : currentSummary,
+    };
+  }
   const nextSuites = suiteIdForCase ? adjustSuiteCounts(currentSuites, suiteIdForCase, delta) : currentSuites;
   if (!currentSummary) return { suites: nextSuites, repoSummary: currentSummary };
   const suiteBucketName = suiteIdForCase ? (currentSuites.find((s) => s.id === suiteIdForCase)?.name ?? "Unassigned") : "Unassigned";
@@ -235,31 +246,12 @@ function applySingleCaseDelta(
 }
 
 /**
- * A test case's status changing in place (archive/unarchive, and later edit) — moves one unit
- * between two byStatus buckets, touching nothing else. Verified against the backend's own suite/
- * repository-summary queries (legacy.service.ts's suite tree query and the testcases_active view,
- * `WHERE deleted_at IS NULL` with no status filter in either): archiving/unarchiving a case changes
- * no suite's testCaseCount/recursiveTestCaseCount and no bySuite bucket and not totalTestCases — the
- * case never stops existing or moves suite, only its status column changes.
- */
-function applyStatusChange(
-  currentSummary: RepositorySummary | null,
-  fromStatus: string,
-  toStatus: string
-): RepositorySummary | null {
-  if (!currentSummary || fromStatus === toStatus) return currentSummary;
-  return {
-    ...currentSummary,
-    byStatus: bumpBucket(bumpBucket(currentSummary.byStatus, fromStatus, -1), toStatus, 1),
-  };
-}
-
-/**
- * The suite/repository-wide effect of editing one existing test case's status and/or suite.
- * totalTestCases never changes (an edit doesn't create or destroy a case). Suite counts are safe to
- * move regardless of status (see applyStatusChange's own comment on the backend queries this was
- * verified against) — a suite move and a status change touch disjoint parts of repoSummary, so
- * applying both in either order gives the same result.
+ * The suite/repository-wide effect of editing one existing test case's status and/or suite —
+ * including archive (status → Archived) and unarchive. Modelled as the case leaving its old
+ * (status, suite) and arriving at its new one, through applySingleCaseDelta, so the counted-vs-
+ * Archived rule lives in one place: archiving takes the case out of the total, its suite badges and
+ * bySuite and puts it in archivedTestCases, exactly as the backend now counts it; a plain status or
+ * suite edit nets the total to zero.
  */
 function applyTestCaseEditDelta(
   currentSuites: SuiteNode[],
@@ -267,24 +259,9 @@ function applyTestCaseEditDelta(
   change: { oldStatus: string; newStatus: string; oldSuiteId: string | null; newSuiteId: string | null }
 ): { suites: SuiteNode[]; repoSummary: RepositorySummary | null } {
   const { oldStatus, newStatus, oldSuiteId, newSuiteId } = change;
-  let nextSuites = currentSuites;
-  let nextSummary = currentSummary;
-
-  if (oldSuiteId !== newSuiteId) {
-    if (oldSuiteId) nextSuites = adjustSuiteCounts(nextSuites, oldSuiteId, -1);
-    if (newSuiteId) nextSuites = adjustSuiteCounts(nextSuites, newSuiteId, 1);
-    if (nextSummary) {
-      const bucketName = (id: string | null) => (id ? (currentSuites.find((s) => s.id === id)?.name ?? "Unassigned") : "Unassigned");
-      nextSummary = {
-        ...nextSummary,
-        bySuite: bumpBucket(bumpBucket(nextSummary.bySuite, bucketName(oldSuiteId), -1), bucketName(newSuiteId), 1),
-      };
-    }
-  }
-  if (oldStatus !== newStatus) {
-    nextSummary = applyStatusChange(nextSummary, oldStatus, newStatus);
-  }
-  return { suites: nextSuites, repoSummary: nextSummary };
+  if (oldStatus === newStatus && oldSuiteId === newSuiteId) return { suites: currentSuites, repoSummary: currentSummary };
+  const removed = applySingleCaseDelta(currentSuites, currentSummary, oldStatus, oldSuiteId, -1);
+  return applySingleCaseDelta(removed.suites, removed.repoSummary, newStatus, newSuiteId, 1);
 }
 
 function statusTone(s: string) {
@@ -690,15 +667,18 @@ export default function TestCasesPage() {
         draft: statusCount("Draft"),
         inReview: statusCount("In Review"),
         approved: statusCount("Approved"),
-        deprecated: statusCount("Deprecated") + statusCount("Archived"),
+        // Deprecated only. Archived used to be folded in, so a project with no Deprecated cases read
+        // "3 DEPRECATED" — the archived ones. They are counted on their own now (archivedCaseCount).
+        deprecated: statusCount("Deprecated"),
       }
     : null;
 
   /*
    * The repository's true size, for every counter that claims to describe the whole repository.
    *
-   * repositorySummary counts `testcases_active` for the project, so it includes cases that belong to
-   * no suite; suiteCaseCountSum cannot see those at all. Basecamp 10194323432 was reported against a
+   * repositorySummary counts every live, non-Archived case in the project (the backend's
+   * countedTestcase rule — the same set the list shows), so it includes cases that belong to no
+   * suite; suiteCaseCountSum cannot see those at all. Basecamp 10194323432 was reported against a
    * project where the two disagreed on screen — the sidebar said 1 while the tiles said 50 with 24
    * Draft — so the Draft tile read as invented.
    */
@@ -709,14 +689,11 @@ export default function TestCasesPage() {
    * extra request. Falls back to the arithmetic when the summary has not landed yet.
    */
   /*
-   * Archived cases are excluded from the list by default (see listTestCases), so the screen has to say
-   * so — the DEPRECATED tile still counts them, and "33 test cases" above "30 results" with no
-   * explanation is exactly the count-mismatch confusion this screen has already been reported for.
+   * Archived cases are excluded from the list and from every count on this screen (see
+   * countedTestcase on the backend), so the screen says how many exist rather than letting them
+   * vanish silently. repositorySummary reports them separately as archivedTestCases.
    */
-  const archivedCaseCount = useMemo(
-    () => repoSummary?.byStatus.find((s) => s.name === "Archived")?.count ?? 0,
-    [repoSummary]
-  );
+  const archivedCaseCount = repoSummary?.archivedTestCases ?? 0;
   const archivedHidden = archivedCaseCount > 0 && suiteStatusFilter !== "Archived";
   const unfiledCaseCount = useMemo(() => {
     const bucket = repoSummary?.bySuite.find((s) => s.name === "Unassigned");
@@ -1407,12 +1384,16 @@ export default function TestCasesPage() {
     try {
       // Server-confirmed prior status (not the edit form's own status state, which could reflect an
       // unsaved dropdown change) — same reasoning as handleDeletePanelTestCase.
-      const priorStatus = suiteCases.find((tc) => tc.id === panelTestcaseId)?.status;
+      const prior = suiteCases.find((tc) => tc.id === panelTestcaseId);
       await updateTestCase(projectId, panelTestcaseId, { status: "Archived" });
-      // No suite/bySuite/total change: archiving neither removes the case (deleted_at is untouched)
-      // nor moves it to a different suite — only its status column changes (verified against the
-      // backend's suite-count and repository-summary queries; see applyStatusChange's own comment).
-      if (priorStatus) applyTestCasesPatch({ repoSummary: applyStatusChange(repoSummary, priorStatus, "Archived") });
+      // Archiving takes the case out of the total, its suite's badges and bySuite, and into
+      // archivedTestCases — the backend's countedTestcase rule (see applyTestCaseEditDelta).
+      if (prior?.status) {
+        const suiteId = prior.suiteId ?? null;
+        applyTestCasesPatch(
+          applyTestCaseEditDelta(suites, repoSummary, { oldStatus: prior.status, newStatus: "Archived", oldSuiteId: suiteId, newSuiteId: suiteId })
+        );
+      }
       await loadSelectedSuiteCases();
       await openViewPanel(panelTestcaseId);
     } catch (err) {
@@ -1428,9 +1409,14 @@ export default function TestCasesPage() {
     setPanelSaving(true);
     setPanelError(null);
     try {
-      const priorStatus = suiteCases.find((tc) => tc.id === panelTestcaseId)?.status;
+      const prior = suiteCases.find((tc) => tc.id === panelTestcaseId);
       await updateTestCase(projectId, panelTestcaseId, { status: "Draft" });
-      if (priorStatus) applyTestCasesPatch({ repoSummary: applyStatusChange(repoSummary, priorStatus, "Draft") });
+      if (prior?.status) {
+        const suiteId = prior.suiteId ?? null;
+        applyTestCasesPatch(
+          applyTestCaseEditDelta(suites, repoSummary, { oldStatus: prior.status, newStatus: "Draft", oldSuiteId: suiteId, newSuiteId: suiteId })
+        );
+      }
       await loadSelectedSuiteCases();
       await openViewPanel(panelTestcaseId);
     } catch (err) {

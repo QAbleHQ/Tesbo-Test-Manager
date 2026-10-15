@@ -178,7 +178,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "list_testcases",
       description:
-        "List test cases in the token's project. Supports optional filters: suiteId, status, priority, type, automationStatus, jiraIssueKey, search, and pagination (limit up to 500, offset). Archived test cases are excluded unless status is \"Archived\" or includeArchived is true — pass includeArchived to match the project's total test case count (e.g. the repository summary total), which includes Archived cases.",
+        "List test cases in the token's project. Supports optional filters: suiteId, status, priority, type, automationStatus, jiraIssueKey, search, and pagination (limit up to 500, offset). Archived test cases are excluded unless status is \"Archived\" or includeArchived is true. The default (Archived excluded) is the same set every Tesbo test case count uses — the repository total, project card, dashboards and reports — so an unfiltered total matches them; pass includeArchived only to see archived cases as well.",
       requiredScope: "read",
       inputSchema: {
         type: "object",

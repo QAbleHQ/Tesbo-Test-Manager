@@ -168,7 +168,7 @@ test.describe("projects list — creating a project", () => {
       // Nothing is seeded into a new project's suites — createProject only seeds knowledge-base
       // folders — so a fresh project genuinely has none.
       expect(await cardStat(card, "Suites")).toBe("0");
-      expect(await cardStat(card, "Pass rate")).toBe("—");
+      expect(await cardStat(card, "Last run pass rate")).toBe("—");
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -601,11 +601,11 @@ test.describe("projects list — what the cards report", () => {
       });
 
       const card = await gotoProjectsAndFind(page, project.name);
-      expect(await cardStat(card, "Pass rate")).toBe("90%");
+      expect(await cardStat(card, "Last run pass rate")).toBe("90%");
 
       const colour = await card.evaluate((el) => {
         const label = Array.from(el.querySelectorAll("div")).find(
-          (d) => d.textContent?.trim() === "Pass rate",
+          (d) => d.textContent?.trim() === "Last run pass rate",
         );
         const value = label?.previousElementSibling as HTMLElement | null;
         return value ? getComputedStyle(value).color : "";
@@ -651,7 +651,7 @@ test.describe("projects list — what the cards report", () => {
        * last — `completedRuns` never actually filters on status — so scheduling an empty run drops
        * the same project from 100% to 0% on this screen while the dashboard still says 100%.
        */
-      expect(await cardStat(card, "Pass rate")).toBe(`${summary.passRate.value}%`);
+      expect(await cardStat(card, "Last run pass rate")).toBe(`${summary.passRate.value}%`);
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -691,6 +691,27 @@ test.describe("projects list — what the cards report", () => {
       await expect(card).toContainText("1 failed");
       // The blocked legend entry is rendered only when there is something to report.
       await expect(card).not.toContainText("0 blocked");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PRJ-D-08b the card's breakdown follows the newest run with results, not the first", async ({ page }) => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Passed"], status: "Completed" });
+      await seedRun(api, project.id, { statuses: ["Passed", "Failed", "Blocked"], status: "Completed" });
+
+      // Re-navigated until it settles rather than read once: the overview behind the card caches each
+      // project for 10s with no invalidation on write, and another worker listing projects mid-seed
+      // can cache the first run's breakdown. The retry window outlasts that TTL.
+      await expect(async () => {
+        const card = await gotoProjectsAndFind(page, project.name);
+        await expect(card).toContainText("1 passed", { timeout: 2_000 });
+        await expect(card).toContainText("1 failed", { timeout: 2_000 });
+        await expect(card).toContainText("1 blocked", { timeout: 2_000 });
+        expect(await cardStat(card, "Last run pass rate")).toBe("33%");
+      }, "the card is still showing the first run").toPass({ timeout: 25_000 });
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -784,7 +805,7 @@ test.describe("projects list — what the cards report", () => {
       // listTestRuns is caught with .catch(() => []), so the card degrades to "no runs yet".
       const card = projectCard(page, project.name);
       await expect(card).toBeVisible();
-      expect(await cardStat(card, "Pass rate")).toBe("—");
+      expect(await cardStat(card, "Last run pass rate")).toBe("—");
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -850,7 +871,7 @@ test.describe("projects list — what the cards report", () => {
 
       const card = await gotoProjectsAndFind(page, project.name);
       // Nothing has been executed, so there is no rate to report — "0%" would be a lie.
-      expect(await cardStat(card, "Pass rate")).toBe("—");
+      expect(await cardStat(card, "Last run pass rate")).toBe("—");
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -905,7 +926,7 @@ test.describe("projects list — the grid/list toggle", () => {
     await page.goto("/projects");
     await page.getByRole("button", { name: "List view" }).click();
 
-    for (const column of ["Project", "Test cases", "Suites", "Pass rate", "Team", "Updated"]) {
+    for (const column of ["Project", "Test cases", "Suites", "Last run pass rate", "Team", "Updated"]) {
       await expect(page.getByText(column, { exact: true }).first()).toBeVisible();
     }
   });
@@ -921,7 +942,7 @@ test.describe("projects list — the grid/list toggle", () => {
       const grid = {
         cases: await cardStat(gridCard, "Test cases"),
         suites: await cardStat(gridCard, "Suites"),
-        passRate: await cardStat(gridCard, "Pass rate"),
+        passRate: await cardStat(gridCard, "Last run pass rate"),
       };
 
       await page.getByRole("button", { name: "List view" }).click();
