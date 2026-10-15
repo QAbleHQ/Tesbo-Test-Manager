@@ -110,8 +110,17 @@ export async function keepReviewRecommendation(projectId: string, id: string): P
   await api(`${base(projectId)}/recommendations/${id}/keep`, { method: "POST" });
 }
 
-export async function editReviewRecommendation(projectId: string, id: string, testcaseId: string, fields: ReviewEditFields): Promise<void> {
-  await api(`${base(projectId)}/recommendations/${id}/edit`, { method: "POST", body: { testcaseId, confirm: true, ...fields } });
+/** What the server answers after an edit: the finding's match is recalculated from the edited content. */
+export interface ReviewEditResult {
+  id: string;
+  reviewStatus: ReviewStatus;
+  editedTestcaseId: string;
+  classification: ReviewClassification;
+  similarity: number;
+}
+
+export async function editReviewRecommendation(projectId: string, id: string, testcaseId: string, fields: ReviewEditFields): Promise<ReviewEditResult> {
+  return api<ReviewEditResult>(`${base(projectId)}/recommendations/${id}/edit`, { method: "POST", body: { testcaseId, confirm: true, ...fields } });
 }
 
 export async function removeReviewRecommendation(projectId: string, id: string, testcaseId: string): Promise<void> {

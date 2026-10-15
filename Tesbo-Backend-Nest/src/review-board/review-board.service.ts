@@ -16,7 +16,7 @@ import { TestcasesListCacheService } from "../cache/testcases-list-cache.service
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
-import { analyse, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
+import { analyse, rescorePair, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
 import {
   MAX_TESTCASES_PER_RUN,
   REVIEW_BOARD_JOB,
@@ -628,14 +628,49 @@ export class ReviewBoardService {
       ownerId: current.rows[0].owner_id
     });
 
-    await this.db.transaction(async (client) => {
+    const rescored = await this.db.transaction(async (client) => {
       await this.markReviewed(client, recommendationId, userId, "edited");
+      const result = await this.rescoreFinding(client, projectId, rec);
       await this.audit(client, projectId, userId, "review_board_edited", "review_recommendation", recommendationId, null, {
         editedTestcaseId: testcaseId,
-        fields: Object.keys(changes)
+        fields: Object.keys(changes),
+        ...(result ? { similarityBefore: Number(rec.similarity), similarityAfter: result.similarity } : {})
       });
+      return result;
     });
-    return { id: recommendationId, reviewStatus: "edited", editedTestcaseId: testcaseId };
+    return {
+      id: recommendationId,
+      reviewStatus: "edited",
+      editedTestcaseId: testcaseId,
+      // The pair's match as it is NOW, so the caller can show it without waiting for another analysis.
+      classification: rescored?.classification ?? rec.classification,
+      similarity: rescored?.similarity ?? Number(rec.similarity)
+    };
+  }
+
+  /**
+   * Re-scores a finding from the CURRENT content of its two test cases and stores the result on the same row:
+   * classification, match, explanation, differences, and both fingerprints. Called after an edit, so the finding
+   * never keeps showing the pre-edit match, and an edited finding is not left reading "changed since analysis".
+   * Returns null (and leaves the row alone) if either test case is gone.
+   */
+  private async rescoreFinding(client: PoolClient, projectId: string, rec: Row): Promise<Finding | null> {
+    const res = await client.query(
+      `SELECT id, ${TESTCASE_SOURCE_COLUMNS.join(", ")} FROM testcases
+        WHERE id = ANY($1::uuid[]) AND project_id = $2 AND deleted_at IS NULL`,
+      [[rec.testcase_a_id, rec.testcase_b_id], projectId]
+    );
+    if (res.rows.length !== 2) return null;
+    const [x, y] = res.rows.map((r) => toComparable(r as unknown as TestcaseSource));
+    const f = rescorePair(x, y);
+    await client.query(
+      `UPDATE review_recommendations
+          SET classification = $2, similarity = $3, explanation = $4, differences = $5::jsonb,
+              fingerprint_a = $6, fingerprint_b = $7, state_fingerprint_a = $8, state_fingerprint_b = $9, updated_at = now()
+        WHERE id = $1`,
+      [rec.id, f.classification, f.similarity, f.explanation, JSON.stringify(f.differences), f.fingerprintA, f.fingerprintB, f.stateFingerprintA, f.stateFingerprintB]
+    );
+    return f;
   }
 }
 

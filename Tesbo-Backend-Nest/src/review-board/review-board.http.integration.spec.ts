@@ -234,7 +234,10 @@ suite("review board over HTTP + real BullMQ worker", () => {
     expect((await call("POST", url(w, `/recommendations/${rec.id}/edit`), w.owner, { testcaseId: "00000000-0000-4000-8000-000000000000", title: "x", confirm: true })).status).toBe(400);
     // edit
     const edited = await call("POST", url(w, `/recommendations/${rec.id}/edit`), w.owner, { testcaseId: a, title: "Edited over HTTP", confirm: true });
-    expect(edited).toEqual({ status: 200, json: { id: rec.id, reviewStatus: "edited", editedTestcaseId: a } });
+    expect(edited).toEqual({
+      status: 200,
+      json: { id: rec.id, reviewStatus: "edited", editedTestcaseId: a, classification: expect.stringMatching(/^(exact_duplicate|similar)$/), similarity: expect.any(Number) }
+    });
     expect((await one("SELECT title FROM testcases WHERE id = $1", [a])).title).toBe("Edited over HTTP");
     // already reviewed -> 409 { error }
     const again = await call("POST", url(w, `/recommendations/${rec.id}/keep`), w.owner);

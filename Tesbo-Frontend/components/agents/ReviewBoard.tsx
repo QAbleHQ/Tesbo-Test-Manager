@@ -388,8 +388,15 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         projectId={projectId}
         recommendation={editFor}
         onClose={() => setEditFor(null)}
-        onSaved={() => {
-          setNotice("Saved. Re-run the analysis to refresh the findings.");
+        onSaved={(result) => {
+          // The server recalculated this pair from the edited content; say what the match is now. The finding
+          // moves out of "To review", so also say where it went.
+          const pct = Math.round(result.similarity * 100);
+          setNotice(
+            result.classification === "exact_duplicate"
+              ? "Saved. The two test cases are now identical (100% match, exact duplicate). Find this finding under the Edited tab."
+              : `Saved. The match for this pair is now ${pct}%. Find this finding under the Edited tab.`
+          );
           setEditFor(null);
           void loadList();
         }}

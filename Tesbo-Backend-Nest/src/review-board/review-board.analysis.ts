@@ -298,7 +298,7 @@ function orderedPair(x: ComparableCase, y: ComparableCase): [ComparableCase, Com
   return x.id < y.id ? [x, y] : [y, x];
 }
 
-function buildFinding(x: ComparableCase, y: ComparableCase): Finding | null {
+function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = SIMILAR_THRESHOLD): Finding | null {
   const [a, b] = orderedPair(x, y);
   const differences = diffCases(a, b);
   const sameContent = a.fingerprint === b.fingerprint;
@@ -321,7 +321,7 @@ function buildFinding(x: ComparableCase, y: ComparableCase): Finding | null {
   }
 
   const { score, parts } = scoreFields(a, b);
-  if (score < SIMILAR_THRESHOLD) return null;
+  if (score < minScore) return null;
 
   const breakdown = (Object.keys(parts) as ScoredField[])
     .map((f) => `${f === "steps" ? "steps" : FIELD_LABEL[f]} ${pct(parts[f] as number)}`)
@@ -346,6 +346,15 @@ function buildFinding(x: ComparableCase, y: ComparableCase): Finding | null {
     stateFingerprintA: a.stateFingerprint,
     stateFingerprintB: b.stateFingerprint
   };
+}
+
+/**
+ * Scores one pair exactly as the analysis would, but WITHOUT the similarity cut-off, so it always answers.
+ * Used right after a reviewer edits a test case: the finding must show the pair's match as it is now (even if
+ * the edit pushed it below the analysis threshold, or made the two identical), not the score from before the edit.
+ */
+export function rescorePair(x: ComparableCase, y: ComparableCase): Finding {
+  return buildFinding(x, y, 0) as Finding;
 }
 
 const MAX_CANDIDATES_PER_CASE = 25;

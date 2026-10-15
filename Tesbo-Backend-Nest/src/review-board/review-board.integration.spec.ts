@@ -770,6 +770,91 @@ suite("review board (real Postgres)", () => {
       expect(row.external_id).not.toBe("HACK-1");
     });
 
+    describe("the match is recalculated when an edit is saved", () => {
+      it("a similar pair that is edited further apart shows a LOWER match, with fresh differences and explanation, on the same row", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId, { test_data: "user=bob" }); // similar, not identical
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        expect(rec.classification).toBe("similar");
+        const before = rec.similarity;
+
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Totally different topic", preconditions: "Another setup entirely", testData: "x=1", confirm: true });
+        expect(out.similarity).toBeLessThan(before);
+
+        const after = (await list(w, { status: "edited" })).items[0];
+        expect(after.id).toBe(rec.id); // same row, no duplicate
+        expect(after.similarity).toBe(out.similarity);
+        expect(after.similarity).toBeLessThan(before);
+        expect(after.explanation).not.toBe(rec.explanation);
+        expect(after.differences.map((d: Any) => d.field)).toEqual(expect.arrayContaining(["title", "preconditions", "testData"]));
+        expect(after.reviewStatus).toBe("edited");
+      });
+
+      it("an edit that makes the two cases identical turns the finding into an exact duplicate at 100%", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId, { test_data: "user=bob" });
+        await mkCase(w.projectId);
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        expect(rec.classification).toBe("similar");
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, testData: "user=alice", confirm: true });
+        expect(out).toMatchObject({ classification: "exact_duplicate", similarity: 1 });
+        expect((await list(w, { status: "edited" })).items[0]).toMatchObject({ classification: "exact_duplicate", similarity: 1, differences: [] });
+      });
+
+      it("a pair edited far below the analysis threshold still shows its real (low) match instead of disappearing or keeping the old number", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId);
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        const out = await svc.edit(w.owner, w.projectId, rec.id, {
+          testcaseId: a,
+          title: "Export report as PDF",
+          preconditions: "Report exists",
+          testData: "pdf",
+          steps: [{ action: "Click export", expectedResult: "A PDF downloads" }],
+          confirm: true
+        });
+        expect(out.similarity).toBeLessThan(0.7);
+        const row = (await list(w, { status: "edited" })).items[0];
+        expect(row.similarity).toBe(out.similarity);
+        expect(row.similarity).toBeLessThan(0.7);
+      });
+
+      it("the edited finding is current afterwards (not 'changed since analysis') and its stored fingerprints match both cases", async () => {
+        const { w, a, rec } = await withPair();
+        await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Login (edited)", confirm: true });
+        expect((await list(w, { status: "edited" })).items[0]).toMatchObject({ stale: false, staleReason: null });
+      });
+
+      it("a later analysis does not reopen the decision for the same content, and keeps the recalculated match", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId, { test_data: "user=bob" });
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, testData: "user=carol", confirm: true });
+        await analyseNow(w);
+        const row = await one("SELECT review_status, similarity::float AS similarity FROM review_recommendations WHERE id = $1", [rec.id]);
+        expect(row.review_status).toBe("edited");
+        expect(row.similarity).toBe(out.similarity);
+      });
+
+      it("the audit entry records the match before and after", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId, { test_data: "user=bob" });
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, testData: "x=1", confirm: true });
+        const audit = await one("SELECT diff FROM audit_logs WHERE entity_id = $1 AND action = 'review_board_edited'", [rec.id]);
+        expect(audit.diff).toMatchObject({ similarityBefore: rec.similarity, similarityAfter: out.similarity });
+      });
+    });
+
     it("after an edit, the finding it came from can no longer be used to delete anything", async () => {
       const { w, a, rec } = await withPair();
       await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Login (edited)", confirm: true });
@@ -1172,7 +1257,7 @@ suite("review board (real Postgres)", () => {
       const k = await withPair();
       expect(await svc.keep(k.w.owner, k.w.projectId, k.rec.id)).toEqual({ id: k.rec.id, reviewStatus: "kept" });
       const e = await withPair();
-      expect(await svc.edit(e.w.owner, e.w.projectId, e.rec.id, { testcaseId: e.a, title: "t2", confirm: true })).toEqual({ id: e.rec.id, reviewStatus: "edited", editedTestcaseId: e.a });
+      expect(await svc.edit(e.w.owner, e.w.projectId, e.rec.id, { testcaseId: e.a, title: "t2", confirm: true })).toEqual({ id: e.rec.id, reviewStatus: "edited", editedTestcaseId: e.a, classification: expect.stringMatching(/^(exact_duplicate|similar)$/), similarity: expect.any(Number) });
       const r = await withPair();
       expect(await svc.remove(r.w.owner, r.w.projectId, r.rec.id, { testcaseId: r.a, confirm: true })).toEqual({ id: r.rec.id, reviewStatus: "removed", removedTestcaseId: r.a, keptTestcaseId: r.b });
     });

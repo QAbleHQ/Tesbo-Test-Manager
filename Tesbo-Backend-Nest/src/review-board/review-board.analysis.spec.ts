@@ -1,4 +1,4 @@
-import { analyse, parseSteps, stateFingerprintOf, toComparable, type TestcaseSource } from "./review-board.analysis";
+import { analyse, parseSteps, rescorePair, stateFingerprintOf, toComparable, type TestcaseSource } from "./review-board.analysis";
 
 let n = 0;
 function tc(over: Partial<TestcaseSource> & { steps?: unknown }): TestcaseSource {
@@ -197,5 +197,56 @@ describe("state fingerprint (review freshness)", () => {
     expect(finding.stateFingerprintA).toBe(byId.get(finding.aId)!.stateFingerprint);
     expect(finding.stateFingerprintB).toBe(byId.get(finding.bId)!.stateFingerprint);
     expect(finding.stateFingerprintA).not.toBe(finding.stateFingerprintB);
+  });
+});
+
+describe("rescorePair (match after an edit)", () => {
+  const pair = (over: Partial<TestcaseSource>) => [toComparable(tc({})), toComparable(tc(over))] as const;
+
+  it("always answers, even for pairs far below the analysis threshold, with the real (low) score", () => {
+    const [a, b] = pair({
+      title: "Export report as PDF",
+      preconditions: "Report exists",
+      test_data: "pdf",
+      steps: [{ action: "Click export", expectedResult: "A PDF downloads" }]
+    });
+    expect(analyse([a, b]).findings).toEqual([]); // the analysis would drop this pair...
+    const f = rescorePair(a, b); // ...but an edited finding must still show its current match
+    expect(f.classification).toBe("similar");
+    expect(f.similarity).toBeGreaterThanOrEqual(0);
+    expect(f.similarity).toBeLessThan(0.7);
+    expect(f.differences.length).toBeGreaterThan(0);
+  });
+
+  it("becomes an exact duplicate at 100% when an edit makes the two cases identical", () => {
+    const [a, b] = pair({});
+    const f = rescorePair(a, b);
+    expect(f).toMatchObject({ classification: "exact_duplicate", similarity: 1, differences: [] });
+  });
+
+  it("matches what the analysis itself reports for a pair that is above the threshold", () => {
+    const [a, b] = pair({ test_data: "user=bob" });
+    const [fromAnalysis] = analyse([a, b]).findings;
+    const rescored = rescorePair(a, b);
+    expect(rescored.similarity).toBe(fromAnalysis.similarity);
+    expect(rescored.explanation).toBe(fromAnalysis.explanation);
+    expect(rescored.classification).toBe(fromAnalysis.classification);
+  });
+
+  it("goes DOWN when an edit moves the cases apart, and UP when it moves them together", () => {
+    const original = toComparable(tc({ test_data: "user=bob", preconditions: "Different setup" }));
+    const other = toComparable(tc({}));
+    const before = rescorePair(other, original).similarity;
+    const editedApart = toComparable({ ...tc({}), id: original.id, test_data: "completely other data", preconditions: "Another setup entirely", title: "Something else", steps: [] });
+    const editedTogether = toComparable({ ...tc({}), id: original.id });
+    expect(rescorePair(other, editedApart).similarity).toBeLessThan(before);
+    expect(rescorePair(other, editedTogether).similarity).toBeGreaterThan(before);
+  });
+
+  it("carries both fingerprints on the result, ordered like the pair", () => {
+    const [a, b] = pair({ test_data: "user=bob" });
+    const f = rescorePair(a, b);
+    expect([f.fingerprintA, f.fingerprintB].sort()).toEqual([a.fingerprint, b.fingerprint].sort());
+    expect(f.aId < f.bId).toBe(true);
   });
 });
