@@ -108,6 +108,36 @@ export async function listReviewRecommendations(
   return api<RecommendationList>(`${base(projectId)}/recommendations${qs ? `?${qs}` : ""}`);
 }
 
+/** One removal recorded by the Review Board (GET …/review-board/history). */
+export interface ReviewHistoryItem {
+  id: string;
+  classification: ReviewClassification;
+  /** The match at the moment of removal. */
+  similarity: number;
+  explanation: string;
+  removedAt: string | null;
+  removedBy: string | null;
+  repositoryName: string;
+  /** The test case that was removed; `stillDeleted` is false if something restored it since. */
+  removed: { id: string; externalId: string; title: string; stillDeleted: boolean };
+  /** The test case that stayed; `deleted` is true if it was deleted later. */
+  kept: { id: string; externalId: string; title: string; deleted: boolean };
+}
+
+export interface ReviewHistory {
+  items: ReviewHistoryItem[];
+  total: number;
+  counts: Record<ReviewStatus, number>;
+}
+
+export async function listReviewHistory(projectId: string, params: { limit?: number; offset?: number } = {}): Promise<ReviewHistory> {
+  const sp = new URLSearchParams();
+  if (params.limit) sp.set("limit", String(params.limit));
+  if (params.offset) sp.set("offset", String(params.offset));
+  const qs = sp.toString();
+  return api<ReviewHistory>(`${base(projectId)}/history${qs ? `?${qs}` : ""}`);
+}
+
 export async function keepReviewRecommendation(projectId: string, id: string): Promise<void> {
   await api(`${base(projectId)}/recommendations/${id}/keep`, { method: "POST" });
 }

@@ -209,6 +209,7 @@ suite("review board (real Postgres)", () => {
         () => svc.getLatestAnalysis(as, w.projectId),
         () => svc.startAnalysis(as, w.projectId),
         () => svc.listRecommendations(as, w.projectId, {}),
+        () => svc.listHistory(as, w.projectId, {}),
         () => svc.keep(as, w.projectId, recId),
         () => svc.edit(as, w.projectId, recId, { testcaseId: a, title: "x", confirm: true }),
         () => svc.remove(as, w.projectId, recId, { testcaseId: a, confirm: true })
@@ -916,7 +917,8 @@ suite("review board (real Postgres)", () => {
       await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: a, confirm: true });
       const res = await list(w);
       expect(res.items).toEqual([]); // a deleted case makes the pair non-actionable
-      expect(res.counts).toEqual({ pending: 0, kept: 0, edited: 0, removed: 0, obsolete: 0 });
+      // ...but the removal itself is counted, because it is listed in History.
+      expect(res.counts).toEqual({ pending: 0, kept: 0, edited: 0, removed: 1, obsolete: 0 });
     });
 
     it("cannot remove twice (409) and cannot remove after Keep (409)", async () => {
@@ -1280,6 +1282,103 @@ suite("review board (real Postgres)", () => {
       expect(await svc.edit(e.w.owner, e.w.projectId, e.rec.id, { testcaseId: e.a, title: "t2", confirm: true })).toEqual({ id: e.rec.id, reviewStatus: "edited", editedTestcaseId: e.a, classification: expect.stringMatching(/^(exact_duplicate|similar)$/), similarity: expect.any(Number) });
       const r = await withPair();
       expect(await svc.remove(r.w.owner, r.w.projectId, r.rec.id, { testcaseId: r.a, confirm: true })).toEqual({ id: r.rec.id, reviewStatus: "removed", removedTestcaseId: r.a, keptTestcaseId: r.b });
+    });
+  });
+
+  // ------------------------------------------------------------- history
+
+  describe("History: test cases removed through the Review Board (read-only)", () => {
+    const history = (w: World, query: Any = {}, as = w.owner) => svc.listHistory(as, w.projectId, query);
+
+    it("is empty before any removal, and Keep / Edit decisions never appear in it", async () => {
+      const k = await withPair();
+      await svc.keep(k.w.owner, k.w.projectId, k.rec.id);
+      const e = await withPair();
+      await svc.edit(e.w.owner, e.w.projectId, e.rec.id, { testcaseId: e.a, title: "Edited title", confirm: true });
+      expect(await history(k.w)).toEqual({ items: [], total: 0, counts: expect.objectContaining({ removed: 0 }) });
+      expect((await history(e.w)).total).toBe(0);
+    });
+
+    it("lists a removal with who removed it, when, the removed and the kept case, the match and the explanation", async () => {
+      const { w, a, b, rec } = await withPair();
+      await svc.remove(w.manager, w.projectId, rec.id, { testcaseId: b, confirm: true });
+      const h = await history(w);
+      expect(h.total).toBe(1);
+      expect(h.counts.removed).toBe(1);
+      expect((await list(w)).counts.removed).toBe(1); // the same number drives the tab count on the main list
+      const item = h.items[0];
+      expect(item).toMatchObject({ id: rec.id, classification: "exact_duplicate", similarity: 1, removedBy: "U", repositoryName: "Repo One", explanation: rec.explanation });
+      expect(new Date(item.removedAt).getTime()).toBeGreaterThan(Date.now() - 60_000);
+      expect(item.removed).toMatchObject({ id: b, stillDeleted: true, title: "Login with valid credentials" });
+      expect(item.removed.externalId).toEqual(expect.any(String));
+      expect(item.kept).toMatchObject({ id: a, deleted: false });
+    });
+
+    it("records the removed case correctly whichever side of the pair it was (a or b)", async () => {
+      for (const side of ["a", "b"] as const) {
+        const { w, rec } = await withPair();
+        const target = side === "a" ? rec.testcaseA.id : rec.testcaseB.id;
+        const other = side === "a" ? rec.testcaseB.id : rec.testcaseA.id;
+        await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: target, confirm: true });
+        const item = (await history(w)).items[0];
+        expect(item.removed.id).toBe(target);
+        expect(item.kept.id).toBe(other);
+      }
+    });
+
+    it("is newest first and paginated, with an accurate total", async () => {
+      const w = await world();
+      for (const t of ["Alpha flow", "Bravo flow", "Charlie flow"]) {
+        const steps = JSON.stringify([{ action: `Do ${t} thing`, expectedResult: `${t} works` }]);
+        await mkCase(w.projectId, { title: t, steps, preconditions: null, test_data: null });
+        await mkCase(w.projectId, { title: t, steps, preconditions: null, test_data: null });
+      }
+      await analyseNow(w);
+      const pending = (await list(w, { status: "pending" })).items;
+      expect(pending).toHaveLength(3);
+      const removedOrder: string[] = [];
+      for (const rec of pending) {
+        await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: rec.testcaseA.id, confirm: true });
+        removedOrder.push(rec.id);
+        await new Promise((r) => setTimeout(r, 15)); // distinct timestamps
+      }
+      const page1 = await history(w, { limit: "2", offset: "0" });
+      const page2 = await history(w, { limit: "2", offset: "2" });
+      expect(page1.total).toBe(3);
+      expect(page1.counts.removed).toBe(3);
+      expect(page1.items.map((i: Any) => i.id)).toEqual([removedOrder[2], removedOrder[1]]); // most recent first
+      expect(page2.items.map((i: Any) => i.id)).toEqual([removedOrder[0]]);
+      expect((await history(w, { limit: "0" })).items).toHaveLength(3); // junk paging falls back to the default
+    });
+
+    it("reports a removed case that was restored elsewhere, and a kept case that was deleted later", async () => {
+      const { w, a, b, rec } = await withPair();
+      await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: b, confirm: true });
+      await pool.query("UPDATE testcases SET deleted_at = NULL, deleted_by = NULL WHERE id = $1", [b]); // restored by something else
+      await pool.query("UPDATE testcases SET deleted_at = now() WHERE id = $1", [a]); // the kept one was deleted later
+      const item = (await history(w)).items[0];
+      expect(item.removed.stillDeleted).toBe(false);
+      expect(item.kept.deleted).toBe(true);
+    });
+
+    it("is scoped to its own project", async () => {
+      const first = await withPair();
+      const second = await withPair();
+      await svc.remove(first.w.owner, first.w.projectId, first.rec.id, { testcaseId: first.a, confirm: true });
+      await svc.remove(second.w.owner, second.w.projectId, second.rec.id, { testcaseId: second.a, confirm: true });
+      const h = await history(first.w);
+      expect(h.items.map((i: Any) => i.id)).toEqual([first.rec.id]);
+    });
+
+    it("has exactly the documented response shape", async () => {
+      const { w, rec } = await withPair();
+      await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: rec.testcaseA.id, confirm: true });
+      const h = await history(w);
+      expect(Object.keys(h).sort()).toEqual(["counts", "items", "total"]);
+      const item = h.items[0];
+      expect(Object.keys(item).sort()).toEqual(["classification", "explanation", "id", "kept", "removed", "removedAt", "removedBy", "repositoryName", "similarity"]);
+      expect(Object.keys(item.removed).sort()).toEqual(["externalId", "id", "stillDeleted", "title"]);
+      expect(Object.keys(item.kept).sort()).toEqual(["deleted", "externalId", "id", "title"]);
     });
   });
 

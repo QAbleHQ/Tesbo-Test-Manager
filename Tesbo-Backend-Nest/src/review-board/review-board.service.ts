@@ -366,10 +366,7 @@ export class ReviewBoardService {
         `SELECT count(*)::text AS n FROM review_recommendations r ${live} WHERE r.project_id = $1 AND r.review_status = ANY($2::text[])`,
         [projectId, statuses]
       ),
-      this.db.query<{ review_status: string; n: string }>(
-        `SELECT r.review_status, count(*)::text AS n FROM review_recommendations r ${live} WHERE r.project_id = $1 GROUP BY r.review_status`,
-        [projectId]
-      )
+      this.loadCounts(projectId)
     ]);
 
     const items = rows.rows.map((r) => {
@@ -397,9 +394,82 @@ export class ReviewBoardService {
         testcaseB: { id: caseB.id, externalId: caseB.externalId, title: caseB.title, repositoryName: project.name }
       };
     });
+    return { items, total: Number(total.rows[0].n), counts };
+  }
+
+  /**
+   * Findings per status for the tab counts. Open findings only count while BOTH test cases still exist (a finding about
+   * a deleted case is not actionable), but 'removed' ones count regardless: a removed finding by definition has a
+   * deleted test case, and they are exactly what the History tab lists.
+   */
+  private async loadCounts(projectId: string): Promise<Record<string, number>> {
+    const res = await this.db.query<{ review_status: string; n: string }>(
+      `SELECT r.review_status, count(*)::text AS n
+         FROM review_recommendations r
+         LEFT JOIN testcases a ON a.id = r.testcase_a_id AND a.deleted_at IS NULL
+         LEFT JOIN testcases b ON b.id = r.testcase_b_id AND b.deleted_at IS NULL
+        WHERE r.project_id = $1 AND (r.review_status = 'removed' OR (a.id IS NOT NULL AND b.id IS NOT NULL))
+        GROUP BY r.review_status`,
+      [projectId]
+    );
     const byStatus: Record<string, number> = Object.fromEntries(REVIEW_STATUSES.map((s) => [s, 0]));
-    for (const c of counts.rows) byStatus[c.review_status] = Number(c.n);
-    return { items, total: Number(total.rows[0].n), counts: byStatus };
+    for (const c of res.rows) byStatus[c.review_status] = Number(c.n);
+    return byStatus;
+  }
+
+  /**
+   * History: the test cases removed from this project through the Review Board, newest first. Read-only. Everything shown
+   * is already recorded when a removal happens (who, when, which case went, which stayed, the match at that moment), so
+   * this needs no extra storage. `stillDeleted` / `deleted` are read live: a removed case that someone restored elsewhere
+   * is reported as such rather than as deleted, and a kept case that was deleted later is flagged.
+   */
+  async listHistory(userId: string | null | undefined, projectId: string, query: { limit?: string; offset?: string }) {
+    const project = await this.requireReviewAccess(userId, projectId);
+    const limit = Math.min(Math.max(Math.trunc(Number(query.limit)) || 25, 1), 100);
+    const offset = Math.max(Math.trunc(Number(query.offset)) || 0, 0);
+
+    const [rows, total, counts] = await Promise.all([
+      this.db.query(
+        `SELECT r.id, r.classification, r.similarity, r.explanation, r.reviewed_at, r.removed_testcase_id,
+                r.testcase_a_id, r.testcase_b_id, u.name AS reviewer_name,
+                a.external_id AS a_external_id, a.title AS a_title, a.deleted_at AS a_deleted_at,
+                b.external_id AS b_external_id, b.title AS b_title, b.deleted_at AS b_deleted_at
+           FROM review_recommendations r
+           JOIN testcases a ON a.id = r.testcase_a_id AND a.project_id = r.project_id
+           JOIN testcases b ON b.id = r.testcase_b_id AND b.project_id = r.project_id
+           LEFT JOIN users u ON u.id = r.reviewed_by
+          WHERE r.project_id = $1 AND r.review_status = 'removed'
+          ORDER BY r.reviewed_at DESC NULLS LAST, r.id
+          LIMIT $2 OFFSET $3`,
+        [projectId, limit, offset]
+      ),
+      this.db.query<{ n: string }>("SELECT count(*)::text AS n FROM review_recommendations WHERE project_id = $1 AND review_status = 'removed'", [projectId]),
+      this.loadCounts(projectId)
+    ]);
+
+    const items = rows.rows.map((r) => {
+      const removedIsA = r.removed_testcase_id === r.testcase_a_id;
+      const side = (isA: boolean) => ({
+        id: isA ? r.testcase_a_id : r.testcase_b_id,
+        externalId: isA ? r.a_external_id : r.b_external_id,
+        title: isA ? r.a_title : r.b_title,
+        deleted: Boolean(isA ? r.a_deleted_at : r.b_deleted_at)
+      });
+      const removed = side(removedIsA);
+      const kept = side(!removedIsA);
+      return {
+        id: r.id,
+        classification: r.classification,
+        similarity: Number(r.similarity),
+        explanation: r.explanation,
+        removedAt: r.reviewed_at,
+        removedBy: r.reviewer_name ?? null,
+        repositoryName: project.name,
+        removed: { id: removed.id, externalId: removed.externalId, title: removed.title, stillDeleted: removed.deleted },
+        kept
+      };
+    });
+    return { items, total: Number(total.rows[0].n), counts };
   }
 
   /** The recommendation plus both live test cases, scoped to this project. 404 when any part is gone. */
