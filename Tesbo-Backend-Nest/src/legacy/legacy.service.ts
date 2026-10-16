@@ -3416,8 +3416,8 @@ export class LegacyService implements OnModuleInit {
    *
    *  - test case count excludes deleted AND Archived, matching listTestCases' default filters
    *  - suite count is every suite, nested ones included, matching listSuites' flat list
-   *  - the run is the most recently created one with at least one executed case, and the pass rate
-   *    divides by executed cases rather than total — the same rule the project dashboard uses
+   *  - the execution breakdown and pass rate cover every live run, counted the way analytics()
+   *    counts them for the project and workspace dashboards
    *  - last activity is the newest row of the same union listActivity reads
    */
   async projectsOverview(userId: string | null | undefined) {
@@ -3451,7 +3451,7 @@ export class LegacyService implements OnModuleInit {
    * entirely, and a 100% miss runs it exactly as it always has, for the full id list.
    */
   private async computeProjectOverviewFields(ids: string[]): Promise<Map<string, ProjectOverviewFields>> {
-    const [cases, suites, members, runs, activity] = await Promise.all([
+    const [cases, suites, members, executionTotals, activity] = await Promise.all([
       // Mirrors listTestCases' default filters: live rows only, and Archived is not part of the
       // working repository (see the comment on listTestCases).
       this.db.query<{ project_id: string; count: number }>(
@@ -3472,11 +3472,13 @@ export class LegacyService implements OnModuleInit {
           ORDER BY pm.project_id, name`,
         [ids]
       ),
-      // DISTINCT ON picks one row per project — the newest run that has actually been executed.
-      // Ranking by creation date alone is what let scheduling an empty run replace a finished
-      // 100% run with an unstarted one, so the executed filter is part of the definition, not a
-      // refinement of it.
-      this.db.query<{
+      // "[Projects Dashboard] Aggregate Execution Status Counts Across All Test Runs". The card used
+      // to show one run — DISTINCT ON the newest run with an executed case — so a project with many
+      // runs read "0 passed, 1 failed" beside a workspace dashboard counting all of them. It now
+      // totals every live execution in every live run, with exactly the joins analytics() uses for
+      // the project and workspace dashboards, so the card, both dashboards and the sum of the cards
+      // all agree. Grouped by project only, so no execution can be counted twice.
+      this.db.heavyQuery<{
         project_id: string;
         total_cases: number;
         passed: number;
@@ -3485,14 +3487,12 @@ export class LegacyService implements OnModuleInit {
         skipped: number;
         untested: number;
       }>(
-        `SELECT DISTINCT ON (c.project_id) c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}, c.created_at
-           FROM cycles c
-           LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
-           LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-          WHERE c.project_id = ANY($1::uuid[]) AND c.deleted_at IS NULL
-          GROUP BY c.id
-         HAVING COUNT(e.id) FILTER (WHERE e.status NOT IN ('Untested', 'Retest')) > 0
-          ORDER BY c.project_id, c.created_at DESC`,
+        `SELECT c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}
+           FROM executions_active e
+           JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
+           JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
+          WHERE c.project_id = ANY($1::uuid[])
+          GROUP BY c.project_id`,
         [ids]
       ),
       // The same union listActivity reads, reduced to its newest timestamp per project. The outer
@@ -3526,7 +3526,7 @@ export class LegacyService implements OnModuleInit {
     const caseCounts = new Map(cases.rows.map((r) => [r.project_id, r.count]));
     const suiteCounts = new Map(suites.rows.map((r) => [r.project_id, r.count]));
     const lastActivity = new Map(activity.rows.map((r) => [r.project_id, r.last_activity_at]));
-    const runByProject = new Map(runs.rows.map((r) => [r.project_id, r]));
+    const totalsByProject = new Map(executionTotals.rows.map((r) => [r.project_id, r]));
     const membersByProject = new Map<string, { userId: string; name: string }[]>();
     for (const row of members.rows) {
       const list = membersByProject.get(row.project_id) ?? [];
@@ -3538,14 +3538,14 @@ export class LegacyService implements OnModuleInit {
     for (const id of ids) {
       const testCaseCount = caseCounts.get(id) ?? 0;
       const lastActivityAt = lastActivity.get(id) ?? null;
-      const run = runByProject.get(id);
-      const metrics = run
+      const totals = totalsByProject.get(id);
+      const metrics = totals
         ? LegacyService.computeExecutionMetrics({
-            passed: run.passed,
-            failed: run.failed,
-            blocked: run.blocked,
-            skipped: run.skipped,
-            totalCases: run.total_cases
+            passed: totals.passed,
+            failed: totals.failed,
+            blocked: totals.blocked,
+            skipped: totals.skipped,
+            totalCases: totals.total_cases
           })
         : null;
       result.set(id, {
@@ -3556,10 +3556,10 @@ export class LegacyService implements OnModuleInit {
         // An empty project needs setting up; one with cases but no activity is configured but idle.
         status: testCaseCount === 0 ? "setup_required" : lastActivityAt ? "active" : "configured",
         runCounts:
-          run && metrics && metrics.executed > 0
-            ? { passed: run.passed, failed: run.failed, blocked: run.blocked, skipped: run.skipped, total: run.total_cases }
+          totals && metrics && metrics.executed > 0
+            ? { passed: totals.passed, failed: totals.failed, blocked: totals.blocked, skipped: totals.skipped, total: totals.total_cases }
             : null,
-        // Passed / (Passed + Failed + Blocked) — see computeExecutionMetrics. A run that is nothing
+        // Passed / (Passed + Failed + Blocked) — see computeExecutionMetrics. A project whose results are nothing
         // but Skipped cases has no settled verdict, so this is null (rendered as "—"), not 0%.
         currentPassRate: metrics ? metrics.passRate : null
       });
