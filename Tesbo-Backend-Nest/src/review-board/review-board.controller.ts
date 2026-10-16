@@ -28,6 +28,11 @@ export class ReviewBoardController {
     return this.reviewBoard.listRecommendations(req.userId, projectId, query);
   }
 
+  @Get("/history")
+  history(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: { limit?: string; offset?: string }) {
+    return this.reviewBoard.listHistory(req.userId, projectId, query);
+  }
+
   @Post("/recommendations/:recommendationId/keep")
   @HttpCode(200)
   keep(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("recommendationId") recommendationId: string) {

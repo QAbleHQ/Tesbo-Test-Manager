@@ -92,6 +92,9 @@ function CompareBody({ projectId, rec, onClose }: { projectId: string; rec: Revi
               {rec.classification === "exact_duplicate" ? "Exact duplicate" : "Similar"}
             </StatusChip>
             <span className="text-xs text-[var(--muted)]">{formatPercent(rec.similarity)} match</span>
+            {rec.stepAgreement.total > 0 && (
+              <span className="text-xs text-[var(--muted)]">· {rec.stepAgreement.identical} of {rec.stepAgreement.total} step{rec.stepAgreement.total === 1 ? "" : "s"} identical</span>
+            )}
             {rec.stale && <StatusChip tone="warning">{rec.staleReason === "unverified" ? "Needs re-analysis" : "Changed since analysis"}</StatusChip>}
           </div>
           <p className="text-xs text-[var(--muted)]">{rec.explanation}</p>
