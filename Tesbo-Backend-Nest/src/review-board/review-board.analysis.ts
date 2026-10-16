@@ -358,7 +358,10 @@ function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = S
   const score = blendedScore(wording, agreement);
   if (score < minScore) return null;
 
+  // Only fields that actually resemble each other are worth listing. A wall of "title 0%, steps 0%, …" says nothing
+  // the match figure does not, so fields at 1% or less are left out, and the whole clause goes when none remain.
   const breakdown = (Object.keys(parts) as ScoredField[])
+    .filter((f) => Math.round((parts[f] as number) * 100) > 1)
     .map((f) => `${f === "steps" ? "steps" : FIELD_LABEL[f]} ${pct(parts[f] as number)}`)
     .join(", ");
   let explanation: string;
@@ -367,8 +370,10 @@ function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = S
     explanation = "Identical title and details, but at least one of the two has no steps, so their behaviour cannot be compared. Not treated as an exact duplicate.";
   } else {
     const differing = differences.map((d) => FIELD_LABEL[d.field]).join(", ");
-    const stepsNote = agreement.total > 0 ? `${agreement.identical} of ${agreement.total} step${agreement.total === 1 ? "" : "s"} identical; ` : "";
-    explanation = `${pct(score)} match (${stepsNote}wording similarity: ${breakdown}). Differs in: ${differing}.`;
+    const clauses: string[] = [];
+    if (agreement.total > 0) clauses.push(`${agreement.identical} of ${agreement.total} step${agreement.total === 1 ? "" : "s"} identical`);
+    if (breakdown) clauses.push(`wording similarity: ${breakdown}`);
+    explanation = `${pct(score)} match${clauses.length ? ` (${clauses.join("; ")})` : ""}. Differs in: ${differing}.`;
   }
   return {
     aId: a.id,

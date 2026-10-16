@@ -333,6 +333,45 @@ export const STALE_HINT: Record<StaleReason, string> = {
   unverified: "This finding was recorded before change tracking existed, so it cannot be verified as current.",
 };
 
+/**
+ * The server writes a finding's explanation when it is analysed, and older findings still carry the long form that lists
+ * every field, including the ones at 0%. This drops any field at 1% or less (and the whole "wording similarity" clause when
+ * none are left), so old and new findings read the same. Text in any other shape is returned unchanged.
+ */
+export function tidyExplanation(text: string): string {
+  const relevant = (list: string) =>
+    list
+      .split(", ")
+      .map((part) => part.trim())
+      .filter((part) => {
+        const m = /(\d+)%$/.exec(part);
+        return !m || Number(m[1]) > 1;
+      });
+
+  // "NN% match (1 of 4 steps identical; wording similarity: title 57%, steps 95%). Differs in: …"
+  const current = /^(\d+% match) \(([^)]*)\)([\s\S]*)$/.exec(text);
+  if (current) {
+    const clauses = current[2]
+      .split("; ")
+      .map((clause) => {
+        const prefix = "wording similarity: ";
+        if (!clause.startsWith(prefix)) return clause;
+        const kept = relevant(clause.slice(prefix.length));
+        return kept.length ? prefix + kept.join(", ") : "";
+      })
+      .filter(Boolean);
+    return current[1] + (clauses.length ? " (" + clauses.join("; ") + ")" : "") + current[3];
+  }
+
+  // Older still: "NN% similar overall (title 57%, steps 95%, …). Differs in: …"
+  const legacy = /^(\d+% similar overall) \(([^)]*)\)([\s\S]*)$/.exec(text);
+  if (legacy) {
+    const kept = relevant(legacy[2]);
+    return legacy[1] + (kept.length ? " (" + kept.join(", ") + ")" : "") + legacy[3];
+  }
+  return text;
+}
+
 export function formatPercent(similarity: number): string {
   return `${Math.round(similarity * 100)}%`;
 }

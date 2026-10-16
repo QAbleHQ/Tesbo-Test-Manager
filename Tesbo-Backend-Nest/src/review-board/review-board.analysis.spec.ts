@@ -340,3 +340,46 @@ describe("match score: wording similarity blended with identical steps", () => {
     expect(stepAgreement(toComparable(tc({})), toComparable(tc({ steps: [] })))).toEqual({ identical: 0, total: 2 });
   });
 });
+
+describe("explanation text lists only the fields that actually resemble each other", () => {
+  const zero = /\b(title|steps|expected results|preconditions|test data) (0|1)%/;
+
+  it("a pair with nothing in common has no wall of 0% fields (reported after an edit moved two cases fully apart)", () => {
+    const base = toComparable(tc({}));
+    const apart = toComparable(
+      tc({
+        title: "zzz qqq",
+        preconditions: "aaa",
+        test_data: "bbb",
+        steps: [{ action: "xxx yyy", expectedResult: "ppp" }]
+      })
+    );
+    const f = rescorePair(base, apart);
+    expect(f.similarity).toBeLessThan(0.1);
+    expect(f.explanation).not.toMatch(zero);
+    expect(f.explanation).not.toMatch(/wording similarity/);
+    expect(f.explanation).toMatch(/^\d+% match \(0 of 2 steps identical\)\. Differs in: /);
+  });
+
+  it("shows only the fields with real similarity, not the zero ones beside them", () => {
+    const base = toComparable(tc({}));
+    const titleOnly = toComparable(
+      tc({ title: "Login flow", preconditions: "aaa", test_data: "bbb", steps: [{ action: "xxx yyy", expectedResult: "ppp" }] })
+    );
+    const f = rescorePair(base, titleOnly);
+    expect(f.explanation).toMatch(/wording similarity: title \d+%\)/); // title is the only field listed
+    expect(f.explanation).not.toMatch(/steps \d+%|expected results \d+%|preconditions \d+%|test data \d+%/);
+  });
+
+  it("keeps the full breakdown when every field resembles the other", () => {
+    const f = rescorePair(toComparable(tc({})), toComparable(tc({ test_data: "user=bob" })));
+    expect(f.explanation).toMatch(/wording similarity: title \d+%, steps \d+%, expected results \d+%, preconditions \d+%, test data \d+%/);
+  });
+
+  it("cases with no steps get no steps clause, and a zero-only breakdown disappears cleanly", () => {
+    const a = toComparable(tc({ steps: [], title: "alpha beta", preconditions: null, test_data: null }));
+    const b = toComparable(tc({ steps: [], title: "gamma delta", preconditions: null, test_data: null }));
+    const f = rescorePair(a, b);
+    expect(f.explanation).toBe("0% match. Differs in: title.");
+  });
+});

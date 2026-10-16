@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getTestCase } from "@/lib/api";
-import { buildCompareRows, buildContextRows, formatPercent, type CompareRow, type ReviewRecommendation } from "@/lib/reviewBoard";
+import { buildCompareRows, buildContextRows, formatPercent, tidyExplanation, type CompareRow, type ReviewRecommendation } from "@/lib/reviewBoard";
 import { Button, Modal, PageLoader, StatusChip } from "@/components/ui";
 
 function Cell({ value, differs, caption }: { value: string; differs: boolean; caption: string }) {
@@ -97,7 +97,7 @@ function CompareBody({ projectId, rec, onClose }: { projectId: string; rec: Revi
             )}
             {rec.stale && <StatusChip tone="warning">{rec.staleReason === "unverified" ? "Needs re-analysis" : "Changed since analysis"}</StatusChip>}
           </div>
-          <p className="text-xs text-[var(--muted)]">{rec.explanation}</p>
+          <p className="text-xs text-[var(--muted)]">{tidyExplanation(rec.explanation)}</p>
 
           <div className={`grid gap-2 ${COLUMNS}`}>
             <div />

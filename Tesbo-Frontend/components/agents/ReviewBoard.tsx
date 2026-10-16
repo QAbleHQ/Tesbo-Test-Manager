@@ -14,6 +14,7 @@ import {
   DIFFERENCE_LABEL,
   EDITED_FIELD_LABEL,
   STALE_HINT,
+  tidyExplanation,
   getReviewAnalysis,
   keepReviewRecommendation,
   listReviewHistory,
@@ -471,57 +472,75 @@ function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
   const matchNote =
     before !== null && after !== null && Math.abs(after - rec.similarity) < 0.0005
       ? before === after
-        ? `Match unchanged (${Math.round(after * 100)}%)`
-        : `Match ${Math.round(before * 100)}% → ${Math.round(after * 100)}%`
+        ? "Match unchanged (" + Math.round(after * 100) + "%)"
+        : "Match " + Math.round(before * 100) + "% → " + Math.round(after * 100) + "%"
       : null;
   // The description (and other details such as status or priority) are not part of the comparison, so editing only
   // those can never change the match — say so instead of implying the edit should have.
   const onlyOutsideComparison = edit.changes.length > 0 && edit.changes.every((c) => c.field === "description");
   const cell = "min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere]";
+  const byLine = (edit.editedBy ? "by " + edit.editedBy + " " : "") + "on " + (fmtDate(edit.editedAt) || "—") + (matchNote ? " · " + matchNote : "");
   return (
-    <section aria-label="What was edited" className="space-y-3 rounded-lg border border-[var(--border)] p-3.5">
-      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <IconPencil size={15} stroke={1.9} className="text-[var(--accent-light)]" />
-          <h4 className="text-sm font-semibold text-[var(--foreground)]">What was edited</h4>
-          {edited && <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]">{edited.externalId}</span>}
-        </div>
-        <p className="text-xs text-[var(--muted)]">
-          {edit.editedBy ? (<>by <span className="font-medium text-[var(--foreground)]">{edit.editedBy}</span> </>) : null}on {fmtDate(edit.editedAt) || "—"}
-          {matchNote && <span className="ml-3 font-medium text-[var(--foreground)]">{matchNote}</span>}
-        </p>
-      </header>
+    <details aria-label="What was edited" className="rounded-lg border border-[var(--border)]">
+      <summary className="cursor-pointer px-3.5 py-2.5 text-sm font-medium text-[var(--foreground)]">
+        What was edited
+        {edited && <span className="ml-2 rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs font-normal text-[var(--foreground)] ring-1 ring-[var(--border)]">{edited.externalId}</span>}
+        <span className="ml-2 font-normal text-[var(--muted)]">{byLine}</span>
+      </summary>
 
-      {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
-      {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
+      <div className="space-y-3 border-t border-[var(--border)] p-3.5">
+        {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
+        {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
 
-      {onlyOutsideComparison && (
-        <p className="text-xs text-[var(--muted)]">Only the description changed. It is not part of the comparison, so this edit does not change the match.</p>
-      )}
+        {onlyOutsideComparison && (
+          <p className="text-xs text-[var(--muted)]">Only the description changed. It is not part of the comparison, so this edit does not change the match.</p>
+        )}
 
-      {edit.changes.length > 0 && (
-        <div className="space-y-2">
-          <div className="hidden gap-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)] md:grid md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
-            <span />
-            <span>Before</span>
-            <span>After</span>
-          </div>
-          {edit.changes.map((c) => (
-            <div key={c.field} className="grid gap-2 md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
-              <div className="pt-1 text-xs font-semibold text-[var(--foreground)]">{EDITED_FIELD_LABEL[c.field]}</div>
-              <div className={`${cell} bg-[var(--error-soft)] text-[var(--foreground)]`}>
-                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)] md:hidden">Before</span>
-                {c.before.trim() ? c.before : <span className="text-[var(--muted-soft)]">— (empty)</span>}
-              </div>
-              <div className={`${cell} bg-[var(--success-soft)] text-[var(--foreground)]`}>
-                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--success-foreground)] md:hidden">After</span>
-                {c.after.trim() ? c.after : <span className="text-[var(--muted-soft)]">— (empty)</span>}
-              </div>
+        {edit.changes.length > 0 && (
+          <div className="space-y-2">
+            <div className="hidden gap-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)] md:grid md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+              <span />
+              <span>Before</span>
+              <span>After</span>
             </div>
-          ))}
-        </div>
-      )}
-    </section>
+            {edit.changes.map((c) => (
+              <div key={c.field} className="grid gap-2 md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+                <div className="pt-1 text-xs font-semibold text-[var(--foreground)]">{EDITED_FIELD_LABEL[c.field]}</div>
+                <div className={cell + " bg-[var(--error-soft)] text-[var(--foreground)]"}>
+                  <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)] md:hidden">Before</span>
+                  {c.before.trim() ? c.before : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+                </div>
+                <div className={cell + " bg-[var(--success-soft)] text-[var(--foreground)]"}>
+                  <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--success-foreground)] md:hidden">After</span>
+                  {c.after.trim() ? c.after : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
+/**
+ * "Why they match" as a dropdown like "What is different": the match and step count are visible on the summary line, the
+ * full sentence opens on demand.
+ */
+function WhyTheyMatch({ label, text }: { label: string; text: string }) {
+  const full = tidyExplanation(text);
+  // First sentence only ("0% match (0 of 1 step identical)"), so the closed line stays short.
+  const preview = full.split(". ")[0].replace(/\.$/, "");
+  return (
+    <details className="rounded-lg border border-[var(--border)]">
+      <summary className="cursor-pointer px-3.5 py-2.5 text-sm font-medium text-[var(--foreground)]">
+        {label}
+        <span className="ml-2 font-normal text-[var(--muted)]">{preview}</span>
+      </summary>
+      <div className="border-t border-[var(--border)] px-3.5 py-3">
+        <p className="border-l-2 border-[var(--brand-primary)] pl-3 text-sm leading-relaxed text-[var(--foreground)]">{full}</p>
+      </div>
+    </details>
   );
 }
 
@@ -566,10 +585,7 @@ function HistoryRow({ item }: { item: ReviewHistoryItem }) {
         </div>
       </div>
 
-      <div className="rounded-lg border-l-2 border-[var(--brand-primary)] bg-[var(--surface-secondary)] px-3.5 py-2.5">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Why they matched</p>
-        <p className="mt-0.5 text-sm leading-relaxed text-[var(--foreground)]">{item.explanation}</p>
-      </div>
+      <WhyTheyMatch label="Why they matched" text={item.explanation} />
     </article>
   );
 }
@@ -661,10 +677,7 @@ function RecommendationRow({
 
       {rec.reviewStatus === "edited" && rec.edit && <EditedPanel rec={rec} />}
 
-      <div className="rounded-lg border-l-2 border-[var(--brand-primary)] bg-[var(--surface-secondary)] px-3.5 py-2.5">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Why they match</p>
-        <p className="mt-0.5 text-sm leading-relaxed text-[var(--foreground)]">{rec.explanation}</p>
-      </div>
+      <WhyTheyMatch label="Why they match" text={rec.explanation} />
 
       {rec.differences.length > 0 && (
         <details className="rounded-lg border border-[var(--border)]" open={rec.differences.length <= 2}>
