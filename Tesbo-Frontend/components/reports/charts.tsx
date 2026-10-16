@@ -249,42 +249,74 @@ export function TrendLineChart({
 }
 
 /* ═══════════════════ Simple vertical bar chart — execution velocity / bug discovery ═══════════════════ */
+// A 9px monospace glyph is ~0.6em wide, in the same viewBox units the bars are laid out in.
+const VBAR_LABEL_CHAR_WIDTH = 5.4;
+
 export function VerticalBarChart({
   data,
   width = 400,
   height = 100,
   color = "var(--brand-primary)",
+  fitLabels = false,
 }: {
   data: { label: string; value: number }[];
   width?: number;
   height?: number;
   color?: string;
+  /*
+   * Cut each label to what fits its own bar's slot, and show the full label in a tooltip on hover
+   * when it was cut. Opt-in, for labels of arbitrary length (Execution velocity's run names): a fixed
+   * cut there overlapped neighbours once there were more runs than ~9 characters' room each.
+   */
+  fitLabels?: boolean;
 }) {
+  const [hovered, setHovered] = useState<number | null>(null);
   if (data.length === 0) return <p className="py-8 text-center text-[13px] text-[var(--muted-soft)]">No data available</p>;
   const max = Math.max(...data.map((d) => d.value), 1);
   const slot = width / data.length;
   const bw = Math.min(slot * 0.55, 48);
+  const maxChars = Math.max(1, Math.floor((slot - 2) / VBAR_LABEL_CHAR_WIDTH));
+  const shown = (label: string) => (fitLabels && label.length > maxChars ? `${label.slice(0, Math.max(1, maxChars - 1))}…` : label);
+  const tip = fitLabels && hovered !== null && shown(data[hovered].label) !== data[hovered].label ? hovered : null;
   return (
-    <svg viewBox={`0 0 ${width} ${height + 18}`} className="w-full">
-      {data.map((d, i) => {
-        const bh = Math.max((d.value / max) * height, d.value > 0 ? 2 : 0);
-        const x = i * slot + (slot - bw) / 2;
-        return (
-          <g key={i}>
-            <rect x={x} y={height - bh} width={bw} height={bh} rx="3" fill={color} opacity={0.8} />
-            <text
-              x={x + bw / 2}
-              y={height + 13}
-              textAnchor="middle"
-              className="fill-[var(--muted-soft)]"
-              style={{ fontSize: "9px", fontFamily: "var(--font-mono)" }}
+    <div className="relative">
+      <svg viewBox={`0 0 ${width} ${height + 18}`} className="w-full">
+        {data.map((d, i) => {
+          const bh = Math.max((d.value / max) * height, d.value > 0 ? 2 : 0);
+          const x = i * slot + (slot - bw) / 2;
+          return (
+            <g
+              key={i}
+              data-bar-index={i}
+              {...(fitLabels ? { onMouseEnter: () => setHovered(i), onMouseLeave: () => setHovered(null) } : {})}
             >
-              {d.label}
-            </text>
-          </g>
-        );
-      })}
-    </svg>
+              {/* Fills the whole slot so hovering anywhere over a bar's column, label included, counts. */}
+              {fitLabels && <rect x={i * slot} y={0} width={slot} height={height + 18} fill="transparent" />}
+              <rect x={x} y={height - bh} width={bw} height={bh} rx="3" fill={color} opacity={0.8} />
+              <text
+                x={x + bw / 2}
+                y={height + 13}
+                textAnchor="middle"
+                className="fill-[var(--muted-soft)]"
+                style={{ fontSize: "9px", fontFamily: "var(--font-mono)" }}
+              >
+                {shown(d.label)}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+      {/* Same styled tooltip as TruncatedLabel — not the native SVG <title>, whose delay hides it. */}
+      {tip !== null && (
+        <span
+          role="tooltip"
+          className="pointer-events-none absolute bottom-full z-20 mb-1 w-max max-w-xs -translate-x-1/2 break-words rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-[12px] text-[var(--foreground)] shadow-md"
+          style={{ left: `${((tip + 0.5) / data.length) * 100}%` }}
+        >
+          {data[tip].label}
+        </span>
+      )}
+    </div>
   );
 }
 
