@@ -980,4 +980,37 @@ test.describe("activity feed", () => {
     expect((await feedRes.json()).list).toHaveLength(30);
     expect(wall, `the workspace Activity screen's requests took ${wall}ms together with 8000 testcase audit rows`).toBeLessThan(5000);
   });
+
+  test("ACT-A-27 total is exact below the cap and stops at cap + 1 above it, flagged, without reading the whole history", async () => {
+    /*
+     * An exact count has to read every audit row the project ever wrote, which on a large tenant is
+     * millions. The feed counts up to 10,000 and reports "at least that many" past it; the screen only
+     * needs the count to know whether another page exists. Below the cap nothing changes: the total is
+     * exact and carries no flag.
+     */
+    test.setTimeout(120_000);
+    seedBulkTestcaseAudit(10_500);
+
+    const t0 = Date.now();
+    const big = (await feed({ limit: 10 })) as { list: ActivityItem[]; total: number; totalCapped?: boolean };
+    const ms = Date.now() - t0;
+    expect(big.list).toHaveLength(10);
+    expect(big.total, "total past the cap is the cap plus one").toBe(10_001);
+    expect(big.totalCapped, "a capped total says so").toBe(true);
+    expect(ms, `GET /activity took ${ms}ms with more than 10,000 events`).toBeLessThan(5000);
+
+    // "Load more" still has somewhere to go: the page asked for is not the end.
+    const deep = await feed({ limit: 100, offset: 9_000 });
+    expect(deep.list).toHaveLength(100);
+
+    // A filter that brings the result under the cap is counted exactly, with no flag.
+    const tag = stamp("UnderCap");
+    seedAudit(tag, [
+      ["a", "testcase_created", tenant!.owner.userId, `now() - interval '1 hour'`, "testcase"],
+      ["b", "testcase_created", tenant!.owner.userId, `now() - interval '2 hours'`, "testcase"],
+    ]);
+    const small = (await feed({ search: tag, limit: 100 })) as { list: ActivityItem[]; total: number; totalCapped?: boolean };
+    expect(small.total).toBe(2);
+    expect(small.totalCapped).toBeUndefined();
+  });
 });

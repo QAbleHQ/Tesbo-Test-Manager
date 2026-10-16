@@ -19,7 +19,7 @@ import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
 import { writeNotifications } from "./notification-writer";
-import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, type NotificationLink, type NotificationType } from "./notification-events";
+import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
 import {
@@ -3416,8 +3416,8 @@ export class LegacyService implements OnModuleInit {
    *
    *  - test case count excludes deleted AND Archived, matching listTestCases' default filters
    *  - suite count is every suite, nested ones included, matching listSuites' flat list
-   *  - the run is the most recently created one with at least one executed case, and the pass rate
-   *    divides by executed cases rather than total — the same rule the project dashboard uses
+   *  - the execution breakdown and pass rate cover every live run, counted the way analytics()
+   *    counts them for the project and workspace dashboards
    *  - last activity is the newest row of the same union listActivity reads
    */
   async projectsOverview(userId: string | null | undefined) {
@@ -3451,7 +3451,7 @@ export class LegacyService implements OnModuleInit {
    * entirely, and a 100% miss runs it exactly as it always has, for the full id list.
    */
   private async computeProjectOverviewFields(ids: string[]): Promise<Map<string, ProjectOverviewFields>> {
-    const [cases, suites, members, runs, activity] = await Promise.all([
+    const [cases, suites, members, executionTotals, activity] = await Promise.all([
       // Mirrors listTestCases' default filters: live rows only, and Archived is not part of the
       // working repository (see the comment on listTestCases).
       this.db.query<{ project_id: string; count: number }>(
@@ -3472,11 +3472,13 @@ export class LegacyService implements OnModuleInit {
           ORDER BY pm.project_id, name`,
         [ids]
       ),
-      // DISTINCT ON picks one row per project — the newest run that has actually been executed.
-      // Ranking by creation date alone is what let scheduling an empty run replace a finished
-      // 100% run with an unstarted one, so the executed filter is part of the definition, not a
-      // refinement of it.
-      this.db.query<{
+      // "[Projects Dashboard] Aggregate Execution Status Counts Across All Test Runs". The card used
+      // to show one run — DISTINCT ON the newest run with an executed case — so a project with many
+      // runs read "0 passed, 1 failed" beside a workspace dashboard counting all of them. It now
+      // totals every live execution in every live run, with exactly the joins analytics() uses for
+      // the project and workspace dashboards, so the card, both dashboards and the sum of the cards
+      // all agree. Grouped by project only, so no execution can be counted twice.
+      this.db.heavyQuery<{
         project_id: string;
         total_cases: number;
         passed: number;
@@ -3485,14 +3487,12 @@ export class LegacyService implements OnModuleInit {
         skipped: number;
         untested: number;
       }>(
-        `SELECT DISTINCT ON (c.project_id) c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}, c.created_at
-           FROM cycles c
-           LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
-           LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-          WHERE c.project_id = ANY($1::uuid[]) AND c.deleted_at IS NULL
-          GROUP BY c.id
-         HAVING COUNT(e.id) FILTER (WHERE e.status NOT IN ('Untested', 'Retest')) > 0
-          ORDER BY c.project_id, c.created_at DESC`,
+        `SELECT c.project_id, ${LegacyService.EXECUTION_BUCKET_COUNTS}
+           FROM executions_active e
+           JOIN cycle_items ci ON ci.id = e.cycle_item_id AND ci.deleted_at IS NULL
+           JOIN cycles c ON c.id = ci.cycle_id AND c.deleted_at IS NULL
+          WHERE c.project_id = ANY($1::uuid[])
+          GROUP BY c.project_id`,
         [ids]
       ),
       // The same union listActivity reads, reduced to its newest timestamp per project. The outer
@@ -3526,7 +3526,7 @@ export class LegacyService implements OnModuleInit {
     const caseCounts = new Map(cases.rows.map((r) => [r.project_id, r.count]));
     const suiteCounts = new Map(suites.rows.map((r) => [r.project_id, r.count]));
     const lastActivity = new Map(activity.rows.map((r) => [r.project_id, r.last_activity_at]));
-    const runByProject = new Map(runs.rows.map((r) => [r.project_id, r]));
+    const totalsByProject = new Map(executionTotals.rows.map((r) => [r.project_id, r]));
     const membersByProject = new Map<string, { userId: string; name: string }[]>();
     for (const row of members.rows) {
       const list = membersByProject.get(row.project_id) ?? [];
@@ -3538,14 +3538,14 @@ export class LegacyService implements OnModuleInit {
     for (const id of ids) {
       const testCaseCount = caseCounts.get(id) ?? 0;
       const lastActivityAt = lastActivity.get(id) ?? null;
-      const run = runByProject.get(id);
-      const metrics = run
+      const totals = totalsByProject.get(id);
+      const metrics = totals
         ? LegacyService.computeExecutionMetrics({
-            passed: run.passed,
-            failed: run.failed,
-            blocked: run.blocked,
-            skipped: run.skipped,
-            totalCases: run.total_cases
+            passed: totals.passed,
+            failed: totals.failed,
+            blocked: totals.blocked,
+            skipped: totals.skipped,
+            totalCases: totals.total_cases
           })
         : null;
       result.set(id, {
@@ -3556,10 +3556,10 @@ export class LegacyService implements OnModuleInit {
         // An empty project needs setting up; one with cases but no activity is configured but idle.
         status: testCaseCount === 0 ? "setup_required" : lastActivityAt ? "active" : "configured",
         runCounts:
-          run && metrics && metrics.executed > 0
-            ? { passed: run.passed, failed: run.failed, blocked: run.blocked, skipped: run.skipped, total: run.total_cases }
+          totals && metrics && metrics.executed > 0
+            ? { passed: totals.passed, failed: totals.failed, blocked: totals.blocked, skipped: totals.skipped, total: totals.total_cases }
             : null,
-        // Passed / (Passed + Failed + Blocked) — see computeExecutionMetrics. A run that is nothing
+        // Passed / (Passed + Failed + Blocked) — see computeExecutionMetrics. A project whose results are nothing
         // but Skipped cases has no settled verdict, so this is null (rendered as "—"), not 0%.
         currentPassRate: metrics ? metrics.passRate : null
       });
@@ -6393,25 +6393,34 @@ export class LegacyService implements OnModuleInit {
     return out;
   }
 
-  async listCyclesForUser(userId: string | null | undefined, projectId: string) {
+  async listCyclesForUser(userId: string | null | undefined, projectId: string, opts: { limit?: number } = {}) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
-    return this.listCycles(projectId);
+    return this.listCycles(projectId, opts);
   }
 
-  async listCycles(projectId: string) {
-    const res = await this.db.query(
+  /**
+   * `limit` returns only the newest N runs. The project home shows four, but the counts below come from
+   * every execution of every run listed, so asking for all of them meant reading all ~700k executions of
+   * a large project to draw four cards. With a limit the newest runs are picked first and only theirs
+   * are counted. Without one the answer is unchanged.
+   */
+  async listCycles(projectId: string, opts: { limit?: number } = {}) {
+    const limit = Number.isFinite(opts.limit) && Number(opts.limit) > 0 ? Math.min(Math.trunc(Number(opts.limit)), 500) : null;
+    const res = await this.db.heavyQuery(
       // Counted off the live execution rows, matching executions() exactly, so the number shown
       // on the run card can never disagree with the number of rows the run's own table renders.
       // Counting cycle_items instead let anything without a live execution inflate the card.
-      `SELECT c.*,
+      `${limit ? "WITH recent AS (SELECT id FROM cycles WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT $2)" : ""}
+       SELECT c.*,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
+       ${limit ? "JOIN recent r ON r.id = c.id" : ""}
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
        LEFT JOIN executions e ON e.cycle_item_id = ci.id AND e.deleted_at IS NULL
-       WHERE c.project_id = $1 AND c.deleted_at IS NULL
+       ${limit ? "" : "WHERE c.project_id = $1 AND c.deleted_at IS NULL"}
        GROUP BY c.id
-       ORDER BY c.created_at DESC`,
-      [projectId]
+       ORDER BY c.created_at DESC, c.id DESC`,
+      limit ? [projectId, limit] : [projectId]
     );
     return res.rows.map(LegacyService.cycleRow);
   }
@@ -9894,13 +9903,22 @@ export class LegacyService implements OnModuleInit {
     // The newest `offset + limit` rows of each branch are all a page can be made of (see activityUnionSql).
     const eventsSql = this.activityEventsSql(where, projectScopeSql, orgOnlySql, { branchLimit: `$${n + 1}` });
     const [total, page] = await Promise.all([
-      this.db.heavyQuery<{ count: string }>(this.activityCountSql(where, projectScopeSql, orgOnlySql), [...filterValues]),
+      this.db.heavyQuery<{ count: string }>(
+        this.activityCountSql(where, projectScopeSql, orgOnlySql, `$${n + 1}`),
+        [...filterValues, LegacyService.ACTIVITY_TOTAL_CAP + 1]
+      ),
       this.db.heavyQuery(
         `${eventsSql} ORDER BY created_at DESC, id DESC LIMIT $${n + 2} OFFSET $${n + 3}`,
         [...filterValues, offset + limit, limit, offset]
       )
     ]);
-    return { list: page.rows.map(toCamel), total: Number(total.rows[0]?.count || 0) };
+    const counted = Number(total.rows[0]?.count || 0);
+    // `total` is exact up to the cap; past it, it is the cap plus one and `totalCapped` says so.
+    return {
+      list: page.rows.map(toCamel),
+      total: counted,
+      ...(counted > LegacyService.ACTIVITY_TOTAL_CAP ? { totalCapped: true } : {})
+    };
   }
 
   // Testcase created/updated/deleted are intentionally NOT synthesized from the `testcases`
@@ -9925,35 +9943,30 @@ export class LegacyService implements OnModuleInit {
   private static readonly ACTIVITY_COLUMNS =
     "project_id, id, actor_id, actor_email, actor_name, actor_kind, action, entity_type, entity_id, entity_name, diff, created_at";
 
-  // The audit_logs rows a zyra_* sibling makes redundant: testcase_created/testcase_updated rows with a
-  // zyra_* row for the same entity within 5 seconds (see activityEventsSql).
+  // The audit_logs branch: the only one with real actors, and the only one that can be big (one row per
+  // mutation, forever).
   //
-  // Driven from the zyra_* rows (a small slice of the table, served by idx_audit_logs_zyra_sibling) and
-  // matched to their testcase_* rows through idx_audit_logs_entity, so the cost follows the number of
-  // Zyra actions in scope and not the size of the history, and not the filters on the request. A
-  // per-row "does a sibling exist" probe was tried first: it is fast only while a LIMIT stops the scan
-  // early, and it ran once per testcase_* row whenever a filter, an empty search or a deep offset
-  // stopped that from happening.
-  private zyraDroppedIdsSql(projectScopeSql: string): string {
-    return `
-      SELECT a2.id
-      FROM (
-        SELECT project_id, entity_id, created_at FROM audit_logs
-        WHERE ${projectScopeSql} AND action IN ('zyra_created', 'zyra_updated', 'zyra_archived')
-      ) z
-      JOIN audit_logs a2
-        ON a2.entity_type = 'testcase' AND a2.entity_id = z.entity_id AND a2.project_id = z.project_id
-      WHERE a2.action IN ('testcase_created', 'testcase_updated')
-        AND abs(extract(epoch FROM z.created_at - a2.created_at)) < 5`;
-  }
-
-  // The audit_logs branch: the only one with real actors, and the only one that can be big (one row
-  // per mutation, forever). `dedupZyra` drops the rows zyraDroppedIdsSql names, as an anti-join, so it
-  // applies before a branch's LIMIT and a dropped row never takes a page slot.
-  private activityAuditBranch(projectScopeSql: string, dedupZyra: boolean): string {
-    const dedup = dedupZyra
-      ? `AND NOT EXISTS (SELECT 1 FROM (${this.zyraDroppedIdsSql(projectScopeSql)}) dropped WHERE dropped.id = a.id)`
-      : "";
+  // It drops a plain testcase_created/testcase_updated row whenever a zyra_* row exists for the same entity
+  // within 5 seconds (see activityEventsSql). That test is a correlated NOT EXISTS behind an OR on the
+  // action, so Postgres evaluates it lazily: only for testcase_* rows, and only for rows it actually reads.
+  // Each evaluation is one lookup in idx_audit_logs_entity (entity_type, entity_id), which holds a handful
+  // of rows per test case, so it costs the same however large the history is, and a LIMIT stops it early.
+  // It needs no index of its own, which matters: a set-based version (collect every zyra_* row of the
+  // project, then anti-join) is fast only while a partial index on those rows exists, and reads the
+  // project's whole history on every request when it does not.
+  // (zyra_created/updated/archived rows are always written with entity_type 'testcase'.)
+  private activityAuditBranch(projectScopeSql: string): string {
+    const dedup = `AND (
+            a.action NOT IN ('testcase_created', 'testcase_updated')
+            OR NOT EXISTS (
+              SELECT 1 FROM audit_logs z
+              WHERE z.entity_type = 'testcase'
+                AND z.entity_id = a.entity_id
+                AND z.action IN ('zyra_created', 'zyra_updated', 'zyra_archived')
+                AND z.project_id = a.project_id
+                AND abs(extract(epoch FROM z.created_at - a.created_at)) < 5
+            )
+          )`;
     return `
         SELECT
           a.project_id, a.id::text, a.actor_id, u.email, COALESCE(u.name, g.display_name),
@@ -9988,7 +10001,7 @@ export class LegacyService implements OnModuleInit {
     outerWhere: string,
     projectScopeSql: string,
     orgOnlySql: string | null,
-    opts: { branchLimit?: string; dedupZyra: boolean }
+    opts: { branchLimit?: string }
   ): string {
     const orgOnlyBranch = orgOnlySql
       ? `
@@ -10106,7 +10119,7 @@ export class LegacyService implements OnModuleInit {
         LEFT JOIN users u ON u.id = b.reported_by
         WHERE ${projectScopeSql} AND b.updated_at > b.created_at + interval '1 second' AND ${bugHasNoAuditTrail}
       `,
-      this.activityAuditBranch(projectScopeSql, opts.dedupZyra)
+      this.activityAuditBranch(projectScopeSql)
     ];
     if (orgOnlyBranch) branches.push(orgOnlyBranch);
 
@@ -10132,7 +10145,7 @@ export class LegacyService implements OnModuleInit {
     orgOnlySql: string | null = null,
     opts: { branchLimit?: string } = {}
   ): string {
-    const union = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, { ...opts, dedupZyra: true });
+    const union = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, opts);
     return `
       SELECT ae.*, pr.name AS project_name
       FROM (${union}) ae
@@ -10140,25 +10153,20 @@ export class LegacyService implements OnModuleInit {
     `;
   }
 
+  // Counting stops after this many rows: past it a project's history is just "a lot", and what the screen
+  // needs from the count is whether another page exists, not the exact size of an audit trail that can run
+  // to millions of rows. An exact count has to read every one of them; this reads at most CAP + 1.
+  private static readonly ACTIVITY_TOTAL_CAP = 10_000;
+
   /**
-   * How many rows activityEventsSql would return for `outerWhere`, without building them.
-   *
-   * Counting the de-duplicated rows directly would mean probing for a zyra sibling on every
-   * testcase_* row, i.e. once per row of a history that can run to hundreds of thousands. So it is
-   * counted as (every row) - (the testcase_* rows that have a zyra sibling): the second term is driven
-   * from the zyra_* rows, which are few, and each is matched to its testcase_* rows through
-   * idx_audit_logs_entity. Same rows, same filters, so the total always agrees with the list.
+   * How many rows activityEventsSql would return for `outerWhere`, up to `capPlaceholder` (a `$n` bound to
+   * ACTIVITY_TOTAL_CAP + 1). Same rows, same filters and same de-duplication as the list, so under the cap
+   * the total always agrees with it. The LIMIT sits on the un-ordered union, so Postgres stops reading as
+   * soon as it has found enough: the cost follows the cap, not the size of the history.
    */
-  private activityCountSql(outerWhere: string, projectScopeSql: string, orgOnlySql: string | null): string {
-    const everyRow = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, { dedupZyra: false });
-    const droppedRows = `
-      SELECT 1
-      FROM (${this.activityAuditBranch(projectScopeSql, false)}) ae(${LegacyService.ACTIVITY_COLUMNS})
-      WHERE ${outerWhere}
-        AND ae.action IN ('testcase_created', 'testcase_updated')
-        AND ae.id IN (SELECT dropped.id::text FROM (${this.zyraDroppedIdsSql(projectScopeSql)}) dropped)
-    `;
-    return `SELECT (SELECT COUNT(*) FROM (${everyRow}) every_row) - (SELECT COUNT(*) FROM (${droppedRows}) dropped_row) AS count`;
+  private activityCountSql(outerWhere: string, projectScopeSql: string, orgOnlySql: string | null, capPlaceholder: string): string {
+    const rows = this.activityUnionSql(outerWhere, projectScopeSql, orgOnlySql, {});
+    return `SELECT COUNT(*) AS count FROM (SELECT 1 FROM (${rows}) every_row LIMIT ${capPlaceholder}) capped`;
   }
 
   // Powers the Activity screen's right-hand summary panel: this-week action-category counts,
@@ -18959,19 +18967,53 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
    */
   private async notifyZyraTask(projectId: string, taskId: string, kind: "ready" | "failed" | "reviewed", actorId: string | null = null): Promise<void> {
     try {
-      const res = await this.db.query<{ requested_by: string | null }>("SELECT requested_by FROM ai_generation_requests WHERE id = $1 AND project_id = $2", [taskId, projectId]);
-      const requester = res.rows[0]?.requested_by;
+      const res = await this.db.query<{ requested_by: string | null; generated_count: number | null; user_story: string | null; jira_issue_keys: unknown; linear_issue_keys: unknown; notion_page_ids: unknown }>(
+        "SELECT requested_by, generated_count, user_story, jira_issue_keys, linear_issue_keys, notion_page_ids FROM ai_generation_requests WHERE id = $1 AND project_id = $2",
+        [taskId, projectId]
+      );
+      const row = res.rows[0];
+      const requester = row?.requested_by;
       if (!requester) return;
-      const [type, title] =
-        kind === "ready"
-          ? (["zyra_generation_ready", notificationMessages.zyraGenerationReady()] as const)
-          : kind === "failed"
-            ? (["zyra_generation_failed", notificationMessages.zyraGenerationFailed()] as const)
-            : (["zyra_review_completed", notificationMessages.zyraReviewCompleted()] as const);
-      await this.notifyUsers([requester], { type, title, link: notificationLinks.zyraTask(projectId, taskId), actorId, memberOf: { projectId } });
+      const link = notificationLinks.zyraTask(projectId, taskId);
+      if (kind === "reviewed") {
+        await this.notifyUsers([requester], { type: "zyra_review_completed", title: notificationMessages.zyraReviewCompleted(), link, actorId, memberOf: { projectId } });
+        return;
+      }
+      const subject = await this.zyraTaskSubject(projectId, row);
+      const { title, body } = kind === "ready" ? notificationMessages.zyraGenerationReady(Number(row.generated_count) || 0, subject) : notificationMessages.zyraGenerationFailed(subject);
+      await this.notifyUsers([requester], { type: kind === "ready" ? "zyra_generation_ready" : "zyra_generation_failed", title, body, link, actorId, memberOf: { projectId } });
     } catch (err) {
       this.logger.error(`Zyra notification failed — ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * The ticket(s) a task was generated for, as a notification names them ("PROJ-123 – Login Flow").
+   * A ticket's title is only looked up when there is exactly one (several are listed by key), and a
+   * missing or unsynced ticket just drops the title — the notification must still go out.
+   */
+  private async zyraTaskSubject(
+    projectId: string,
+    row: { user_story?: string | null; jira_issue_keys?: unknown; linear_issue_keys?: unknown; notion_page_ids?: unknown }
+  ): Promise<string> {
+    const list = (value: unknown) => (Array.isArray(value) ? value.map((v) => String(v ?? "").trim()).filter(Boolean) : []);
+    const jira = list(row.jira_issue_keys);
+    const linear = list(row.linear_issue_keys);
+    const notion = list(row.notion_page_ids);
+    const tickets = [
+      ...jira.map((key) => ({ key, table: "jira_tickets", keyColumn: "jira_issue_key" })),
+      ...linear.map((key) => ({ key, table: "linear_tickets", keyColumn: "linear_issue_key" })),
+      ...notion.map((id) => ({ key: id, table: "notion_pages", keyColumn: "notion_page_id" }))
+    ];
+    const named = tickets.map((t) => ({ key: t.table === "notion_pages" ? notionPageKey(t.key) : t.key, title: null as string | null }));
+    if (tickets.length === 1) {
+      const [t] = tickets;
+      const found = await this.db
+        .query<{ summary: string | null }>(`SELECT summary FROM ${t.table} WHERE project_id = $1 AND ${t.keyColumn} = $2 LIMIT 1`, [projectId, t.key])
+        .catch(() => ({ rows: [] as Array<{ summary: string | null }> }));
+      named[0].title = found.rows[0]?.summary ?? null;
+    }
+    return zyraSubject(named, row.user_story);
   }
 
   private async markZyraTaskFailed(projectId: string, taskId: string, detail: string) {
@@ -21501,6 +21543,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     opts: {
       type: NotificationType;
       title: string;
+      body?: string | null;
       link?: NotificationLink | null;
       dedupeKey?: string;
       actorId?: string | null;

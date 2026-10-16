@@ -307,7 +307,9 @@ describe("ZyraArchiveSweepService.run — notifications", () => {
       "proj-a",
       expect.objectContaining({
         type: "zyra_archive_sweep",
-        title: expect.stringContaining("3"),
+        // The count lives in the body now ("You have 3 tasks awaiting review ..."); the title is fixed wording.
+        title: "Tasks Awaiting Your Review",
+        body: expect.stringContaining("You have 3 tasks"),
         linkEntityType: "zyra_task_board",
         linkEntityId: "proj-a"
       })
@@ -397,5 +399,68 @@ describe("ZyraArchiveSweepService.run — notifications", () => {
 
     expect(notifyProjectMembers).toHaveBeenCalledTimes(1);
     expect(summary.notifiedProjects).toBe(1);
+  });
+
+  describe("wording", () => {
+    /** One staged candidate; `pending` is what the task-board count query returns, `name` the project lookup. */
+    async function notifiedWith(opts: { pending?: string | Error; name?: string | null | Error; staged?: number }) {
+      const staged = opts.staged ?? 1;
+      const candidates = Array.from({ length: staged }, (_, i) => candidate(`tc-${i}`, "proj-a", { jiraIssueKey: `A-${i}` }));
+      const { svc, dbQuery, fetchLiveJiraTicketCategoriesBulk, notifyProjectMembers } = makeService(candidates);
+      fetchLiveJiraTicketCategoriesBulk.mockResolvedValue(lookupMap(candidates.map((c) => [c.jiraIssueKey as string, DONE])));
+      dbQuery.mockImplementation((sql: string) => {
+        const text = String(sql);
+        if (text.includes("FROM testcases_active")) return Promise.resolve({ rows: candidates });
+        if (text.includes("sweep_testcase_id FROM ai_generation_requests")) return Promise.resolve({ rows: [] });
+        if (text.includes("SELECT name FROM projects")) {
+          return opts.name instanceof Error ? Promise.reject(opts.name) : Promise.resolve({ rows: opts.name === undefined ? [] : [{ name: opts.name }] });
+        }
+        if (text.includes("COUNT(*)")) return opts.pending instanceof Error ? Promise.reject(opts.pending) : Promise.resolve({ rows: opts.pending === undefined ? [] : [{ count: opts.pending }] });
+        return Promise.resolve({ rows: [] });
+      });
+      await svc.run();
+      return notifyProjectMembers.mock.calls[0][1] as { title: string; body: string };
+    }
+
+    it("titles it 'Tasks Awaiting Your Review' and names the pending count and the project", async () => {
+      expect(await notifiedWith({ name: "Nevvon Agency Panel", pending: "14", staged: 3 })).toMatchObject({
+        title: "Tasks Awaiting Your Review",
+        body: "You have 14 tasks awaiting review for the Nevvon Agency Panel project. Please review and take action."
+      });
+    });
+
+    it("counts every unresolved task on the board, not only the ones staged this run", async () => {
+      expect((await notifiedWith({ name: "P", pending: "9", staged: 2 })).body).toContain("You have 9 tasks");
+    });
+
+    it("never reports fewer than were just staged, even if the count query lags or returns nothing", async () => {
+      expect((await notifiedWith({ name: "P", pending: "1", staged: 3 })).body).toContain("You have 3 tasks");
+      expect((await notifiedWith({ name: "P", staged: 3 })).body).toContain("You have 3 tasks");
+    });
+
+    it("falls back to the staged count when the count query fails, and still notifies", async () => {
+      expect((await notifiedWith({ name: "P", pending: new Error("boom"), staged: 2 })).body).toContain("You have 2 tasks");
+    });
+
+    it("uses the singular for one task", async () => {
+      expect((await notifiedWith({ name: "Acme", pending: "1" })).body).toBe("You have 1 task awaiting review for the Acme project. Please review and take action.");
+    });
+
+    it("does not say 'project project' for a name that already ends in Project", async () => {
+      expect((await notifiedWith({ name: "Checkout Project", pending: "2" })).body).toBe("You have 2 tasks awaiting review for the Checkout Project. Please review and take action.");
+    });
+
+    it("drops the project clause for a missing, blank or unreadable name", async () => {
+      const bare = "You have 2 tasks awaiting review. Please review and take action.";
+      expect((await notifiedWith({ pending: "2" })).body).toBe(bare);
+      expect((await notifiedWith({ name: "   ", pending: "2" })).body).toBe(bare);
+      expect((await notifiedWith({ name: new Error("x"), pending: "2" })).body).toBe(bare);
+    });
+
+    it("collapses whitespace and clips an overlong project name", async () => {
+      expect((await notifiedWith({ name: "My\n  Big   App", pending: "2" })).body).toContain("for the My Big App project.");
+      const body = (await notifiedWith({ name: "x".repeat(300), pending: "2" })).body;
+      expect(body).toContain(`for the ${"x".repeat(79)}… project.`);
+    });
   });
 });

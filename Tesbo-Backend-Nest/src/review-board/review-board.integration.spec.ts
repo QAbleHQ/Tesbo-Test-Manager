@@ -209,6 +209,7 @@ suite("review board (real Postgres)", () => {
         () => svc.getLatestAnalysis(as, w.projectId),
         () => svc.startAnalysis(as, w.projectId),
         () => svc.listRecommendations(as, w.projectId, {}),
+        () => svc.listHistory(as, w.projectId, {}),
         () => svc.keep(as, w.projectId, recId),
         () => svc.edit(as, w.projectId, recId, { testcaseId: a, title: "x", confirm: true }),
         () => svc.remove(as, w.projectId, recId, { testcaseId: a, confirm: true })
@@ -770,6 +771,228 @@ suite("review board (real Postgres)", () => {
       expect(row.external_id).not.toBe("HACK-1");
     });
 
+    describe("the match is recalculated when an edit is saved", () => {
+      it("a similar pair that is edited further apart shows a LOWER match, with fresh differences and explanation, on the same row", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId, { test_data: "user=bob" }); // similar, not identical
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        expect(rec.classification).toBe("similar");
+        const before = rec.similarity;
+
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Totally different topic", preconditions: "Another setup entirely", testData: "x=1", confirm: true });
+        expect(out.similarity).toBeLessThan(before);
+
+        const after = (await list(w, { status: "edited" })).items[0];
+        expect(after.id).toBe(rec.id); // same row, no duplicate
+        expect(after.similarity).toBe(out.similarity);
+        expect(after.similarity).toBeLessThan(before);
+        expect(after.explanation).not.toBe(rec.explanation);
+        expect(after.differences.map((d: Any) => d.field)).toEqual(expect.arrayContaining(["title", "preconditions", "testData"]));
+        expect(after.reviewStatus).toBe("edited");
+      });
+
+      it("an edit that makes the two cases identical turns the finding into an exact duplicate at 100%", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId, { test_data: "user=bob" });
+        await mkCase(w.projectId);
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        expect(rec.classification).toBe("similar");
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, testData: "user=alice", confirm: true });
+        expect(out).toMatchObject({ classification: "exact_duplicate", similarity: 1 });
+        expect((await list(w, { status: "edited" })).items[0]).toMatchObject({ classification: "exact_duplicate", similarity: 1, differences: [] });
+      });
+
+      it("a pair edited far below the analysis threshold still shows its real (low) match instead of disappearing or keeping the old number", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId);
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        const out = await svc.edit(w.owner, w.projectId, rec.id, {
+          testcaseId: a,
+          title: "Export report as PDF",
+          preconditions: "Report exists",
+          testData: "pdf",
+          steps: [{ action: "Click export", expectedResult: "A PDF downloads" }],
+          confirm: true
+        });
+        expect(out.similarity).toBeLessThan(0.7);
+        const row = (await list(w, { status: "edited" })).items[0];
+        expect(row.similarity).toBe(out.similarity);
+        expect(row.similarity).toBeLessThan(0.7);
+      });
+
+      it("the edited finding is current afterwards (not 'changed since analysis') and its stored fingerprints match both cases", async () => {
+        const { w, a, rec } = await withPair();
+        await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Login (edited)", confirm: true });
+        expect((await list(w, { status: "edited" })).items[0]).toMatchObject({ stale: false, staleReason: null });
+      });
+
+      it("a later analysis does not reopen the decision for the same content, and keeps the recalculated match", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId, { test_data: "user=bob" });
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, testData: "user=carol", confirm: true });
+        await analyseNow(w);
+        const row = await one("SELECT review_status, similarity::float AS similarity FROM review_recommendations WHERE id = $1", [rec.id]);
+        expect(row.review_status).toBe("edited");
+        expect(row.similarity).toBe(out.similarity);
+      });
+
+      it("the audit entry records the match before and after", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId, { test_data: "user=bob" });
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        const out = await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, testData: "x=1", confirm: true });
+        const audit = await one("SELECT diff FROM audit_logs WHERE entity_id = $1 AND action = 'review_board_edited'", [rec.id]);
+        expect(audit.diff).toMatchObject({ similarityBefore: rec.similarity, similarityAfter: out.similarity });
+      });
+    });
+
+    describe("the Edited tab: only edited findings, each with its before and after", () => {
+      it("an edited finding leaves To review and appears only under Edited, with the counts to match", async () => {
+        const { w, a, rec } = await withPair();
+        expect((await list(w, { status: "pending" })).total).toBe(1);
+        await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Login (edited)", confirm: true });
+        const pending = await list(w, { status: "pending" });
+        const kept = await list(w, { status: "kept" });
+        const edited = await list(w, { status: "edited" });
+        expect(pending.total).toBe(0);
+        expect(kept.total).toBe(0);
+        expect(edited.items.map((i: Any) => i.id)).toEqual([rec.id]);
+        expect(edited.counts).toMatchObject({ pending: 0, kept: 0, edited: 1 });
+      });
+
+      it("records exactly what changed: each changed field with its before and after, who edited it and when", async () => {
+        const { w, a, rec } = await withPair();
+        const out = await svc.edit(w.manager, w.projectId, rec.id, {
+          testcaseId: a,
+          title: "Login (edited)",
+          testData: "user=bob",
+          steps: [{ action: "Open the login page", expectedResult: "Form is shown" }, { action: "Submit valid credentials", expectedResult: "An error banner appears" }],
+          confirm: true
+        });
+        const item = (await list(w, { status: "edited" })).items[0];
+        expect(item.edit).toMatchObject({ testcaseId: a, editedBy: "U", recorded: true, similarityBefore: rec.similarity, similarityAfter: out.similarity });
+        expect(new Date(item.edit!.editedAt).getTime()).toBeGreaterThan(Date.now() - 60_000);
+        expect(item.edit!.changes).toEqual([
+          { field: "title", before: "Login with valid credentials", after: "Login (edited)" },
+          {
+            field: "steps",
+            before: "1. Open the login page\n   Expected: Form is shown\n2. Submit valid credentials\n   Expected: Dashboard opens",
+            after: "1. Open the login page\n   Expected: Form is shown\n2. Submit valid credentials\n   Expected: An error banner appears"
+          },
+          { field: "testData", before: "user=alice", after: "user=bob" }
+        ]);
+      });
+
+      it("writes the before/after into the Review Board's OWN audit entry at save time (it does not depend on recovery)", async () => {
+        const { w, a, rec } = await withPair();
+        await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Saved title", confirm: true });
+        const audit = await one("SELECT diff FROM audit_logs WHERE entity_id = $1 AND action = 'review_board_edited'", [rec.id]);
+        expect(audit.diff.changes).toEqual([{ field: "title", before: "Login with valid credentials", after: "Saved title" }]);
+        expect(audit.diff).toMatchObject({ editedTestcaseId: a, similarityBefore: rec.similarity, similarityAfter: expect.any(Number) });
+      });
+
+      it("lists only the fields that changed (an untouched field is never shown as changed)", async () => {
+        const { w, a, rec } = await withPair();
+        await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, description: "A new description", confirm: true });
+        const changes = (await list(w, { status: "edited" })).items[0].edit!.changes;
+        expect(changes).toEqual([{ field: "description", before: "", after: "A new description" }]);
+      });
+
+      it("the recorded before/after is a snapshot: later changes to the test case do not rewrite it", async () => {
+        const { w, a, rec } = await withPair();
+        await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "First edit", confirm: true });
+        await pool.query("UPDATE testcases SET title = 'Changed again elsewhere' WHERE id = $1", [a]);
+        const item = (await list(w, { status: "edited" })).items[0];
+        expect(item.edit!.changes).toEqual([{ field: "title", before: "Login with valid credentials", after: "First edit" }]);
+      });
+
+      it("findings that were not edited carry no edit summary", async () => {
+        const { w, rec } = await withPair();
+        await svc.keep(w.owner, w.projectId, rec.id);
+        const all = (await list(w)).items;
+        expect(all).toHaveLength(1);
+        expect(all[0].edit).toBeNull();
+      });
+
+      it("an edited finding STAYS in Edited through the next analysis, even if the test cases changed again — only its match refreshes", async () => {
+        const w = await world();
+        const a = await mkCase(w.projectId);
+        await mkCase(w.projectId, { test_data: "user=bob" });
+        await analyseNow(w);
+        const rec = (await list(w)).items[0];
+        await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, testData: "user=carol", confirm: true });
+        const before = await one("SELECT reviewed_by, reviewed_at FROM review_recommendations WHERE id = $1", [rec.id]);
+        await pool.query("UPDATE testcases SET test_data = 'user=dave', title = 'Login again' WHERE id = $1", [a]); // changed once more, outside the board
+        await analyseNow(w);
+        expect(await statusOf(rec.id)).toBe("edited");
+        expect((await list(w, { status: "pending" })).total).toBe(0);
+        expect((await list(w, { status: "edited" })).items.map((i: Any) => i.id)).toEqual([rec.id]);
+        expect(await one("SELECT reviewed_by, reviewed_at FROM review_recommendations WHERE id = $1", [rec.id])).toEqual(before); // who/when kept
+        expect((await one("SELECT count(*)::int AS n FROM review_recommendations WHERE project_id = $1", [w.projectId])).n).toBe(1);
+      });
+
+      it("recovers the before/after of an edit saved before the Review Board recorded it, from the standard update entry", async () => {
+        const { w, a, rec } = await withPair();
+        await pool.query("UPDATE review_recommendations SET review_status = 'edited', reviewed_by = $2, reviewed_at = now() WHERE id = $1", [rec.id, w.owner]);
+        const audit = (action: string, entityType: string, entityId: string, diff: object) =>
+          pool.query(
+            `INSERT INTO audit_logs (project_id, actor_id, action, entity_type, entity_id, diff, organization_id)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, (SELECT organization_id FROM projects WHERE id = $1))`,
+            [w.projectId, w.owner, action, entityType, entityId, JSON.stringify(diff)]
+          );
+        // what an older save wrote: the standard update entry (full before/after rows), then the review entry WITHOUT changes
+        await audit("testcase_updated", "testcase", a, {
+          before: { title: "Old title", testData: "user=alice", steps: [{ action: "Open", expectedResult: "Shown" }] },
+          after: { title: "New title", testData: "user=alice", steps: [{ action: "Open", expectedResult: "Shown" }] }
+        });
+        await audit("review_board_edited", "review_recommendation", rec.id, { editedTestcaseId: a, fields: ["title"] });
+        const item = (await list(w, { status: "edited" })).items[0];
+        expect(item.edit).toMatchObject({ testcaseId: a, recorded: true, similarityBefore: null, similarityAfter: null });
+        expect(item.edit!.changes).toEqual([{ field: "title", before: "Old title", after: "New title" }]);
+      });
+
+      it("says plainly when nothing was recorded and nothing can be recovered", async () => {
+        const { w, a, rec } = await withPair();
+        await pool.query("UPDATE review_recommendations SET review_status = 'edited', reviewed_by = $2, reviewed_at = now() WHERE id = $1", [rec.id, w.owner]);
+        await pool.query(
+          `INSERT INTO audit_logs (project_id, actor_id, action, entity_type, entity_id, diff, organization_id)
+           VALUES ($1, $2, 'review_board_edited', 'review_recommendation', $3, $4::jsonb, (SELECT organization_id FROM projects WHERE id = $1))`,
+          [w.projectId, w.owner, rec.id, JSON.stringify({ editedTestcaseId: a, fields: ["title"] })]
+        );
+        const item = (await list(w, { status: "edited" })).items[0];
+        expect(item.edit).toMatchObject({ recorded: false, changes: [] });
+      });
+    });
+
+    it("the step agreement shown with the match is live: editing a step lowers 'N of M identical' and the % together", async () => {
+      const w = await world();
+      const a = await mkCase(w.projectId);
+      await mkCase(w.projectId, { test_data: "user=bob" });
+      await analyseNow(w);
+      const rec = (await list(w)).items[0];
+      expect(rec.stepAgreement).toEqual({ identical: 2, total: 2 });
+      const out = await svc.edit(w.owner, w.projectId, rec.id, {
+        testcaseId: a,
+        steps: [LOGIN_STEPS[0], { action: "Submit valid credentials", expectedResult: "An error banner appears" }],
+        confirm: true
+      });
+      const after = (await list(w, { status: "edited" })).items[0];
+      expect(after.stepAgreement).toEqual({ identical: 1, total: 2 });
+      expect(after.similarity).toBe(out.similarity);
+      expect(after.similarity).toBeLessThan(rec.similarity);
+      expect(after.explanation).toMatch(/1 of 2 steps identical/);
+    });
+
     it("after an edit, the finding it came from can no longer be used to delete anything", async () => {
       const { w, a, rec } = await withPair();
       await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: a, title: "Login (edited)", confirm: true });
@@ -812,7 +1035,8 @@ suite("review board (real Postgres)", () => {
       await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: a, confirm: true });
       const res = await list(w);
       expect(res.items).toEqual([]); // a deleted case makes the pair non-actionable
-      expect(res.counts).toEqual({ pending: 0, kept: 0, edited: 0, removed: 0, obsolete: 0 });
+      // ...but the removal itself is counted, because it is listed in History.
+      expect(res.counts).toEqual({ pending: 0, kept: 0, edited: 0, removed: 1, obsolete: 0 });
     });
 
     it("cannot remove twice (409) and cannot remove after Keep (409)", async () => {
@@ -1152,10 +1376,11 @@ suite("review board (real Postgres)", () => {
       expect(sorted(res)).toEqual(["counts", "items", "total"]);
       expect(sorted(res.counts)).toEqual(["edited", "kept", "obsolete", "pending", "removed"]);
       expect(sorted(rec)).toEqual(
-        sorted({ id: 1, classification: 1, similarity: 1, explanation: 1, differences: 1, reviewStatus: 1, stale: 1, staleReason: 1, reviewedBy: 1, reviewedAt: 1, lastAnalysis: 1, testcaseA: 1, testcaseB: 1 })
+        sorted({ id: 1, classification: 1, similarity: 1, explanation: 1, differences: 1, reviewStatus: 1, stale: 1, staleReason: 1, stepAgreement: 1, edit: 1, reviewedBy: 1, reviewedAt: 1, lastAnalysis: 1, testcaseA: 1, testcaseB: 1 })
       );
       expect(sorted(rec.testcaseA)).toEqual(["externalId", "id", "repositoryName", "title"]);
       expect(sorted(rec.lastAnalysis)).toEqual(["finishedAt", "runId", "status"]);
+      expect(rec.stepAgreement).toEqual({ identical: 2, total: 2 }); // an exact duplicate shares every step
       expect(typeof rec.similarity).toBe("number");
       expect(rec.staleReason).toBeNull();
 
@@ -1172,9 +1397,106 @@ suite("review board (real Postgres)", () => {
       const k = await withPair();
       expect(await svc.keep(k.w.owner, k.w.projectId, k.rec.id)).toEqual({ id: k.rec.id, reviewStatus: "kept" });
       const e = await withPair();
-      expect(await svc.edit(e.w.owner, e.w.projectId, e.rec.id, { testcaseId: e.a, title: "t2", confirm: true })).toEqual({ id: e.rec.id, reviewStatus: "edited", editedTestcaseId: e.a });
+      expect(await svc.edit(e.w.owner, e.w.projectId, e.rec.id, { testcaseId: e.a, title: "t2", confirm: true })).toEqual({ id: e.rec.id, reviewStatus: "edited", editedTestcaseId: e.a, classification: expect.stringMatching(/^(exact_duplicate|similar)$/), similarity: expect.any(Number) });
       const r = await withPair();
       expect(await svc.remove(r.w.owner, r.w.projectId, r.rec.id, { testcaseId: r.a, confirm: true })).toEqual({ id: r.rec.id, reviewStatus: "removed", removedTestcaseId: r.a, keptTestcaseId: r.b });
+    });
+  });
+
+  // ------------------------------------------------------------- history
+
+  describe("History: test cases removed through the Review Board (read-only)", () => {
+    const history = (w: World, query: Any = {}, as = w.owner) => svc.listHistory(as, w.projectId, query);
+
+    it("is empty before any removal, and Keep / Edit decisions never appear in it", async () => {
+      const k = await withPair();
+      await svc.keep(k.w.owner, k.w.projectId, k.rec.id);
+      const e = await withPair();
+      await svc.edit(e.w.owner, e.w.projectId, e.rec.id, { testcaseId: e.a, title: "Edited title", confirm: true });
+      expect(await history(k.w)).toEqual({ items: [], total: 0, counts: expect.objectContaining({ removed: 0 }) });
+      expect((await history(e.w)).total).toBe(0);
+    });
+
+    it("lists a removal with who removed it, when, the removed and the kept case, the match and the explanation", async () => {
+      const { w, a, b, rec } = await withPair();
+      await svc.remove(w.manager, w.projectId, rec.id, { testcaseId: b, confirm: true });
+      const h = await history(w);
+      expect(h.total).toBe(1);
+      expect(h.counts.removed).toBe(1);
+      expect((await list(w)).counts.removed).toBe(1); // the same number drives the tab count on the main list
+      const item = h.items[0];
+      expect(item).toMatchObject({ id: rec.id, classification: "exact_duplicate", similarity: 1, removedBy: "U", repositoryName: "Repo One", explanation: rec.explanation });
+      expect(new Date(item.removedAt).getTime()).toBeGreaterThan(Date.now() - 60_000);
+      expect(item.removed).toMatchObject({ id: b, stillDeleted: true, title: "Login with valid credentials" });
+      expect(item.removed.externalId).toEqual(expect.any(String));
+      expect(item.kept).toMatchObject({ id: a, deleted: false });
+    });
+
+    it("records the removed case correctly whichever side of the pair it was (a or b)", async () => {
+      for (const side of ["a", "b"] as const) {
+        const { w, rec } = await withPair();
+        const target = side === "a" ? rec.testcaseA.id : rec.testcaseB.id;
+        const other = side === "a" ? rec.testcaseB.id : rec.testcaseA.id;
+        await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: target, confirm: true });
+        const item = (await history(w)).items[0];
+        expect(item.removed.id).toBe(target);
+        expect(item.kept.id).toBe(other);
+      }
+    });
+
+    it("is newest first and paginated, with an accurate total", async () => {
+      const w = await world();
+      for (const t of ["Alpha flow", "Bravo flow", "Charlie flow"]) {
+        const steps = JSON.stringify([{ action: `Do ${t} thing`, expectedResult: `${t} works` }]);
+        await mkCase(w.projectId, { title: t, steps, preconditions: null, test_data: null });
+        await mkCase(w.projectId, { title: t, steps, preconditions: null, test_data: null });
+      }
+      await analyseNow(w);
+      const pending = (await list(w, { status: "pending" })).items;
+      expect(pending).toHaveLength(3);
+      const removedOrder: string[] = [];
+      for (const rec of pending) {
+        await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: rec.testcaseA.id, confirm: true });
+        removedOrder.push(rec.id);
+        await new Promise((r) => setTimeout(r, 15)); // distinct timestamps
+      }
+      const page1 = await history(w, { limit: "2", offset: "0" });
+      const page2 = await history(w, { limit: "2", offset: "2" });
+      expect(page1.total).toBe(3);
+      expect(page1.counts.removed).toBe(3);
+      expect(page1.items.map((i: Any) => i.id)).toEqual([removedOrder[2], removedOrder[1]]); // most recent first
+      expect(page2.items.map((i: Any) => i.id)).toEqual([removedOrder[0]]);
+      expect((await history(w, { limit: "0" })).items).toHaveLength(3); // junk paging falls back to the default
+    });
+
+    it("reports a removed case that was restored elsewhere, and a kept case that was deleted later", async () => {
+      const { w, a, b, rec } = await withPair();
+      await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: b, confirm: true });
+      await pool.query("UPDATE testcases SET deleted_at = NULL, deleted_by = NULL WHERE id = $1", [b]); // restored by something else
+      await pool.query("UPDATE testcases SET deleted_at = now() WHERE id = $1", [a]); // the kept one was deleted later
+      const item = (await history(w)).items[0];
+      expect(item.removed.stillDeleted).toBe(false);
+      expect(item.kept.deleted).toBe(true);
+    });
+
+    it("is scoped to its own project", async () => {
+      const first = await withPair();
+      const second = await withPair();
+      await svc.remove(first.w.owner, first.w.projectId, first.rec.id, { testcaseId: first.a, confirm: true });
+      await svc.remove(second.w.owner, second.w.projectId, second.rec.id, { testcaseId: second.a, confirm: true });
+      const h = await history(first.w);
+      expect(h.items.map((i: Any) => i.id)).toEqual([first.rec.id]);
+    });
+
+    it("has exactly the documented response shape", async () => {
+      const { w, rec } = await withPair();
+      await svc.remove(w.owner, w.projectId, rec.id, { testcaseId: rec.testcaseA.id, confirm: true });
+      const h = await history(w);
+      expect(Object.keys(h).sort()).toEqual(["counts", "items", "total"]);
+      const item = h.items[0];
+      expect(Object.keys(item).sort()).toEqual(["classification", "explanation", "id", "kept", "removed", "removedAt", "removedBy", "repositoryName", "similarity"]);
+      expect(Object.keys(item.removed).sort()).toEqual(["externalId", "id", "stillDeleted", "title"]);
+      expect(Object.keys(item.kept).sort()).toEqual(["deleted", "externalId", "id", "title"]);
     });
   });
 

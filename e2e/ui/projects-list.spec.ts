@@ -168,7 +168,7 @@ test.describe("projects list — creating a project", () => {
       // Nothing is seeded into a new project's suites — createProject only seeds knowledge-base
       // folders — so a fresh project genuinely has none.
       expect(await cardStat(card, "Suites")).toBe("0");
-      expect(await cardStat(card, "Last run pass rate")).toBe("—");
+      expect(await cardStat(card, "Pass rate · all runs")).toBe("—");
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -601,11 +601,11 @@ test.describe("projects list — what the cards report", () => {
       });
 
       const card = await gotoProjectsAndFind(page, project.name);
-      expect(await cardStat(card, "Last run pass rate")).toBe("90%");
+      expect(await cardStat(card, "Pass rate · all runs")).toBe("90%");
 
       const colour = await card.evaluate((el) => {
         const label = Array.from(el.querySelectorAll("div")).find(
-          (d) => d.textContent?.trim() === "Last run pass rate",
+          (d) => d.textContent?.trim() === "Pass rate · all runs",
         );
         const value = label?.previousElementSibling as HTMLElement | null;
         return value ? getComputedStyle(value).color : "";
@@ -651,7 +651,7 @@ test.describe("projects list — what the cards report", () => {
        * last — `completedRuns` never actually filters on status — so scheduling an empty run drops
        * the same project from 100% to 0% on this screen while the dashboard still says 100%.
        */
-      expect(await cardStat(card, "Last run pass rate")).toBe(`${summary.passRate.value}%`);
+      expect(await cardStat(card, "Pass rate · all runs")).toBe(`${summary.passRate.value}%`);
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -696,7 +696,14 @@ test.describe("projects list — what the cards report", () => {
     }
   });
 
-  test("PRJ-D-08b the card's breakdown follows the newest run with results, not the first", async ({ page }) => {
+  test("PRJ-D-08b the card's breakdown totals every run, not just one", async ({ page }) => {
+    /*
+     * "[Projects Dashboard] Aggregate Execution Status Counts Across All Test Runs". This test used to
+     * pin the opposite — the card following only the newest run with results (cb1643c). The card now
+     * totals every run, the way the project and workspace dashboards count: 3 passed in the first run
+     * plus 1 passed, 1 failed, 1 blocked in the second is 4 / 1 / 1, and 4 of 6 settled = 67%.
+     * Neither run alone produces those numbers, so a card stuck on either one fails here.
+     */
     const project = await createProject(api);
     try {
       await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Passed"], status: "Completed" });
@@ -704,14 +711,18 @@ test.describe("projects list — what the cards report", () => {
 
       // Re-navigated until it settles rather than read once: the overview behind the card caches each
       // project for 10s with no invalidation on write, and another worker listing projects mid-seed
-      // can cache the first run's breakdown. The retry window outlasts that TTL.
+      // can cache a partial total. The retry window outlasts that TTL.
       await expect(async () => {
         const card = await gotoProjectsAndFind(page, project.name);
-        await expect(card).toContainText("1 passed", { timeout: 2_000 });
+        await expect(card).toContainText("4 passed", { timeout: 2_000 });
         await expect(card).toContainText("1 failed", { timeout: 2_000 });
         await expect(card).toContainText("1 blocked", { timeout: 2_000 });
-        expect(await cardStat(card, "Last run pass rate")).toBe("33%");
-      }, "the card is still showing the first run").toPass({ timeout: 25_000 });
+        expect(await cardStat(card, "Pass rate · all runs")).toBe("67%");
+      }, "the card is not totalling both runs").toPass({ timeout: 25_000 });
+
+      // The same numbers the project dashboard reports for this project.
+      const summary = await getDashboard(api, project.id);
+      expect(`${summary.passRate.value}%`).toBe("67%");
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -805,7 +816,7 @@ test.describe("projects list — what the cards report", () => {
       // listTestRuns is caught with .catch(() => []), so the card degrades to "no runs yet".
       const card = projectCard(page, project.name);
       await expect(card).toBeVisible();
-      expect(await cardStat(card, "Last run pass rate")).toBe("—");
+      expect(await cardStat(card, "Pass rate · all runs")).toBe("—");
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -871,7 +882,7 @@ test.describe("projects list — what the cards report", () => {
 
       const card = await gotoProjectsAndFind(page, project.name);
       // Nothing has been executed, so there is no rate to report — "0%" would be a lie.
-      expect(await cardStat(card, "Last run pass rate")).toBe("—");
+      expect(await cardStat(card, "Pass rate · all runs")).toBe("—");
     } finally {
       await deleteProjects(api, [project.id]);
     }
@@ -926,7 +937,7 @@ test.describe("projects list — the grid/list toggle", () => {
     await page.goto("/projects");
     await page.getByRole("button", { name: "List view" }).click();
 
-    for (const column of ["Project", "Test cases", "Suites", "Last run pass rate", "Team", "Updated"]) {
+    for (const column of ["Project", "Test cases", "Suites", "Pass rate · all runs", "Team", "Updated"]) {
       await expect(page.getByText(column, { exact: true }).first()).toBeVisible();
     }
   });
@@ -942,7 +953,7 @@ test.describe("projects list — the grid/list toggle", () => {
       const grid = {
         cases: await cardStat(gridCard, "Test cases"),
         suites: await cardStat(gridCard, "Suites"),
-        passRate: await cardStat(gridCard, "Last run pass rate"),
+        passRate: await cardStat(gridCard, "Pass rate · all runs"),
       };
 
       await page.getByRole("button", { name: "List view" }).click();
@@ -962,7 +973,7 @@ test.describe("projects list — the grid/list toggle", () => {
     try {
       await page.goto("/projects");
       await expect(projectCard(page, project.name)).toBeVisible();
-      expect(await cardStat(projectCard(page, project.name), "Pass rate")).toBe("—");
+      expect(await cardStat(projectCard(page, project.name), "Pass rate · all runs")).toBe("—");
 
       await page.getByRole("button", { name: "List view" }).click();
       await expect(projectCard(page, project.name)).toContainText("No runs yet");

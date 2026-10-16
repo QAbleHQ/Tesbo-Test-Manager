@@ -133,6 +133,38 @@ export function runLabel(name: string, externalId?: string | null): string {
   return id ? `${id} (${name})` : name;
 }
 
+function clipText(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * What a Zyra generation was about, for a notification body: "PROJ-123 – Login Flow" for one ticket
+ * (just the key when its title is unknown), "PROJ-1, PROJ-2 and 2 more" for several, the quoted start
+ * of the user story when no ticket was involved, "" when there is nothing to name.
+ */
+export function zyraSubject(tickets: Array<{ key: string; title?: string | null }>, story?: string | null): string {
+  const seen = new Set<string>();
+  const unique = tickets.filter((t) => {
+    const key = (t.key ?? "").trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (unique.length === 1) {
+    const title = clipText(unique[0].title ?? "", 80);
+    return title ? `${unique[0].key.trim()} – ${title}` : unique[0].key.trim();
+  }
+  if (unique.length > 1) {
+    const shown = unique.slice(0, 2).map((t) => t.key.trim()).join(", ");
+    return unique.length > 2 ? `${shown} and ${unique.length - 2} more` : shown;
+  }
+  const excerpt = clipText(story ?? "", 60);
+  return excerpt ? `"${excerpt}"` : "";
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 export const notificationMessages = {
   workspaceInvitation: (workspaceName: string) => `You've been invited to join ${workspaceName}.`,
   workspaceInvitationAccepted: (userName: string, workspaceName: string) => `${userName} accepted your invitation to ${workspaceName}.`,
@@ -157,8 +189,24 @@ export const notificationMessages = {
   bugStatusChanged: (bugId: string, status: string) => `Bug ${bugId} status changed to ${status}.`,
   bugMentioned: (userName: string, bugId: string) => `${userName} mentioned you on bug ${bugId}.`,
   commentReplied: (userName: string) => `${userName} replied to your comment.`,
-  zyraGenerationReady: () => "Zyra-generated test cases are ready for your review.",
-  zyraGenerationFailed: () => "Zyra could not generate the requested test cases.",
+  zyraGenerationReady: (count: number, subject = ""): { title: string; body: string } => {
+    const about = subject ? ` for ${subject}` : "";
+    // A batch with nothing in it has nothing to review, so it must not say "ready for review".
+    return count > 0
+      ? { title: "Test Cases Ready for Review", body: `Zyra generated ${plural(count, "test case")}${about}. Review and save the test case${count === 1 ? "" : "s"}.` }
+      : { title: "No Test Cases Generated", body: `Zyra did not generate any test cases${about}. Open the task to review it and try again.` };
+  },
+  zyraGenerationFailed: (subject = ""): { title: string; body: string } => ({
+    title: "Test Case Generation Failed",
+    body: `Zyra could not generate test cases${subject ? ` for ${subject}` : ""}. Open the task to see what went wrong and try again.`
+  }),
+  /** The daily archive sweep's notification: Zyra tasks waiting on a human in one project. */
+  zyraTasksAwaitingReview: (count: number, projectName?: string | null): { title: string; body: string } => {
+    const name = clipText(projectName ?? "", 80);
+    // "Acme Project" already says it is a project; anything else gets the word added.
+    const where = name ? ` for the ${/\bproject$/i.test(name) ? name : `${name} project`}` : "";
+    return { title: "Tasks Awaiting Your Review", body: `You have ${plural(count, "task")} awaiting review${where}. Please review and take action.` };
+  },
   zyraTaskFailed: () => "Zyra task failed. Please retry or review the details.",
   zyraReviewCompleted: () => "Review completed for Zyra-generated test cases.",
   zyraCoverageCompleted: () => "Zyra has completed coverage analysis.",

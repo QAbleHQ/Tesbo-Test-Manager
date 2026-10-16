@@ -2668,8 +2668,9 @@ export interface TestRunSchedule {
   updatedAt: string;
 }
 
-export async function listTestRuns(projectId: string): Promise<TestRunListItem[]> {
-  return api(`/api/projects/${projectId}/cycles`);
+// `limit` returns only the newest N runs, counted without reading the older ones' executions.
+export async function listTestRuns(projectId: string, opts: { limit?: number } = {}): Promise<TestRunListItem[]> {
+  return api(`/api/projects/${projectId}/cycles${opts.limit ? `?limit=${opts.limit}` : ""}`);
 }
 
 export async function getTestRun(cycleId: string): Promise<TestRunDetail> {

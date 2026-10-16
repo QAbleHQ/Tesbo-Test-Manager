@@ -44,8 +44,9 @@ export function TrendsTab({ trends, loading }: { trends: ReportsTrends | null; l
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
           <h3 className="mb-3.5 text-[13px] font-semibold text-[var(--foreground)]">Execution velocity</h3>
           <VerticalBarChart
-            data={trends.executionVelocity.map((v) => ({ label: v.name.length > 9 ? `${v.name.slice(0, 8)}…` : v.name, value: v.count }))}
+            data={trends.executionVelocity.map((v) => ({ label: v.name, value: v.count }))}
             color="var(--brand-primary)"
+            fitLabels
           />
         </div>
         <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">

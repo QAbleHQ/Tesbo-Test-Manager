@@ -242,6 +242,153 @@ test.describe("execution report run-name tooltip", () => {
 });
 
 /*
+ * "[Insights] Keep Execution Distribution Visible When Scrolling". The status list renders one row
+ * per run, and the Distribution card sat in the same grid row with its content centred — so 300+
+ * runs stretched the row and left the donut hundreds of pixels down, behind a wall of blank space.
+ * The list now scrolls inside its own card and Distribution keeps its natural height at the top.
+ * Seeds more runs than fit the list's height, so the scrolling is actually exercised.
+ */
+test.describe("execution report distribution stays in view", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  const RUNS = 15;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    test.setTimeout(240_000);
+    api = await screensApi();
+    projectId = (await createProject(api)).id;
+    for (let i = 0; i < RUNS; i++) {
+      await seedRun(api, projectId, { name: `E2E Distribution Run ${i + 1}`, statuses: [i % 2 ? "Passed" : "Failed"], status: "Completed" });
+    }
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(async ({ page }) => {
+    test.skip(skipReason !== null, skipReason ?? "");
+    // Wide enough for the side-by-side (lg) layout the fix applies to.
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/projects/${projectId}/reports`);
+    await page.getByRole("button", { name: /Execution Report/i }).first().click();
+    await expect(page.getByRole("heading", { name: /Execution status by/i })).toBeVisible();
+  });
+
+  test("RPT-U-DIST-1 the list scrolls on its own and Distribution sits at the top beside it, in view", async ({ page }) => {
+    const list = page.getByTestId("execution-status-list");
+    const distribution = page.getByRole("heading", { name: "Distribution", exact: true });
+    const listHeading = page.getByRole("heading", { name: /Execution status by/i });
+
+    // Precondition: more rows than the list shows, otherwise there is nothing to prove.
+    expect(await list.evaluate((el) => el.scrollHeight > el.clientHeight), "the list overflows its own height").toBe(true);
+    expect(await list.evaluate((el) => getComputedStyle(el).overflowY)).toBe("auto");
+
+    // Both cards' headings line up at the top, and Distribution is on screen without scrolling.
+    const [d, l] = [await distribution.boundingBox(), await listHeading.boundingBox()];
+    expect(Math.abs(d!.y - l!.y), "Distribution starts level with the list").toBeLessThan(4);
+    await expect(distribution).toBeInViewport();
+    await expect(page.getByText("Passed (7)")).toBeInViewport();
+
+    // Scrolling the list moves its rows, not the page — Distribution stays exactly where it was.
+    const pageScrollBefore = await page.evaluate(() => document.scrollingElement?.scrollTop ?? 0);
+    await list.evaluate((el) => el.scrollTo(0, el.scrollHeight));
+    await expect(page.getByText(`E2E Distribution Run ${RUNS}`, { exact: true })).toBeVisible();
+    expect(await page.evaluate(() => document.scrollingElement?.scrollTop ?? 0)).toBe(pageScrollBefore);
+    expect((await distribution.boundingBox())!.y).toBeCloseTo(d!.y, 0);
+    // Every run is still in the chart — the fix only changes how it scrolls.
+    for (let i = 1; i <= RUNS; i++) await expect(page.getByText(`E2E Distribution Run ${i}`, { exact: true })).toHaveCount(1);
+  });
+
+  test("RPT-U-DIST-2 on a narrow screen the cards still stack, with the list at full height", async ({ page }) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    const list = page.getByTestId("execution-status-list");
+    // Below lg nothing changed: no inner scrolling, and Distribution comes after the list.
+    expect(await list.evaluate((el) => getComputedStyle(el).overflowY)).toBe("visible");
+    const [d, l] = [await page.getByRole("heading", { name: "Distribution", exact: true }).boundingBox(), await list.boundingBox()];
+    expect(d!.y).toBeGreaterThan(l!.y + l!.height);
+  });
+});
+
+/*
+ * "[Insights] Fix Execution Velocity Chart Label Overlapping". Every run name was cut to a fixed 8
+ * characters + "…" whatever the room, and 12 bars across the chart leave each ~33 of its 400 units —
+ * less than a 9-character label needs — so neighbours ran into each other, and names sharing a prefix
+ * all read the same. Labels are now cut to their own slot, and the full name shows on hover.
+ */
+test.describe("execution velocity labels", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+  const RUNS = 12;
+  const name = (i: number) => `E2E Velocity Run Sharing A Long Prefix ${i}`;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    test.setTimeout(240_000);
+    api = await screensApi();
+    projectId = (await createProject(api)).id;
+    for (let i = 1; i <= RUNS; i++) await seedRun(api, projectId, { name: name(i), statuses: ["Passed"], status: "Completed" });
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(async ({ page }) => {
+    test.skip(skipReason !== null, skipReason ?? "");
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto(`/projects/${projectId}/reports`);
+    await page.getByRole("button", { name: /Trends/i }).first().click();
+    await expect(page.getByRole("heading", { name: "Execution velocity" })).toBeVisible();
+  });
+
+  function chartCard(page: Page, heading: string) {
+    return page.getByRole("heading", { name: heading, exact: true }).locator("xpath=..");
+  }
+
+  test("RPT-U-VEL-1 labels fit their bars without overlapping, one per run", async ({ page }) => {
+    const bars = chartCard(page, "Execution velocity").locator("g[data-bar-index]");
+    await expect(bars).toHaveCount(RUNS);
+    const boxes = await bars.locator("text").evaluateAll((els) => els.map((el) => el.getBoundingClientRect()).map((r) => ({ left: r.left, right: r.right })));
+    boxes.sort((a, b) => a.left - b.left);
+    for (let i = 1; i < boxes.length; i++) {
+      expect(boxes[i - 1].right, `label ${i} overlaps label ${i + 1}`).toBeLessThanOrEqual(boxes[i].left);
+    }
+  });
+
+  test("RPT-U-VEL-2 hovering a bar shows its full run name; leaving hides it", async ({ page }) => {
+    const bars = chartCard(page, "Execution velocity").locator("g[data-bar-index]");
+    const tooltip = page.getByRole("tooltip");
+    await expect(tooltip).toHaveCount(0);
+    // Every label is cut (the names are far longer than a slot), so each one has a full name to show.
+    const labels = await bars.locator("text").allTextContents();
+    expect(labels.every((l) => l.endsWith("…")), `labels: ${labels.join(" | ")}`).toBe(true);
+    await bars.first().hover();
+    await expect(tooltip).toBeVisible();
+    await expect(tooltip).toHaveText(/^E2E Velocity Run Sharing A Long Prefix \d+$/);
+    await page.mouse.move(5, 5);
+    await expect(tooltip).toHaveCount(0);
+  });
+
+  test("RPT-U-VEL-3 the Bug discovery chart is untouched: its week labels, no hover tooltip", async ({ page }) => {
+    const card = chartCard(page, "Bug discovery rate");
+    const labels = await card.locator("svg text").allTextContents();
+    for (const label of labels) expect(label).toMatch(/^\d{2}-\d{2}$/);
+    if (labels.length) {
+      await card.locator("svg g").first().hover();
+      await expect(page.getByRole("tooltip")).toHaveCount(0);
+    }
+  });
+});
+
+/*
  * "[Insights] UI issue in Priority and status labels". On the Traceability table the Priority and
  * Status columns were 70px / 90px in a fixed-layout table, so a "Medium" or "Approved" chip spilled
  * into the next column. A priority outside P0-P3 also rendered with no tone at all.
