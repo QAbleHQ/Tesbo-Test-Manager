@@ -464,7 +464,19 @@ function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
   const edit = rec.edit;
   if (!edit) return null;
   const edited = edit.testcaseId === rec.testcaseA.id ? rec.testcaseA : edit.testcaseId === rec.testcaseB.id ? rec.testcaseB : null;
-  const moved = edit.similarityBefore !== null && edit.similarityAfter !== null;
+  // The match numbers recorded at edit time are only worth showing while they still describe this finding. A later
+  // analysis (or a change to how matches are scored) can move the current match, and then "94% → 94%" beside a
+  // headline of 64% would contradict it, so they are left out unless they agree with the current match.
+  const { similarityBefore: before, similarityAfter: after } = edit;
+  const matchNote =
+    before !== null && after !== null && Math.abs(after - rec.similarity) < 0.0005
+      ? before === after
+        ? `Match unchanged (${Math.round(after * 100)}%)`
+        : `Match ${Math.round(before * 100)}% → ${Math.round(after * 100)}%`
+      : null;
+  // The description (and other details such as status or priority) are not part of the comparison, so editing only
+  // those can never change the match — say so instead of implying the edit should have.
+  const onlyOutsideComparison = edit.changes.length > 0 && edit.changes.every((c) => c.field === "description");
   const cell = "min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere]";
   return (
     <section aria-label="What was edited" className="space-y-3 rounded-lg border border-[var(--border)] p-3.5">
@@ -476,16 +488,16 @@ function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
         </div>
         <p className="text-xs text-[var(--muted)]">
           {edit.editedBy ? (<>by <span className="font-medium text-[var(--foreground)]">{edit.editedBy}</span> </>) : null}on {fmtDate(edit.editedAt) || "—"}
-          {moved && (
-            <span className="ml-3 font-medium text-[var(--foreground)]">
-              Match {Math.round((edit.similarityBefore as number) * 100)}% → {Math.round((edit.similarityAfter as number) * 100)}%
-            </span>
-          )}
+          {matchNote && <span className="ml-3 font-medium text-[var(--foreground)]">{matchNote}</span>}
         </p>
       </header>
 
       {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
       {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
+
+      {onlyOutsideComparison && (
+        <p className="text-xs text-[var(--muted)]">Only the description changed. It is not part of the comparison, so this edit does not change the match.</p>
+      )}
 
       {edit.changes.length > 0 && (
         <div className="space-y-2">
