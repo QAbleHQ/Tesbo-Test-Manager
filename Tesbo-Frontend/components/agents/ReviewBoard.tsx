@@ -14,7 +14,7 @@ import {
   DIFFERENCE_LABEL,
   EDITED_FIELD_LABEL,
   STALE_HINT,
-  tidyExplanation,
+  matchExplanation,
   getReviewAnalysis,
   keepReviewRecommendation,
   listReviewHistory,
@@ -527,18 +527,19 @@ function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
  * "Why they match" as a dropdown like "What is different": the match and step count are visible on the summary line, the
  * full sentence opens on demand.
  */
-function WhyTheyMatch({ label, text }: { label: string; text: string }) {
-  const full = tidyExplanation(text);
-  // First sentence only ("0% match (0 of 1 step identical)"), so the closed line stays short.
-  const preview = full.split(". ")[0].replace(/\.$/, "");
+function WhyTheyMatch({ label, text, similarity }: { label: string; text: string; similarity: number }) {
+  const { notMatching, text: full } = matchExplanation(text, similarity);
+  // First sentence only ("0% match (0 of 1 step identical)"), so the closed line stays short. A pair at 0% is not
+  // matching at all, so it says so instead of offering a "why they match".
+  const preview = notMatching ? "0% match" : full.split(". ")[0].replace(/\.$/, "");
   return (
     <details className="rounded-lg border border-[var(--border)]">
       <summary className="cursor-pointer px-3.5 py-2.5 text-sm font-medium text-[var(--foreground)]">
-        {label}
+        {notMatching ? "They are not matching" : label}
         <span className="ml-2 font-normal text-[var(--muted)]">{preview}</span>
       </summary>
       <div className="border-t border-[var(--border)] px-3.5 py-3">
-        <p className="border-l-2 border-[var(--brand-primary)] pl-3 text-sm leading-relaxed text-[var(--foreground)]">{full}</p>
+        <p className={"pl-3 text-sm leading-relaxed text-[var(--foreground)] border-l-2 " + (notMatching ? "border-[var(--warning-foreground)]" : "border-[var(--brand-primary)]")}>{full}</p>
       </div>
     </details>
   );
@@ -585,7 +586,7 @@ function HistoryRow({ item }: { item: ReviewHistoryItem }) {
         </div>
       </div>
 
-      <WhyTheyMatch label="Why they matched" text={item.explanation} />
+      <WhyTheyMatch label="Why they matched" text={item.explanation} similarity={item.similarity} />
     </article>
   );
 }
@@ -677,7 +678,7 @@ function RecommendationRow({
 
       {rec.reviewStatus === "edited" && rec.edit && <EditedPanel rec={rec} />}
 
-      <WhyTheyMatch label="Why they match" text={rec.explanation} />
+      <WhyTheyMatch label="Why they match" text={rec.explanation} similarity={rec.similarity} />
 
       {rec.differences.length > 0 && (
         <details className="rounded-lg border border-[var(--border)]" open={rec.differences.length <= 2}>

@@ -372,6 +372,22 @@ export function tidyExplanation(text: string): string {
   return text;
 }
 
+/**
+ * What to tell the reader about a finding's match. At 0% the pair is not matching at all, and "Why they match" followed by
+ * "0% match (…)" contradicts itself, so a 0% finding gets a plain "not matching" message instead. This is decided from the
+ * match figure, so it also corrects findings stored with the older wording. Any other match keeps the (tidied) explanation.
+ */
+export function matchExplanation(text: string, similarity: number): { notMatching: boolean; text: string } {
+  const tidy = tidyExplanation(text);
+  if (Math.round(similarity * 100) !== 0) return { notMatching: false, text: tidy };
+  const steps = /\((\d+ of \d+ steps? identical)\)/.exec(tidy)?.[1];
+  const differs = /Differs in: [\s\S]*$/.exec(tidy)?.[0];
+  return {
+    notMatching: true,
+    text: "These two test cases are not matching: they have virtually nothing in common" + (steps ? " (" + steps + ")" : "") + "." + (differs ? " " + differs : ""),
+  };
+}
+
 export function formatPercent(similarity: number): string {
   return `${Math.round(similarity * 100)}%`;
 }
