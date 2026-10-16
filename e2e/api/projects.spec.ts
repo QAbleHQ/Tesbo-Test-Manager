@@ -1224,20 +1224,90 @@ test.describe("projects overview", () => {
     }
   });
 
-  test("PVW-A-08 a newer unexecuted run does not displace the last executed one", { tag: '@tesbo.testId("TES-TC-1194")' }, async () => {
+  test("PVW-A-08 a newer unexecuted run adds untested cases without dragging the pass rate down", { tag: '@tesbo.testId("TES-TC-1194")' }, async () => {
     const project = await createProject(api);
     try {
       await seedRun(api, project.id, { statuses: ["Passed", "Passed"] });
-      // Scheduling an empty run is routine, and ranking by creation date alone let it replace a
-      // finished 100% run with an unstarted one — the card then read 0% or "—" for a project whose
-      // last real run passed everything.
+      // Scheduling an empty run is routine, and it must not turn a project whose real results all
+      // passed into 0% or "—". Now that the card totals every run, the new run's cases are counted
+      // (total 4) but, being Untested, stay out of the pass-rate denominator.
       await seedRun(api, project.id, { statuses: ["Untested", "Untested"] });
 
       const entry = await overviewFor(project.id);
-      expect(entry.currentPassRate, "an unexecuted run displaced the last executed one").toBe(100);
-      expect(entry.runCounts!.total).toBe(2);
+      expect(entry.currentPassRate, "an unexecuted run dragged the pass rate down").toBe(100);
+      expect(entry.runCounts!.passed).toBe(2);
+      expect(entry.runCounts!.total, "the unexecuted run's cases are part of every run's total").toBe(4);
     } finally {
       await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * "[Projects Dashboard] Aggregate Execution Status Counts Across All Test Runs". The card showed
+   * one run's breakdown — the newest with results — beside dashboards that count every run. It now
+   * totals every live execution in every live run, exactly as analytics() does for the project
+   * dashboard, so the two are pinned against each other here rather than against a constant alone.
+   */
+  test("PVW-A-16 the breakdown totals every run, and matches the project dashboard's own counts", async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Failed"], status: "Completed" });
+      await seedRun(api, project.id, { statuses: ["Passed", "Blocked", "Skipped", "Untested"], status: "Completed" });
+      // Retest is folded into "untested" by the shared bucket counts, like everywhere else.
+      await seedRun(api, project.id, { statuses: ["Retest"] });
+
+      const entry = await overviewFor(project.id);
+      // No single run has these numbers — only the sum of all three does.
+      expect(entry.runCounts).toEqual({ passed: 3, failed: 1, blocked: 1, skipped: 1, total: 8 });
+      // Passed / (Passed + Failed + Blocked) over every run: 3 / 5.
+      expect(entry.currentPassRate).toBe(60);
+
+      // The project dashboard's analytics count the same executions the same way.
+      const analytics = await (await api.get(`/api/projects/${project.id}/analytics`)).json();
+      expect(entry.runCounts!.passed).toBe(analytics.executionStatus.Passed);
+      expect(entry.runCounts!.failed).toBe(analytics.executionStatus.Failed);
+      expect(entry.runCounts!.blocked).toBe(analytics.executionStatus.Blocked);
+      expect(entry.runCounts!.skipped).toBe(analytics.executionStatus.Skipped);
+      expect(entry.runCounts!.total).toBe(analytics.executionTotal);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-17 a deleted run and a case removed from a run are left out of the total, with nothing counted twice", async () => {
+    const project = await createProject(api);
+    try {
+      const kept = await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+      const deleted = await seedRun(api, project.id, { statuses: ["Blocked", "Blocked"] });
+      await seedRun(api, project.id, { statuses: ["Passed"] });
+
+      // The Failed case leaves its run; the whole Blocked run goes.
+      const removed = await api.delete(`/api/cycles/${kept.cycleId}/testcases/${kept.testcaseIds[1]}`, { failOnStatusCode: false });
+      expect(removed.ok(), `removing a case from the run — ${await removed.text()}`).toBeTruthy();
+      const gone = await api.delete(`/api/cycles/${deleted.cycleId}`, { failOnStatusCode: false });
+      expect(gone.ok(), `deleting the run — ${await gone.text()}`).toBeTruthy();
+
+      // Read only after every write, so a cached earlier answer cannot stand in for this one.
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).toEqual({ passed: 2, failed: 0, blocked: 0, skipped: 0, total: 2 });
+      expect(entry.currentPassRate).toBe(100);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-18 another project's runs never reach this project's totals", async () => {
+    const mine = await createProject(api);
+    const other = await createProject(api);
+    try {
+      await seedRun(api, mine.id, { statuses: ["Passed"] });
+      await seedRun(api, other.id, { statuses: ["Failed", "Failed", "Blocked"] });
+
+      const list: Overview[] = await (await api.get("/api/projects/overview")).json();
+      expect(list.find((p) => p.id === mine.id)!.runCounts).toEqual({ passed: 1, failed: 0, blocked: 0, skipped: 0, total: 1 });
+      expect(list.find((p) => p.id === other.id)!.runCounts).toEqual({ passed: 0, failed: 2, blocked: 1, skipped: 0, total: 3 });
+    } finally {
+      await deleteProjects(api, [mine.id, other.id]);
     }
   });
 

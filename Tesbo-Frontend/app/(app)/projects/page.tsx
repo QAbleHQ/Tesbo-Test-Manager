@@ -71,8 +71,8 @@ type ProjectWithStats = ProjectSummary & {
   teamMembers: { userId: string; name: string }[];
   lastActivityAt: string | null;
   status: ProjectStatus;
-  runCounts: RunCounts | null; // latest completed run's breakdown, null if no runs
-  currentPassRate: number | null; // latest run's pass %, null if no runs
+  runCounts: RunCounts | null; // every live run's results, totalled; null if none executed
+  currentPassRate: number | null; // pass % across every run, null if no settled results
 };
 
 const VIEW_STORAGE_KEY = "tesbo_projects_view";
@@ -745,7 +745,7 @@ function ProjectsPageContent() {
                             <div className="text-xl font-semibold tracking-tight" style={{ color: passRateTextColor(p.currentPassRate) }}>
                               {p.currentPassRate !== null ? `${p.currentPassRate}%` : "—"}
                             </div>
-                            <div className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Last run pass rate</div>
+                            <div className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Pass rate · all runs</div>
                           </div>
                         </div>
                         {p.runCounts ? <PassRateBar counts={p.runCounts} /> : null}
@@ -772,7 +772,7 @@ function ProjectsPageContent() {
                 <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Status</div>
                 <div className="text-center text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Test cases</div>
                 <div className="text-center text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Total Suites</div>
-                <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Last run pass rate</div>
+                <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Pass rate · all runs</div>
                 <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Team</div>
                 <div className="text-right text-[11px] font-medium uppercase tracking-wide text-[var(--muted-soft)]">Updated</div>
               </div>
