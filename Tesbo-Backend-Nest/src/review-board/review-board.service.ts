@@ -352,6 +352,13 @@ export class ReviewBoardService {
     // Both test cases must still exist: a finding about a deleted case is not actionable.
     const live = `JOIN testcases a ON a.id = r.testcase_a_id AND a.deleted_at IS NULL
                   JOIN testcases b ON b.id = r.testcase_b_id AND b.deleted_at IS NULL`;
+    // The Edited tab is a record of work: the most recently edited finding comes first (reviewed_at is set when the
+    // edit is saved and kept by later analyses). Every other view ranks by how strong the match is. Both clauses are
+    // fixed strings chosen here, never built from input.
+    const onlyEdited = statuses.length === 1 && statuses[0] === "edited";
+    const orderBy = onlyEdited
+      ? "r.reviewed_at DESC NULLS LAST, r.id"
+      : "(r.classification = 'exact_duplicate') DESC, r.similarity DESC, r.id";
     const [rows, total, counts] = await Promise.all([
       this.db.query(
         `SELECT r.*, ${selectSide("a")}, ${selectSide("b")},
@@ -359,7 +366,7 @@ export class ReviewBoardService {
            FROM review_recommendations r ${live}
            LEFT JOIN review_analysis_runs lr ON lr.id = r.last_run_id
           WHERE r.project_id = $1 AND r.review_status = ANY($2::text[])
-          ORDER BY (r.classification = 'exact_duplicate') DESC, r.similarity DESC, r.id
+          ORDER BY ${orderBy}
           LIMIT $3 OFFSET $4`,
         [projectId, statuses, limit, offset]
       ),

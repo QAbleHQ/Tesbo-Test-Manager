@@ -916,6 +916,52 @@ suite("review board (real Postgres)", () => {
         expect(item.edit!.changes).toEqual([{ field: "title", before: "Login with valid credentials", after: "First edit" }]);
       });
 
+      it("the Edited tab lists the most recently edited finding first, and paginates in that order", async () => {
+        const w = await world();
+        for (const t of ["Alpha flow", "Bravo flow", "Charlie flow"]) {
+          const steps = JSON.stringify([{ action: `Do ${t} thing`, expectedResult: `${t} works` }]);
+          await mkCase(w.projectId, { title: t, steps, preconditions: null, test_data: null });
+          await mkCase(w.projectId, { title: t, steps, preconditions: null, test_data: null });
+        }
+        await analyseNow(w);
+        const pending = (await list(w, { status: "pending" })).items;
+        expect(pending).toHaveLength(3);
+        // Edit them in a deliberate order that is NOT the order the pending list ranks them in.
+        const editOrder = [pending[2], pending[0], pending[1]];
+        for (const rec of editOrder) {
+          await svc.edit(w.owner, w.projectId, rec.id, { testcaseId: rec.testcaseA.id, description: `edited ${rec.id}`, confirm: true });
+          await new Promise((r) => setTimeout(r, 20)); // distinct edit times
+        }
+        const expected = [...editOrder].reverse().map((r) => r.id); // newest edit first
+        const edited = await list(w, { status: "edited" });
+        expect(edited.items.map((i: Any) => i.id)).toEqual(expected);
+        const page1 = await list(w, { status: "edited", limit: "2", offset: "0" });
+        const page2 = await list(w, { status: "edited", limit: "2", offset: "2" });
+        expect([...page1.items, ...page2.items].map((i: Any) => i.id)).toEqual(expected);
+      });
+
+      it("a later analysis does not move an edited finding: its place in the list is the time it was edited", async () => {
+        const w = await world();
+        const make = async (title: string) => {
+          const steps = JSON.stringify([{ action: `Do ${title}`, expectedResult: `${title} ok` }]);
+          const a = await mkCase(w.projectId, { title, steps, preconditions: null, test_data: null });
+          await mkCase(w.projectId, { title, steps, preconditions: null, test_data: null });
+          return a;
+        };
+        await make("First pair");
+        await make("Second pair");
+        await analyseNow(w);
+        const [one1, two2] = (await list(w, { status: "pending" })).items;
+        await svc.edit(w.owner, w.projectId, one1.id, { testcaseId: one1.testcaseA.id, description: "x", confirm: true });
+        await new Promise((r) => setTimeout(r, 20));
+        await svc.edit(w.owner, w.projectId, two2.id, { testcaseId: two2.testcaseA.id, description: "y", confirm: true });
+        const before = (await list(w, { status: "edited" })).items.map((i: Any) => i.id);
+        await analyseNow(w);
+        await analyseNow(w);
+        expect((await list(w, { status: "edited" })).items.map((i: Any) => i.id)).toEqual(before);
+        expect(before).toEqual([two2.id, one1.id]);
+      });
+
       it("findings that were not edited carry no edit summary", async () => {
         const { w, rec } = await withPair();
         await svc.keep(w.owner, w.projectId, rec.id);

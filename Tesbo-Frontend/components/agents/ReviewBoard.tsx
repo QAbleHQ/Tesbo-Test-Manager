@@ -622,13 +622,10 @@ function RecommendationRow({
   // An outdated finding must not stay actionable: once either case changed after the analysis, only
   // Compare is available until the analysis is re-run. The API refuses the destructive actions regardless.
   const actionable = rec.reviewStatus === "pending" && !rec.stale && !busy;
-  const whyDisabled = actionable
-    ? undefined
-    : rec.reviewStatus !== "pending"
-      ? "This finding has already been reviewed."
-      : rec.stale
-        ? "This finding is out of date — analyse again first."
-        : "Working…";
+  // Kept and Edited findings are finished: Keep as is, Edit and Remove no longer apply, so they are not shown at all
+  // (only Compare is). On a finding still to review they stay visible and, when out of date, say why they are disabled.
+  const reviewed = rec.reviewStatus !== "pending";
+  const whyDisabled = actionable ? undefined : rec.stale ? "This finding is out of date — analyse again first." : "Working…";
   const exact = rec.classification === "exact_duplicate";
 
   return (
@@ -706,21 +703,25 @@ function RecommendationRow({
         <Button type="button" size="sm" variant="secondary" onClick={onCompare}>
           <span className="inline-flex items-center gap-1.5"><IconEye size={15} stroke={1.9} />Compare</span>
         </Button>
-        <span title={whyDisabled}>
-          <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onKeep}>
-            <span className="inline-flex items-center gap-1.5"><IconCheck size={15} stroke={1.9} />Keep as is</span>
-          </Button>
-        </span>
-        <span title={whyDisabled}>
-          <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onEdit}>
-            <span className="inline-flex items-center gap-1.5"><IconPencil size={15} stroke={1.9} />Edit</span>
-          </Button>
-        </span>
-        <span className="ml-auto" title={whyDisabled}>
-          <Button type="button" size="sm" variant="destructive" disabled={!actionable} onClick={onRemove}>
-            <span className="inline-flex items-center gap-1.5"><IconTrash size={15} stroke={1.9} />Remove from project</span>
-          </Button>
-        </span>
+        {!reviewed && (
+          <>
+            <span title={whyDisabled}>
+              <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onKeep}>
+                <span className="inline-flex items-center gap-1.5"><IconCheck size={15} stroke={1.9} />Keep as is</span>
+              </Button>
+            </span>
+            <span title={whyDisabled}>
+              <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onEdit}>
+                <span className="inline-flex items-center gap-1.5"><IconPencil size={15} stroke={1.9} />Edit</span>
+              </Button>
+            </span>
+            <span className="ml-auto" title={whyDisabled}>
+              <Button type="button" size="sm" variant="destructive" disabled={!actionable} onClick={onRemove}>
+                <span className="inline-flex items-center gap-1.5"><IconTrash size={15} stroke={1.9} />Remove from project</span>
+              </Button>
+            </span>
+          </>
+        )}
         <p className="basis-full text-[11px] text-[var(--muted-soft)]">
           Found by the analysis on {fmtDate(rec.lastAnalysis.finishedAt) || "—"}
           {rec.lastAnalysis.status && rec.lastAnalysis.status !== "completed" ? ` (${rec.lastAnalysis.status})` : ""}.
