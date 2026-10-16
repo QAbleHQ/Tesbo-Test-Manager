@@ -32,7 +32,7 @@ import {
 const PAGE_SIZE = 25;
 const POLL_MS = 2500;
 
-// Open findings only. Removed ones live in the History tab, which has its own list (a removed finding by
+// Open findings only. Removed ones live in the Deleted tab, which has its own list (a removed finding by
 // definition has a deleted test case, so the findings list cannot show it).
 const FILTERS: Array<{ key: ReviewStatus; label: string }> = [
   { key: "pending", label: "To review" },
@@ -332,7 +332,7 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
 
       {analysis !== undefined && analysis !== null && (
         <div role="tablist" aria-label="Filter findings" className="flex flex-wrap gap-1 border-b border-[var(--border)]">
-          {[...FILTERS, { key: "history" as const, label: "History" }].map((f) => (
+          {[...FILTERS, { key: "history" as const, label: "Deleted" }].map((f) => (
             <button
               key={f.key}
               type="button"
@@ -441,7 +441,7 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         recommendation={removeFor}
         onClose={() => setRemoveFor(null)}
         onRemoved={(label) => {
-          setNotice(`${label} was removed from the project. You can see it under the History tab.`);
+          setNotice(`${label} was removed from the project. You can see it under the Deleted tab.`);
           setRemoveFor(null);
           void loadList();
         }}
@@ -525,7 +525,7 @@ function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
   );
 }
 
-/** One removal in the History tab. Read-only: it records what happened, it offers no actions. */
+/** One removal in the Deleted tab. Read-only: it records what happened, it offers no actions. */
 function HistoryRow({ item }: { item: ReviewHistoryItem }) {
   const exact = item.classification === "exact_duplicate";
   const pct = Math.round(item.similarity * 100);
