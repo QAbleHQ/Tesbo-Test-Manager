@@ -66,23 +66,6 @@ export default function BugDetailsBody({
         </div>
       )}
 
-      {/* Evidence */}
-      {bug.betterbugsUrl ? (
-        <div>
-          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">BetterBugs Session</p>
-          <a
-            href={bug.betterbugsUrl}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1.5 text-sm text-[var(--accent-light)] hover:underline break-all"
-          >
-            {bug.betterbugsUrl}
-          </a>
-        </div>
-      ) : bug.attachments.length > 0 ? (
-        <BugAttachments projectId={projectId} attachments={bug.attachments} onDeleted={onAttachmentDeleted} />
-      ) : null}
-
       {/* Severity / Priority / Status — read-only here; Edit Bug is where they change. These
           used to sit unlabelled beside the title, where an untriaged bug's priority rendered as
           a bare "—" that read as a separator rather than a value. */}
@@ -164,6 +147,23 @@ export default function BugDetailsBody({
           Last updated: {formatDateTime(bug.updatedAt)}
         </p>
       )}
+
+      {/* Evidence — last, after the dates, so the fields people scan for come first */}
+      {bug.betterbugsUrl ? (
+        <div>
+          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">BetterBugs Session</p>
+          <a
+            href={bug.betterbugsUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 text-sm text-[var(--accent-light)] hover:underline break-all"
+          >
+            {bug.betterbugsUrl}
+          </a>
+        </div>
+      ) : bug.attachments.length > 0 ? (
+        <BugAttachments projectId={projectId} attachments={bug.attachments} onDeleted={onAttachmentDeleted} />
+      ) : null}
     </>
   );
 }
