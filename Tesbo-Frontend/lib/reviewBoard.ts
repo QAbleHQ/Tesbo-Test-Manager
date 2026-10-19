@@ -19,7 +19,7 @@ export type RunStatus = "queued" | "running" | "completed" | "failed";
  *   unverified — recorded before change tracking existed; cannot be proven current
  */
 export type StaleReason = "content" | "state" | "unverified";
-export type DifferenceField = "title" | "preconditions" | "steps" | "expectedResults" | "testData" | "postconditions";
+export type DifferenceField = "title" | "description" | "preconditions" | "steps" | "expectedResults" | "testData" | "postconditions";
 
 export interface AnalysisRun {
   id: string;
@@ -61,7 +61,7 @@ export const EDITED_FIELD_LABEL: Record<EditedField, string> = {
 /** What a reviewer changed when they edited a test case from a finding, kept at the moment of the edit. */
 export interface ReviewEditSummary {
   /** The test case that was edited (one of the finding's two). */
-  testcaseId: string | null;
+  testcaseId: string;
   editedAt: string;
   editedBy: string | null;
   /** The finding's match before and after the edit (null for edits saved before this was recorded). */
@@ -85,8 +85,8 @@ export interface ReviewRecommendation {
   staleReason: StaleReason | null;
   /** Steps the two test cases share right now (same action and expected result); the match % alone cannot show this. */
   stepAgreement: { identical: number; total: number };
-  /** Set only on edited findings: what was changed, before and after. */
-  edit: ReviewEditSummary | null;
+  /** Edits made to either test case since this finding appeared (from anywhere in the app), each with before and after. */
+  edits: ReviewEditSummary[];
   reviewedBy: string | null;
   reviewedAt: string | null;
   lastAnalysis: { runId: string | null; status: RunStatus | null; finishedAt: string | null };
@@ -193,6 +193,7 @@ export const RUN_ACTIVE: ReadonlySet<RunStatus> = new Set<RunStatus>(["queued", 
 
 export const DIFFERENCE_LABEL: Record<DifferenceField, string> = {
   title: "Title",
+  description: "Description",
   preconditions: "Preconditions",
   steps: "Steps",
   expectedResults: "Expected results",

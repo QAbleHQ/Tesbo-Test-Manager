@@ -1,4 +1,4 @@
-import { analyse, parseSteps, rescorePair, stateFingerprintOf, stepAgreement, toComparable, type TestcaseSource } from "./review-board.analysis";
+import { analyse, descriptionDifference, diffCases, parseSteps, rescorePair, stateFingerprintOf, stepAgreement, toComparable, type TestcaseSource } from "./review-board.analysis";
 import { SIMILAR_THRESHOLD } from "./review-board.constants";
 
 let n = 0;
@@ -381,5 +381,43 @@ describe("explanation text lists only the fields that actually resemble each oth
     const b = toComparable(tc({ steps: [], title: "gamma delta", preconditions: null, test_data: null }));
     const f = rescorePair(a, b);
     expect(f.explanation).toBe("0% match. Differs in: title.");
+  });
+});
+
+describe("description in 'What is different' (shown, never compared)", () => {
+  const withDesc = (description: string | null) => toComparable(tc({ description }));
+
+  it("lists a differing description, trimmed, with each side's text", () => {
+    expect(descriptionDifference(withDesc("  Checks the happy path  "), withDesc("Checks the error path"))).toEqual({
+      field: "description",
+      a: "Checks the happy path",
+      b: "Checks the error path"
+    });
+  });
+
+  it("does not list it when the descriptions only differ in case, spacing or punctuation, or are both empty", () => {
+    expect(descriptionDifference(withDesc("Checks the happy path"), withDesc("  CHECKS   the happy path!! "))).toBeNull();
+    expect(descriptionDifference(withDesc(null), withDesc(""))).toBeNull();
+  });
+
+  it("shows an empty side as empty when only one case has a description", () => {
+    expect(descriptionDifference(withDesc(null), withDesc("Now described"))).toEqual({ field: "description", a: "", b: "Now described" });
+  });
+
+  it("never affects matching: exact duplicates with different descriptions are still exact, at 100%, with equal fingerprints", () => {
+    const a = toComparable(tc({ description: "One wording" }));
+    const b = toComparable(tc({ description: "A completely different description" }));
+    expect(a.fingerprint).toBe(b.fingerprint);
+    const [f] = analyse([a, b]).findings;
+    expect(f).toMatchObject({ classification: "exact_duplicate", similarity: 1 });
+    expect(f.differences).toEqual([]); // the analysis' own list never contains it; the API adds it for display
+    expect(diffCases(a, b)).toEqual([]);
+  });
+
+  it("does not change the score of a similar pair", () => {
+    const same = rescorePair(toComparable(tc({ description: "x" })), toComparable(tc({ test_data: "user=bob", description: "x" })));
+    const differ = rescorePair(toComparable(tc({ description: "x" })), toComparable(tc({ test_data: "user=bob", description: "something else entirely" })));
+    expect(differ.similarity).toBe(same.similarity);
+    expect(differ.explanation).toBe(same.explanation);
   });
 });

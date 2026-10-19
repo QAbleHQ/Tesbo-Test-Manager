@@ -17,7 +17,7 @@ import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
 import { changesBetween, type FieldChange } from "./review-board.edit-diff";
-import { analyse, rescorePair, stepAgreement, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
+import { analyse, descriptionDifference, rescorePair, stepAgreement, TESTCASE_SOURCE_COLUMNS, toComparable, type ComparableCase, type Finding, type TestcaseSource } from "./review-board.analysis";
 import {
   MAX_TESTCASES_PER_RUN,
   REVIEW_BOARD_JOB,
@@ -76,6 +76,16 @@ const STALE_MESSAGE: Record<StaleReason, string> = {
 
 /** A failure whose message is safe, and useful, to show to the reviewer who started the run. */
 class AnalysisError extends Error {}
+
+/** Inserts the description difference (if any) right after the title's, or first when the title does not differ. */
+type DiffRow = { field: string; a: string; b: string };
+
+function withDescription(stored: unknown, description: DiffRow | null): DiffRow[] {
+  const list = Array.isArray(stored) ? (stored as DiffRow[]) : [];
+  if (!description) return list;
+  const titleAt = list.findIndex((d) => d.field === "title");
+  return [...list.slice(0, titleAt + 1), description, ...list.slice(titleAt + 1)];
+}
 
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
@@ -377,17 +387,23 @@ export class ReviewBoardService {
       this.loadCounts(projectId)
     ]);
 
-    const edits = await this.loadEdits(rows.rows.filter((r) => r.review_status === "edited").map((r) => r.id));
+    const edits = await this.loadEdits(rows.rows);
     const items = rows.rows.map((r) => {
       const caseA = toComparable(sourceOf(r, "a"));
       const caseB = toComparable(sourceOf(r, "b"));
       const staleReason = staleReasonOf(r, caseA, caseB);
+      // The match, its explanation and the differences are worked out from the two test cases AS THEY ARE NOW, not
+      // read from what the analysis stored, so an edit made anywhere (the Test cases page, an import…) shows up on the
+      // next load without another analysis. The stored values stay as the analysis' own record and still decide the
+      // order of the list and whether the finding is stale (and so whether it may be acted on).
+      const live = rescorePair(caseA, caseB);
       return {
         id: r.id,
-        classification: r.classification,
-        similarity: Number(r.similarity),
-        explanation: r.explanation,
-        differences: r.differences,
+        classification: live.classification,
+        similarity: live.similarity,
+        explanation: live.explanation,
+        // The description is never compared, so it is added for display (after the title, where a reader expects it).
+        differences: withDescription(live.differences, descriptionDifference(caseA, caseB)),
         reviewStatus: r.review_status,
         // Either test case changed since the analysis that produced this finding (see StaleReason). Actions on a
         // stale finding are refused by the API, not just disabled in the UI.
@@ -396,8 +412,8 @@ export class ReviewBoardService {
         // How many steps the two cases share RIGHT NOW (same action and expected result), so the number next to the
         // match percentage is never out of date, even after an edit.
         stepAgreement: stepAgreement(caseA, caseB),
-        // For an edited finding: which test case was edited and what changed (before / after). Null for everything else.
-        edit: edits.get(r.id) ?? null,
+        // Edits made to either test case since this finding appeared, each with before / after. Empty when nobody edited them.
+        edits: edits.get(r.id) ?? [],
         reviewedBy: r.reviewed_by,
         reviewedAt: r.reviewed_at,
         lastAnalysis: { runId: r.last_run_id, status: r.run_status, finishedAt: r.run_finished_at },
@@ -409,50 +425,81 @@ export class ReviewBoardService {
   }
 
   /**
-   * The before/after of each edited finding, from the audit entry written when the edit was saved. Edits saved before the
-   * Review Board recorded its own before/after are recovered from the standard `testcase_updated` entry of the same save
-   * (same test case, written moments earlier); if neither exists, `recorded` is false and the UI says so.
+   * What was edited on each finding's two test cases since the finding first appeared, with before and after.
+   *
+   * Source: the standard `testcase_updated` audit entry the app writes for every edit, whoever made it and from wherever
+   * (the Review Board, the Test cases page…). A test case edited several times is shown as ONE net change, from how it was
+   * before the first edit to how it is now. For an edit saved from the Review Board, its own recorded entry adds the match
+   * before/after, and stands in if the standard entry is missing; if neither can say what changed, `recorded` is false and
+   * the UI says so. Changes that do not write an audit entry (bulk updates, imports) cannot be listed here.
    */
-  private async loadEdits(recommendationIds: string[]) {
-    const out = new Map<
-      string,
-      { testcaseId: string | null; editedAt: string; editedBy: string | null; similarityBefore: number | null; similarityAfter: number | null; recorded: boolean; changes: FieldChange[] }
-    >();
-    if (recommendationIds.length === 0) return out;
+  private async loadEdits(rows: Row[]) {
+    type EditSummary = {
+      testcaseId: string;
+      editedAt: string;
+      editedBy: string | null;
+      similarityBefore: number | null;
+      similarityAfter: number | null;
+      recorded: boolean;
+      changes: FieldChange[];
+    };
+    const out = new Map<string, EditSummary[]>();
+    if (rows.length === 0) return out;
     const parse = (v: unknown): Row => ((typeof v === "string" ? JSON.parse(v) : v) ?? {}) as Row;
-    const res = await this.db.query(
-      `SELECT DISTINCT ON (a.entity_id) a.entity_id AS rec_id, a.created_at, a.diff, u.name AS actor_name
-         FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
-        WHERE a.action = 'review_board_edited' AND a.entity_id = ANY($1::text[])
-        ORDER BY a.entity_id, a.created_at DESC`,
-      [recommendationIds]
-    );
-    await Promise.all(
-      res.rows.map(async (row) => {
-        const diff = parse(row.diff);
-        let changes: FieldChange[] | null = Array.isArray(diff.changes) ? (diff.changes as FieldChange[]) : null;
-        if (changes === null && typeof diff.editedTestcaseId === "string") {
-          const legacy = await this.db.query(
-            `SELECT diff FROM audit_logs
-              WHERE action = 'testcase_updated' AND entity_id = $1
-                AND created_at <= $2 AND created_at >= $2::timestamptz - interval '2 minutes'
-              ORDER BY created_at DESC LIMIT 1`,
-            [diff.editedTestcaseId, row.created_at]
-          );
-          const before = parse(legacy.rows[0]?.diff);
-          if (before.before && before.after) changes = changesBetween(before.before as Row, before.after as Row);
-        }
-        out.set(row.rec_id, {
-          testcaseId: typeof diff.editedTestcaseId === "string" ? diff.editedTestcaseId : null,
-          editedAt: row.created_at,
-          editedBy: row.actor_name ?? null,
-          similarityBefore: typeof diff.similarityBefore === "number" ? diff.similarityBefore : null,
-          similarityAfter: typeof diff.similarityAfter === "number" ? diff.similarityAfter : null,
-          recorded: changes !== null,
-          changes: changes ?? []
-        });
-      })
-    );
+    const time = (v: unknown) => new Date(v as string).getTime();
+
+    const caseIds = [...new Set(rows.flatMap((r) => [r.testcase_a_id as string, r.testcase_b_id as string]))];
+    const since = new Date(Math.min(...rows.map((r) => time(r.created_at))));
+    const editedIds = rows.filter((r) => r.review_status === "edited").map((r) => r.id as string);
+    const [updates, boardEntries] = await Promise.all([
+      this.db.query(
+        `SELECT a.entity_id, a.created_at, a.diff, u.name AS actor_name
+           FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
+          WHERE a.action = 'testcase_updated' AND a.entity_type = 'testcase'
+            AND a.entity_id = ANY($1::text[]) AND a.created_at >= $2
+          ORDER BY a.created_at ASC`,
+        [caseIds, since]
+      ),
+      this.db.query(
+        `SELECT DISTINCT ON (a.entity_id) a.entity_id AS rec_id, a.created_at, a.diff, u.name AS actor_name
+           FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
+          WHERE a.action = 'review_board_edited' AND a.entity_id = ANY($1::text[])
+          ORDER BY a.entity_id, a.created_at DESC`,
+        [editedIds]
+      )
+    ]);
+    const board = new Map(boardEntries.rows.map((e) => [e.rec_id as string, { diff: parse(e.diff), at: e.created_at as string, by: (e.actor_name as string | null) ?? null }]));
+
+    for (const r of rows) {
+      const list: EditSummary[] = [];
+      const recorded = board.get(r.id);
+      const boardCase = typeof recorded?.diff.editedTestcaseId === "string" ? recorded.diff.editedTestcaseId : null;
+      const numbers = (caseId: string) => ({
+        similarityBefore: caseId === boardCase && typeof recorded?.diff.similarityBefore === "number" ? recorded.diff.similarityBefore : null,
+        similarityAfter: caseId === boardCase && typeof recorded?.diff.similarityAfter === "number" ? recorded.diff.similarityAfter : null
+      });
+
+      for (const caseId of [r.testcase_a_id as string, r.testcase_b_id as string]) {
+        const entries = updates.rows.filter((u) => u.entity_id === caseId && time(u.created_at) >= time(r.created_at));
+        if (entries.length === 0) continue;
+        const first = parse(entries[0].diff);
+        const lastEntry = entries[entries.length - 1];
+        const last = parse(lastEntry.diff);
+        if (!first.before || !last.after) continue;
+        const changes = changesBetween(first.before as Row, last.after as Row);
+        if (changes.length === 0) continue; // edited and put back: nothing to show
+        list.push({ testcaseId: caseId, editedAt: lastEntry.created_at, editedBy: lastEntry.actor_name ?? null, ...numbers(caseId), recorded: true, changes });
+      }
+
+      // A Review Board edit whose standard update entry is missing: fall back to what the board itself recorded.
+      if (recorded && boardCase && !list.some((e) => e.testcaseId === boardCase)) {
+        const snapshot = Array.isArray(recorded.diff.changes) ? (recorded.diff.changes as FieldChange[]) : null;
+        list.push({ testcaseId: boardCase, editedAt: recorded.at, editedBy: recorded.by, ...numbers(boardCase), recorded: snapshot !== null, changes: snapshot ?? [] });
+      }
+
+      list.sort((x, y) => time(y.editedAt) - time(x.editedAt));
+      if (list.length > 0) out.set(r.id as string, list);
+    }
     return out;
   }
 

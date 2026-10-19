@@ -25,6 +25,7 @@ import {
   type AnalysisRun,
   type RecommendationList,
   type ReviewHistory,
+  type ReviewEditSummary,
   type ReviewHistoryItem,
   type ReviewRecommendation,
   type ReviewStatus,
@@ -462,64 +463,96 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
  * the original even if the test case is changed again later.
  */
 function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
-  const edit = rec.edit;
-  if (!edit) return null;
-  const edited = edit.testcaseId === rec.testcaseA.id ? rec.testcaseA : edit.testcaseId === rec.testcaseB.id ? rec.testcaseB : null;
-  // The match numbers recorded at edit time are only worth showing while they still describe this finding. A later
-  // analysis (or a change to how matches are scored) can move the current match, and then "94% → 94%" beside a
-  // headline of 64% would contradict it, so they are left out unless they agree with the current match.
-  const { similarityBefore: before, similarityAfter: after } = edit;
-  const matchNote =
-    before !== null && after !== null && Math.abs(after - rec.similarity) < 0.0005
-      ? before === after
-        ? "Match unchanged (" + Math.round(after * 100) + "%)"
-        : "Match " + Math.round(before * 100) + "% → " + Math.round(after * 100) + "%"
-      : null;
-  // The description (and other details such as status or priority) are not part of the comparison, so editing only
-  // those can never change the match — say so instead of implying the edit should have.
-  const onlyOutsideComparison = edit.changes.length > 0 && edit.changes.every((c) => c.field === "description");
-  const cell = "min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere]";
-  const byLine = (edit.editedBy ? "by " + edit.editedBy + " " : "") + "on " + (fmtDate(edit.editedAt) || "—") + (matchNote ? " · " + matchNote : "");
+  const edits = rec.edits;
+  if (edits.length === 0) return null;
+  const caseOf = (id: string) => (id === rec.testcaseA.id ? rec.testcaseA : id === rec.testcaseB.id ? rec.testcaseB : null);
+  // The match numbers recorded when an edit was saved from the board are only worth showing while they still describe this
+  // finding. The match on screen is always the current one, so a recorded figure that no longer agrees with it is left out
+  // rather than contradicting the headline.
+  const matchNote = (edit: ReviewEditSummary) => {
+    const { similarityBefore: before, similarityAfter: after } = edit;
+    if (before === null || after === null || Math.abs(after - rec.similarity) >= 0.0005) return null;
+    return before === after ? "Match unchanged (" + Math.round(after * 100) + "%)" : "Match " + Math.round(before * 100) + "% → " + Math.round(after * 100) + "%";
+  };
+  const byLine = (edit: ReviewEditSummary) => {
+    const note = matchNote(edit);
+    return (edit.editedBy ? "by " + edit.editedBy + " " : "") + "on " + (fmtDate(edit.editedAt) || "—") + (note ? " · " + note : "");
+  };
+  const keyChip = "rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs font-normal text-[var(--foreground)] ring-1 ring-[var(--border)]";
+  const single = edits.length === 1 ? edits[0] : null;
+  const singleCase = single ? caseOf(single.testcaseId) : null;
   return (
     <details aria-label="What was edited" className="rounded-lg border border-[var(--border)]">
       <summary className="cursor-pointer px-3.5 py-2.5 text-sm font-medium text-[var(--foreground)]">
         What was edited
-        {edited && <span className="ml-2 rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs font-normal text-[var(--foreground)] ring-1 ring-[var(--border)]">{edited.externalId}</span>}
-        <span className="ml-2 font-normal text-[var(--muted)]">{byLine}</span>
+        {single ? (
+          <>
+            {singleCase && <span className={"ml-2 " + keyChip}>{singleCase.externalId}</span>}
+            <span className="ml-2 font-normal text-[var(--muted)]">{byLine(single)}</span>
+          </>
+        ) : (
+          <span className="ml-2 font-normal text-[var(--muted)]">{edits.length} test cases edited</span>
+        )}
       </summary>
 
-      <div className="space-y-3 border-t border-[var(--border)] p-3.5">
-        {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
-        {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
-
-        {onlyOutsideComparison && (
-          <p className="text-xs text-[var(--muted)]">Only the description changed. It is not part of the comparison, so this edit does not change the match.</p>
-        )}
-
-        {edit.changes.length > 0 && (
-          <div className="space-y-2">
-            <div className="hidden gap-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)] md:grid md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
-              <span />
-              <span>Before</span>
-              <span>After</span>
-            </div>
-            {edit.changes.map((c) => (
-              <div key={c.field} className="grid gap-2 md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
-                <div className="pt-1 text-xs font-semibold text-[var(--foreground)]">{EDITED_FIELD_LABEL[c.field]}</div>
-                <div className={cell + " bg-[var(--error-soft)] text-[var(--foreground)]"}>
-                  <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)] md:hidden">Before</span>
-                  {c.before.trim() ? c.before : <span className="text-[var(--muted-soft)]">— (empty)</span>}
-                </div>
-                <div className={cell + " bg-[var(--success-soft)] text-[var(--foreground)]"}>
-                  <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--success-foreground)] md:hidden">After</span>
-                  {c.after.trim() ? c.after : <span className="text-[var(--muted-soft)]">— (empty)</span>}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
+      <div className="space-y-4 border-t border-[var(--border)] p-3.5">
+        {edits.map((edit) => {
+          const edited = caseOf(edit.testcaseId);
+          return (
+            <EditBlock key={edit.testcaseId} edit={edit}>
+              {!single && (
+                <p className="flex flex-wrap items-center gap-2 text-sm">
+                  {edited && <span className={keyChip}>{edited.externalId}</span>}
+                  <span className="text-[var(--muted)]">{byLine(edit)}</span>
+                </p>
+              )}
+            </EditBlock>
+          );
+        })}
       </div>
     </details>
+  );
+}
+
+/** One edited test case: its optional heading (shown when several were edited) and the Before / After of each changed field. */
+function EditBlock({ edit, children }: { edit: ReviewEditSummary; children?: React.ReactNode }) {
+  // The description (and other details such as status or priority) are not part of the comparison, so editing only
+  // those can never change the match — say so instead of implying the edit should have.
+  const onlyOutsideComparison = edit.changes.length > 0 && edit.changes.every((c) => c.field === "description");
+  const cell = "min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere]";
+  return (
+    <div className="space-y-3">
+      {children}
+      {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
+      {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
+
+      {onlyOutsideComparison && (
+        <p className="text-xs text-[var(--muted)]">Only the description changed. It is not part of the comparison, so this edit does not change the match.</p>
+      )}
+
+      {edit.changes.length > 0 && (
+        <div className="space-y-2">
+          <div className="hidden gap-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)] md:grid md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+            <span />
+            <span>Before</span>
+            <span>After</span>
+          </div>
+          {edit.changes.map((c) => (
+            <div key={c.field} className="grid gap-2 md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
+              <div className="pt-1 text-xs font-semibold text-[var(--foreground)]">{EDITED_FIELD_LABEL[c.field]}</div>
+              <div className={cell + " bg-[var(--error-soft)] text-[var(--foreground)]"}>
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)] md:hidden">Before</span>
+                {c.before.trim() ? c.before : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+              </div>
+              <div className={cell + " bg-[var(--success-soft)] text-[var(--foreground)]"}>
+                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--success-foreground)] md:hidden">After</span>
+                {c.after.trim() ? c.after : <span className="text-[var(--muted-soft)]">— (empty)</span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -676,7 +709,7 @@ function RecommendationRow({
         <TestcaseCard label="Test case B" t={rec.testcaseB} />
       </div>
 
-      {rec.reviewStatus === "edited" && rec.edit && <EditedPanel rec={rec} />}
+      {rec.edits.length > 0 && <EditedPanel rec={rec} />}
 
       <WhyTheyMatch label="Why they match" text={rec.explanation} similarity={rec.similarity} />
 
