@@ -3395,6 +3395,22 @@ test.describe("bug attachments in Bug Details", () => {
       .toBe(true);
   }
 
+  test("the Attachments section sits below Reported On, as the last section of Bug Details", async ({ page }) => {
+    const bug = await bugWith("Order", [pngFile("order.png")]);
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+      const attachments = (await body.getByText(/^Attachments/).first().boundingBox())!;
+      for (const label of ["Description", "Severity", "Linked Test Cases & Runs", "Reported By", "Assigned To", "Reported On"]) {
+        const box = await body.getByText(label, { exact: true }).boundingBox();
+        // Description is only rendered when the bug has one; skip a label that isn't on screen.
+        if (box) expect(attachments.y, `Attachments should be below ${label}`).toBeGreaterThan(box.y);
+      }
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("BUG-U-71 images show as thumbnails and other files as filename links, each with Open/View and Delete", async ({ page }) => {
     const bug = await bugWith("Mixed", [
       pngFile("shot-one.png"),

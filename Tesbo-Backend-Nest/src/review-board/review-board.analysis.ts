@@ -50,6 +50,8 @@ export interface ComparableCase {
   id: string;
   externalId: string;
   title: string;
+  /** Shown to reviewers but never compared for matching, scored, or fingerprinted. */
+  description: string;
   preconditions: string;
   postconditions: string;
   testData: string;
@@ -71,7 +73,7 @@ export interface ComparableCase {
 export type Classification = "exact_duplicate" | "similar";
 
 export interface Difference {
-  field: "title" | "preconditions" | "steps" | "expectedResults" | "testData" | "postconditions";
+  field: "title" | "description" | "preconditions" | "steps" | "expectedResults" | "testData" | "postconditions";
   a: string;
   b: string;
 }
@@ -208,6 +210,7 @@ export function toComparable(source: TestcaseSource): ComparableCase {
     id: source.id,
     externalId: source.external_id,
     title: String(source.title ?? ""),
+    description: String(source.description ?? ""),
     preconditions: String(source.preconditions ?? ""),
     postconditions: String(source.postconditions ?? ""),
     testData: String(source.test_data ?? ""),
@@ -236,6 +239,7 @@ type ScoredField = keyof typeof WEIGHTS;
 
 const FIELD_LABEL: Record<Difference["field"], string> = {
   title: "title",
+  description: "description",
   preconditions: "preconditions",
   steps: "steps",
   expectedResults: "expected results",
@@ -272,6 +276,17 @@ function clip(text: string): string {
 
 function numbered(steps: Step[], pick: (s: Step) => string): string {
   return clip(steps.map((s, i) => `${i + 1}. ${pick(s)}`).join("\n"));
+}
+
+/**
+ * The description, as a difference row for the reviewer. It is NOT one of the compared fields: it plays no part in the match,
+ * the classification, exact-duplicate detection or either fingerprint, so two cases can be exact duplicates and still have
+ * different descriptions. It is listed so the reviewer sees every visible difference. Case, spacing and punctuation are not
+ * differences, same as everywhere else.
+ */
+export function descriptionDifference(a: ComparableCase, b: ComparableCase): Difference | null {
+  if (normalizeText(a.description) === normalizeText(b.description)) return null;
+  return { field: "description", a: clip(a.description.trim()), b: clip(b.description.trim()) };
 }
 
 /** Field-by-field differences, judged on the normalised text (case/spacing/punctuation are not differences). */
@@ -358,7 +373,10 @@ function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = S
   const score = blendedScore(wording, agreement);
   if (score < minScore) return null;
 
+  // Only fields that actually resemble each other are worth listing. A wall of "title 0%, steps 0%, …" says nothing
+  // the match figure does not, so fields at 1% or less are left out, and the whole clause goes when none remain.
   const breakdown = (Object.keys(parts) as ScoredField[])
+    .filter((f) => Math.round((parts[f] as number) * 100) > 1)
     .map((f) => `${f === "steps" ? "steps" : FIELD_LABEL[f]} ${pct(parts[f] as number)}`)
     .join(", ");
   let explanation: string;
@@ -367,8 +385,10 @@ function buildFinding(x: ComparableCase, y: ComparableCase, minScore: number = S
     explanation = "Identical title and details, but at least one of the two has no steps, so their behaviour cannot be compared. Not treated as an exact duplicate.";
   } else {
     const differing = differences.map((d) => FIELD_LABEL[d.field]).join(", ");
-    const stepsNote = agreement.total > 0 ? `${agreement.identical} of ${agreement.total} step${agreement.total === 1 ? "" : "s"} identical; ` : "";
-    explanation = `${pct(score)} match (${stepsNote}wording similarity: ${breakdown}). Differs in: ${differing}.`;
+    const clauses: string[] = [];
+    if (agreement.total > 0) clauses.push(`${agreement.identical} of ${agreement.total} step${agreement.total === 1 ? "" : "s"} identical`);
+    if (breakdown) clauses.push(`wording similarity: ${breakdown}`);
+    explanation = `${pct(score)} match${clauses.length ? ` (${clauses.join("; ")})` : ""}. Differs in: ${differing}.`;
   }
   return {
     aId: a.id,
