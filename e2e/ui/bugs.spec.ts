@@ -1,5 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+import { dbControlAvailable, exec, literal } from "../utils/psql";
 import { filesForm, filesFormWith, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 import {
   createBug,
@@ -2220,7 +2221,7 @@ test.describe("bug details panel", () => {
       await expect(body.getByText("Not linked", { exact: true })).toBeVisible();
       // No description was given, so the section is omitted rather than rendered empty.
       await expect(body.getByText("Description", { exact: true })).toHaveCount(0);
-      await expect(body.getByText(/^Last updated:/)).toHaveCount(0);
+      await expect(body.getByText("Last Updated", { exact: true })).toHaveCount(0);
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
@@ -3869,3 +3870,202 @@ async function openComposer(section: Locator): Promise<void> {
   const opener = section.getByTestId("bug-comment-open");
   if (await opener.isVisible()) await opener.click();
 }
+
+/*
+ * Bug due date — "[Bug] Need due date field for Bugs".
+ *
+ * The date travels as a plain "YYYY-MM-DD", so what is asserted here is the persisted API value after
+ * the UI action, plus what Bug Details shows: the formatted day, "Not set" when empty, and an
+ * Overdue marker only while a past-due bug is still open.
+ */
+test.describe("bug due date", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  async function seed(label: string, data: Record<string, unknown> = {}): Promise<{ id: string; title: string }> {
+    const res = await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: `E2E Bug Due UI ${label} ${uniqueSuffix()}`, ...data },
+    });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  async function openDetails(page: Page, bugId: string): Promise<Locator> {
+    await page.goto(`/projects/${projectId}/bugs/${bugId}`);
+    const due = page.getByTestId("bug-due-date");
+    await expect(due).toBeVisible();
+    return due;
+  }
+
+  test("BUG-U-90 the report form's Due date is what gets saved, and left empty it saves none", async ({ page }) => {
+    const withDate = `E2E Due Report ${uniqueSuffix()}`;
+    const withoutDate = `E2E No Due Report ${uniqueSuffix()}`;
+    try {
+      for (const [title, date] of [[withDate, "2031-04-12"], [withoutDate, ""]] as const) {
+        await openReportModal(page, projectId);
+        await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+        if (date) await page.getByLabel("Due date").fill(date);
+        await page.getByRole("button", { name: "Report Bug" }).last().click();
+        await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+      }
+      const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+      expect(bugs.find((b: { title: string }) => b.title === withDate)?.dueDate).toBe("2031-04-12");
+      expect(bugs.find((b: { title: string }) => b.title === withoutDate)?.dueDate).toBeNull();
+    } finally {
+      const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+      for (const b of bugs.filter((x: { title: string }) => [withDate, withoutDate].includes(x.title))) {
+        await api.delete(`/api/bugs/${b.id}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
+  test("BUG-U-91 Edit Bug sets, changes and clears the due date, and Bug Details reflects each", async ({ page }) => {
+    const bug = await seed("Edit");
+    try {
+      await openDetails(page, bug.id).then((due) => expect(due).toHaveText("Not set"));
+
+      // Set.
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      await expect(form.getByLabel("Due date")).toHaveValue("");
+      await form.getByLabel("Due date").fill("2031-06-20");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect.poll(async () => (await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBe("2031-06-20");
+      await expect(await openDetails(page, bug.id)).toContainText("20 Jun 2031");
+
+      // The form reopens with the stored value, and clearing it removes the date.
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const reopened = page.getByRole("region", { name: "Edit bug" }).getByLabel("Due date");
+      await expect(reopened).toHaveValue("2031-06-20");
+      await reopened.fill("");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect.poll(async () => (await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBeNull();
+      await expect(await openDetails(page, bug.id)).toHaveText("Not set");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-92 Overdue shows only for a past-due bug that is still open", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs DB access to back-date a due date");
+    const past = "2001-01-01";
+    const future = "2099-01-01";
+    // The API refuses a due date before the report day, so a bug can only become overdue as time
+    // passes. Back-date the stored column directly to stand in for that; these rows belong to this
+    // suite's own disposable project.
+    const overdueOpen = await seed("Overdue", { dueDate: future });
+    const pastClosed = await seed("PastClosed", { dueDate: future });
+    const upcoming = await seed("Upcoming", { dueDate: future });
+    const none = await seed("None");
+    try {
+      await api.patch(`/api/bugs/${pastClosed.id}`, { data: { status: "Closed" } });
+      exec(`UPDATE bugs SET due_date = ${literal(past)}::date WHERE id IN (${literal(overdueOpen.id)}, ${literal(pastClosed.id)})`);
+
+      await openDetails(page, overdueOpen.id);
+      await expect(page.getByTestId("bug-overdue-badge")).toBeVisible();
+
+      for (const bug of [pastClosed, upcoming, none]) {
+        await openDetails(page, bug.id);
+        await expect(page.getByTestId("bug-overdue-badge"), bug.title).toHaveCount(0);
+      }
+    } finally {
+      for (const bug of [overdueOpen, pastClosed, upcoming, none]) {
+        await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
+  test("BUG-U-94 the report form will not take a due date before today", async ({ page }) => {
+    const title = `E2E Past Due Report ${uniqueSuffix()}`;
+    await openReportModal(page, projectId);
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+
+    const due = page.getByLabel("Due date");
+    const today = await page.evaluate(() => {
+      const d = new Date();
+      const pad = (n: number) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    });
+    // The picker greys out earlier days...
+    await expect(due).toHaveAttribute("min", today);
+
+    // ...and typing one anyway is refused with a reason and cannot be submitted.
+    await due.fill("2001-01-01");
+    await expect(page.getByTestId("due-date-error")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Report Bug" }).last()).toBeDisabled();
+
+    // Today itself is fine.
+    await due.fill(today);
+    await expect(page.getByTestId("due-date-error")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Report Bug" }).last()).toBeEnabled();
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    expect(bugs.some((b: { title: string }) => b.title === title), "nothing was filed by the refused attempt").toBe(false);
+  });
+
+  test("BUG-U-95 Edit Bug will not take a due date before the day the bug was reported", async ({ page }) => {
+    const bug = await seed("EditMin", { dueDate: "2031-06-20" });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      const due = form.getByLabel("Due date");
+      const reportedDay = (await (await api.get(`/api/bugs/${bug.id}`)).json()).createdAt as string;
+      await expect(due).toHaveAttribute("min", /^\d{4}-\d{2}-\d{2}$/);
+      // The reported day is the floor: it is the same calendar day as createdAt in the browser's zone.
+      const expectedMin = await page.evaluate((iso) => {
+        const d = new Date(iso);
+        const pad = (n: number) => String(n).padStart(2, "0");
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      }, reportedDay);
+      await expect(due).toHaveAttribute("min", expectedMin);
+
+      await due.fill("2001-01-01");
+      await expect(form.getByTestId("due-date-error")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate, "nothing was saved").toBe("2031-06-20");
+
+      await due.fill("2031-07-01");
+      await expect(form.getByTestId("due-date-error")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Save Changes" })).toBeEnabled();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-93 a rejected due date is shown on the edit form, and the stored date is unchanged", async ({ page }) => {
+    const bug = await seed("Reject", { dueDate: "2031-02-02" });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      // Simulate the server refusing the save (as it does for a malformed date).
+      await page.route(`**/api/bugs/${bug.id}`, (route) =>
+        route.request().method() === "PATCH"
+          ? route.fulfill({ status: 400, json: { error: "dueDate must be a valid date in YYYY-MM-DD format", field: "dueDate" } })
+          : route.continue(),
+      );
+      const form = page.getByRole("region", { name: "Edit bug" });
+      await form.getByLabel("Due date").fill("2031-03-03");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect(page.getByText(/dueDate must be a valid date|valid date/i)).toBeVisible();
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBe("2031-02-02");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
