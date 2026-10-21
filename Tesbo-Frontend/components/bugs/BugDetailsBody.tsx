@@ -69,7 +69,7 @@ export default function BugDetailsBody({
       {/* Severity / Priority / Status — read-only here; Edit Bug is where they change. These
           used to sit unlabelled beside the title, where an untriaged bug's priority rendered as
           a bare "—" that read as a separator rather than a value. */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-3 gap-x-4 gap-y-5">
         <div>
           <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
             Severity
@@ -96,11 +96,10 @@ export default function BugDetailsBody({
           </p>
           <BugStatusBadge status={bug.status} />
         </div>
-      </div>
 
-      {/* Metadata grid */}
-      <div className="grid grid-cols-2 gap-4">
-        <div className="col-span-2">
+        {/* Same grid as the row above, so Reported By / Assigned To / Reported On line up
+            under Severity / Priority / Status instead of snapping to a 2-column split. */}
+        <div className="col-span-3">
           <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
             Linked Test Cases &amp; Runs
           </p>
