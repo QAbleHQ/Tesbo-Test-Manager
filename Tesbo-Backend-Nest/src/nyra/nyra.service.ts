@@ -3,16 +3,17 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
-  HttpException,
   Injectable,
   Logger,
+  NotFoundException,
   ServiceUnavailableException
 } from "@nestjs/common";
-import { safeFetch } from "../common/safe-fetch";
-import { AppConfigService } from "../config/app-config.service";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService } from "../legacy/legacy.service";
 import { PlanLimitsService } from "../plan-limits/plan-limits.service";
+import { NyraClient, nyraValidationMessage } from "./nyra.client";
+
+export { nyraValidationMessage };
 
 type Row = Record<string, any>;
 
@@ -20,8 +21,7 @@ const NAME_MAX = 120; // NYRA's own limit (projects.name VARCHAR(120)).
 const URL_MAX = 2000;
 const USERNAME_MAX = 255; // NYRA's environments.username is VARCHAR(255) and answers 500, not 422, past it.
 const PASSWORD_MAX = 512;
-const NYRA_TIMEOUT_MS = 15_000;
-const NYRA_MAX_BYTES = 2 * 1024 * 1024;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const bad = (error: string) => new BadRequestException({ error });
 
@@ -67,19 +67,51 @@ export function parseCreateBody(body: Record<string, any> | undefined) {
   };
 }
 
-/**
- * NYRA's 422 body echoes the caller's input, which includes the test-account password. Only the `msg`
- * of each error is kept, never `input`, and a raw body is never logged.
- */
-export function nyraValidationMessage(detail: unknown): string {
-  if (typeof detail === "string" && detail.trim()) return detail.trim().slice(0, 300);
-  if (Array.isArray(detail)) {
-    const msgs = detail
-      .map((d) => (d && typeof d === "object" && typeof d.msg === "string" ? d.msg : ""))
-      .filter(Boolean);
-    if (msgs.length) return msgs.join("; ").slice(0, 300);
+const ENV_NAME_MAX = 60; // NYRA's environments.name is VARCHAR(60) and answers 500, not 422, past it.
+const DOMAIN = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+
+/** An environment edit. Fields left out stay as they are; a blank password keeps the saved one. */
+export function parseEnvironmentUpdate(body: Record<string, any> | undefined) {
+  const out: Record<string, unknown> = {};
+  if (body?.name !== undefined) {
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!name) throw bad("Environment name is required");
+    if (name.length > ENV_NAME_MAX) throw bad(`Environment name must be at most ${ENV_NAME_MAX} characters`);
+    out.name = name;
   }
-  return "NYRA rejected the project details";
+  if (body?.baseUrl !== undefined) out.base_url = httpUrl(body.baseUrl, "App URL");
+  if (body?.mode !== undefined) {
+    if (body.mode !== "observe" && body.mode !== "sandbox") throw bad("Mode must be observe or sandbox");
+    out.mode = body.mode;
+  }
+  if (body?.allowedDomains !== undefined) {
+    const list = Array.isArray(body.allowedDomains) ? body.allowedDomains : null;
+    if (!list || list.length > 50) throw bad("Allowed domains must be a list of at most 50 domains");
+    const domains = list.map((d: unknown) => (typeof d === "string" ? d.trim().toLowerCase() : ""));
+    // A bare suffix such as "com" would let the crawler follow every .com site, so only full hostnames pass.
+    if (domains.some((d: string) => !DOMAIN.test(d))) throw bad("Each allowed domain must be a full hostname such as accounts.example.com");
+    out.allowed_domains = [...new Set(domains)];
+  }
+  const acct = body?.testAccount;
+  if (acct && typeof acct === "object") {
+    const str = (v: unknown) => (typeof v === "string" ? v : "");
+    const username = str(acct.username).trim();
+    const password = str(acct.password);
+    const loginUrl = str(acct.loginUrl).trim();
+    if (acct.loginMethod !== undefined && acct.loginMethod !== "password") throw bad("Only password login is supported");
+    if (!username) throw bad("Username or email is required for the test account");
+    if (username.length > USERNAME_MAX) throw bad(`Username must be at most ${USERNAME_MAX} characters`);
+    if (password.length > PASSWORD_MAX) throw bad(`Password must be at most ${PASSWORD_MAX} characters`);
+    // login_url is always sent: NYRA clears it when a test account arrives without one.
+    out.test_account = {
+      login_url: loginUrl ? httpUrl(loginUrl, "Login page URL") : null,
+      username,
+      login_method: "password",
+      ...(password && { password })
+    };
+  }
+  if (!Object.keys(out).length) throw bad("Nothing to update");
+  return out;
 }
 
 @Injectable()
@@ -88,23 +120,23 @@ export class NyraService {
 
   constructor(
     private readonly db: DatabaseService,
-    private readonly config: AppConfigService,
+    private readonly client: NyraClient,
     private readonly planLimits: PlanLimitsService,
     private readonly legacy: LegacyService
   ) {}
 
   private get configured(): boolean {
-    return !!this.config.nyraApiKey && !!this.config.nyraBaseUrl;
+    return this.client.configured;
   }
 
   /** Project membership, then the EFFECTIVE Pro plan (same order as the Review Board). */
-  private async requireAccess(userId: string | null | undefined, projectId: string): Promise<Row> {
+  async requireAccess(userId: string | null | undefined, projectId: string): Promise<Row> {
     const project = await this.legacy.requireProjectAccess(userId, projectId);
     await this.planLimits.assertNyraEnabled(project.organization_id);
     return project;
   }
 
-  private requireConfigured(): void {
+  requireConfigured(): void {
     if (!this.configured) throw new ServiceUnavailableException({ error: "NYRA is not configured on this server." });
   }
 
@@ -136,7 +168,7 @@ export class NyraService {
       throw new ConflictException({ error: "A NYRA project with this name already exists in this project." });
     }
 
-    const created = await this.nyra("POST", "/projects", {
+    const created = await this.client.json("POST", "/projects", { body: {
       name: input.name,
       environment: {
         base_url: input.appUrl,
@@ -150,7 +182,7 @@ export class NyraService {
           }
         })
       }
-    });
+    } });
     const id = String(created?.id ?? "");
     if (!id) throw new BadGatewayException({ error: "NYRA returned an unexpected response." });
     try {
@@ -167,12 +199,65 @@ export class NyraService {
     return this.dto(created);
   }
 
+  /** Access, Pro, the NYRA project being one this Tesbo project created, and NYRA being configured. */
+  async requireLinked(userId: string | null | undefined, projectId: string, nyraId: string): Promise<Row> {
+    const project = await this.requireAccess(userId, projectId);
+    if (!UUID.test(nyraId)) throw new NotFoundException({ error: "NYRA project not found" });
+    const link = await this.db.query(`SELECT 1 FROM nyra_projects WHERE project_id = $1 AND nyra_project_id = $2`, [projectId, nyraId]);
+    // Same answer for "does not exist" and "belongs to another Tesbo project", so ids cannot be probed.
+    if (!link.rows.length) throw new NotFoundException({ error: "NYRA project not found" });
+    this.requireConfigured();
+    return project;
+  }
+
+  /** One NYRA project with its environments, which the scan form needs. */
+  async detail(userId: string | null | undefined, projectId: string, nyraId: string) {
+    await this.requireLinked(userId, projectId, nyraId);
+    const p = await this.client.json("GET", `/projects/${nyraId}`);
+    if (!p?.id) throw new BadGatewayException({ error: "NYRA returned an unexpected response." });
+    return {
+      ...this.dto(p),
+      environments: (Array.isArray(p.environments) ? p.environments : []).map((e: Row) => ({
+        id: String(e.id),
+        name: String(e.name ?? ""),
+        baseUrl: e.base_url ?? null,
+        mode: e.mode ?? "observe",
+        allowedDomains: Array.isArray(e.allowed_domains) ? e.allowed_domains : [],
+        loginUrl: e.login_url ?? null,
+        username: e.username ?? null,
+        loginMethod: e.login_method ?? null,
+        hasPassword: !!e.has_password
+      }))
+    };
+  }
+
+  /** Edit an environment of a NYRA project this Tesbo project created. Owners and managers only. */
+  async updateEnvironment(userId: string | null | undefined, projectId: string, nyraId: string, envId: string, body: Row) {
+    const project = await this.requireLinked(userId, projectId, nyraId);
+    if (this.legacy.normalizeRole(project.caller_role) === "qa_engineer") {
+      throw new ForbiddenException({ error: "Only project owners and managers can change NYRA settings." });
+    }
+    if (!UUID.test(envId)) throw new NotFoundException({ error: "Environment not found" });
+    const patch = parseEnvironmentUpdate(body);
+    const account = patch.test_account as { password?: string } | undefined;
+    if (account && !account.password) {
+      // A blank password keeps the saved one, which only exists if one was saved. Without it NYRA stores
+      // a username with no password and the scan silently skips login.
+      const current = await this.client.json("GET", `/projects/${nyraId}`);
+      const env = (Array.isArray(current?.environments) ? current.environments : []).find((e: Row) => String(e.id) === envId);
+      if (!env) throw new NotFoundException({ error: "Environment not found" });
+      if (!env.has_password) throw bad("Password is required for the test account");
+    }
+    await this.client.json("PATCH", `/projects/${nyraId}/environments/${envId}`, { body: patch });
+    return this.detail(userId, projectId, nyraId);
+  }
+
   /** NYRA projects this Tesbo project created, oldest first. A NYRA project missing upstream is simply not shown. */
   private async projectsOf(projectId: string) {
     const links = await this.db.query<{ nyra_project_id: string }>(`SELECT nyra_project_id FROM nyra_projects WHERE project_id = $1`, [projectId]);
     if (!links.rows.length) return [];
     const mine = new Set(links.rows.map((r) => r.nyra_project_id));
-    const all = await this.nyra("GET", "/projects");
+    const all = await this.client.json("GET", "/projects");
     if (!Array.isArray(all)) throw new BadGatewayException({ error: "NYRA returned an unexpected response." });
     return all.filter((p: Row) => mine.has(String(p?.id))).map((p: Row) => this.dto(p));
   }
@@ -189,33 +274,5 @@ export class NyraService {
       loginMethod: env.login_method ?? null,
       createdAt: p.created_at ?? null
     };
-  }
-
-  private async nyra(method: "GET" | "POST", path: string, body?: unknown): Promise<any> {
-    let res: Response;
-    try {
-      res = await safeFetch(
-        `${this.config.nyraBaseUrl}/api/v1${path}`,
-        {
-          method,
-          headers: { Authorization: `Bearer ${this.config.nyraApiKey}`, Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
-          ...(body ? { body: JSON.stringify(body) } : {})
-        },
-        { timeoutMs: NYRA_TIMEOUT_MS, maxBytes: NYRA_MAX_BYTES }
-      );
-    } catch (err) {
-      this.logger.warn(`NYRA ${method} ${path} failed: ${(err as Error).message}`);
-      throw new BadGatewayException({ error: "NYRA is unreachable. Try again later." });
-    }
-    const payload: any = await res.json().catch(() => null);
-    if (res.ok) return payload;
-    // Never forward NYRA's body as is: a 422 echoes the submitted password.
-    this.logger.warn(`NYRA ${method} ${path} answered ${res.status}`);
-    if (res.status === 422) throw bad(nyraValidationMessage(payload?.detail));
-    if (res.status === 401 || res.status === 403) {
-      throw new BadGatewayException({ error: "NYRA rejected this server's API key. Ask an administrator to check NYRA_API_KEY." });
-    }
-    if (res.status === 429) throw new HttpException({ error: "NYRA is rate limiting requests. Try again in a minute." }, 429);
-    throw new BadGatewayException({ error: "NYRA is unavailable. Try again later." });
   }
 }

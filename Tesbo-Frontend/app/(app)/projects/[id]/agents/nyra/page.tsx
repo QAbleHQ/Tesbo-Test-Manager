@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useParams } from "@/lib/routeParams";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
@@ -161,15 +162,20 @@ export default function NyraPage() {
       {projects && projects.length > 0 && (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => (
-            <Card key={p.id} className="p-5" data-testid="nyra-project">
-              <div className="flex items-start justify-between gap-3">
-                <h3 className="min-w-0 break-words text-[15px] font-semibold text-[var(--foreground)]">{p.name}</h3>
-                <StatusChip tone={p.hasTestAccount ? "success" : "neutral"}>{p.hasTestAccount ? "Test account" : "No test account"}</StatusChip>
-              </div>
-              <p className="mt-1 break-all text-[13px] text-[var(--muted)]">{p.appUrl}</p>
-              {p.username && <p className="mt-1 text-[12px] text-[var(--muted-soft)]">Signs in as {p.username}</p>}
-              {p.createdAt && <p className="mt-3 text-[11px] text-[var(--muted-soft)]">Created {formatDate(new Date(p.createdAt))}</p>}
-            </Card>
+            <Link key={p.id} href={`/projects/${projectId}/agents/nyra/${p.id}`} className="block rounded-[10px] transition hover:shadow-[var(--shadow-card)]">
+              <Card className="h-full p-5 transition hover:border-[var(--brand-primary)]" data-testid="nyra-project">
+                <div className="flex items-start justify-between gap-3">
+                  <h3 className="min-w-0 break-words text-[15px] font-semibold text-[var(--foreground)]">{p.name}</h3>
+                  <StatusChip tone={p.hasTestAccount ? "success" : "neutral"}>{p.hasTestAccount ? "Test account" : "No test account"}</StatusChip>
+                </div>
+                <p className="mt-1 break-all text-[13px] text-[var(--muted)]">{p.appUrl}</p>
+                {p.username && <p className="mt-1 text-[12px] text-[var(--muted-soft)]">Signs in as {p.username}</p>}
+                <div className="mt-3 flex items-center justify-between text-[11px] text-[var(--muted-soft)]">
+                  <span>{p.createdAt ? `Created ${formatDate(new Date(p.createdAt))}` : ""}</span>
+                  <span className="font-medium text-[var(--accent-light)]">Open</span>
+                </div>
+              </Card>
+            </Link>
           ))}
         </div>
       )}

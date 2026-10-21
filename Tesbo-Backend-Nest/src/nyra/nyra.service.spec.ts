@@ -40,3 +40,45 @@ describe("nyraValidationMessage", () => {
     expect(nyraValidationMessage(undefined)).toBe("NYRA rejected the project details");
   });
 });
+
+describe("parseEnvironmentUpdate", () => {
+  const { parseEnvironmentUpdate } = require("./nyra.service");
+  it("maps the fields NYRA expects and drops unknown ones", () => {
+    expect(parseEnvironmentUpdate({ baseUrl: "https://a.example.com", mode: "sandbox", allowedDomains: ["Accounts.Example.com", "accounts.example.com"], junk: 1 })).toEqual({
+      base_url: "https://a.example.com",
+      mode: "sandbox",
+      allowed_domains: ["accounts.example.com"]
+    });
+  });
+  it("always sends login_url and keeps the saved password when none is typed", () => {
+    expect(parseEnvironmentUpdate({ testAccount: { username: "qa@x.com", password: "" } }).test_account).toEqual({ login_url: null, username: "qa@x.com", login_method: "password" });
+    expect(parseEnvironmentUpdate({ testAccount: { username: "qa@x.com", password: "pw", loginUrl: "https://x.com/login" } }).test_account).toEqual({
+      login_url: "https://x.com/login",
+      username: "qa@x.com",
+      login_method: "password",
+      password: "pw"
+    });
+  });
+  it.each([
+    [{}],
+    [{ name: " " }],
+    [{ name: "n".repeat(61) }],
+    [{ mode: "yolo" }],
+    [{ baseUrl: "ftp://x" }],
+    [{ allowedDomains: ["com"] }],
+    [{ allowedDomains: "x.com" }],
+    [{ allowedDomains: Array.from({ length: 51 }, (_, i) => `d${i}.example.com`) }],
+    [{ testAccount: { username: "" } }],
+    [{ testAccount: { username: "u", loginMethod: "otp" } }]
+  ])("rejects %j", (body) => {
+    expect(() => parseEnvironmentUpdate(body)).toThrow();
+  });
+});
+
+describe("neutralizeCsv", () => {
+  const { neutralizeCsv } = require("./nyra-runs.service");
+  it("quotes formula cells, keeps multiline cells and doubled quotes intact", () => {
+    const csv = '"Title","Steps"\r\n"=HYPERLINK(""http://x"")","1. Open\n2. Click"\r\n"-5","+cmd|x"';
+    expect(neutralizeCsv(csv)).toBe('"Title","Steps"\r\n"\'=HYPERLINK(""http://x"")","1. Open\n2. Click"\r\n"-5","\'+cmd|x"');
+  });
+});

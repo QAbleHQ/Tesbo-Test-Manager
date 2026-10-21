@@ -1,9 +1,10 @@
-import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { expect, request, test, type APIRequestContext } from "@playwright/test";
 import { resetToLaunch, setGraceWindow, setProPlan } from "../utils/billing-db";
 import { env } from "../utils/env";
 import {
+  FAKE_RECORDING,
   NYRA_FAKE_SKIP_REASON,
   nyraFakeIsWired,
   startFakeNyraServer,
@@ -210,6 +211,8 @@ test.describe("NYRA agent", () => {
     let fake: FakeNyraServer | null = null;
 
     test.beforeAll(async () => {
+      // May wait for the other NYRA spec file to release the fake (see startFakeNyraServer).
+      test.setTimeout(11 * 60_000);
       if (nyraFakeIsWired()) fake = await startFakeNyraServer();
     });
 
@@ -334,6 +337,464 @@ test.describe("NYRA agent", () => {
       const res = await asOwner.get(`${base()}/projects`, { failOnStatusCode: false });
       expect(res.status()).toBe(502);
       expect((await res.json()).error).toContain("unreachable");
+    });
+  });
+
+  // ─── Scan routes: refusals and validation (no NYRA needed, but NYRA must be configured) ───
+
+  test.describe("scan routes without reaching NYRA", () => {
+    let configured = false;
+    let linked: string;
+
+    test.beforeAll(async () => {
+      if (!tenant) return;
+      configured = (await (await asOwner.get(base())).json()).configured === true;
+    });
+
+    test.beforeEach(async () => {
+      test.skip(!configured, "needs NYRA_API_KEY and NYRA_BASE_URL set on the stack so the routes get past the configured check.");
+      // A link row alone is enough: every request below is refused before NYRA is called.
+      linked = randomUUID();
+      exec(`DELETE FROM nyra_projects WHERE project_id IN (${literal(tenant!.mainProjectId)}, ${literal(tenant!.secondProjectId)});`);
+      exec(`INSERT INTO nyra_projects (project_id, nyra_project_id) VALUES (${literal(tenant!.mainProjectId)}, ${literal(linked)});`);
+    });
+
+    const at = (nyraId: string, rest = "", projectId?: string) => `${base(projectId)}/projects/${nyraId}${rest}`;
+    const RUN = randomUUID();
+
+    test("a NYRA project this Tesbo project did not create is a 404 on every route", async () => {
+      const stranger = randomUUID();
+      const routes: Array<[string, string]> = [
+        ["GET", ""],
+        ["GET", "/runs"],
+        ["POST", "/runs"],
+        ["GET", `/runs/${RUN}`],
+        ["POST", `/runs/${RUN}/stop`],
+        ["GET", `/runs/${RUN}/items`],
+        ["GET", `/runs/${RUN}/recordings`],
+        ["GET", `/runs/${RUN}/live.jpg`],
+        ["GET", `/runs/${RUN}/files/screens/screen-001.jpg`],
+        ["GET", `/runs/${RUN}/export/test-cases.csv`],
+        ["GET", `/runs/${RUN}/events`],
+        ["PATCH", `/environments/${randomUUID()}`],
+      ];
+      for (const [method, rest] of routes) {
+        const res = await asOwner.fetch(at(stranger, rest), { method, data: method === "GET" ? undefined : {}, failOnStatusCode: false });
+        expect(res.status(), `${method} ${rest}`).toBe(404);
+      }
+    });
+
+    test("a NYRA project linked to one Tesbo project cannot be opened through another", async () => {
+      // `linked` belongs to the main project; the second project (same owner, same workspace) must not see it.
+      for (const rest of ["", "/runs", `/runs/${RUN}/items`]) {
+        const res = await asOwner.get(at(linked, rest, tenant!.secondProjectId), { failOnStatusCode: false });
+        expect(res.status(), rest).toBe(404);
+      }
+    });
+
+    test("malformed ids are 404, not 500", async () => {
+      for (const rest of ["", "/runs", "/runs/not-a-uuid", "/runs/not-a-uuid/items", "/runs/not-a-uuid/events"]) {
+        const res = await asOwner.get(at("not-a-uuid", rest), { failOnStatusCode: false });
+        expect(res.status(), `bad project id ${rest}`).toBe(404);
+      }
+      for (const rest of ["/runs/not-a-uuid", "/runs/not-a-uuid/items", "/runs/%20/recordings"]) {
+        const res = await asOwner.get(at(linked, rest), { failOnStatusCode: false });
+        expect(res.status(), `bad run id ${rest}`).toBe(404);
+      }
+    });
+
+    test("a non-member, an anonymous caller and another workspace are refused", async () => {
+      for (const [label, api] of [
+        ["guest", asGuest],
+        ["anonymous", anon],
+        ["other workspace", asOtherTenant],
+      ] as const) {
+        for (const rest of ["", "/runs", `/runs/${RUN}/items`, `/runs/${RUN}/export/knowledge.md`]) {
+          const res = await api.get(at(linked, rest), { failOnStatusCode: false });
+          expect(REFUSED, `${label} ${rest}`).toContain(res.status());
+        }
+      }
+    });
+
+    test("on the Launch plan the scan routes are Pro-only", async () => {
+      resetToLaunch(tenant!.organizationId);
+      try {
+        for (const rest of ["", "/runs", `/runs/${RUN}/items`]) {
+          const res = await asOwner.get(at(linked, rest), { failOnStatusCode: false });
+          expect(res.status(), rest).toBe(403);
+          expect((await res.json()).error).toContain("Pro");
+        }
+      } finally {
+        setProPlan(tenant!.organizationId);
+      }
+    });
+
+    test.describe("start-scan validation", () => {
+      const env = randomUUID();
+      const cases: Array<[string, Record<string, unknown>, string]> = [
+        ["no environment", {}, "Choose an environment"],
+        ["an environment id that is not a uuid", { environmentId: "staging" }, "Choose an environment"],
+        ["zero pages", { environmentId: env, budget: { maxPages: 0 } }, "Max pages"],
+        ["too many pages", { environmentId: env, budget: { maxPages: 501 } }, "Max pages"],
+        ["fractional pages", { environmentId: env, budget: { maxPages: 1.5 } }, "Max pages"],
+        ["pages as text", { environmentId: env, budget: { maxPages: "10" } }, "Max pages"],
+        ["too many minutes", { environmentId: env, budget: { maxMinutes: 121 } }, "Max minutes"],
+        ["zero minutes", { environmentId: env, budget: { maxMinutes: 0 } }, "Max minutes"],
+        ["too deep", { environmentId: env, budget: { maxDepth: 21 } }, "Max depth"],
+        ["negative depth", { environmentId: env, budget: { maxDepth: -1 } }, "Max depth"],
+      ];
+      for (const [label, body, message] of cases) {
+        test(`rejects ${label}`, async () => {
+          const res = await asOwner.post(at(linked, "/runs"), { data: body, failOnStatusCode: false });
+          expect(res.status()).toBe(400);
+          expect((await res.json()).error).toContain(message);
+        });
+      }
+    });
+
+    test("files and exports refuse names and kinds that are not NYRA's", async () => {
+      for (const rest of [
+        `/runs/${RUN}/files/other/x.jpg`,
+        `/runs/${RUN}/files/screens/..%2Fsecret`,
+        `/runs/${RUN}/files/screens/${"a".repeat(129)}`,
+        `/runs/${RUN}/files/screens/has space.jpg`,
+        `/runs/${RUN}/export/secrets.txt`,
+      ]) {
+        const res = await asOwner.get(at(linked, rest), { failOnStatusCode: false });
+        expect(res.status(), rest).toBe(404);
+      }
+    });
+
+    test.describe("environment settings validation", () => {
+      const patch = (api: APIRequestContext, data: unknown) => api.patch(at(linked, `/environments/${randomUUID()}`), { data: data as object, failOnStatusCode: false });
+
+      test("a QA engineer cannot change settings", async () => {
+        const res = await patch(asQa, { mode: "sandbox" });
+        expect(res.status()).toBe(403);
+        expect((await res.json()).error).toContain("owners and managers");
+      });
+
+      const cases: Array<[string, Record<string, unknown>, string]> = [
+        ["nothing to update", {}, "Nothing to update"],
+        ["a blank name", { name: "  " }, "Environment name is required"],
+        ["a 61-character name", { name: "n".repeat(61) }, "at most 60"],
+        ["an unknown mode", { mode: "yolo" }, "Mode must be"],
+        ["a non-http app URL", { baseUrl: "ftp://x" }, "http://"],
+        ["a bare suffix as an allowed domain", { allowedDomains: ["com"] }, "full hostname"],
+        ["allowed domains that is not a list", { allowedDomains: "a.example.com" }, "list"],
+        ["more than 50 allowed domains", { allowedDomains: Array.from({ length: 51 }, (_, i) => `d${i}.example.com`) }, "at most 50"],
+        ["a test account with no username", { testAccount: { password: "pw" } }, "Username or email is required"],
+        ["an OTP login method", { testAccount: { username: "qa@example.com", loginMethod: "otp" } }, "Only password login"],
+      ];
+      for (const [label, body, message] of cases) {
+        test(`a manager's edit with ${label} is a 400`, async () => {
+          const res = await patch(asManager, body);
+          expect(res.status()).toBe(400);
+          expect((await res.json()).error).toContain(message);
+        });
+      }
+    });
+  });
+
+  // ─── Scans, results, files, exports, live stream and settings, against the fake NYRA ───
+
+  test.describe("scans against the fake NYRA", () => {
+    let fake: FakeNyraServer | null = null;
+    let nyraId = "";
+    let envId = "";
+
+    test.beforeAll(async () => {
+      // May wait for the other NYRA spec file to release the fake (see startFakeNyraServer).
+      test.setTimeout(11 * 60_000);
+      if (nyraFakeIsWired()) fake = await startFakeNyraServer();
+    });
+
+    test.afterAll(async () => {
+      await fake?.close().catch(() => undefined);
+    });
+
+    test.beforeEach(async () => {
+      test.skip(!nyraFakeIsWired(), NYRA_FAKE_SKIP_REASON);
+      // The outage test closes the fake; bring it back for the tests after it.
+      if (!fake) fake = await startFakeNyraServer();
+      fake.reset();
+      purge(tenant!);
+      const created = await (await create(asOwner, { ...valid("Scans"), testAccount: { username: "qa@example.com", password: "S3cret-pw!", loginMethod: "password" } })).json();
+      nyraId = created.id;
+      envId = fake!.projects[0].environments[0].id;
+    });
+
+    const at = (rest = "", id?: string) => `${base()}/projects/${id ?? nyraId}${rest}`;
+    const start = (body: Record<string, unknown> = {}, api: APIRequestContext = asOwner) =>
+      api.post(at("/runs"), { data: { environmentId: envId, ...body }, failOnStatusCode: false });
+    const begin = async (body: Record<string, unknown> = {}) => {
+      const res = await start(body);
+      expect(res.status(), await res.text()).toBe(201);
+      return res.json();
+    };
+
+    test("the project detail lists its environments and never a password", async () => {
+      const res = await asOwner.get(at());
+      expect(res.status()).toBe(200);
+      const detail = await res.json();
+      expect(detail.environments).toHaveLength(1);
+      expect(detail.environments[0]).toMatchObject({ id: envId, mode: "observe", username: "qa@example.com", hasPassword: true, loginMethod: "password" });
+      expect(JSON.stringify(detail)).not.toContain("S3cret-pw!");
+    });
+
+    test("starts a scan with NYRA's defaults, then with a custom budget sent in NYRA's own field names", async () => {
+      const first = await begin();
+      expect(first).toMatchObject({ status: "running", environmentId: envId, budget: { maxPages: 25, maxMinutes: 10, maxDepth: 4 } });
+      expect(fake!.calls.find((c) => c.method === "POST" && c.path.endsWith("/runs"))!.body).toEqual({ environment_id: envId });
+
+      fake!.finishRun(first.id);
+      const second = await begin({ budget: { maxPages: 3, maxMinutes: 2, maxDepth: 1 } });
+      expect(second.budget).toEqual({ maxPages: 3, maxMinutes: 2, maxDepth: 1 });
+      expect(fake!.calls.filter((c) => c.method === "POST" && c.path.endsWith("/runs")).pop()!.body.budget).toEqual({ max_pages: 3, max_minutes: 2, max_depth: 1 });
+    });
+
+    test("accepts the budget limits themselves", async () => {
+      const run = await begin({ budget: { maxPages: 500, maxMinutes: 120, maxDepth: 20 } });
+      expect(run.budget).toEqual({ maxPages: 500, maxMinutes: 120, maxDepth: 20 });
+    });
+
+    test("a second scan on the same environment is a 409 and starts nothing", async () => {
+      await begin();
+      const again = await start();
+      expect(again.status()).toBe(409);
+      expect((await again.json()).error).toContain("already running");
+      expect(fake!.runs).toHaveLength(1);
+    });
+
+    test("an environment NYRA does not know is a 404", async () => {
+      const res = await start({ environmentId: randomUUID() });
+      expect(res.status()).toBe(404);
+    });
+
+    test("lists scans newest first, and reads one", async () => {
+      const a = await begin();
+      fake!.finishRun(a.id);
+      const b = await begin();
+      const list = (await (await asOwner.get(at("/runs"))).json()).list;
+      expect(list.map((r: any) => r.id)).toEqual([b.id, a.id]);
+      const one = await (await asOwner.get(at(`/runs/${a.id}`))).json();
+      expect(one).toMatchObject({ id: a.id, status: "completed", summary: { pagesVisited: 1, recordings: 1 } });
+      expect(one.finishedAt).toBeTruthy();
+    });
+
+    test("a QA engineer can start and stop a scan, as in NYRA", async () => {
+      const res = await start({}, asQa);
+      expect(res.status()).toBe(201);
+      const run = await res.json();
+      const stop = await asQa.post(at(`/runs/${run.id}/stop`), { failOnStatusCode: false });
+      expect(stop.status()).toBe(202);
+      expect(await stop.json()).toEqual({ status: "stopping" });
+    });
+
+    test("stopping a finished scan reports its real status", async () => {
+      const run = await begin();
+      fake!.finishRun(run.id, "partial");
+      const res = await asOwner.post(at(`/runs/${run.id}/stop`));
+      expect(res.status()).toBe(202);
+      expect(await res.json()).toEqual({ status: "partial" });
+    });
+
+    test("results are empty while the scan runs and complete once it ends, in Tesbo's field names", async () => {
+      const run = await begin();
+      expect((await (await asOwner.get(at(`/runs/${run.id}/items`))).json()).list).toEqual([]);
+      fake!.finishRun(run.id);
+      const { list } = await (await asOwner.get(at(`/runs/${run.id}/items`))).json();
+      expect(list.map((i: any) => i.kind).sort()).toEqual(["business_rule", "feature", "screen", "test_case", "workflow"]);
+      expect(list[0]).toHaveProperty("reviewStatus", "waiting");
+      expect(list[0]).not.toHaveProperty("review_status");
+    });
+
+    test("an unknown run is a 404", async () => {
+      expect((await asOwner.get(at(`/runs/${randomUUID()}`), { failOnStatusCode: false })).status()).toBe(404);
+    });
+
+    test("the live frame is 204 until NYRA has one, then a JPEG that is never cached", async () => {
+      const run = await begin();
+      expect((await asOwner.get(at(`/runs/${run.id}/live.jpg`))).status()).toBe(204);
+      fake!.finishRun(run.id);
+      const frame = await asOwner.get(at(`/runs/${run.id}/live.jpg`));
+      expect(frame.status()).toBe(200);
+      expect(frame.headers()["content-type"]).toBe("image/jpeg");
+      expect(frame.headers()["cache-control"]).toContain("no-store");
+    });
+
+    test("recordings are listed by name and size only, and served with Range support", async () => {
+      const run = await begin();
+      expect((await (await asOwner.get(at(`/runs/${run.id}/recordings`))).json()).list).toEqual([]);
+      fake!.finishRun(run.id);
+      const { list } = await (await asOwner.get(at(`/runs/${run.id}/recordings`))).json();
+      expect(list).toEqual([{ name: "session-1.webm", sizeBytes: FAKE_RECORDING.length }]);
+
+      const url = at(`/runs/${run.id}/files/recordings/session-1.webm`);
+      const full = await asOwner.get(url);
+      expect(full.status()).toBe(200);
+      expect(full.headers()["content-type"]).toBe("video/webm");
+      expect(full.headers()["accept-ranges"]).toBe("bytes");
+      expect((await full.body()).equals(FAKE_RECORDING)).toBe(true);
+
+      const part = await asOwner.get(url, { headers: { Range: "bytes=100-199" } });
+      expect(part.status()).toBe(206);
+      expect(part.headers()["content-range"]).toBe(`bytes 100-199/${FAKE_RECORDING.length}`);
+      expect((await part.body()).equals(FAKE_RECORDING.subarray(100, 200))).toBe(true);
+
+      const past = await asOwner.get(url, { headers: { Range: `bytes=${FAKE_RECORDING.length + 10}-` }, failOnStatusCode: false });
+      expect(past.status()).toBe(416);
+    });
+
+    test("files carry nosniff and a sandbox policy, and a type Tesbo did not choose becomes a download", async () => {
+      const run = await begin();
+      fake!.finishRun(run.id);
+      const shot = await asOwner.get(at(`/runs/${run.id}/files/screens/screen-001.jpg`));
+      expect(shot.status()).toBe(200);
+      expect(shot.headers()["content-type"]).toBe("image/jpeg");
+      expect(shot.headers()["x-content-type-options"]).toBe("nosniff");
+      expect(shot.headers()["content-security-policy"]).toBe("sandbox");
+
+      // NYRA's file said text/html; a browser must never be told that about scanned content.
+      const evil = await asOwner.get(at(`/runs/${run.id}/files/recordings/evil.webm`));
+      expect(evil.headers()["content-type"]).toBe("application/octet-stream");
+      expect(evil.headers()["content-disposition"]).toContain("attachment");
+    });
+
+    test("the CSV export neutralises formulas; the knowledge and rules exports pass through; empty rules are a 204", async () => {
+      const run = await begin();
+      expect((await asOwner.get(at(`/runs/${run.id}/export/business-rules.md`))).status()).toBe(204);
+      fake!.finishRun(run.id);
+
+      const csv = await asOwner.get(at(`/runs/${run.id}/export/test-cases.csv`));
+      expect(csv.status()).toBe(200);
+      expect(csv.headers()["content-type"]).toContain("text/csv");
+      expect(csv.headers()["content-disposition"]).toContain(`nyra-${run.id.slice(0, 8)}-test-cases.csv`);
+      const text = await csv.text();
+      expect(text).toContain(`"'=HYPERLINK(""http://evil.example"")"`);
+      expect(text).not.toMatch(/"=HYPERLINK/);
+
+      expect(await (await asOwner.get(at(`/runs/${run.id}/export/knowledge.md`))).text()).toContain("# Fake: knowledge file");
+      expect((await asOwner.get(at(`/runs/${run.id}/export/business-rules.md`))).status()).toBe(200);
+    });
+
+    test("NYRA being unreachable on a scan route is a 502 with a plain message", async () => {
+      const run = await begin();
+      await fake!.close();
+      fake = null;
+      const res = await asOwner.get(at(`/runs/${run.id}`), { failOnStatusCode: false });
+      expect(res.status()).toBe(502);
+      expect((await res.json()).error).toContain("unreachable");
+    });
+
+    test.describe("live events", () => {
+      /** The session cookie a browser's EventSource would send. */
+      async function cookieHeader(api: APIRequestContext): Promise<string> {
+        return (await api.storageState()).cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+      }
+
+      /** Reads the stream until `until` matches the text so far, or the timeout passes. */
+      async function readStream(runId: string, until: RegExp, headers: Record<string, string> = {}, afterOpen?: () => void) {
+        const controller = new AbortController();
+        const res = await fetch(`${env.apiBaseUrl}${at(`/runs/${runId}/events`)}`, {
+          headers: { cookie: await cookieHeader(asOwner), accept: "text/event-stream", ...headers },
+          signal: controller.signal,
+        });
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let text = "";
+        const timer = setTimeout(() => controller.abort(), 15_000);
+        let fired = false;
+        try {
+          while (!until.test(text)) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            text += decoder.decode(value, { stream: true });
+            if (!fired && /event: item/.test(text)) {
+              fired = true;
+              afterOpen?.();
+            }
+          }
+        } catch {
+          // aborted by the timer: the assertions below report what was and was not received
+        } finally {
+          clearTimeout(timer);
+          controller.abort();
+        }
+        return { status: res.status, contentType: res.headers.get("content-type"), text };
+      }
+
+      test("passes NYRA's events through unchanged, including ones sent after it opened", async () => {
+        const run = await begin();
+        const got = await readStream(run.id, /Later line/, {}, () => fake!.emit(run.id, "log", { level: "info", message: "Later line" }));
+        expect(got.status).toBe(200);
+        expect(got.contentType).toContain("text/event-stream");
+        for (const event of ["log", "status", "digest", "item"]) expect(got.text, event).toContain(`event: ${event}`);
+        expect(got.text).toContain("Later line");
+        expect(got.text).toContain('"kind":"screen"');
+      });
+
+      test("forwards a real Last-Event-ID and drops a malformed one", async () => {
+        const run = await begin();
+        await readStream(run.id, /event: item/, { "last-event-id": "1761052800123-0" });
+        await readStream(run.id, /event: item/, { "last-event-id": "not-a-stream-id" });
+        const sent = fake!.calls.filter((c) => c.path.endsWith("/events")).map((c) => c.headers["last-event-id"]);
+        expect(sent).toEqual(["1761052800123-0", undefined]);
+      });
+
+      test("an unlinked project or an unknown run gets a 404, not an open stream", async () => {
+        const run = await begin();
+        for (const url of [at(`/runs/${run.id}/events`, randomUUID()), at(`/runs/${randomUUID()}/events`)]) {
+          const res = await asOwner.get(url, { failOnStatusCode: false });
+          expect(res.status(), url).toBe(404);
+        }
+      });
+    });
+
+    test.describe("environment settings", () => {
+      const patch = (data: unknown, api: APIRequestContext = asOwner) => api.patch(at(`/environments/${envId}`), { data: data as object, failOnStatusCode: false });
+
+      test("saves mode, URL and allowed domains, and returns the refreshed project", async () => {
+        const res = await patch({ mode: "sandbox", baseUrl: "https://new.example.com", allowedDomains: ["Accounts.Example.com"] });
+        expect(res.status(), await res.text()).toBe(200);
+        expect((await res.json()).environments[0]).toMatchObject({ mode: "sandbox", baseUrl: "https://new.example.com", allowedDomains: ["accounts.example.com"] });
+        expect(fake!.calls.filter((c) => c.method === "PATCH").pop()!.body).toEqual({ base_url: "https://new.example.com", mode: "sandbox", allowed_domains: ["accounts.example.com"] });
+      });
+
+      test("a blank password keeps the saved one, and a typed one replaces it", async () => {
+        const keep = await patch({ testAccount: { username: "other@example.com", password: "" } });
+        expect(keep.status(), await keep.text()).toBe(200);
+        const sent = fake!.calls.filter((c) => c.method === "PATCH").pop()!.body.test_account;
+        expect(sent).toEqual({ login_url: null, username: "other@example.com", login_method: "password" });
+        expect((await keep.json()).environments[0]).toMatchObject({ username: "other@example.com", hasPassword: true });
+
+        await patch({ testAccount: { username: "other@example.com", password: "New-pw-1!" } });
+        expect(fake!.calls.filter((c) => c.method === "PATCH").pop()!.body.test_account.password).toBe("New-pw-1!");
+      });
+
+      test("adding a test account to an environment that has none needs a password", async () => {
+        const bare = await (await create(asOwner, valid("No account"))).json();
+        const bareEnv = fake!.projects.find((p) => p.id === bare.id).environments[0].id;
+        const res = await asOwner.patch(at(`/environments/${bareEnv}`, bare.id), { data: { testAccount: { username: "qa@example.com", password: "" } }, failOnStatusCode: false });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).error).toContain("Password is required");
+        expect(fake!.calls.some((c) => c.method === "PATCH")).toBe(false);
+      });
+
+      test("an environment that is not the project's is a 404", async () => {
+        const res = await asOwner.patch(at(`/environments/${randomUUID()}`), { data: { mode: "sandbox" }, failOnStatusCode: false });
+        expect(res.status()).toBe(404);
+      });
+
+      test("NYRA's refusal is a 400 that does not echo the password", async () => {
+        const res = await patch({ name: "force-422", testAccount: { username: "qa@example.com", password: "Echo-env-pw-1" } });
+        expect(res.status()).toBe(400);
+        expect(await res.text()).not.toContain("Echo-env-pw-1");
+      });
+
+      test("a manager can save settings", async () => {
+        expect((await patch({ mode: "sandbox" }, asManager)).status()).toBe(200);
+      });
     });
   });
 });
