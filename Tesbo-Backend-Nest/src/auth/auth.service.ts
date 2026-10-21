@@ -16,7 +16,7 @@ import { SuperAdminService } from "../admin/super-admin.service";
 import { validateMobileNumber } from "../common/mobile-number.util";
 import { EmailService } from "./email.service";
 import { LoginLockoutService } from "./login-lockout.service";
-import { OtpService } from "./otp.service";
+import { OtpRateLimitedException, OtpService } from "./otp.service";
 import { PasswordResetService } from "./password-reset.service";
 import { PasswordService } from "./password.service";
 
@@ -42,7 +42,7 @@ export class AuthService {
    * wrong — someone mistyping a signup code has nothing to do with someone hammering a login.
    */
   async requestOtp(email: string | undefined, req: AuthenticatedRequest): Promise<void> {
-    if (!email) throw new BadRequestException({ error: "email required" });
+    if (typeof email !== "string" || !email) throw new BadRequestException({ error: "email required" });
     const normalizedEmail = email.trim().toLowerCase();
 
     const activeLock = await this.lockout.getActiveLock(normalizedEmail);
@@ -53,7 +53,8 @@ export class AuthService {
     let sent = false;
     try {
       sent = await this.otp.requestOtp(email, this.ip(req), req.get("user-agent"));
-    } catch {
+    } catch (error) {
+      if (error instanceof OtpRateLimitedException) throw error;
       throw new ServiceUnavailableException({ error: "otp_delivery_failed" });
     }
     if (!sent) throw new BadRequestException({ error: "email required" });
@@ -68,7 +69,10 @@ export class AuthService {
   }
 
   async verifyOtp(email: string | undefined, code: string | undefined, req: AuthenticatedRequest, res: Response) {
-    if (!email || !code) throw new BadRequestException({ error: "email and code required" });
+    // typeof, not truthiness: a number or object body field used to reach .trim() and answer 500.
+    if (typeof email !== "string" || typeof code !== "string" || !email || !code) {
+      throw new BadRequestException({ error: "email and code required" });
+    }
     const normalizedEmail = email.trim().toLowerCase();
 
     const activeLock = await this.lockout.getActiveLock(normalizedEmail);

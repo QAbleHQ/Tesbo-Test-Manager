@@ -260,6 +260,163 @@ test.describe("self-serve signup", () => {
     expect(userCount(email)).toBe(0);
   });
 
+  // ─── Brute force: a 6-digit code must not be guessable ─────────────────────
+  //
+  // signup/verify (and the invite verify routes) call OtpService.verifyOtpCode directly, and unlike
+  // login's /otp/verify they had no lockout at all, so a 6-digit code could be guessed at wire speed.
+  // The budget is per code: five guesses, then the code is dead even if the next guess is right. A
+  // fresh code retires the older ones, and no more than ten are issued per email per hour.
+  //
+  // None of these needs a signup/start, so they spend nothing from the rate-limited allowance above.
+
+  /** The most guesses spent on any live code for this address. */
+  function guessesSpent(email: string): number {
+    return Number(scalar(`SELECT COALESCE(MAX(attempts), 0) FROM otp_codes WHERE email = ${literal(email.toLowerCase())};`));
+  }
+
+  function purgeCodes(email: string): void {
+    execMany([
+      `DELETE FROM otp_codes WHERE email = ${literal(email.toLowerCase())}`,
+      `DELETE FROM otp_rate_limit WHERE email = ${literal(`login:${email.toLowerCase()}`)}`,
+    ]);
+  }
+
+  test("SGN-OTP-01 five wrong guesses kill the code, so the right code is refused afterwards", async () => {
+    const email = signupEmail("otp-dead");
+    seedOtpCode(email, "111111");
+    try {
+      for (let guess = 1; guess <= 5; guess++) {
+        const res = await verify({ email, code: `99999${guess}` });
+        expect(res.status(), `guess ${guess} was not a plain 401`).toBe(401);
+      }
+      expect(guessesSpent(email)).toBe(5);
+
+      // 401, not 400 "No pending signup": a 400 would mean the OTP check passed and only the
+      // pending lookup stopped it, i.e. the dead code was still accepted.
+      const right = await verify({ email, code: "111111" });
+      expect(right.status(), "the correct code was accepted after five wrong guesses").toBe(401);
+      expect(JSON.stringify(await right.json())).toContain("invalid_or_expired_otp");
+      expect(userCount(email)).toBe(0);
+    } finally {
+      purgeCodes(email);
+    }
+  });
+
+  test("SGN-OTP-02 the right code still works on the fifth guess (the budget is five, not four)", async () => {
+    const email = signupEmail("otp-fifth");
+    seedOtpCode(email, "222222");
+    try {
+      for (let guess = 1; guess <= 4; guess++) {
+        expect((await verify({ email, code: `88888${guess}` })).status()).toBe(401);
+      }
+      // The OTP passes here; it is the missing pending signup that answers 400. That is the proof.
+      const fifth = await verify({ email, code: "222222" });
+      expect(fifth.status(), `fifth guess — ${await fifth.text()}`).toBe(400);
+    } finally {
+      purgeCodes(email);
+    }
+  });
+
+  test("SGN-OTP-03 a parallel burst cannot spend more than five guesses", async () => {
+    // The race that a read-then-increment limiter loses: twenty guesses in flight at once all read
+    // attempts < 5 before any of them writes. Here the burst is wrong guesses, then the right code.
+    const email = signupEmail("otp-burst");
+    seedOtpCode(email, "333333");
+    try {
+      const burst = await Promise.all(
+        Array.from({ length: 20 }, (_, i) => verify({ email, code: `7777${String(i).padStart(2, "0")}` })),
+      );
+      for (const res of burst) expect(res.status()).toBe(401);
+      expect(guessesSpent(email), "the burst overshot the attempt budget").toBe(5);
+      expect((await verify({ email, code: "333333" })).status()).toBe(401);
+    } finally {
+      purgeCodes(email);
+    }
+  });
+
+  test("SGN-OTP-04 requesting a new code retires the older ones", async () => {
+    // Left live, ten requests would leave ten codes to guess against and multiply the odds tenfold.
+    const email = signupEmail("otp-retire");
+    seedOtpCode(email, "444444");
+    try {
+      const requested = await anon.post("/api/auth/otp/request", { data: { email }, failOnStatusCode: false });
+      expect(requested.status(), `otp/request — ${await requested.text()}`).toBeLessThan(300);
+
+      const old = await verify({ email, code: "444444" });
+      expect(old.status(), "an older code still worked after a newer one was issued").toBe(401);
+      expect(
+        Number(scalar(`SELECT COUNT(*) FROM otp_codes WHERE email = ${literal(email.toLowerCase())} AND used_at IS NULL;`)),
+        "more than one code is live",
+      ).toBe(1);
+      // Retired, not deleted: the row count still says how many were sent.
+      expect(Number(scalar(`SELECT COUNT(*) FROM otp_codes WHERE email = ${literal(email.toLowerCase())};`))).toBe(2);
+    } finally {
+      purgeCodes(email);
+    }
+  });
+
+  test("SGN-OTP-05 the eleventh code in an hour is refused with 429, on both entry points", async () => {
+    const email = signupEmail("otp-cap");
+    const normalized = email.toLowerCase();
+    exec(
+      `INSERT INTO otp_codes (email, code_hash, expires_at, used_at) ` +
+        `SELECT ${literal(normalized)}, 'e2e-cap-' || g, now() + interval '10 minutes', now() FROM generate_series(1, 10) g;`,
+    );
+    try {
+      const login = await anon.post("/api/auth/otp/request", { data: { email }, failOnStatusCode: false });
+      // 429 with its own code, not the 503 "otp_delivery_failed" a swallowed error would have become.
+      expect(login.status()).toBe(429);
+      expect(JSON.stringify(await login.json())).toContain("otp_rate_limited");
+
+      const signup = await start({ firstName: "EndToEnd", lastName: "Capped", email, password: "E2eSignPass9f3!" });
+      expect(signup.status()).toBe(429);
+      expect(JSON.stringify(await signup.json())).toContain("otp_rate_limited");
+
+      expect(Number(scalar(`SELECT COUNT(*) FROM otp_codes WHERE email = ${literal(normalized)};`)), "a refused request still issued a code").toBe(10);
+      // A refused request is not a failed login: it must not feed the 24-hour password lockout.
+      expect(Number(scalar(`SELECT COUNT(*) FROM otp_rate_limit WHERE email = ${literal(`login:${normalized}`)};`))).toBe(0);
+    } finally {
+      purgeCodes(email);
+    }
+  });
+
+  test("SGN-OTP-06 a non-string code or email is a 400, never a 500, and spends no guess", async () => {
+    const email = signupEmail("otp-types");
+    seedOtpCode(email, "555555");
+    try {
+      for (const code of [123456, { $ne: "" }, ["555555"], true, null]) {
+        const res = await verify({ email, code });
+        expect(res.status(), `${JSON.stringify(code)} was not refused as a bad request`).toBe(400);
+        const login = await anon.post("/api/auth/otp/verify", { data: { email, code }, failOnStatusCode: false });
+        expect(login.status(), `login /otp/verify with ${JSON.stringify(code)}`).toBe(400);
+      }
+      const loginEmail = await anon.post("/api/auth/otp/verify", { data: { email: 12345, code: "555555" }, failOnStatusCode: false });
+      expect(loginEmail.status()).toBe(400);
+      const requestEmail = await anon.post("/api/auth/otp/request", { data: { email: { a: 1 } }, failOnStatusCode: false });
+      expect(requestEmail.status()).toBe(400);
+      expect(guessesSpent(email), "a malformed request spent a guess").toBe(0);
+    } finally {
+      purgeCodes(email);
+    }
+  });
+
+  test("SGN-OTP-07 a code for one address cannot be guessed against another's", async () => {
+    // Guesses are spent per address. Burning one victim's budget must not touch a second address.
+    const victim = signupEmail("otp-victim");
+    const bystander = signupEmail("otp-bystander");
+    seedOtpCode(victim, "666666");
+    seedOtpCode(bystander, "777777");
+    try {
+      for (let guess = 1; guess <= 5; guess++) await verify({ email: victim, code: `00000${guess}` });
+      expect(guessesSpent(victim)).toBe(5);
+      expect(guessesSpent(bystander), "guesses against one address were charged to another").toBe(0);
+      expect((await verify({ email: bystander, code: "777777" })).status()).toBe(400);
+    } finally {
+      purgeCodes(victim);
+      purgeCodes(bystander);
+    }
+  });
+
   // ─── The happy path: the only rate-limited attempts in this file ───────────
 
   test("SGN-A-10 a signup completes end to end and signs the new user in", { tag: '@tesbo.testId("TES-TC-525")' }, async () => {

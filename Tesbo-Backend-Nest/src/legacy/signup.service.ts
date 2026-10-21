@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import type { Response } from "express";
 import { AuditService } from "../audit/audit.service";
 import { AuthService } from "../auth/auth.service";
-import { OtpService } from "../auth/otp.service";
+import { OtpRateLimitedException, OtpService } from "../auth/otp.service";
 import { PasswordService } from "../auth/password.service";
 import { AppConfigService } from "../config/app-config.service";
 import { AuthenticatedRequest } from "../common/request.types";
@@ -71,7 +71,7 @@ export class SignupService {
 
   async verifySelfServeSignup(rawEmail: string | undefined, code: string | undefined, ip: string, ua: string | null | undefined, req: AuthenticatedRequest, res: Response) {
     const email = this.validateEmail(rawEmail);
-    if (!code?.trim()) throw new BadRequestException({ error: "code is required" });
+    if (typeof code !== "string" || !code.trim()) throw new BadRequestException({ error: "code is required" });
     if (!(await this.otp.verifyOtpCode(email, code))) throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
 
     const pending = await this.findPendingSignup(email, null);
@@ -137,7 +137,7 @@ export class SignupService {
 
   private async completeInviteVerification(token: string, code: string | undefined, ip: string, ua: string | null | undefined, req: AuthenticatedRequest, res: Response) {
     const inv = await this.legacy.getInvitationRowOrThrow(token);
-    if (!code?.trim()) throw new BadRequestException({ error: "code is required" });
+    if (typeof code !== "string" || !code.trim()) throw new BadRequestException({ error: "code is required" });
     if (!(await this.otp.verifyOtpCode(inv.email, code))) throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
 
     const pending = await this.findPendingSignup(inv.email, inv.id);
@@ -269,7 +269,8 @@ export class SignupService {
     let sent = false;
     try {
       sent = await this.otp.requestOtp(email, ip, ua);
-    } catch {
+    } catch (error) {
+      if (error instanceof OtpRateLimitedException) throw error;
       throw new ServiceUnavailableException({ error: "otp_delivery_failed" });
     }
     if (!sent) throw new BadRequestException({ error: "email required" });

@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { HttpException, HttpStatus, Injectable } from "@nestjs/common";
 import { randomBytes, randomInt, createHash } from "crypto";
 import { DatabaseService } from "../database/database.service";
 import { AppConfigService } from "../config/app-config.service";
@@ -6,6 +6,20 @@ import { EmailService } from "./email.service";
 import { SessionCacheService } from "../cache/session-cache.service";
 import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
 import { ACTIVITY_TZ } from "./user-activity.service";
+
+// A 6-digit code has 1M values, so the guess budget has to be per code, not per caller: signup and
+// invite verification share verifyOtpCode and have no other limiter. Five guesses per code, and at
+// most ten codes per email per hour, caps a blind attacker at 50 guesses an hour per email (0.005%).
+const MAX_VERIFY_ATTEMPTS = 5;
+const MAX_REQUESTS_PER_HOUR = 10;
+const MAX_CODE_LENGTH = 64;
+
+/** Too many codes requested for one email. Callers must let this through, not report it as a delivery failure. */
+export class OtpRateLimitedException extends HttpException {
+  constructor() {
+    super({ error: "otp_rate_limited" }, HttpStatus.TOO_MANY_REQUESTS);
+  }
+}
 
 @Injectable()
 export class OtpService {
@@ -25,11 +39,23 @@ export class OtpService {
     const codeHash = this.hash(plainCode);
     const expiresAt = new Date(Date.now() + this.config.otpExpiryMinutes * 60_000);
 
-    await this.db.query("INSERT INTO otp_codes (email, code_hash, expires_at) VALUES ($1, $2, $3)", [
-      email,
-      codeHash,
-      expiresAt
-    ]);
+    await this.db.transaction(async (client) => {
+      // One request at a time per email, so a burst cannot all read the same count and overshoot the cap.
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`otp:${email}`]);
+      const recent = await client.query<{ n: string }>(
+        "SELECT count(*) AS n FROM otp_codes WHERE email = $1 AND created_at > now() - interval '1 hour'",
+        [email]
+      );
+      if (Number(recent.rows[0]?.n ?? 0) >= MAX_REQUESTS_PER_HOUR) throw new OtpRateLimitedException();
+      // Only the newest code may work. Left live, N requests would leave N codes to guess against.
+      // Marked used rather than deleted so the row count still shows how many were sent.
+      await client.query("UPDATE otp_codes SET used_at = now() WHERE email = $1 AND used_at IS NULL", [email]);
+      await client.query("INSERT INTO otp_codes (email, code_hash, expires_at) VALUES ($1, $2, $3)", [
+        email,
+        codeHash,
+        expiresAt
+      ]);
+    });
     await this.email.sendOtp(email, plainCode);
     return true;
   }
@@ -47,16 +73,26 @@ export class OtpService {
 
   async verifyOtpCode(rawEmail: string, code: string): Promise<boolean> {
     const email = rawEmail.trim().toLowerCase();
+    // A non-string body field (number, object) used to throw on .trim() and surface as a 500.
+    if (typeof code !== "string") return false;
+    const guess = code.trim();
+    if (!guess || guess.length > MAX_CODE_LENGTH) return false;
 
-    const result = await this.db.query<{ id: string }>(
-      "SELECT id FROM otp_codes WHERE email = $1 AND code_hash = $2 AND expires_at > now() AND used_at IS NULL ORDER BY created_at DESC LIMIT 1",
-      [email, this.hash(code.trim())]
+    // Spend an attempt BEFORE comparing. A read-then-increment lets a parallel burst all see
+    // attempts < max and each get a guess; one UPDATE makes Postgres serialise on the row lock and
+    // re-check `attempts < max` after the wait, so no more than MAX guesses ever get through.
+    const live = await this.db.query<{ id: string; code_hash: string }>(
+      `UPDATE otp_codes SET attempts = attempts + 1
+       WHERE email = $1 AND used_at IS NULL AND expires_at > now() AND attempts < $2
+       RETURNING id, code_hash`,
+      [email, MAX_VERIFY_ATTEMPTS]
     );
-    const otpId = result.rows[0]?.id;
-    if (!otpId) return false;
+    const guessHash = this.hash(guess);
+    const match = live.rows.find((row) => row.code_hash === guessHash);
+    if (!match) return false;
 
-    await this.markOtpUsed(otpId);
-    return true;
+    // Single use even under two simultaneous correct submissions: only the call that flips used_at wins.
+    return this.markOtpUsed(match.id);
   }
 
   async createSession(userId: string, ipAddress?: string | null, userAgent?: string | null): Promise<string> {
@@ -127,8 +163,9 @@ export class OtpService {
     await this.sessionCache.invalidateAllForUser(userId);
   }
 
-  private async markOtpUsed(otpId: string): Promise<void> {
-    await this.db.query("UPDATE otp_codes SET used_at = now() WHERE id = $1", [otpId]);
+  private async markOtpUsed(otpId: string): Promise<boolean> {
+    const result = await this.db.query("UPDATE otp_codes SET used_at = now() WHERE id = $1 AND used_at IS NULL", [otpId]);
+    return (result.rowCount ?? 0) > 0;
   }
 
   private async findOrCreateUser(email: string): Promise<{ id: string; created: boolean } | null> {

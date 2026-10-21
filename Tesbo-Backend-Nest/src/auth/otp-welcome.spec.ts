@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { OtpService } from "./otp.service";
 import { EmailService } from "./email.service";
 import { AppConfigService } from "../config/app-config.service";
@@ -12,7 +13,12 @@ import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
  */
 function makeService(users: { existing?: string; insertReturns?: string | null } = {}) {
   const query = jest.fn((sql: string) => {
-    if (sql.includes("FROM otp_codes")) return Promise.resolve({ rows: [{ id: "otp-1" }] });
+    // verifyOtpCode now spends an attempt with one UPDATE ... RETURNING and compares the hash itself,
+    // then consumes the row with a second UPDATE — "123456" is the code every test below submits.
+    if (sql.includes("SET attempts")) {
+      return Promise.resolve({ rows: [{ id: "otp-1", code_hash: createHash("sha256").update("123456", "utf8").digest("base64url") }] });
+    }
+    if (sql.includes("SET used_at")) return Promise.resolve({ rows: [], rowCount: 1 });
     if (sql.includes("SELECT id FROM users WHERE email")) {
       return Promise.resolve({ rows: users.existing ? [{ id: users.existing }] : [] });
     }
