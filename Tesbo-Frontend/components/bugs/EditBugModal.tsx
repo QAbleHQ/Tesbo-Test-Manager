@@ -211,21 +211,22 @@ export default function EditBugModal({
         />
       </Field>
       {/* Status is edit-only (Create Bug always starts "Open"), so it has no equivalent slot in
-          that form's Severity/Priority/Assign-to row. Kept as its own field right before them
-          rather than disrupting that row's order. */}
-      <Field>
-        <FieldLabel>Status</FieldLabel>
-        <Select
-          value={editStatus}
-          onChange={(e) => setEditStatus(e.target.value)}
-        >
-          <option value="Open">Open</option>
-          <option value="In Progress">In Progress</option>
-          <option value="Closed">Closed</option>
-          <option value="Reopened">Reopened</option>
-        </Select>
-      </Field>
-      <div className="grid grid-cols-3 gap-3">
+          that form's Severity/Priority/Assign-to row. It leads the same row here, rather than
+          taking a full-width row of its own that left the row below it floating. */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <Field>
+          <FieldLabel>Status</FieldLabel>
+          <Select
+            value={editStatus}
+            onChange={(e) => setEditStatus(e.target.value)}
+            aria-label="Status"
+          >
+            <option value="Open">Open</option>
+            <option value="In Progress">In Progress</option>
+            <option value="Closed">Closed</option>
+            <option value="Reopened">Reopened</option>
+          </Select>
+        </Field>
         <Field>
           <FieldLabel>Severity</FieldLabel>
           <Select
