@@ -3915,7 +3915,7 @@ test.describe("bug due date", () => {
     return due;
   }
 
-  test("BUG-U-90 the report form's Due date is what gets saved, and left empty it saves none", async ({ page }) => {
+  test("BUG-U-118 the report form's Due date is what gets saved, and left empty it saves none", async ({ page }) => {
     const withDate = `E2E Due Report ${uniqueSuffix()}`;
     const withoutDate = `E2E No Due Report ${uniqueSuffix()}`;
     try {
@@ -3937,7 +3937,7 @@ test.describe("bug due date", () => {
     }
   });
 
-  test("BUG-U-91 Edit Bug sets, changes and clears the due date, and Bug Details reflects each", async ({ page }) => {
+  test("BUG-U-119 Edit Bug sets, changes and clears the due date, and Bug Details reflects each", async ({ page }) => {
     const bug = await seed("Edit");
     try {
       await openDetails(page, bug.id).then((due) => expect(due).toHaveText("Not set"));
@@ -3964,7 +3964,7 @@ test.describe("bug due date", () => {
     }
   });
 
-  test("BUG-U-92 Overdue shows only for a past-due bug that is still open", async ({ page }) => {
+  test("BUG-U-120 Overdue shows only for a past-due bug that is still open", async ({ page }) => {
     test.skip(!dbControlAvailable(), "needs DB access to back-date a due date");
     const past = "2001-01-01";
     const future = "2099-01-01";
@@ -3993,7 +3993,7 @@ test.describe("bug due date", () => {
     }
   });
 
-  test("BUG-U-94 the report form will not take a due date before today", async ({ page }) => {
+  test("BUG-U-122 the report form will not take a due date before today", async ({ page }) => {
     const title = `E2E Past Due Report ${uniqueSuffix()}`;
     await openReportModal(page, projectId);
     await page.getByPlaceholder("Brief summary of the bug…").fill(title);
@@ -4020,7 +4020,7 @@ test.describe("bug due date", () => {
     expect(bugs.some((b: { title: string }) => b.title === title), "nothing was filed by the refused attempt").toBe(false);
   });
 
-  test("BUG-U-95 Edit Bug will not take a due date before the day the bug was reported", async ({ page }) => {
+  test("BUG-U-123 Edit Bug will not take a due date before the day the bug was reported", async ({ page }) => {
     const bug = await seed("EditMin", { dueDate: "2031-06-20" });
     try {
       await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
@@ -4049,7 +4049,7 @@ test.describe("bug due date", () => {
     }
   });
 
-  test("BUG-U-93 a rejected due date is shown on the edit form, and the stored date is unchanged", async ({ page }) => {
+  test("BUG-U-121 a rejected due date is shown on the edit form, and the stored date is unchanged", async ({ page }) => {
     const bug = await seed("Reject", { dueDate: "2031-02-02" });
     try {
       await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
@@ -4066,6 +4066,70 @@ test.describe("bug due date", () => {
       expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBe("2031-02-02");
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * "[Bug] Bug search not working if try to find with Bug Id number" — the Bugs list search matched
+ * only the title and linked test-case fields, so typing a bug's own key ("PRO-BUG-60") found
+ * nothing even though that bug was on screen.
+ */
+test.describe("bug search by bug id", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-124 searching a bug's key, in any case or by its number, finds that bug", async ({ page }) => {
+    const first = await createBug(api, projectId, { title: `E2E Search Id A ${uniqueSuffix()}` });
+    const second = await createBug(api, projectId, { title: `E2E Search Id B ${uniqueSuffix()}` });
+    try {
+      const firstKey = (await (await api.get(`/api/bugs/${first.id}`)).json()).externalId as string;
+      const secondKey = (await (await api.get(`/api/bugs/${second.id}`)).json()).externalId as string;
+      expect(firstKey).not.toBe(secondKey);
+
+      await openBugsList(page, projectId);
+      const search = page.getByPlaceholder("Search bugs…");
+      const rowFor = (title: string) => page.locator("tbody tr").filter({ hasText: title });
+
+      // Full key, lower-cased, with stray whitespace — what people paste or type.
+      await search.fill(`  ${firstKey.toLowerCase()}  `);
+      await expect(rowFor(first.title)).toBeVisible();
+      await expect(rowFor(second.title), "the other bug's key is different").toHaveCount(0);
+
+      // The trailing number alone, as the card puts it ("Bug Id number").
+      const number = firstKey.split("-").pop()!;
+      await search.fill(number);
+      await expect(rowFor(first.title)).toBeVisible();
+
+      // A key that exists nowhere finds nothing, and says so.
+      await search.fill("ZZZ-BUG-999999");
+      await expect(page.getByText("No bugs match your filter.")).toBeVisible();
+
+      // Clearing it brings both back.
+      await search.fill("");
+      await expect(rowFor(first.title)).toBeVisible();
+      await expect(rowFor(second.title)).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${first.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/bugs/${second.id}`, { failOnStatusCode: false });
     }
   });
 });
