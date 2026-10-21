@@ -1,10 +1,97 @@
 "use client";
 
 import { IconFlame, IconEyeOff, IconAlertCircle, IconMap } from "@tabler/icons-react";
-import { StatusChip } from "@/components/ui";
-import type { ReportsInsights } from "@/lib/api";
+import { useState } from "react";
+import { Modal, StatusChip } from "@/components/ui";
+import type { FlakyTestRow, ReportsInsights } from "@/lib/api";
 import { HealthGauge } from "./charts";
 import { statusTone, LoadingBlock } from "./shared";
+
+// A test can have hundreds of runs; the strip shows only the most recent ones so a row stays one line tall.
+const RUN_STRIP_MAX = 30;
+
+const FLAKY_TONE = {
+  High: { color: "var(--error)", bg: "var(--error-soft)" },
+  Medium: { color: "var(--warning)", bg: "var(--warning-soft)" },
+  Low: { color: "var(--info)", bg: "var(--info-soft)" },
+} as const;
+
+const RUN_DOT: Record<string, string> = {
+  Passed: "var(--success)",
+  Failed: "var(--error)",
+  Blocked: "var(--status-blocked-dot)",
+  Skipped: "var(--status-skipped-dot)",
+  Retest: "var(--status-retest-dot)",
+};
+
+function FlakyRow({ f }: { f: FlakyTestRow }) {
+  const tone = FLAKY_TONE[f.flakinessLabel];
+  const failed = f.runs.filter((r) => r.status === "Failed").length;
+  const shown = f.runs.slice(-RUN_STRIP_MAX);
+  const hidden = f.runs.length - shown.length;
+  const passed = f.runs.filter((r) => r.status === "Passed").length;
+  const [open, setOpen] = useState(false);
+  return (
+    <li className="flex flex-col gap-3 px-4 py-3.5 md:flex-row md:items-center md:gap-6">
+      <div className="min-w-0 md:w-[38%]">
+        <div className="flex items-center gap-2">
+          <span className="shrink-0 rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-[10.5px] text-[var(--muted)]">{f.externalId}</span>
+          <span className="truncate text-[13px] font-medium text-[var(--foreground)]" title={f.title}>{f.title}</span>
+        </div>
+        <div className="mt-1 truncate text-[11.5px] text-[var(--muted-soft)]">{f.suiteName}</div>
+      </div>
+
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-[3px]">
+          {hidden > 0 && (
+            <button
+              type="button"
+              onClick={() => setOpen(true)}
+              className="mr-1 cursor-pointer text-[10.5px] font-medium text-[var(--brand)] underline-offset-2 hover:underline"
+            >
+              +{hidden} earlier
+            </button>
+          )}
+          {shown.map((r, i) => (
+            <span
+              key={i}
+              title={`${r.runName}: ${r.status}`}
+              className="h-3.5 w-3.5 rounded-[3px]"
+              style={{ background: RUN_DOT[r.status] ?? "var(--border)" }}
+            />
+          ))}
+        </div>
+        <div className="mt-1.5 text-[11px] text-[var(--muted-soft)]">
+          {f.runs.length} runs · {passed} passed · {failed} failed · {f.flipCount} changed
+        </div>
+      </div>
+
+      <Modal open={open} onClose={() => setOpen(false)} title={`${f.externalId} · all runs`} className="max-w-[640px]">
+        <p className="mb-3 text-[12.5px] text-[var(--muted)]">{f.title}</p>
+        <div className="mb-3 text-[11.5px] text-[var(--muted-soft)]">
+          {f.runs.length} runs · {passed} passed · {failed} failed · {f.flipCount} changed
+        </div>
+        <ol className="divide-y divide-[var(--border-subtle)] rounded-lg border border-[var(--border)]">
+          {f.runs.map((r, i) => (
+            <li key={i} className="flex items-center gap-3 px-3 py-2">
+              <span className="w-8 shrink-0 text-right font-mono text-[11px] text-[var(--muted-soft)]">#{i + 1}</span>
+              <span className="h-3 w-3 shrink-0 rounded-[3px]" style={{ background: RUN_DOT[r.status] ?? "var(--border)" }} />
+              <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--foreground)]" title={r.runName}>{r.runName}</span>
+              <StatusChip tone={statusTone(r.status)}>{r.status}</StatusChip>
+            </li>
+          ))}
+        </ol>
+      </Modal>
+
+      <span
+        className="w-fit shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-semibold md:w-[84px] md:text-center"
+        style={{ background: tone.bg, color: tone.color }}
+      >
+        {f.flakinessLabel}
+      </span>
+    </li>
+  );
+}
 
 function CoverageHeatmap({ rows }: { rows: ReportsInsights["coverageBySuite"] }) {
   const tone = (pct: number) => (pct >= 70 ? "var(--success)" : pct >= 30 ? "var(--warning)" : "var(--error)");
@@ -104,57 +191,23 @@ export function AIInsightsTab({ insights, loading }: { insights: ReportsInsights
           </div>
           <span className="text-[11px] text-[var(--muted-soft)]">Inconsistent results across runs</span>
         </div>
+        {insights.flakyTests.length > 0 && (
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-[var(--border-subtle)] px-4 py-2 text-[11px] text-[var(--muted-soft)]">
+            <span className="font-medium uppercase tracking-wide">Legend</span>
+            {Object.entries(RUN_DOT).map(([status, color]) => (
+              <span key={status} className="flex items-center gap-1.5">
+                <span className="h-3 w-3 rounded-[3px]" style={{ background: color }} />
+                {status}
+              </span>
+            ))}
+          </div>
+        )}
         {insights.flakyTests.length === 0 ? (
           <p className="py-8 text-center text-[13px] text-[var(--muted-soft)]">No flaky tests detected yet</p>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full" style={{ minWidth: 640 }}>
-              <thead>
-                <tr className="border-b border-[var(--border)] bg-[var(--surface-secondary)] text-left text-[10px] uppercase tracking-wider text-[var(--muted-soft)]">
-                  <th className="px-4 py-2.5 font-medium">Test case</th>
-                  <th className="px-4 py-2.5 font-medium">Title</th>
-                  <th className="px-4 py-2.5 font-medium">Suite</th>
-                  <th className="px-4 py-2.5 font-medium">Runs</th>
-                  <th className="px-4 py-2.5 font-medium">Flakiness</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[var(--border-subtle)]">
-                {insights.flakyTests.map((f) => (
-                  <tr key={f.testcaseId}>
-                    <td className="px-4 py-2.5 font-mono text-[11px] text-[var(--muted)]">{f.externalId}</td>
-                    <td className="max-w-[260px] px-4 py-2.5 text-[12.5px] text-[var(--foreground)]">{f.title}</td>
-                    <td className="whitespace-nowrap px-4 py-2.5 text-[12px] text-[var(--muted)]">{f.suiteName}</td>
-                    <td className="px-4 py-2.5">
-                      <div className="flex flex-wrap gap-1">
-                        {f.runs.map((r, i) => (
-                          <StatusChip key={i} tone={statusTone(r.status)}>{r.status}</StatusChip>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="px-4 py-2.5">
-                      <div className="flex items-center gap-1.5">
-                        <div className="h-1.5 w-16 overflow-hidden rounded-full bg-[var(--surface-secondary)]">
-                          <div
-                            className="h-full rounded-full"
-                            style={{
-                              width: f.flakinessLabel === "High" ? "100%" : f.flakinessLabel === "Medium" ? "60%" : "30%",
-                              background: f.flakinessLabel === "High" ? "var(--error)" : f.flakinessLabel === "Medium" ? "var(--warning)" : "var(--info)",
-                            }}
-                          />
-                        </div>
-                        <span
-                          className="text-[11px] font-medium"
-                          style={{ color: f.flakinessLabel === "High" ? "var(--error)" : f.flakinessLabel === "Medium" ? "var(--warning)" : "var(--info)" }}
-                        >
-                          {f.flakinessLabel}
-                        </span>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <ul className="divide-y divide-[var(--border-subtle)]">
+            {insights.flakyTests.map((f) => <FlakyRow key={f.testcaseId} f={f} />)}
+          </ul>
         )}
       </div>
 
