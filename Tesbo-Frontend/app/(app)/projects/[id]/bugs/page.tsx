@@ -508,7 +508,7 @@ export default function BugsPage() {
 
   /* filtered list */
   const filtered = useMemo(() => {
-    const term = search.toLowerCase();
+    const term = search.trim().toLowerCase();
     return bugs.filter((b) => {
       if (filterStatus && b.status !== filterStatus) return false;
       if (filterSeverity && b.severity !== filterSeverity) return false;
@@ -518,6 +518,10 @@ export default function BugsPage() {
       if (
         term &&
         !b.title.toLowerCase().includes(term) &&
+        // The bug's own key ("PRO-BUG-60", or the Jira/Linear key once linked) — what people
+        // actually type when they are looking for one bug.
+        !b.externalId?.toLowerCase().includes(term) &&
+        !b.integrationIssueKey?.toLowerCase().includes(term) &&
         !b.links.some(
           (link) =>
             link.testcaseTitle?.toLowerCase().includes(term) ||
