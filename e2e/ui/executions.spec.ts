@@ -2244,6 +2244,60 @@ test.describe("execution evidence and automation provenance", () => {
     }
   });
 
+  /*
+   * "[Test Run] Evidence > Not able to delete evidence once attached." Each file gets a delete
+   * control behind a confirm. Asserted against the persisted list, not just the DOM.
+   */
+  test("evidence can be deleted after a confirm; cancelling and a failed delete both keep the file", async ({ page }) => {
+    const { runId, testcase } = await seedAutomatedRun("delete-evidence");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const executions = await (await api.get(`/api/cycles/${runId}/executions`)).json();
+      const listUrl = `/api/cycles/${runId}/executions/${executions[0].id}/attachments`;
+      const names = async () =>
+        ((await (await api.get(listUrl)).json()).list as { fileName: string }[]).map((f) => f.fileName);
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+
+      // Cancel: nothing is deleted.
+      await page.getByRole("button", { name: "Delete cart-failure.png" }).click();
+      await expect(page.getByText(/will be permanently deleted/)).toBeVisible();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(page.getByText(/will be permanently deleted/)).toHaveCount(0);
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      expect(await names()).toContain("cart-failure.png");
+
+      // Failure path: a 500 keeps the dialog open with the error, and the file stays.
+      await page.route(/\/attachments\/[0-9a-f-]{36}$/, (route) =>
+        route.request().method() === "DELETE"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "boom" }) })
+          : route.continue(),
+      );
+      await page.getByRole("button", { name: "Delete cart-failure.png" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByRole("alert")).toBeVisible();
+      expect(await names()).toContain("cart-failure.png");
+      await page.unroute(/\/attachments\/[0-9a-f-]{36}$/);
+
+      // Confirm: the screenshot goes, the trace is untouched.
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toHaveCount(0);
+      await expect(page.getByText("cart-trace.zip")).toBeVisible();
+      expect(await names()).toEqual(["cart-trace.zip"]);
+
+      // Deleting the last file returns to the empty state.
+      await page.getByRole("button", { name: "Delete cart-trace.zip" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByText(/No evidence attached/)).toBeVisible();
+      expect(await names()).toEqual([]);
+    } finally {
+      await api.dispose();
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
   test("opening a result fetches its evidence once, and stops", async ({ page }) => {
     /*
      * The regression for a drawer that never left "Loading evidence…".

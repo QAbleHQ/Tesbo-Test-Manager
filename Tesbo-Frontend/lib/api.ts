@@ -3066,6 +3066,14 @@ export async function uploadBugAttachments(
   return { list, total: list.length };
 }
 
+export async function deleteExecutionEvidence(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<void> {
+  await api(`/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}`, { method: "DELETE" });
+}
+
 export async function deleteBugAttachment(attachmentId: string): Promise<void> {
   await api(`/api/bugs/attachments/${attachmentId}`, { method: "DELETE" });
 }

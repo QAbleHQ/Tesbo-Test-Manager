@@ -6,14 +6,16 @@ import {
   IconDownload,
   IconFileText,
   IconPaperclip,
+  IconTrash,
   IconTimeline,
   IconUpload,
   IconVideo,
 } from "@tabler/icons-react";
-import { Button } from "@/components/ui";
+import { Button, ConfirmModal } from "@/components/ui";
 import TraceViewerPanel from "@/components/TraceViewerPanel";
 import {
   API_BASE,
+  deleteExecutionEvidence,
   listExecutionEvidence,
   uploadExecutionEvidence,
   type EvidenceKind,
@@ -78,6 +80,29 @@ export function evidenceDownloadUrl(
   return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/download${suffix}`;
 }
 
+function RemoveEvidenceButton({
+  file,
+  onRemove,
+  className = "",
+}: {
+  file: ExecutionEvidence;
+  onRemove: (file: ExecutionEvidence) => void;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onRemove(file)}
+      aria-label={`Delete ${file.fileName}`}
+      title="Delete"
+      data-testid="evidence-delete"
+      className={`shrink-0 text-[var(--muted)] hover:text-[var(--error-foreground)] ${className}`}
+    >
+      <IconTrash size={13} />
+    </button>
+  );
+}
+
 /*
  * A video row: the download link it always was, plus a View toggle that plays it in place. The
  * backend already serves `?inline=1` for video (it refuses inline for logs and archives on purpose),
@@ -88,10 +113,12 @@ function VideoEvidenceRow({
   cycleId,
   executionId,
   file,
+  onRemove,
 }: {
   cycleId: string;
   executionId: string;
   file: ExecutionEvidence;
+  onRemove?: (file: ExecutionEvidence) => void;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -120,6 +147,7 @@ function VideoEvidenceRow({
         >
           <IconDownload size={13} />
         </a>
+        {onRemove && <RemoveEvidenceButton file={file} onRemove={onRemove} />}
       </div>
       {open && (
         <video
@@ -156,6 +184,9 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [pendingDelete, setPendingDelete] = useState<ExecutionEvidence | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   /*
    * The count callback is held in a ref, and deliberately kept out of `load`'s dependencies.
@@ -234,8 +265,43 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
     }
   }
 
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteExecutionEvidence(cycleId, executionId, pendingDelete.id);
+      setPendingDelete(null);
+      await load();
+    } catch (err) {
+      // Kept open on failure with the confirm button live, so a transient error can be retried.
+      setDeleteError(err instanceof Error ? err.message : "Couldn't delete this file.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  // Undefined on a read-only screen, which hides every delete control, same as the Add button.
+  const askRemove = readOnly
+    ? undefined
+    : (file: ExecutionEvidence) => {
+        setDeleteError(null);
+        setPendingDelete(file);
+      };
+
   return (
     <div>
+      <ConfirmModal
+        open={pendingDelete !== null}
+        title="Delete evidence?"
+        message={`"${pendingDelete?.fileName ?? ""}" will be permanently deleted from this result.`}
+        confirmLabel="Delete"
+        loading={deleting}
+        loadingLabel="Deleting…"
+        error={deleteError}
+        onConfirm={() => void confirmDelete()}
+        onCancel={() => setPendingDelete(null)}
+      />
       <div className="mb-2 flex items-center justify-between gap-3">
         <p className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-[var(--muted)]">
           <IconPaperclip size={13} />
@@ -309,14 +375,15 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
                           <IconDownload size={12} />
                           Download .zip
                         </a>
+                        {askRemove && <RemoveEvidenceButton file={file} onRemove={askRemove} className="ml-3 align-middle" />}
                       </div>
                     ))}
                   </div>
                 ) : kind === "screenshot" ? (
                   <div className="flex flex-wrap gap-2">
                     {items.map((file) => (
+                      <div key={file.id} className="relative">
                       <a
-                        key={file.id}
                         href={evidenceDownloadUrl(cycleId, executionId, file.id, true)}
                         target="_blank"
                         rel="noreferrer"
@@ -330,21 +397,29 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
                           className="h-24 w-auto max-w-[180px] object-cover"
                         />
                       </a>
+                      {askRemove && (
+                        <RemoveEvidenceButton
+                          file={file}
+                          onRemove={askRemove}
+                          className="absolute right-1 top-1 rounded-md bg-[var(--surface-secondary)] p-1"
+                        />
+                      )}
+                      </div>
                     ))}
                   </div>
                 ) : kind === "video" ? (
                   <ul className="space-y-1">
                     {items.map((file) => (
-                      <VideoEvidenceRow key={file.id} cycleId={cycleId} executionId={executionId} file={file} />
+                      <VideoEvidenceRow key={file.id} cycleId={cycleId} executionId={executionId} file={file} onRemove={askRemove} />
                     ))}
                   </ul>
                 ) : (
                   <ul className="space-y-1">
                     {items.map((file) => (
-                      <li key={file.id}>
+                      <li key={file.id} className="flex items-center gap-1.5">
                         <a
                           href={evidenceDownloadUrl(cycleId, executionId, file.id)}
-                          className="flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-secondary)] px-2.5 py-1.5 text-[12.5px] transition-colors hover:border-[var(--accent-light)]"
+                          className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-secondary)] px-2.5 py-1.5 text-[12.5px] transition-colors hover:border-[var(--accent-light)]"
                         >
                           <IconDownload size={13} className="shrink-0 text-[var(--muted)]" />
                           <span className="truncate text-[var(--foreground)]">{file.fileName}</span>
@@ -354,6 +429,7 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
                             </span>
                           )}
                         </a>
+                        {askRemove && <RemoveEvidenceButton file={file} onRemove={askRemove} />}
                       </li>
                     ))}
                   </ul>

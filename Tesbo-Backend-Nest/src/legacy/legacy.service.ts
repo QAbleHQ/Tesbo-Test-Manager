@@ -8935,6 +8935,47 @@ export class LegacyService implements OnModuleInit {
   }
 
   /**
+   * Deletes one evidence file from a run's result.
+   *
+   * Evidence could be uploaded and billed against the storage allowance but never removed, so a
+   * wrong or sensitive file (a trace that captured a secret) was permanent. Any project member may
+   * delete, including files the automation ingest attached. Mirrors deleteBugAttachment: the stored
+   * object is destroyed and the row is soft-deleted (who/when), which also releases the storage
+   * allowance. The lookup is scoped to this execution, so another execution's attachment id is a 404.
+   */
+  async deleteExecutionAttachment(
+    cycleId: string,
+    userId: string | null | undefined,
+    executionId: string,
+    attachmentId: string
+  ) {
+    const uid = this.requireUser(userId);
+    const execution = await this.executionOwner(cycleId, executionId);
+    const projectId = String(execution.project_id);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
+    const res = await this.db.query(
+      `SELECT * FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
+      [attachmentId, executionId, projectId]
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Attachment not found" });
+    if (file.storage_path) await this.storage.delete(file.storage_path);
+    const deleted = await this.db.query(
+      "UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+      [attachmentId, uid]
+    );
+    if (deleted.rows[0]) {
+      await this.logProjectActivity(projectId, uid, "execution_evidence_deleted", "execution", executionId, null, {
+        attachmentId,
+        fileName: String(file.file_name)
+      });
+    }
+    return { ok: true };
+  }
+
+  /**
    * True for a Playwright trace archive.
    *
    * Checked at both ends of the trace link — when one is minted and again when it is redeemed —
