@@ -39,7 +39,7 @@ import TrackingDestinationField, { type TrackingDestination } from "@/components
 import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/SelfLoggedTrackerField";
 import IssuePickerModal from "@/components/IssuePickerModal";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
-import { formatDate } from "@/lib/date";
+import { formatDate, toLocalDay } from "@/lib/date";
 import {
   BUG_PRIORITIES,
   BUG_SEVERITIES,
@@ -447,6 +447,10 @@ export default function BugsPage() {
   const [createStagedFiles, setCreateStagedFiles] = useState<File[]>([]);
   const [createBetterbugsUrl, setCreateBetterbugsUrl] = useState("");
   const [createAssigneeId, setCreateAssigneeId] = useState("");
+  const [createDueDate, setCreateDueDate] = useState("");
+  // Reported today, so the earliest allowed due date is today (the server enforces it too).
+  const createMinDueDate = toLocalDay();
+  const createDueDateTooEarly = !!createDueDate && createDueDate < createMinDueDate;
   const [creating, setCreating] = useState(false);
   /*
    * Basecamp: >10 attachments made createBug() succeed, then the (single, unbatched)
@@ -596,11 +600,12 @@ export default function BugsPage() {
     setCreateStagedFiles([]);
     setCreateBetterbugsUrl("");
     setCreateAssigneeId("");
+    setCreateDueDate("");
   }
 
   /* create */
   async function handleCreate() {
-    if (!createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired) return;
+    if (!createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired || createDueDateTooEarly) return;
     // Belt-and-suspenders alongside the button's `disabled={creating}`: guards a re-entrant call
     // (e.g. a key-repeat Enter) that lands before the disabled state has re-rendered.
     if (creating) return;
@@ -619,6 +624,7 @@ export default function BugsPage() {
           severity: createSeverity || undefined,
           priority: createPriority || null,
           assigneeId: createAssigneeId || null,
+          dueDate: createDueDate || null,
           externalUrl: selfLogged ? createUrl.trim() : undefined,
           integrationProvider: selfLogged && createSelfSystem !== "OTHER" ? createSelfSystem : null,
           integrationIssueKey: selfLogged && createSelfSystem !== "OTHER" ? createSelectedIssue?.key || null : null,
@@ -1183,7 +1189,7 @@ export default function BugsPage() {
               placeholder="Steps to reproduce, expected vs actual behavior…"
             />
           </Field>
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <Field>
               {/* Neither Severity nor Priority is required, and both open on "Not selected" rather
                   than a preselected value, so nothing is filed with a value nobody chose. */}
@@ -1232,6 +1238,22 @@ export default function BugsPage() {
                   </option>
                 ))}
               </Select>
+            </Field>
+            <Field>
+              <FieldLabel>Due date</FieldLabel>
+              <Input
+                type="date"
+                value={createDueDate}
+                min={createMinDueDate}
+                onChange={(e) => setCreateDueDate(e.target.value)}
+                aria-label="Due date"
+                aria-invalid={createDueDateTooEarly || undefined}
+              />
+              {createDueDateTooEarly && (
+                <p role="alert" data-testid="due-date-error" className="text-[13px] text-[var(--error-foreground)]">
+                  Due date cannot be before today.
+                </p>
+              )}
             </Field>
           </div>
           <BugEvidenceField
@@ -1323,7 +1345,7 @@ export default function BugsPage() {
             <Button
               variant="primary"
               onClick={handleCreate}
-              disabled={creating || !createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired}
+              disabled={creating || !createTitle.trim() || (hasTestRuns && !createLinks.length) || createIssueRequired || createDueDateTooEarly}
             >
               {creating ? "Creating…" : "Report Bug"}
             </Button>

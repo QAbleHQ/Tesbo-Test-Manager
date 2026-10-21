@@ -64,3 +64,12 @@ export function formatRelative(input: DateInput, locale?: string): string {
   if (days < 7) return `${days}d ago`;
   return formatDate(d, locale);
 }
+
+/** A date's local calendar day as "YYYY-MM-DD" — the shape an <input type="date"> and a bug's
+ *  dueDate use. toISOString() would give the UTC day, which is the wrong one near midnight. */
+export function toLocalDay(input: DateInput = new Date()): string {
+  const d = toDate(input);
+  if (!d) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}

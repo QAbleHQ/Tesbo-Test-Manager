@@ -18,6 +18,7 @@ const FIELD_LABELS: Record<string, string> = {
   integrationIssueKey: "tracker issue",
   betterbugsUrl: "BetterBugs session",
   links: "linked test cases",
+  dueDate: "due date",
 };
 
 function Mention({ name }: { name: string }) {

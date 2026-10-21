@@ -1,7 +1,7 @@
 "use client";
 
 import type { BugItem } from "@/lib/api";
-import { formatDateTime } from "@/lib/date";
+import { formatDate, formatDateTime } from "@/lib/date";
 import BugAttachments from "@/components/bugs/BugAttachments";
 import { BugAssignee, BugPriorityBadge, BugSeverityBadge, BugStatusBadge } from "@/components/bugs/BugBadges";
 
@@ -10,6 +10,13 @@ import { BugAssignee, BugPriorityBadge, BugSeverityBadge, BugStatusBadge } from 
  * both the Bug Details side panel and the full-page bug view, so the two cannot drift apart.
  * Layout (padding, scrolling, header, actions) belongs to the caller.
  */
+/** "YYYY-MM-DD" as a local calendar day — new Date("2026-10-07") is UTC midnight and shows as the
+ *  6th west of Greenwich. */
+function localDay(iso: string): Date {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 export default function BugDetailsBody({
   bug,
   projectId,
@@ -97,8 +104,61 @@ export default function BugDetailsBody({
           <BugStatusBadge status={bug.status} />
         </div>
 
-        {/* Same grid as the row above, so Reported By / Assigned To / Reported On line up
-            under Severity / Priority / Status instead of snapping to a 2-column split. */}
+        <div>
+          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+            Reported By
+          </p>
+          <span className="text-sm text-[var(--foreground)]">
+            {bug.reporterName || bug.reporterEmail || "Unknown"}
+          </span>
+        </div>
+        <div>
+          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+            Assigned To
+          </p>
+          <BugAssignee id={bug.assigneeId} name={bug.assigneeName} />
+        </div>
+        <div>
+          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+            Due Date
+          </p>
+          {bug.dueDate ? (
+            <span className="inline-flex items-center gap-2 text-sm text-[var(--foreground)]" data-testid="bug-due-date">
+              {formatDate(localDay(bug.dueDate))}
+              {/* Overdue only while the bug is still open — a closed bug past its date is finished work. */}
+              {bug.status !== "Closed" && localDay(bug.dueDate) < new Date(new Date().setHours(0, 0, 0, 0)) && (
+                <span
+                  data-testid="bug-overdue-badge"
+                  className="rounded-full border border-[var(--error)] bg-[var(--error)]/10 px-2 py-0.5 text-xs font-medium text-[var(--error-foreground)]"
+                >
+                  Overdue
+                </span>
+              )}
+            </span>
+          ) : (
+            <span className="text-sm text-[var(--muted-soft)]" data-testid="bug-due-date">Not set</span>
+          )}
+        </div>
+        <div>
+          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+            Reported On
+          </p>
+          <span className="text-sm text-[var(--foreground)]">
+            {formatDateTime(bug.createdAt)}
+          </span>
+        </div>
+        {bug.updatedAt !== bug.createdAt && (
+          <div>
+            <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
+              Last Updated
+            </p>
+            <span className="text-sm text-[var(--foreground)]">
+              {formatDateTime(bug.updatedAt)}
+            </span>
+          </div>
+        )}
+        {/* One grid for every field, so the columns line up all the way down. Linked runs can be a
+            long list, so they sit last, full width, below the short fields. */}
         <div className="col-span-3">
           <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
             Linked Test Cases &amp; Runs
@@ -117,35 +177,7 @@ export default function BugDetailsBody({
             <span className="text-sm text-[var(--muted-soft)]">Not linked</span>
           )}
         </div>
-        <div>
-          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-            Reported By
-          </p>
-          <span className="text-sm text-[var(--foreground)]">
-            {bug.reporterName || bug.reporterEmail || "Unknown"}
-          </span>
-        </div>
-        <div>
-          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-            Assigned To
-          </p>
-          <BugAssignee id={bug.assigneeId} name={bug.assigneeName} />
-        </div>
-        <div>
-          <p className="text-xs font-medium text-[var(--muted)] uppercase tracking-wide mb-1">
-            Reported On
-          </p>
-          <span className="text-sm text-[var(--foreground)]">
-            {formatDateTime(bug.createdAt)}
-          </span>
-        </div>
       </div>
-
-      {bug.updatedAt !== bug.createdAt && (
-        <p className="text-xs text-[var(--muted-soft)]">
-          Last updated: {formatDateTime(bug.updatedAt)}
-        </p>
-      )}
 
       {/* Evidence — last, after the dates, so the fields people scan for come first */}
       {bug.betterbugsUrl ? (
