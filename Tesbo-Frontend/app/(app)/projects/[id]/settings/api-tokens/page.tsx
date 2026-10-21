@@ -13,7 +13,7 @@ import {
   type ApiToken,
   type ApiTokenWithSecret,
 } from "@/lib/api";
-import { Button, Card, Modal, Input, Field, FieldLabel, StatusChip, CopyButton } from "@/components/ui";
+import { Button, Card, Modal, Input, Select, Field, FieldHint, FieldLabel, StatusChip, CopyButton } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -31,6 +31,41 @@ function normalizeRole(role: string): "owner" | "manager" | "qa_engineer" {
 function formatDate(iso: string | null): string {
   if (!iso) return "Never";
   return formatDateShared(iso);
+}
+
+const DAY_MS = 86_400_000;
+/** Warn this many days before a token lapses. */
+const EXPIRING_SOON_DAYS = 14;
+/** The server default is 90 days (ApiTokenService); these are the lifetimes a creator may pick instead. */
+const EXPIRY_CHOICES = [
+  { days: 30, label: "30 days" },
+  { days: 90, label: "90 days (recommended)" },
+  { days: 180, label: "180 days" },
+  { days: 365, label: "1 year" },
+];
+
+type TokenExpiry = { status: "active" | "expired"; relative: string | null; soon: boolean };
+
+/**
+ * Where a token stands against its expiry. The server refuses an expired token (401) on its own
+ * clock, so this is only the page telling the user what they will hit, not an enforcement point.
+ * A token with no expiry (one that predates expiry and was never migrated) is simply active.
+ */
+function tokenExpiry(expiresAt: string | null, now = Date.now()): TokenExpiry {
+  if (!expiresAt) return { status: "active", relative: null, soon: false };
+  const at = new Date(expiresAt).getTime();
+  if (Number.isNaN(at)) return { status: "active", relative: null, soon: false };
+  const diff = at - now;
+  if (diff <= 0) {
+    const daysAgo = Math.floor(-diff / DAY_MS);
+    return { status: "expired", relative: daysAgo === 0 ? "today" : `${daysAgo} day${daysAgo === 1 ? "" : "s"} ago`, soon: false };
+  }
+  const daysLeft = Math.ceil(diff / DAY_MS);
+  return {
+    status: "active",
+    relative: daysLeft === 1 ? "in 1 day" : `in ${daysLeft} days`,
+    soon: daysLeft <= EXPIRING_SOON_DAYS,
+  };
 }
 
 function scopeLabel(scopes: string[]): string {
@@ -149,6 +184,7 @@ export default function ApiTokensPage() {
   const [createStep, setCreateStep] = useState<"form" | "reveal">("form");
   const [newTokenName, setNewTokenName] = useState("");
   const [newTokenScopes, setNewTokenScopes] = useState({ read: true, write: true });
+  const [newTokenDays, setNewTokenDays] = useState(90);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [revealedToken, setRevealedToken] = useState<ApiTokenWithSecret | null>(null);
@@ -185,6 +221,7 @@ export default function ApiTokensPage() {
   function openCreateModal() {
     setNewTokenName("");
     setNewTokenScopes({ read: true, write: true });
+    setNewTokenDays(90);
     setCreateError(null);
     setCreateStep("form");
     setCreateModalOpen(true);
@@ -207,7 +244,7 @@ export default function ApiTokensPage() {
     setCreating(true);
     setCreateError(null);
     try {
-      const result = await createApiKey(projectId, { name, scopes });
+      const result = await createApiKey(projectId, { name, scopes, expiresInDays: newTokenDays });
       setTokens((prev) => [result, ...prev]);
       setRevealedToken(result);
       setCreateStep("reveal");
@@ -342,6 +379,11 @@ export default defineConfig({
         </div>
       )}
 
+      <p className="text-sm text-[var(--muted)]" data-testid="token-expiry-help">
+        Tokens expire automatically. Create a replacement before the date shown to avoid interrupting CI pipelines or MCP
+        clients. An expired token is rejected with a 401 and cannot be renewed: remove it and create a new one.
+      </p>
+
       {listError && <p className="text-sm text-[var(--error-foreground)]">{listError}</p>}
 
       <Card className="overflow-hidden">
@@ -352,47 +394,74 @@ export default defineConfig({
                 <th className="px-4 py-3 font-medium">Name</th>
                 <th className="px-4 py-3 font-medium">Token</th>
                 <th className="px-4 py-3 font-medium">Scopes</th>
+                <th className="px-4 py-3 font-medium">Status</th>
                 <th className="px-4 py-3 font-medium">Last used</th>
                 <th className="px-4 py-3 font-medium">Created</th>
+                <th className="px-4 py-3 font-medium">Expires</th>
                 {canManageApiTokens && <th className="px-4 py-3 font-medium text-right">Action</th>}
               </tr>
             </thead>
             <tbody>
-              {tokens.map((token) => (
-                <tr key={token.id}>
-                  <td className="px-4 py-3 text-[var(--foreground)]">{token.name}</td>
-                  <td className="px-4 py-3 font-mono text-xs text-[var(--muted)]">{token.tokenPrefix}</td>
-                  <td className="px-4 py-3">
-                    <StatusChip tone="brand" dot>
-                      {scopeLabel(token.scopes)}
-                    </StatusChip>
-                  </td>
-                  <td className="px-4 py-3 text-[var(--muted)]">{formatDate(token.lastUsedAt)}</td>
-                  <td className="px-4 py-3 text-[var(--muted)]">{formatDate(token.createdAt)}</td>
-                  {canManageApiTokens && (
-                    <td className="px-4 py-3 text-right">
-                      <button
-                        type="button"
-                        onClick={() => handleRevoke(token.id)}
-                        disabled={revokingId === token.id}
-                        className="text-[var(--error-foreground)] hover:underline disabled:opacity-50"
-                      >
-                        {revokingId === token.id ? "Revoking…" : "Revoke"}
-                      </button>
+              {tokens.map((token) => {
+                const expiry = tokenExpiry(token.expiresAt);
+                const expired = expiry.status === "expired";
+                return (
+                  <tr key={token.id} data-token-status={expiry.status}>
+                    <td className="px-4 py-3 text-[var(--foreground)]">{token.name}</td>
+                    <td className="px-4 py-3 font-mono text-xs text-[var(--muted)]">{token.tokenPrefix}</td>
+                    <td className="px-4 py-3">
+                      <StatusChip tone="brand" dot>
+                        {scopeLabel(token.scopes)}
+                      </StatusChip>
                     </td>
-                  )}
-                </tr>
-              ))}
+                    <td className="px-4 py-3">
+                      <StatusChip tone={expired ? "error" : "success"} dot>
+                        {expired ? "Expired" : "Active"}
+                      </StatusChip>
+                    </td>
+                    <td className="px-4 py-3 text-[var(--muted)]">{formatDate(token.lastUsedAt)}</td>
+                    <td className="px-4 py-3 text-[var(--muted)]">{formatDate(token.createdAt)}</td>
+                    <td className="px-4 py-3 text-[var(--muted)]">
+                      <div>{formatDate(token.expiresAt)}</div>
+                      {expiry.relative && (
+                        <div
+                          className={`text-xs ${
+                            expired
+                              ? "text-[var(--error-foreground)]"
+                              : expiry.soon
+                                ? "text-[var(--warning-foreground)]"
+                                : "text-[var(--muted-soft)]"
+                          }`}
+                        >
+                          {expired ? `Expired ${expiry.relative}` : `Expires ${expiry.relative}`}
+                        </div>
+                      )}
+                    </td>
+                    {canManageApiTokens && (
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleRevoke(token.id)}
+                          disabled={revokingId === token.id}
+                          className="text-[var(--error-foreground)] hover:underline disabled:opacity-50"
+                        >
+                          {revokingId === token.id ? "Removing…" : expired ? "Remove" : "Revoke"}
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                );
+              })}
               {!tokensLoading && tokens.length === 0 && (
                 <tr>
-                  <td colSpan={canManageApiTokens ? 6 : 5} className="px-4 py-6 text-center text-[var(--muted)]">
+                  <td colSpan={canManageApiTokens ? 8 : 7} className="px-4 py-6 text-center text-[var(--muted)]">
                     No API tokens yet.
                   </td>
                 </tr>
               )}
               {tokensLoading && (
                 <tr>
-                  <td colSpan={canManageApiTokens ? 6 : 5} className="px-4 py-6 text-center text-[var(--muted)]">
+                  <td colSpan={canManageApiTokens ? 8 : 7} className="px-4 py-6 text-center text-[var(--muted)]">
                     Loading tokens…
                   </td>
                 </tr>
@@ -669,6 +738,22 @@ export default defineConfig({
                 </div>
               </label>
             </div>
+            <Field>
+              <FieldLabel htmlFor="token-expiry">Expires after</FieldLabel>
+              <Select
+                id="token-expiry"
+                value={newTokenDays}
+                onChange={(e) => setNewTokenDays(Number(e.target.value))}
+                disabled={creating}
+              >
+                {EXPIRY_CHOICES.map((choice) => (
+                  <option key={choice.days} value={choice.days}>
+                    {choice.label}
+                  </option>
+                ))}
+              </Select>
+              <FieldHint>After this date, requests using the token are rejected and you will need to create a new one.</FieldHint>
+            </Field>
             {createError && <p className="text-sm text-[var(--error-foreground)]">{createError}</p>}
             <div className="flex justify-end gap-2">
               <Button type="button" variant="secondary" onClick={closeCreateModal} disabled={creating}>
@@ -696,6 +781,13 @@ export default defineConfig({
             <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
               This is the only time you&apos;ll see this token. Copy it now — for example, paste it directly into the connection instructions below.
             </div>
+            {revealedToken.expiresAt && (
+              <p className="text-sm text-[var(--muted)]" data-testid="token-reveal-expiry">
+                This token expires on{" "}
+                <span className="font-medium text-[var(--foreground)]">{formatDate(revealedToken.expiresAt)}</span>. After that
+                date, requests that use it return 401 and you will need to create a new token.
+              </p>
+            )}
             <div className="flex justify-end">
               <Button type="button" onClick={finishReveal}>
                 Done

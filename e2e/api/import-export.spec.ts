@@ -364,6 +364,199 @@ test.describe("import / export", () => {
     expect(body).toContain('"E2E Export ""quoted"", comma');
   });
 
+  /*
+   * ── Spreadsheet formula injection ─────────────────────────────────────────
+   *
+   * A title, step or custom field value is typed by one project member and opened in Excel or Sheets
+   * by another. In a CSV a cell beginning with = + - or @ (or a tab / carriage return) is a formula,
+   * so `=HYPERLINK(...)` in a title was a live link, and `=cmd|' /C ...'!A0` a command where DDE is
+   * enabled. The CSV writer (src/common/spreadsheet-safe.ts) now prefixes a single quote, which
+   * spreadsheets show as a literal; real numbers such as -5 are left as numbers. The importer takes
+   * the quote off again (see the UI spec), so a round trip is exact. XLSX needs no quote: its strings
+   * are text cells a spreadsheet never evaluates, and a quote there would only corrupt the data.
+   */
+  const HOSTILE_TITLES = [
+    '=HYPERLINK("http://evil.example/steal","click me")',
+    "+1+1",
+    "-2+3",
+    "@SUM(1,1)",
+    "=cmd|' /C calc'!A0",
+    "=1+1,2+2",
+    '=say "hi"',
+    "'=already quoted",
+  ];
+  const FORMULA_START = /^[=+\-@\t\r]/;
+
+  test("CSV: a title, description, step and custom field value that start like a formula are exported as text", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Formula ${stamp}`);
+    const text = await (
+      await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+        data: { name: `Owner ${stamp}`, fieldType: "text" },
+      })
+    ).json();
+    const seeded: SeededCase[] = [];
+    for (const [i, title] of HOSTILE_TITLES.entries()) {
+      seeded.push(
+        await seedCase(
+          {
+            title: `${title}`,
+            description: `=desc ${i}`,
+            preconditions: `+pre ${i}`,
+            steps: [{ stepNumber: 1, action: `-act ${i}`, expectedResult: `@exp ${i}` }],
+            customFieldValues: { [text.id]: `=cf ${i}` },
+          },
+          project,
+        ),
+      );
+    }
+
+    const body = await (await exportCsv(asOwner, project)).text();
+    const { records } = parseCsvRecords(body);
+    expect(records).toHaveLength(HOSTILE_TITLES.length);
+
+    // Not a single data cell begins with a character a spreadsheet would read as a formula.
+    for (const record of records) {
+      for (const [column, cell] of Object.entries(record)) {
+        expect(cell, `column ${column} holds an armed cell: ${JSON.stringify(cell)}`).not.toMatch(FORMULA_START);
+      }
+    }
+
+    // Each one carries exactly one added quote, and the rest of the text is untouched.
+    const byDescription = new Map(records.map((r) => [r.description, r]));
+    for (const [i, title] of HOSTILE_TITLES.entries()) {
+      const row = byDescription.get(`'=desc ${i}`);
+      expect(row, `row ${i} (${title}) is missing`).toBeTruthy();
+      expect(row!.title).toBe(`'${title}`);
+      expect(row!.preconditions).toBe(`'+pre ${i}`);
+      expect(row![`cf_${text.key}`]).toBe(`'=cf ${i}`);
+      expect(row!.action).toBe(`'-act ${i}`);
+      expect(row!.expectedResult).toBe(`'@exp ${i}`);
+    }
+    // A value that already began with a quote and a trigger gets a second one, so import restores it exactly.
+    expect(records.find((r) => r.title.endsWith("already quoted"))!.title).toBe("''=already quoted");
+  });
+
+  test("CSV: ordinary values, real numbers and negative numbers are not quoted", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Formula Plain ${stamp}`);
+    const number = await (
+      await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, {
+        data: { name: `Delta ${stamp}`, fieldType: "number" },
+      })
+    ).json();
+    const seeded = await seedCase(
+      {
+        title: `E2E plain title ${stamp}`,
+        description: "a=b and a+b are fine in the middle, and so is user@example.com",
+        customFieldValues: { [number.id]: -5 },
+      },
+      project,
+    );
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    const row = records.find((r) => r.title === seeded.title)!;
+    expect(row.description).toBe("a=b and a+b are fine in the middle, and so is user@example.com");
+    // -5 is a number in a numeric column, not a payload: quoting it would turn every negative into text.
+    expect(row[`cf_${number.key}`]).toBe("-5");
+  });
+
+  test("CSV: a multi-line hostile value stays one cell in one row", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Formula Multiline ${stamp}`);
+    const seeded = await seedCase(
+      { title: `E2E multiline ${stamp}`, description: `=HYPERLINK("http://evil","x")\nsecond line,\n=another` },
+      project,
+    );
+    const { records } = parseCsvRecords(await (await exportCsv(asOwner, project)).text());
+    expect(records).toHaveLength(1);
+    expect(records[0].title).toBe(seeded.title);
+    expect(records[0].description).toBe(`'=HYPERLINK("http://evil","x")\nsecond line,\n=another`);
+  });
+
+  test("XLSX: the same hostile values are written as text cells with their exact original text, never as formulas", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Formula XLSX ${stamp}`);
+    for (const [i, title] of HOSTILE_TITLES.entries()) {
+      await seedCase({ title, description: `=desc ${i}` }, project);
+    }
+    const res = await asOwner.get(`/api/projects/${project}/testcases/export/xlsx`);
+    expect(res.status()).toBe(200);
+    const workbook = XLSX.read(await res.body(), { type: "buffer" });
+    const sheet = workbook.Sheets["Test Cases"];
+    const header = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1 })[0] as string[];
+    const titleCol = header.indexOf("title");
+    const descriptionCol = header.indexOf("description");
+    expect(titleCol).toBeGreaterThanOrEqual(0);
+
+    const seen = new Set<string>();
+    for (let r = 1; r <= HOSTILE_TITLES.length; r++) {
+      for (const col of [titleCol, descriptionCol]) {
+        const cell = sheet[XLSX.utils.encode_cell({ r, c: col })];
+        expect(cell, `cell r${r} c${col} is missing`).toBeTruthy();
+        // A string cell, with no formula attached: this is what stops a spreadsheet evaluating it.
+        expect(cell.t, `r${r} c${col} is not a string cell`).toBe("s");
+        expect(cell.f, `r${r} c${col} carries a formula`).toBeUndefined();
+        seen.add(String(cell.v));
+      }
+    }
+    // Unchanged: no added quote, so the importer has nothing to undo for an xlsx.
+    for (const title of HOSTILE_TITLES) expect(seen.has(title), `${title} was altered in the workbook`).toBe(true);
+  });
+
+  test("the import template neutralises a custom field named like a formula in the CSV, and leaves the workbook header plain", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Formula Template ${stamp}`);
+    const name = `=cmd|calc ${stamp}`;
+    await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, { data: { name, fieldType: "text" } });
+
+    const csv = await (await asOwner.get(`/api/projects/${project}/testcases/import/template`)).text();
+    const { headers } = parseCsvRecords(csv);
+    expect(headers, "the field's own column header is armed").not.toContain(name);
+    expect(headers).toContain(`'${name}`);
+    // The whole header row is still the right width: nothing in a name can split it.
+    expect(headers.filter((h) => FORMULA_START.test(h))).toEqual([]);
+
+    const xlsx = await asOwner.get(`/api/projects/${project}/testcases/import/template?format=xlsx`);
+    const sheet = XLSX.read(await xlsx.body(), { type: "buffer" }).Sheets["Test Cases"];
+    const xlsxHeaders = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1 })[0] as string[];
+    expect(xlsxHeaders).toContain(name);
+  });
+
+  test("a custom field named with a comma and a quote no longer breaks the template's header row", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Header Quoting ${stamp}`);
+    const name = `Steps, "notes" ${stamp}`;
+    await asOwner.post(`/api/projects/${project}/custom-fields/definitions`, { data: { name, fieldType: "text" } });
+    const csv = await (await asOwner.get(`/api/projects/${project}/testcases/import/template`)).text();
+    const { headers, records } = parseCsvRecords(csv);
+    expect(headers).toContain(name);
+    // Header and example row have the same number of fields, so the file still parses as a table.
+    expect(Object.keys(records[0])).toHaveLength(headers.length);
+  });
+
+  test("report CSVs neutralise user-named data too: a suite named like a formula is quoted wherever it appears", async () => {
+    const stamp = Date.now();
+    const project = await newProject(`E2E Export Formula Report ${stamp}`);
+    const suiteName = `=HYPERLINK("http://evil","${stamp}")`;
+    const suite = await asOwner.post(`/api/projects/${project}/suites`, { data: { name: suiteName } });
+    expect(suite.ok(), await suite.text()).toBeTruthy();
+    await seedCase({ title: `E2E report formula ${stamp}`, suiteId: (await suite.json()).id }, project);
+
+    let quotedSomewhere = false;
+    for (const view of ["overview", "repository", "matrix"]) {
+      const res = await asOwner.get(`/api/projects/${project}/reports/export/csv`, { params: { view } });
+      expect(res.status(), `report view ${view}`).toBe(200);
+      const body = await res.text();
+      for (const row of parseCsv(body).slice(1)) {
+        for (const cell of row) {
+          expect(cell, `report ${view} has an armed cell: ${JSON.stringify(cell)}`).not.toMatch(FORMULA_START);
+        }
+      }
+      if (body.includes(`'=HYPERLINK(`)) quotedSomewhere = true;
+    }
+    expect(quotedSomewhere, "the formula-named suite never appeared in any report view, so nothing was actually tested").toBe(true);
+  });
+
   test(
     "orders rows the same way the repository shows them by default (newest first, ID sequence), not by last-updated",
     { tag: '@tesbo.testId("TES-TC-200")' },

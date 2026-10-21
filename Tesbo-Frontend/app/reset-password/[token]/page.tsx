@@ -8,6 +8,7 @@ import { IconCircleCheck } from "@tabler/icons-react";
 import { checkPasswordResetToken, resetPassword } from "@/lib/api";
 import { AuthSplitShell } from "@/components/auth/AuthSplitShell";
 import { AuthLoadingScreen } from "@/components/auth/AuthLoadingScreen";
+import { ResetImpactNotice } from "@/components/auth/ResetImpactNotice";
 import { Button, Field, FieldError, FieldHint, FieldLabel, PasswordInput } from "@/components/ui";
 import { PASSWORD_MAX_LENGTH, PASSWORD_RULES_HINT, validatePasswordValue } from "@/lib/validation";
 
@@ -77,7 +78,11 @@ export default function ResetPasswordPage() {
           </div>
           <div className="mb-2 text-[20px] font-bold tracking-tight text-[var(--foreground)]">Password reset</div>
           <p className="mb-7 text-[13px] leading-relaxed text-[var(--muted)]">
-            Your password has been updated. You&apos;ve been signed out everywhere else — sign in again with your new password.
+            Your password has been updated and you have been signed out of every device. Sign in again with your new password.
+          </p>
+          <p className="mb-7 text-[13px] leading-relaxed text-[var(--muted)]" data-testid="reset-tokens-revoked">
+            Your API tokens have been revoked. Create new tokens under Project Settings, API tokens before reconnecting CI
+            pipelines, MCP clients or the Playwright reporter.
           </p>
           <Button
             type="button"
@@ -112,7 +117,8 @@ export default function ResetPasswordPage() {
     <AuthSplitShell>
       <div className="auth-fade-slide">
         <div className="mb-1 text-[22px] font-bold tracking-tight text-[var(--foreground)]">Set a new password</div>
-        <p className="mb-7 text-[13px] text-[var(--muted)]">Choose a new password for your account.</p>
+        <p className="mb-5 text-[13px] text-[var(--muted)]">Choose a new password for your account.</p>
+        <ResetImpactNotice className="mb-6" />
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <Field>

@@ -1,3 +1,4 @@
+import { safeFetch } from "../common/safe-fetch";
 import { DatabaseService } from "../database/database.service";
 import { EmbeddingCapability, embeddingCapability, embeddingCapableProviderKeys, expectedDimension } from "./rag-embedding-providers";
 import { RAG_EMBEDDING_DIMENSION } from "./rag.constants";
@@ -156,7 +157,7 @@ export async function embedTexts(allocation: EmbeddingKeyAllocation, inputs: str
   // is not harmlessly ignored everywhere — some reject an unknown field outright.
   if (allocation.sendDimensionParam) body.dimensions = RAG_EMBEDDING_DIMENSION;
 
-  const res = await fetch(normalizeEmbeddingsUrl(allocation.base_url), {
+  const res = await safeFetch(normalizeEmbeddingsUrl(allocation.base_url), {
     method: "POST",
     headers,
     body: JSON.stringify(body)

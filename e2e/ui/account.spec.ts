@@ -1,6 +1,7 @@
 import { expect, request, test, type APIRequestContext, type Browser, type BrowserContext, type Page } from "@playwright/test";
 import { waitForPasswordResetLinkInLogs, backendLogsAvailable } from "../utils/backend-logs";
 import { env, testAddress } from "../utils/env";
+import { exec, literal, scalar } from "../utils/psql";
 import {
   FIXTURE_PASSWORD,
   provisionRbacTenant,
@@ -265,6 +266,14 @@ test.describe("account screen and password reset (UI)", () => {
     const page = await anonymousPage(browser);
     await page.goto("/forgot-password");
 
+    // Before anything is sent, the screen says what completing a reset will cost: it signs the user
+    // out everywhere and revokes their API tokens, which takes a pipeline offline.
+    const notice = page.getByTestId("reset-impact-notice");
+    await expect(notice).toBeVisible();
+    await expect(notice).toContainText("signed out of every device");
+    await expect(notice).toContainText("All API tokens issued under your account are revoked");
+    await expect(notice).toContainText("create new tokens under Project Settings, API tokens");
+
     // A known address and an unknown one must be answered identically — otherwise the screen is an
     // account-existence oracle for anyone who asks, the same reason signup/start answers 204.
     for (const email of [tenant!.owner.email, testAddress("account-no-such-user")]) {
@@ -288,15 +297,32 @@ test.describe("account screen and password reset (UI)", () => {
     const resetUrl = await waitForPasswordResetLinkInLogs(tenant!.owner.email);
     expect(resetUrl, "the backend should have printed a reset link").toBeTruthy();
 
-    await page.goto(new URL(resetUrl!).pathname);
-    await expect(page.getByText("Set a new password")).toBeVisible();
-    await page.locator("#password").fill(NEW_PASSWORD);
-    await page.locator("#confirmPassword").fill(NEW_PASSWORD);
-    await page.getByRole("button", { name: /^Reset password$/i }).click();
+    // A token on this user, inserted directly (project_id is nullable and the row is never presented as
+    // a credential). The reset must revoke it, and the screens must say so.
+    const tokenHash = `e2e-acu-07-${Date.now()}`;
+    exec(
+      `INSERT INTO api_tokens (user_id, name, token_hash) VALUES (${literal(tenant!.owner.userId)}, 'E2E ACU-07', ${literal(tokenHash)});`,
+    );
+    const tokenRows = () => Number(scalar(`SELECT count(*) FROM api_tokens WHERE token_hash = ${literal(tokenHash)};`));
+    try {
+      expect(tokenRows()).toBe(1);
 
-    await expect(page.getByText("Password reset")).toBeVisible();
-    expect(await passwordWorks(NEW_PASSWORD), "the reset password should authenticate").toBe(true);
-    expect(await passwordWorks(FIXTURE_PASSWORD), "the old password must stop working").toBe(false);
+      await page.goto(new URL(resetUrl!).pathname);
+      await expect(page.getByText("Set a new password")).toBeVisible();
+      // The warning is on the form itself, before the user commits, not only after the fact.
+      await expect(page.getByTestId("reset-impact-notice")).toContainText("All API tokens issued under your account are revoked");
+      await page.locator("#password").fill(NEW_PASSWORD);
+      await page.locator("#confirmPassword").fill(NEW_PASSWORD);
+      await page.getByRole("button", { name: /^Reset password$/i }).click();
+
+      await expect(page.getByText("Password reset")).toBeVisible();
+      await expect(page.getByTestId("reset-tokens-revoked")).toContainText("Create new tokens under Project Settings, API tokens");
+      expect(await passwordWorks(NEW_PASSWORD), "the reset password should authenticate").toBe(true);
+      expect(await passwordWorks(FIXTURE_PASSWORD), "the old password must stop working").toBe(false);
+      expect(tokenRows(), "the screen says tokens were revoked but the row is still there").toBe(0);
+    } finally {
+      exec(`DELETE FROM api_tokens WHERE token_hash = ${literal(tokenHash)};`);
+    }
   });
 
   test("ACU-08 a reset link cannot be used twice", { tag: '@tesbo.testId("TES-TC-993")' }, async ({ browser }) => {

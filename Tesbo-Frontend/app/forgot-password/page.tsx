@@ -5,6 +5,7 @@ import type { FormEvent } from "react";
 import Link from "next/link";
 import { IconMailOpened } from "@tabler/icons-react";
 import { requestPasswordReset } from "@/lib/api";
+import { ResetImpactNotice } from "@/components/auth/ResetImpactNotice";
 import { AuthSplitShell } from "@/components/auth/AuthSplitShell";
 import { Button, Field, FieldError, FieldLabel, Input } from "@/components/ui";
 import { validateEmailValue } from "@/lib/validation";
@@ -63,9 +64,10 @@ export default function ForgotPasswordPage() {
     <AuthSplitShell>
       <div className="auth-fade-slide">
         <div className="mb-1 text-[22px] font-bold tracking-tight text-[var(--foreground)]">Forgot password?</div>
-        <p className="mb-7 text-[13px] text-[var(--muted)]">
+        <p className="mb-5 text-[13px] text-[var(--muted)]">
           Enter your email and we&apos;ll send you a link to reset your password.
         </p>
+        <ResetImpactNotice className="mb-6" />
 
         {/* noValidate: without it, the browser's own "not a valid email" bubble intercepts
             submit on type="email" before onSubmit ever runs, so the inline message below the

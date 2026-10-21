@@ -35,8 +35,10 @@ const MAX_EVIDENCE_FILES_PER_CALL = 10;
  * URL and carry the right scope for the method — enforced here because
  * `LegacyService.requireProjectAccess` authorizes the token's *user*, who may belong to several
  * projects, so on its own it would let a token issued for project A write to project B. McpService
- * makes the same check for the same reason; the rest of the REST surface does not, which is a
- * wider gap recorded in docs/automation-integration-plan.md rather than fixed here.
+ * makes the same check for the same reason. AuthMiddleware now also refuses, before any controller,
+ * a token on another project or outside the allowlist in auth/api-token-policy.ts, so this check is
+ * the second of two rather than the only one; it stays because this controller owns its scope rules
+ * (a POST here can be a read).
  */
 @Controller()
 export class AutomationController {

@@ -118,14 +118,14 @@ describe("OtpService.requestOtp: one live code, capped per hour", () => {
     await expect(svc.verifyOtpCode("a@example.test", sent[0])).resolves.toBe(true);
   });
 
-  it("refuses the 11th code within the hour with a 429 and sends no email", async () => {
-    const { svc, sent } = makeService([], 10);
+  it("refuses the 21st code within the hour with a 429 and sends no email", async () => {
+    const { svc, sent } = makeService([], 20);
     await expect(svc.requestOtp("a@example.test")).rejects.toBeInstanceOf(OtpRateLimitedException);
     expect(sent).toHaveLength(0);
   });
 
-  it("still allows the 10th", async () => {
-    const { svc, sent } = makeService([], 9);
+  it("still allows the 20th", async () => {
+    const { svc, sent } = makeService([], 19);
     await expect(svc.requestOtp("a@example.test")).resolves.toBe(true);
     expect(sent).toHaveLength(1);
   });

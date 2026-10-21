@@ -798,4 +798,54 @@ test.describe("role-based permissions", () => {
     // And the response must still be well formed rather than erroring on the extra bind parameter.
     expect(qaCounts.executionStatus ?? {}, "the execution breakdown is missing").toBeTruthy();
   });
+
+  // ─── API tokens ────────────────────────────────────────────────────────────
+
+  test("a QA engineer cannot create or revoke a project API token; a manager can", async () => {
+    // Explicit: Settings > API tokens already hides this from QA engineers. The check was UI-only, so
+    // a direct POST /apikeys from any project member minted a standing credential. A token outlives
+    // the member's session, and it is only as safe as the role that could mint it.
+    const projectId = tenant!.mainProjectId;
+    const minted: string[] = [];
+    try {
+      const refusedCreate = await asQa.post(`/api/projects/${projectId}/apikeys`, {
+        data: { name: "E2E RBAC qa token" },
+        failOnStatusCode: false,
+      });
+      expect(refusedCreate.status(), `a qa_engineer minted a token: ${await refusedCreate.text()}`).toBe(403);
+      expect((await refusedCreate.json()).error).toContain("Only project owners and managers");
+
+      const managerCreate = await asManager.post(`/api/projects/${projectId}/apikeys`, {
+        data: { name: "E2E RBAC manager token" },
+        failOnStatusCode: false,
+      });
+      expect(managerCreate.status(), `a manager could not mint a token: ${await managerCreate.text()}`).toBe(201);
+      const managerToken = await managerCreate.json();
+      minted.push(managerToken.id);
+
+      // A QA engineer cannot revoke it either: revoking a CI credential is a way to break a pipeline.
+      const refusedRevoke = await asQa.delete(`/api/projects/${projectId}/apikeys/${managerToken.id}`, { failOnStatusCode: false });
+      expect(refusedRevoke.status()).toBe(403);
+      const stillListed = (await (await asOwner.get(`/api/projects/${projectId}/apikeys`)).json()) as Array<{ id: string }>;
+      expect(stillListed.some((t) => t.id === managerToken.id), "a qa_engineer revoked a token").toBe(true);
+
+      // Reading the list stays open to members (names and a 6-character hint, never the secret).
+      const qaList = await asQa.get(`/api/projects/${projectId}/apikeys`, { failOnStatusCode: false });
+      expect(qaList.status()).toBe(200);
+      expect(JSON.stringify(await qaList.json())).not.toContain(managerToken.token);
+
+      // Someone who is not a member of the project at all gets the same "not found" as everywhere else.
+      const guestCreate = await asGuest.post(`/api/projects/${projectId}/apikeys`, {
+        data: { name: "E2E RBAC guest token" },
+        failOnStatusCode: false,
+      });
+      expect(guestCreate.status()).toBe(404);
+
+      // The manager can revoke their own.
+      expect((await asManager.delete(`/api/projects/${projectId}/apikeys/${managerToken.id}`)).ok()).toBeTruthy();
+      minted.pop();
+    } finally {
+      for (const id of minted) await asOwner.delete(`/api/projects/${projectId}/apikeys/${id}`, { failOnStatusCode: false });
+    }
+  });
 });

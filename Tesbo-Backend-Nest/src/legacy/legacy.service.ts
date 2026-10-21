@@ -13,6 +13,8 @@ import { endZyraTurn, recordExistingCoverage, recordGeneration, recordJiraContex
 import { StorageService } from "../storage/storage.service";
 import { encryptSecret, decryptSecret } from "../common/crypto.util";
 import { externallyReachableBaseUrl } from "../common/external-url.util";
+import { UnsafeOutboundUrlError, assertSafeBaseUrl, safeFetch } from "../common/safe-fetch";
+import { PLAIN_TEXT_DELIVERY, resolveFileDelivery, safeContentType, withDelivery } from "../common/file-delivery";
 import { escapeHtml, jiraDescriptionToText } from "../common/integration-text.util";
 import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util";
 import { validatePersonName } from "../common/person-name.util";
@@ -1638,16 +1640,27 @@ export class LegacyService implements OnModuleInit {
     return this.apiTokens.listTokens(projectId);
   }
 
+  // The Settings page already hides token management from QA engineers; this is the same rule where
+  // it can't be bypassed. Without it any project member could POST /apikeys directly, and a token is
+  // a standing credential that outlives the member's session.
+  private assertCanManageApiKeys(project: { caller_role?: string }, action: string) {
+    if (this.normalizeRole(project.caller_role ?? "") === "qa_engineer") {
+      throw new ForbiddenException({ error: `Only project owners and managers can ${action} API tokens` });
+    }
+  }
+
   async createApiKey(userId: string | null | undefined, projectId: string, body: Body) {
     const uid = this.requireUser(userId);
-    await this.requireProjectAccess(uid, projectId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    this.assertCanManageApiKeys(project, "create");
     const name = String(body?.name || "").trim();
     if (!name) throw new BadRequestException({ error: "name is required" });
-    return this.apiTokens.issueToken(uid, projectId, name, body?.scopes);
+    return this.apiTokens.issueToken(uid, projectId, name, body?.scopes, body?.expiresInDays);
   }
 
   async revokeApiKey(userId: string | null | undefined, projectId: string, keyId: string) {
-    await this.requireProjectAccess(userId, projectId);
+    const project = await this.requireProjectAccess(userId, projectId);
+    this.assertCanManageApiKeys(project, "revoke");
     if (!isUuid(keyId)) throw new NotFoundException({ error: "API key not found" });
     const removed = await this.apiTokens.revokeToken(projectId, keyId);
     if (!removed) throw new NotFoundException({ error: "API key not found" });
@@ -3055,7 +3068,7 @@ export class LegacyService implements OnModuleInit {
     const existingUser = await this.db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [inv.email]);
     if (existingUser.rows[0]) throw new BadRequestException({ error: "An account with this email already exists. Please sign in and accept the invite." });
 
-    const passwordHash = this.password.hashPassword(pw);
+    const passwordHash = await this.password.hashPassword(pw);
 
     const newUser = await this.db.transaction(async (client) => {
       const uRes = await client.query<{ id: string }>(
@@ -3162,9 +3175,62 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
+  /** Throws a 400 naming what is wrong with a provider base URL; does nothing for "no URL", which means the provider's own. */
+  private async assertAiBaseUrl(baseUrl: string | null): Promise<void> {
+    if (!baseUrl) return;
+    try {
+      await assertSafeBaseUrl(baseUrl);
+    } catch (err) {
+      if (err instanceof UnsafeOutboundUrlError) {
+        throw new BadRequestException({ error: `Base URL not allowed: ${err.message}`, code: "ai_base_url_blocked" });
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The shape of the AI key fields, checked before any of them is used. They end up in a database
+   * column (name and provider have fixed widths and used to answer a Postgres 500 when over), in an
+   * HTTP header (the key, the header name and the scheme), and in a URL, so each is refused if it is
+   * not text, is longer than it can be, or could break a header. The header name is held to RFC 7230
+   * token characters and may not be one that changes how the request is framed or routed.
+   */
+  private static assertAiKeyFields(body: Body): void {
+    const text = (field: string, max: number, opts: { control?: boolean } = {}) => {
+      const value = body[field];
+      if (value === undefined || value === null || value === "") return;
+      if (typeof value !== "string") throw new BadRequestException({ error: `${field} must be text` });
+      if (value.length > max) throw new BadRequestException({ error: `${field} must be at most ${max} characters` });
+      if (opts.control && /[\u0000-\u001f\u007f]/.test(value)) {
+        throw new BadRequestException({ error: `${field} must not contain control characters or line breaks` });
+      }
+    };
+    text("name", 128, { control: true });
+    text("provider", 32, { control: true });
+    text("apiKey", 4096, { control: true });
+    text("defaultModel", 128, { control: true });
+    text("baseUrl", 2048, { control: true });
+    text("authScheme", 64, { control: true });
+    text("authHeaderName", 128, { control: true });
+    const provider = String(body.provider || "").trim();
+    if (provider && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(provider)) {
+      throw new BadRequestException({ error: "provider may only contain letters, digits, dots, dashes and underscores" });
+    }
+    const header = String(body.authHeaderName || "").trim();
+    if (header) {
+      if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(header)) {
+        throw new BadRequestException({ error: "authHeaderName is not a valid HTTP header name" });
+      }
+      if (/^(host|content-length|content-type|transfer-encoding|connection|upgrade|te|trailer|expect|keep-alive|proxy-.*|cookie|set-cookie|accept-encoding)$/i.test(header)) {
+        throw new BadRequestException({ error: `authHeaderName "${header}" cannot be used: it controls how the request is sent` });
+      }
+    }
+  }
+
   async createAiKey(userId: string | null | undefined, body: Body) {
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage AI keys" });
+    LegacyService.assertAiKeyFields(body);
     const name = String(body.name || "").trim();
     const apiKey = String(body.apiKey || "").trim();
     const provider = String(body.provider || "openai").trim().toLowerCase();
@@ -3189,6 +3255,10 @@ export class LegacyService implements OnModuleInit {
           : "baseUrl is required for custom providers"
       });
     }
+    // Refused when typed rather than when first used. This is the address the server will call with the
+    // stored key, so it must not be one on the server's own network (see common/safe-fetch.ts). The
+    // catalog default counts too: choosing Ollama on a hosted deployment has nowhere to go.
+    await this.assertAiBaseUrl(baseUrl || definition?.defaultBaseUrl || null);
     // Plain insert, not an upsert: the form that posts here has no "edit" mode and always
     // defaults its Provider field to openai, so a conflicting name used to silently overwrite
     // an existing key's provider/model/etc. back to those defaults instead of failing loudly.
@@ -3241,6 +3311,7 @@ export class LegacyService implements OnModuleInit {
     if (this.normalizeRole(workspace.role) !== "owner") {
       throw new ForbiddenException({ error: "Only the workspace owner can manage AI keys" });
     }
+    LegacyService.assertAiKeyFields(body);
     const provider = String(body.provider || "").trim().toLowerCase();
     if (!provider) throw new BadRequestException({ error: "provider is required" });
 
@@ -3260,6 +3331,17 @@ export class LegacyService implements OnModuleInit {
       );
       const row = stored.rows[0];
       if (!row) throw new NotFoundException({ error: "AI key not found" });
+      // The stored secret is only ever sent where it was saved for. Without this, naming a saved key
+      // and supplying a different base URL made the server call that URL WITH the real key: the one way
+      // to read a key the browser only ever sees masked.
+      const sameDestination =
+        !baseUrl || resolveProviderBaseUrl(provider, baseUrl) === resolveProviderBaseUrl(provider, String(row.base_url || "") || null);
+      if (!sameDestination) {
+        throw new BadRequestException({
+          error: "To use this key with a different base URL, enter the API key again.",
+          code: "ai_key_reentry_required"
+        });
+      }
       apiKey = String(row.api_key || "");
       baseUrl = baseUrl || row.base_url || null;
       authHeaderName = authHeaderName || row.auth_header_name || null;
@@ -3315,7 +3397,7 @@ export class LegacyService implements OnModuleInit {
       const query = new URLSearchParams(existingQuery);
       query.set("limit", "100");
       if (cursor) query.set("after_id", cursor);
-      const res = await fetch(`${root}?${query.toString()}`, { method: "GET", headers });
+      const res = await safeFetch(`${root}?${query.toString()}`, { method: "GET", headers });
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({} as Body)) as Body;
         const raw = String(errBody.error?.message || errBody.error || res.status);
@@ -8205,12 +8287,14 @@ export class LegacyService implements OnModuleInit {
         const entry: { key: string; id?: string } = {
           key: `bugs/${projectId}/${bugId}/comments/${commentId}/${randomUUID()}${ext ? `.${ext}` : ""}`
         };
-        await this.storage.put(entry.key, file.buffer, file.mimetype);
+        // The type the uploader's client claimed is never stored: see common/file-delivery.ts.
+        const contentType = safeContentType(file.mimetype, file.originalname);
+        await this.storage.put(entry.key, file.buffer, contentType);
         stored.push(entry);
         const res = await this.db.query<{ id: string }>(
           `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
            VALUES ($1, 'bug_comment', $2, $3, $4, $5, $6, $7) RETURNING id`,
-          [projectId, commentId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, entry.key, uid]
+          [projectId, commentId, LegacyService.displayFileName(file.originalname), contentType, file.size, entry.key, uid]
         );
         entry.id = res.rows[0].id;
       }
@@ -8716,11 +8800,12 @@ export class LegacyService implements OnModuleInit {
     for (const file of files) {
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
       const storageKey = `bugs/${projectId}/${bugId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
-      await this.storage.put(storageKey, file.buffer, file.mimetype);
+      const contentType = safeContentType(file.mimetype, file.originalname);
+      await this.storage.put(storageKey, file.buffer, contentType);
       const res = await this.db.query(
         `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
          VALUES ($1, 'bug', $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [projectId, bugId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
+        [projectId, bugId, LegacyService.displayFileName(file.originalname), contentType, file.size, storageKey, uid]
       );
       created.push(toCamel(res.rows[0]));
       await this.logProjectActivity(projectId, uid, "bug_attachment_added", "bug", bugId, String(bug.rows[0].title ?? ""), {
@@ -8754,9 +8839,9 @@ export class LegacyService implements OnModuleInit {
     if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
-    const mimeType = file.content_type || "application/octet-stream";
-    const access = await this.storage.getAccessUrl(file.storage_path, { filename: file.file_name, inline, contentType: mimeType });
-    return { ...access, mimeType, originalFileName: file.file_name };
+    const delivery = resolveFileDelivery(file.content_type, file.file_name, inline);
+    const access = await this.storage.getAccessUrl(file.storage_path, { filename: file.file_name, ...delivery });
+    return withDelivery(access, delivery, file.file_name);
   }
 
   async deleteBugAttachment(attachmentId: string, userId?: string | null) {
@@ -8828,11 +8913,12 @@ export class LegacyService implements OnModuleInit {
     for (const file of files) {
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
       const storageKey = `executions/${projectId}/${executionId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
-      await this.storage.put(storageKey, file.buffer, file.mimetype);
+      const contentType = safeContentType(file.mimetype, file.originalname);
+      await this.storage.put(storageKey, file.buffer, contentType);
       const res = await this.db.query(
         `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
          VALUES ($1, 'execution', $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [projectId, executionId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
+        [projectId, executionId, LegacyService.displayFileName(file.originalname), contentType, file.size, storageKey, uid]
       );
       created.push(toCamel(res.rows[0]));
     }
@@ -8878,20 +8964,16 @@ export class LegacyService implements OnModuleInit {
     if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
-    const mimeType = file.content_type || "application/octet-stream";
     /*
      * A Playwright trace is a .zip that the ingest accepts as an exception to the evidence
-     * allowlist (see automation.types.ts). It is never served inline: `inline` is forced off for
-     * anything that is not an image or a video, so a stored archive or log cannot be rendered by a
-     * browser in Tesbo's own origin.
+     * allowlist (see automation.types.ts). It is never served inline, and neither is anything else
+     * outside the inline allowlist in common/file-delivery.ts: a stored archive, log or SVG cannot be
+     * rendered by a browser in Tesbo's own origin. This used to be `image/*` or `video/*` by the
+     * uploader's own claimed type, which let `image/svg+xml` through.
      */
-    const safeInline = inline && /^(image|video)\//.test(mimeType);
-    const access = await this.storage.getAccessUrl(file.storage_path, {
-      filename: file.file_name,
-      inline: safeInline,
-      contentType: mimeType
-    });
-    return { ...access, mimeType, originalFileName: file.file_name, inline: safeInline };
+    const delivery = resolveFileDelivery(file.content_type, file.file_name, inline);
+    const access = await this.storage.getAccessUrl(file.storage_path, { filename: file.file_name, ...delivery });
+    return withDelivery(access, delivery, file.file_name);
   }
 
   /**
@@ -11892,7 +11974,7 @@ export class LegacyService implements OnModuleInit {
       const scheme = String(key.auth_scheme || "Bearer").trim();
       const headers: Record<string, string> = {};
       headers[authHeader] = scheme ? `${scheme} ${key.api_key}` : String(key.api_key);
-      const res = await fetch(normalizeAudioTranscriptionsUrl(key.base_url), { method: "POST", headers, body: form });
+      const res = await safeFetch(normalizeAudioTranscriptionsUrl(key.base_url), { method: "POST", headers, body: form });
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({} as Body)) as Body;
         const rawMessage = String(errBody.error?.message || errBody.error || res.status);
@@ -11981,7 +12063,8 @@ export class LegacyService implements OnModuleInit {
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
       const originalFileName = await this.kbUniqueFileName(folderId, file.originalname);
       const storageKey = `knowledge-base/${project.organization_id}/${projectId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
-      await this.storage.put(storageKey, file.buffer, file.mimetype);
+      const contentType = safeContentType(file.mimetype, file.originalname);
+      await this.storage.put(storageKey, file.buffer, contentType);
       // Audio/video transcription is slow (calls an external AI provider) and shouldn't block
       // the upload response — it's kicked off after insert, below, and fills in extracted_text
       // asynchronously. Everything else extracts synchronously (local CPU/WASM work only).
@@ -11991,7 +12074,7 @@ export class LegacyService implements OnModuleInit {
       const res = await this.db.query(
         `INSERT INTO knowledge_files (organization_id, project_id, folder_id, file_name, original_file_name, mime_type, file_extension, file_size, storage_key, uploaded_by, extracted_text, extraction_status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-        [project.organization_id, projectId, folderId, path.basename(storageKey), originalFileName, file.mimetype, ext, file.size, storageKey, uid, extractedText, extractionStatus]
+        [project.organization_id, projectId, folderId, path.basename(storageKey), originalFileName, contentType, ext, file.size, storageKey, uid, extractedText, extractionStatus]
       );
       created.push(this.kbFileView(res.rows[0]));
       await this.logProjectActivity(projectId, uid, "uploaded", "knowledge_file", res.rows[0].id, originalFileName, {});
@@ -12088,22 +12171,25 @@ export class LegacyService implements OnModuleInit {
     if (!file.storage_key || !(await this.storage.exists(file.storage_key))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
-    const mimeType = file.mime_type || "application/octet-stream";
     const ext = String(file.file_extension || "").toLowerCase().replace(/^\./, "");
     // Plaintext previews are fetched client-side with credentials to our own API; streaming them
     // directly (instead of redirecting to a presigned URL) avoids needing the storage bucket's
     // CORS policy to allow credentialed cross-origin requests.
-    if (inline && LegacyService.KB_PLAINTEXT_EXTENSIONS.has(ext)) {
+    // Decided by the extension the server recorded, not the type the uploader claimed: Chrome sends
+    // `video/mp2t` for a .ts and `text/html` is one header away from a script.
+    const textPreview = inline && LegacyService.KB_PLAINTEXT_EXTENSIONS.has(ext);
+    const delivery = textPreview ? PLAIN_TEXT_DELIVERY : resolveFileDelivery(file.mime_type, file.original_file_name, inline);
+    if (textPreview) {
       // The exists() check above is a no-op on S3 (it answers true and lets the signed-URL request
       // do the checking), so this branch — the only one that reads the bytes here rather than
       // redirecting — is where a missing object actually surfaces. Without the catch it escapes as
       // a 500, reporting a server fault for a file that is merely gone.
       const buffer = await this.storage.getBuffer(file.storage_key).catch(() => null);
       if (!buffer) throw new NotFoundException({ error: "File content is not available" });
-      return { buffer, mimeType, originalFileName: file.original_file_name };
+      return { buffer, ...delivery, originalFileName: file.original_file_name };
     }
-    const access = await this.storage.getAccessUrl(file.storage_key, { filename: file.original_file_name, inline, contentType: mimeType });
-    return { ...access, mimeType, originalFileName: file.original_file_name };
+    const access = await this.storage.getAccessUrl(file.storage_key, { filename: file.original_file_name, ...delivery });
+    return withDelivery(access, delivery, file.original_file_name);
   }
 
   // ─── Knowledge Base v2: search ─────────────────────────────────────────────
@@ -14346,7 +14432,7 @@ export class LegacyService implements OnModuleInit {
       }
       if (providerWire(provider) === "anthropic") {
         const headers = this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme);
-        const res = await fetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
+        const res = await safeFetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
           method: "POST",
           headers,
           body: JSON.stringify({
@@ -14363,7 +14449,7 @@ export class LegacyService implements OnModuleInit {
         return { ok: true, provider, model, latencyMs: Math.round(performance.now() - start) };
       }
       const authHeaders = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-      const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+      const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
         method: "POST",
         headers: authHeaders,
         body: JSON.stringify({ model, max_tokens: 5, messages: [{ role: "user", content: "hi" }] })
@@ -20367,7 +20453,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         const chatUrl = normalizeAnthropicMessagesUrlFor(provider, key.base_url);
         const chatHeaders = this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme);
         for (const candidate of providerModelCandidates(provider, model)) {
-          const res = await fetch(chatUrl, {
+          const res = await safeFetch(chatUrl, {
             method: "POST",
             headers: chatHeaders,
             body: JSON.stringify({ model: candidate, max_tokens: 220, messages: [{ role: "user", content: prompt }] })
@@ -20380,7 +20466,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         return "";
       }
       const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-      const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+      const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
         method: "POST",
         headers,
         body: JSON.stringify({ model, max_tokens: 220, messages: [{ role: "user", content: prompt }] })
@@ -22405,7 +22491,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
   // for "all possible cases" generation without pulling in the full chat-decision prompt.
   private async zyraJsonCompletion(provider: string, model: string, key: Body, systemPrompt: string, userPrompt: string): Promise<Body> {
     if (providerWire(provider) === "anthropic") {
-      const res = await fetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
+      const res = await safeFetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
         method: "POST",
         headers: this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme),
         body: JSON.stringify({
@@ -22434,7 +22520,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       return { ...parsed, __zyraUsage: { input, output, total: input + output } };
     }
     const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-    const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+    const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -22564,7 +22650,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       openAiBody.stream_options = { include_usage: true };
     }
     const headers = this.providerAuthHeaders(params.provider, params.apiKey, params.authHeaderName ?? null, params.authScheme ?? null);
-    const response = await fetch(providerChatUrl(params.provider, params.baseUrl, String(openAiBody.model)), {
+    const response = await safeFetch(providerChatUrl(params.provider, params.baseUrl, String(openAiBody.model)), {
       method: "POST",
       headers,
       body: JSON.stringify(openAiBody),
@@ -22625,7 +22711,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     // …and whenever a live batch is listening (zyraDraftSink), whatever the size.
     const stream = params.input.requestedCount > LegacyService.ZYRA_STREAM_ABOVE || Boolean(zyraDraftSink());
     let maxTokens = Math.min(LegacyService.ZYRA_GEN_MAX_TOKENS, 2000 + params.input.requestedCount * 1500);
-    const send = (model: string) => fetch(anthropicUrl, {
+    const send = (model: string) => safeFetch(anthropicUrl, {
       method: "POST",
       headers: anthropicHeaders,
       body: JSON.stringify({
@@ -22780,7 +22866,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     };
     const provider = String(key.provider || "openai").toLowerCase();
     const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-    const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+    const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -22836,7 +22922,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
           { role: "user", content: message }
         ]
       };
-      const res = await fetch(chatUrl, {
+      const res = await safeFetch(chatUrl, {
         method: "POST",
         headers: chatHeaders,
         body: JSON.stringify(body),
@@ -23086,7 +23172,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     if (providerWire(provider) === "anthropic") {
       let lastStatus = "";
       for (const candidate of providerModelCandidates(String(key.provider || "anthropic"), model)) {
-        const res = await fetch(normalizeAnthropicMessagesUrl(key.base_url), {
+        const res = await safeFetch(normalizeAnthropicMessagesUrl(key.base_url), {
           method: "POST",
           headers: this.buildAnthropicAuthHeaders(key.api_key, key.auth_header_name, key.auth_scheme),
           body: JSON.stringify({
@@ -23114,7 +23200,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       }
       throw new Error(`Claude update drafting failed: ${lastStatus || "No compatible model was accepted."}`);
     }
-    const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+    const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
       method: "POST",
       headers: this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme),
       body: JSON.stringify({ model, response_format: { type: "json_object" }, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),

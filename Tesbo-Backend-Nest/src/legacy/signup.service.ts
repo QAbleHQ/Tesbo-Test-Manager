@@ -4,6 +4,7 @@ import type { Response } from "express";
 import { AuditService } from "../audit/audit.service";
 import { AuthService } from "../auth/auth.service";
 import { OtpRateLimitedException, OtpService } from "../auth/otp.service";
+import { LIMITS, RateLimitService, clientKey } from "../rate-limit/rate-limit.service";
 import { PasswordService } from "../auth/password.service";
 import { AppConfigService } from "../config/app-config.service";
 import { AuthenticatedRequest } from "../common/request.types";
@@ -37,7 +38,8 @@ export class SignupService {
     private readonly auth: AuthService,
     private readonly audit: AuditService,
     private readonly legacy: LegacyService,
-    private readonly welcomeEmail: WelcomeEmailService
+    private readonly welcomeEmail: WelcomeEmailService,
+    private readonly rateLimit: RateLimitService
   ) {}
 
   async startSelfServeSignup(
@@ -62,7 +64,7 @@ export class SignupService {
     const existing = await this.db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [email]);
     if (existing.rows[0]) throw new BadRequestException({ error: "An account with this email already exists. Please sign in instead." });
 
-    const passwordHash = this.password.hashPassword(password!.trim());
+    const passwordHash = await this.password.hashPassword(password!.trim());
     await this.insertPendingSignup(email, trimmedName, trimmedFirstName, trimmedLastName, trimmedMobile, passwordHash, null);
 
     await this.sendOtp(email, ip, ua);
@@ -72,7 +74,7 @@ export class SignupService {
   async verifySelfServeSignup(rawEmail: string | undefined, code: string | undefined, ip: string, ua: string | null | undefined, req: AuthenticatedRequest, res: Response) {
     const email = this.validateEmail(rawEmail);
     if (typeof code !== "string" || !code.trim()) throw new BadRequestException({ error: "code is required" });
-    if (!(await this.otp.verifyOtpCode(email, code))) throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
+    await this.verifyCodeOrFail(email, code, ip);
 
     const pending = await this.findPendingSignup(email, null);
     if (!pending) throw new BadRequestException({ error: "No pending signup found for this email. Please start again." });
@@ -101,7 +103,7 @@ export class SignupService {
     this.validatePassword(password);
     await this.assertEmailNotTaken(inv.email);
 
-    const passwordHash = this.password.hashPassword(password!.trim());
+    const passwordHash = await this.password.hashPassword(password!.trim());
     await this.insertPendingSignup(inv.email, trimmedName, trimmedFirstName, trimmedLastName, trimmedMobile, passwordHash, inv.id);
 
     await this.sendOtp(inv.email, ip, ua);
@@ -138,7 +140,7 @@ export class SignupService {
   private async completeInviteVerification(token: string, code: string | undefined, ip: string, ua: string | null | undefined, req: AuthenticatedRequest, res: Response) {
     const inv = await this.legacy.getInvitationRowOrThrow(token);
     if (typeof code !== "string" || !code.trim()) throw new BadRequestException({ error: "code is required" });
-    if (!(await this.otp.verifyOtpCode(inv.email, code))) throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
+    await this.verifyCodeOrFail(inv.email, code, ip);
 
     const pending = await this.findPendingSignup(inv.email, inv.id);
     if (!pending) throw new BadRequestException({ error: "No pending registration found for this invite. Please start again." });
@@ -148,6 +150,20 @@ export class SignupService {
     await this.auth.signInUser(userId, inv.email, req, res);
     await this.audit.log(userId, "invite_registration_completed", "organization", inv.organization_id, "{}", ip, ua);
     return { ok: true, userId, organizationId: inv.organization_id };
+  }
+
+  /**
+   * The code check shared by signup and invite registration. Besides the code's own 5-guess budget, one
+   * address trying codes against many emails is stopped: only wrong codes are counted, so finishing a
+   * signup correctly is never held up, however many people share the address.
+   */
+  private async verifyCodeOrFail(email: string, code: string, ip: string): Promise<void> {
+    const source = clientKey(ip);
+    await this.rateLimit.assertAllowed(LIMITS.codeFailuresPerIp, source);
+    if (!(await this.otp.verifyOtpCode(email, code))) {
+      await this.rateLimit.recordFailure(LIMITS.codeFailuresPerIp, source);
+      throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
+    }
   }
 
   private async completeInviteRegistration(inv: InvitationRow, pending: PendingSignupRow): Promise<string> {

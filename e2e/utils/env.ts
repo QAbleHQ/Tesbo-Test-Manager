@@ -285,4 +285,11 @@ export const env = {
    * The repo's CLAUDE.md carries this as a standing rule: no local database, for any reason.
    */
   dbUrl: backendValue("DATABASE_URL"),
+
+  /**
+   * The stack's RATE_LIMIT_IP_MULTIPLIER (1 on a hosted stack). The brute-force caps are per source address
+   * and scaled by it, and this suite shares one address, so the local stack widens them; the rate-limit
+   * specs read it to know how many failures that takes. Set E2E_RATE_LIMIT_IP_MULTIPLIER for a remote target.
+   */
+  rateLimitIpMultiplier: Math.max(1, Math.floor(Number(backendValue("RATE_LIMIT_IP_MULTIPLIER")) || 1)),
 };

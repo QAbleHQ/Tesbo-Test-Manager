@@ -10,7 +10,7 @@ import {
   seedFixtureUser,
   type RbacTenant,
 } from "../utils/rbac-tenant";
-import { filesForm, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
+import { PNG_1PX as PNG_BYTES, filesForm, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 
 /*
  * Attachment evidence on executions and bugs: upload, list, download, delete, and the storage
@@ -438,6 +438,143 @@ test.describe("attachments", () => {
     // Whatever it stores, the download must not claim image/png for text — that combination is what
     // makes content sniffing dangerous.
     expect(download.headers()["content-type"]).toContain("text/plain");
+  });
+
+  // ─── Stored XSS: the claimed type is never trusted ─────────────────────────
+  //
+  // Bug and execution evidence is attacker-supplied content served from the app's own origin, with
+  // whatever Content-Type the uploader's client claimed. src/common/file-delivery.ts now decides the
+  // stored type and whether a file may render inline. `?inline=1` on an execution attachment used to be
+  // honoured for anything claiming image/* or video/*, which let `image/svg+xml` through.
+
+  /** The type and disposition a download answered with, whichever storage driver served it. */
+  async function downloaded(res: import("@playwright/test").APIResponse) {
+    if (res.status() === 302) {
+      const url = new URL(res.headers()["location"]);
+      return {
+        redirected: true,
+        contentType: url.searchParams.get("response-content-type") ?? "",
+        disposition: url.searchParams.get("response-content-disposition") ?? "",
+        headers: {} as Record<string, string>,
+      };
+    }
+    expect(res.status(), await res.text()).toBe(200);
+    return {
+      redirected: false,
+      contentType: res.headers()["content-type"] ?? "",
+      disposition: res.headers()["content-disposition"] ?? "",
+      headers: res.headers(),
+    };
+  }
+
+  const bugDownloadUrl = (id: string) => `/api/projects/${tenant!.mainProjectId}/bugs/attachments/${id}/download`;
+  const executionDownloadUrl = (id: string, inline = false) =>
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${id}/download${inline ? "?inline=1" : ""}`;
+  const storedType = (id: string) => scalar(`SELECT content_type FROM attachments WHERE id = ${literal(id)};`);
+
+  test("an html bug attachment is stored as plain text and downloaded as one, with nosniff and a sandbox CSP", async () => {
+    const res = await upload(asQa, bugUploadUrl(), [
+      { name: `xss-${Date.now()}.html`, mimeType: "text/html", body: Buffer.from("<script>window.__e2e_xss = true</script>") },
+    ]);
+    expect(res.ok(), await res.text()).toBeTruthy();
+    const [row] = attachmentRows(tenant!);
+    // Recorded safe, so a later reader of the table never sees text/html either.
+    expect(storedType(row.id)).toBe("text/plain");
+
+    const download = await downloaded(await asOwner.get(bugDownloadUrl(row.id), { failOnStatusCode: false }));
+    expect(download.disposition).toContain("attachment");
+    expect(download.contentType).not.toContain("html");
+    if (!download.redirected) {
+      expect(download.headers["x-content-type-options"]).toBe("nosniff");
+      expect(download.headers["content-security-policy"]).toMatch(/^sandbox;/);
+    }
+  });
+
+  test("a bug attachment named .png but claiming image/svg+xml is not rendered inline and is recorded as sent", async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>window.__e2e_xss = true</script></svg>';
+    const res = await upload(asQa, bugUploadUrl(), [{ name: `svg-${Date.now()}.png`, mimeType: "image/svg+xml", body: Buffer.from(svg) }]);
+    expect(res.ok(), await res.text()).toBeTruthy();
+    const [row] = attachmentRows(tenant!);
+    expect(storedType(row.id)).toBe("image/svg+xml");
+    const download = await downloaded(await asOwner.get(bugDownloadUrl(row.id), { failOnStatusCode: false }));
+    expect(download.disposition).toContain("attachment");
+    if (!download.redirected) expect(download.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  test("an execution attachment claiming image/svg+xml stays a download even when ?inline=1 is asked for", async () => {
+    // The regression: inline was allowed for any stored type starting image/ or video/, and the stored
+    // type was whatever the uploader sent.
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>window.__e2e_xss = true</script></svg>';
+    const res = await upload(asQa, executionUploadUrl(), [{ name: `shot-${Date.now()}.png`, mimeType: "image/svg+xml", body: Buffer.from(svg) }]);
+    expect(res.ok(), await res.text()).toBeTruthy();
+    const [row] = attachmentRows(tenant!);
+
+    const download = await downloaded(await asOwner.get(executionDownloadUrl(row.id, true), { failOnStatusCode: false }));
+    expect(download.disposition, "an SVG was offered inline").toContain("attachment");
+    expect(download.disposition).not.toContain("inline");
+    expect(download.contentType).toContain("image/svg+xml");
+  });
+
+  test("an execution attachment claiming text/html is stored as plain text, so even ?inline=1 shows source rather than a page", async () => {
+    // The evidence route accepts the same extensions as the knowledge base, .html and .txt included.
+    const res = await upload(asQa, executionUploadUrl(), [
+      { name: `note-${Date.now()}.html`, mimeType: "text/html", body: Buffer.from("<script>window.__e2e_xss = true</script>") },
+    ]);
+    expect(res.ok(), await res.text()).toBeTruthy();
+    const [row] = attachmentRows(tenant!);
+    expect(storedType(row.id)).toBe("text/plain");
+
+    const inline = await downloaded(await asOwner.get(executionDownloadUrl(row.id, true), { failOnStatusCode: false }));
+    expect(inline.contentType).toContain("text/plain");
+    expect(inline.contentType).not.toContain("html");
+    if (!inline.redirected) {
+      expect(inline.headers["x-content-type-options"]).toBe("nosniff");
+      expect(inline.headers["content-security-policy"]).toMatch(/^sandbox;/);
+    }
+  });
+
+  test("a genuine screenshot is still rendered inline on request, and still a download when not asked", async () => {
+    const res = await upload(asQa, executionUploadUrl(), [pngFile(`real-${Date.now()}.png`)]);
+    expect(res.ok(), await res.text()).toBeTruthy();
+    const [row] = attachmentRows(tenant!);
+
+    const inline = await downloaded(await asOwner.get(executionDownloadUrl(row.id, true), { failOnStatusCode: false }));
+    expect(inline.contentType).toContain("image/png");
+    expect(inline.disposition).toContain("inline");
+
+    const plain = await downloaded(await asOwner.get(executionDownloadUrl(row.id), { failOnStatusCode: false }));
+    expect(plain.disposition).toContain("attachment");
+    // The inline route itself sets nosniff either way.
+    if (!inline.redirected) expect(inline.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  test("a claimed type with a CR/LF or quote cannot reach a response header", async () => {
+    // Blob types containing CR/LF are dropped by the client itself, so the quote and the oversized type
+    // are what can actually be sent; the unit spec covers CR/LF against the function directly.
+    for (const mimeType of ['text/ht"ml', "x".repeat(400), "not a type"]) {
+      purgeAttachments(tenant!);
+      const res = await upload(asQa, bugUploadUrl(), [{ name: `junk-${Date.now()}.png`, mimeType, body: PNG_BYTES }]);
+      expect(res.status(), `a hostile type should not cause a 500`).toBeLessThan(500);
+      if (!res.ok()) continue;
+      const [row] = attachmentRows(tenant!);
+      expect(storedType(row.id)).toMatch(/^(image\/png|application\/octet-stream)$/);
+      const download = await downloaded(await asOwner.get(bugDownloadUrl(row.id), { failOnStatusCode: false }));
+      expect(download.contentType).not.toContain('"');
+      expect(download.contentType.length).toBeLessThan(120);
+    }
+  });
+
+  test("another tenant's member and an anonymous caller cannot fetch a spoofed attachment", async () => {
+    const res = await upload(asQa, bugUploadUrl(), [
+      { name: `private-${Date.now()}.html`, mimeType: "text/html", body: Buffer.from("<script>1</script>") },
+    ]);
+    expect(res.ok(), await res.text()).toBeTruthy();
+    const [row] = attachmentRows(tenant!);
+    for (const [label, api] of [["anonymous", anon], ["non-member", asGuest]] as const) {
+      const denied = await api.get(bugDownloadUrl(row.id), { failOnStatusCode: false });
+      expect([401, 403, 404], label).toContain(denied.status());
+      expect(await denied.text()).not.toContain("script");
+    }
   });
 
   // ─── Type and size validation ──────────────────────────────────────────────

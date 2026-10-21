@@ -1507,6 +1507,8 @@ export interface ApiToken {
   tokenPrefix: string;
   lastUsedAt: string | null;
   createdAt: string;
+  /** Null only for a token that predates expiry; new tokens always carry one. */
+  expiresAt: string | null;
 }
 export interface ApiTokenWithSecret extends ApiToken {
   token: string;
@@ -1518,7 +1520,7 @@ export async function listApiKeys(projectId: string): Promise<ApiToken[]> {
 
 export async function createApiKey(
   projectId: string,
-  data: { name: string; scopes?: string[] }
+  data: { name: string; scopes?: string[]; expiresInDays?: number }
 ): Promise<ApiTokenWithSecret> {
   return api<ApiTokenWithSecret>(`/api/projects/${projectId}/apikeys`, { method: "POST", body: data });
 }

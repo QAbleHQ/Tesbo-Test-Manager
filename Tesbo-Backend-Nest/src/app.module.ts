@@ -8,6 +8,7 @@ import { AppConfigService } from "./config/app-config.service";
 import { DatabaseModule } from "./database/database.module";
 import { RequestCacheModule } from "./request-cache/request-cache.module";
 import { RedisCacheModule } from "./cache/redis-cache.module";
+import { RateLimitModule } from "./rate-limit/rate-limit.module";
 import { AuditModule } from "./audit/audit.module";
 import { AuthModule } from "./auth/auth.module";
 import { SetupModule } from "./setup/setup.module";
@@ -29,6 +30,7 @@ import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.
     DatabaseModule,
     RequestCacheModule,
     RedisCacheModule,
+    RateLimitModule,
     BullModule.forRootAsync({
       inject: [AppConfigService],
       useFactory: (config: AppConfigService) => ({ connection: { url: config.redisUrl } })

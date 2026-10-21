@@ -301,6 +301,194 @@ test.describe("knowledge base v2 — files", () => {
     expect(JSON.stringify(res.headers())).not.toContain(storageKey);
   });
 
+  // ─── Stored XSS: an upload must never run script as the application ───────
+  //
+  // Uploaded files are attacker-supplied and served from the API's own origin, and the Content-Type
+  // that arrives with an upload is whatever the uploader's client claims. It used to be stored as
+  // sent and echoed back inline, so `notes.txt` sent as text/html, or `a.png` as image/svg+xml, ran
+  // script in the application's origin when its preview URL was opened. src/common/file-delivery.ts
+  // now decides the type and the disposition; these pin the outcome through the real routes.
+  //
+  // On S3-compatible storage the preview is a 302 to a presigned URL that carries the type and
+  // disposition as query parameters, so each case reads those instead of response headers.
+
+  /** What a preview or download actually told the browser, whichever storage driver answered. */
+  async function served(res: APIResponse) {
+    if (res.status() === 302) {
+      const url = new URL(res.headers()["location"]);
+      return {
+        redirected: true,
+        contentType: url.searchParams.get("response-content-type") ?? "",
+        disposition: url.searchParams.get("response-content-disposition") ?? "",
+        headers: {} as Record<string, string>,
+        body: Buffer.alloc(0),
+      };
+    }
+    expect(res.status(), await res.text()).toBe(200);
+    return {
+      redirected: false,
+      contentType: res.headers()["content-type"] ?? "",
+      disposition: res.headers()["content-disposition"] ?? "",
+      headers: res.headers(),
+      body: await res.body(),
+    };
+  }
+
+  const SCRIPT = "<script>window.__e2e_xss = true</script><img src=x onerror=alert(1)>";
+
+  test("KBF-X-01 a .txt claimed as text/html is stored and previewed as plain text, with the source intact", async () => {
+    const folder = await createFolder(stamp("XSS txt"));
+    const file = await uploadOne({ name: "notes.txt", mimeType: "text/html", body: Buffer.from(SCRIPT) }, folder.id);
+
+    // What is recorded is already the safe type, so nothing downstream ever sees text/html.
+    expect(file.mimeType).toBe("text/plain");
+    expect(scalar(`SELECT mime_type FROM knowledge_files WHERE id = ${literal(file.id)};`)).toBe("text/plain");
+
+    const preview = await served(await asOwner.get(kbUrl(`/files/${file.id}/preview`), { failOnStatusCode: false }));
+    expect(preview.contentType).toContain("text/plain");
+    expect(preview.contentType).not.toContain("html");
+    // Shown, not executed: the bytes are the upload verbatim, not escaped, because the type does the work.
+    expect(preview.body.toString("utf-8")).toBe(SCRIPT);
+    expect(preview.headers["x-content-type-options"]).toBe("nosniff");
+    expect(preview.headers["content-security-policy"]).toMatch(/^sandbox;/);
+  });
+
+  test("KBF-X-02 an .html file previews as text, never as a page, whatever type it claims or how its extension is cased", async () => {
+    const folder = await createFolder(stamp("XSS html"));
+    for (const [name, mimeType] of [
+      ["page.html", "text/html"],
+      ["PAGE.HTML", "TEXT/HTML"],
+      ["page2.html", "text/html; charset=utf-8"],
+      ["page3.html", "application/xhtml+xml"],
+      ["page4.html", "application/octet-stream"],
+    ] as const) {
+      const file = await uploadOne({ name, mimeType, body: Buffer.from(SCRIPT) }, folder.id);
+      const preview = await served(await asOwner.get(kbUrl(`/files/${file.id}/preview`), { failOnStatusCode: false }));
+      expect(preview.contentType, `${name} as ${mimeType}`).toContain("text/plain");
+      expect(preview.disposition).toContain("inline");
+      expect(preview.body.toString("utf-8")).toBe(SCRIPT);
+      expect(preview.headers["x-content-type-options"]).toBe("nosniff");
+    }
+  });
+
+  test("KBF-X-03 an SVG is never rendered in place: opening its URL downloads it, though an <img> still draws it", async () => {
+    const folder = await createFolder(stamp("XSS svg"));
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>window.__e2e_xss = true</script></svg>';
+    for (const [name, mimeType] of [
+      ["logo.svg", "image/svg+xml"],
+      ["sneaky.png", "image/svg+xml"],
+      ["logo2.svg", "image/svg+xml; charset=utf-8"],
+    ] as const) {
+      const file = await uploadOne({ name, mimeType, body: Buffer.from(svg) }, folder.id);
+      const preview = await served(await asOwner.get(kbUrl(`/files/${file.id}/preview`), { failOnStatusCode: false }));
+      expect(preview.disposition, `${name} as ${mimeType} was offered inline`).toContain("attachment");
+      expect(preview.disposition).not.toContain("inline");
+      // Still image/svg+xml, which is what lets <img src> draw it; only direct navigation is blocked.
+      expect(preview.contentType).toContain("image/svg+xml");
+      if (!preview.redirected) {
+        expect(preview.headers["x-content-type-options"]).toBe("nosniff");
+        expect(preview.headers["content-security-policy"]).toMatch(/^sandbox;/);
+      }
+    }
+  });
+
+  test("KBF-X-04 a text/html claim on a non-text file is neutralised in the record and in what is served", async () => {
+    const folder = await createFolder(stamp("XSS png"));
+    const file = await uploadOne({ name: "photo.png", mimeType: "text/html", body: Buffer.from(SCRIPT) }, folder.id);
+    expect(scalar(`SELECT mime_type FROM knowledge_files WHERE id = ${literal(file.id)};`)).toBe("text/plain");
+
+    for (const suffix of ["preview", "download"]) {
+      const res = await served(await asOwner.get(kbUrl(`/files/${file.id}/${suffix}`), { failOnStatusCode: false }));
+      expect(res.contentType, suffix).not.toContain("html");
+      if (!res.redirected) expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    }
+  });
+
+  test("KBF-X-05 a download is always an attachment, even for a file whose preview is inline", async () => {
+    const folder = await createFolder(stamp("XSS download"));
+    for (const file of [
+      { name: "a.txt", mimeType: "text/html", body: Buffer.from(SCRIPT) },
+      { name: "b.html", mimeType: "text/html", body: Buffer.from(SCRIPT) },
+      pngFile("c.png"),
+    ]) {
+      const uploaded = await uploadOne(file, folder.id);
+      const res = await served(await asOwner.get(kbUrl(`/files/${uploaded.id}/download`), { failOnStatusCode: false }));
+      expect(res.disposition, file.name).toContain("attachment");
+      expect(res.disposition).not.toContain("inline");
+      if (!res.redirected) expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    }
+  });
+
+  test("KBF-X-06 an unusable claimed type never reaches a header, and the file is still stored", async () => {
+    const folder = await createFolder(stamp("XSS junk"));
+    // None of these is a type/subtype token. The multipart part carries each one verbatim.
+    for (const mimeType of ["not a type", 'text/ht"ml', "/", "text/", "x".repeat(300)]) {
+      const file = await uploadOne({ name: "data.json", mimeType, body: Buffer.from("{}") }, folder.id);
+      const stored = scalar(`SELECT mime_type FROM knowledge_files WHERE id = ${literal(file.id)};`);
+      // data.json falls back to its extension's own type, which is safe; the point is it is NOT the junk.
+      expect(stored, `stored type for ${JSON.stringify(mimeType.slice(0, 20))}`).toMatch(/^(application\/json|application\/octet-stream)$/);
+      const res = await served(await asOwner.get(kbUrl(`/files/${file.id}/download`), { failOnStatusCode: false }));
+      expect(res.contentType).not.toContain('"');
+      expect(res.contentType.length).toBeLessThan(120);
+    }
+  });
+
+  test("KBF-X-07 a code file the browser labels with an odd type still previews as text (Chrome says video/mp2t for .ts)", async () => {
+    const folder = await createFolder(stamp("Odd types"));
+    for (const [name, mimeType, body] of [
+      ["app.ts", "video/mp2t", "export const x: number = 1;"],
+      ["job.py", "text/x-python", "print('hi')"],
+      ["conf.yaml", "application/x-yaml", "a: 1"],
+      ["q.sql", "application/x-sql", "select 1;"],
+    ] as const) {
+      const file = await uploadOne({ name, mimeType, body: Buffer.from(body) }, folder.id);
+      const preview = await served(await asOwner.get(kbUrl(`/files/${file.id}/preview`), { failOnStatusCode: false }));
+      expect(preview.contentType, `${name} as ${mimeType}`).toContain("text/plain");
+      expect(preview.disposition).toContain("inline");
+      expect(preview.body.toString("utf-8")).toBe(body);
+    }
+  });
+
+  test("KBF-X-08 genuine images, PDFs and text still render inline: the fix is a filter, not a blanket download", async () => {
+    const folder = await createFolder(stamp("Still inline"));
+    const png = await uploadOne(pngFile("pic.png"), folder.id);
+    const pdf = await uploadOne({ name: "doc.pdf", mimeType: "application/pdf", body: Buffer.from("%PDF-1.4\n") }, folder.id);
+    const txt = await uploadOne(textFile("plain.txt", "hello"), folder.id);
+
+    for (const [file, type] of [[png, "image/png"], [pdf, "application/pdf"], [txt, "text/plain"]] as const) {
+      const preview = await served(await asOwner.get(kbUrl(`/files/${file.id}/preview`), { failOnStatusCode: false }));
+      expect(preview.contentType, file.originalFileName).toContain(type);
+      expect(preview.disposition, file.originalFileName).toContain("inline");
+    }
+    // A PDF is not sandboxed: Chrome blanks its viewer inside a sandboxed document.
+    const pdfPreview = await served(await asOwner.get(kbUrl(`/files/${pdf.id}/preview`), { failOnStatusCode: false }));
+    if (!pdfPreview.redirected) expect(pdfPreview.headers["content-security-policy"]).toBeUndefined();
+  });
+
+  test("KBF-X-09 another tenant's member and an anonymous caller get no file", async () => {
+    const folder = await createFolder(stamp("XSS auth"));
+    const file = await uploadOne({ name: "n.txt", mimeType: "text/html", body: Buffer.from(SCRIPT) }, folder.id);
+    for (const suffix of ["preview", "download"]) {
+      const anonRes = await anon.get(kbUrl(`/files/${file.id}/${suffix}`), { failOnStatusCode: false });
+      expect([401, 403, 404], `anonymous ${suffix}`).toContain(anonRes.status());
+      const guestRes = await asGuest.get(kbUrl(`/files/${file.id}/${suffix}`), { failOnStatusCode: false });
+      expect([401, 403, 404], `non-member ${suffix}`).toContain(guestRes.status());
+      expect((await anonRes.text()).includes("script")).toBe(false);
+    }
+  });
+
+  test("KBF-X-10 every API response, JSON included, carries nosniff and hides the framework", async () => {
+    const res = await asOwner.get(kbUrl("/folders/tree"));
+    expect(res.headers()["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers()["x-powered-by"], "the framework is advertised").toBeUndefined();
+    expect(res.headers()["referrer-policy"]).toBe("no-referrer");
+    // The same on an error, which is where a stray header most often goes missing.
+    const missing = await asOwner.get(kbUrl("/files/00000000-0000-4000-8000-000000000000/preview"), { failOnStatusCode: false });
+    expect(missing.status()).toBeGreaterThanOrEqual(400);
+    expect(missing.headers()["x-content-type-options"]).toBe("nosniff");
+    expect(missing.headers()["x-powered-by"]).toBeUndefined();
+  });
+
   test("KBF-A-10 a file whose stored object has vanished reports it rather than serving an empty body", { tag: '@tesbo.testId("TES-TC-315")' }, async () => {
     const folder = await createFolder(stamp("Dangling"));
     const file = await uploadOne(textFile("gone.txt", "will vanish"), folder.id);
