@@ -135,7 +135,11 @@ export type RbacTenantKind =
   // The language Zyra writes generated test cases in (Accept-Language → zyra_chat_sessions.language /
   // ai_generation_requests.language). Its own tenant because each test asserts on exactly which
   // prompts the fake provider received, which any other suite's concurrent turn would interleave.
-  | "zyra-language";
+  | "zyra-language"
+  // NYRA agent projects (api/nyra.spec.ts, ui/nyra.spec.ts). Separate tenants because the Launch
+  // tests flip the workspace plan, and the API and UI files run concurrently in different workers.
+  | "nyra"
+  | "nyra-ui";
 
 /** The three roles legacy.service.ts's normalizeRole() collapses every stored role into. */
 export type RbacRole = "owner" | "manager" | "qa_engineer";

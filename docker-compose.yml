@@ -132,6 +132,10 @@ services:
       LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
       LANGFUSE_ENVIRONMENT: ${LANGFUSE_ENVIRONMENT:-development}
       LANGFUSE_ALLOW_CLOUD: ${LANGFUSE_ALLOW_CLOUD:-}
+      # NYRA agent (Pro). Key is server-side only. From this container NYRA on the host is
+      # http://host.docker.internal:2905; leave both empty to show the agent as not configured.
+      NYRA_API_KEY: ${NYRA_API_KEY:-}
+      NYRA_BASE_URL: ${NYRA_BASE_URL:-}
     ports:
       - "${BACKEND_PORT:-1011}:7000"
     volumes:

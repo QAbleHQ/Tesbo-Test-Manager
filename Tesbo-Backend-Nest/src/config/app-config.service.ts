@@ -144,6 +144,13 @@ export class AppConfigService {
   // A pathological file could otherwise hang a worker (and, before this phase, the whole process)
   // indefinitely — this is a strict new protection, not a preserved timing contract.
   readonly kbExtractionTimeoutMs = this.integer("KB_EXTRACTION_TIMEOUT_MS", 30_000);
+  // NYRA agent. Server-to-server only: the key is never sent to the browser. One key is bound to one
+  // NYRA workspace and Tesbo project, so project isolation is enforced here (nyra_projects table).
+  // From the backend container, NYRA on the host is http://host.docker.internal:2905 (plain http only
+  // passes safeFetch while ALLOW_PRIVATE_AI_HOSTS=true; a hosted deployment needs an https URL).
+  readonly nyraApiKey = this.string("NYRA_API_KEY", "").trim();
+  readonly nyraBaseUrl = this.string("NYRA_BASE_URL", "").trim().replace(/\/+$/, "");
+
   // Kill switch for Zyra batch-save's set-based create path (legacy.service.ts's
   // processZyraSaveEntriesBatched/zyraBatchInsertTestCases). Defaults OFF, unlike this remediation's
   // other flags: this is the highest-risk change in the plan (no existing test coverage for

@@ -234,6 +234,9 @@ export const env = {
   stripePriceIdProAnnual: backendValue("STRIPE_PRICE_ID_PRO_ANNUAL"),
   stripePriceIdProMonthlyInr: backendValue("STRIPE_PRICE_ID_PRO_MONTHLY_INR"),
   stripePriceIdProAnnualInr: backendValue("STRIPE_PRICE_ID_PRO_ANNUAL_INR"),
+  // The NYRA address the backend was booted with. Specs that create NYRA projects run only when this
+  // is the fake server (utils/fake-nyra-server.ts), so a run can never create projects in a real NYRA.
+  nyraBaseUrl: backendValue("NYRA_BASE_URL"),
   planGraceDays: Number(backendValue("PLAN_GRACE_DAYS") || 30),
 
   /*

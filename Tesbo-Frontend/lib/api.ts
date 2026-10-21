@@ -1222,6 +1222,34 @@ export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
   return api<ZyraAgentState>(`/api/projects/${projectId}/agents/zyra`);
 }
 
+export interface NyraProject {
+  id: string;
+  name: string;
+  appUrl: string | null;
+  hasTestAccount: boolean;
+  username: string | null;
+  loginMethod: string | null;
+  createdAt: string | null;
+}
+
+export interface NyraCreateInput {
+  name: string;
+  appUrl: string;
+  testAccount?: { loginUrl?: string; username?: string; loginMethod?: "password"; password?: string };
+}
+
+export async function getNyraAgent(projectId: string): Promise<{ configured: boolean }> {
+  return api(`/api/projects/${projectId}/agents/nyra`);
+}
+
+export async function listNyraProjects(projectId: string): Promise<{ list: NyraProject[] }> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`);
+}
+
+export async function createNyraProject(projectId: string, data: NyraCreateInput): Promise<NyraProject> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`, { method: "POST", body: data });
+}
+
 export async function testZyraAiConnection(projectId: string): Promise<{ ok: boolean; provider: string; model: string; error?: string; latencyMs: number }> {
   return api(`/api/projects/${projectId}/agents/zyra/test`);
 }
