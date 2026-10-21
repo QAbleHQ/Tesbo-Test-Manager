@@ -78,6 +78,62 @@ export function evidenceDownloadUrl(
   return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/download${suffix}`;
 }
 
+/*
+ * A video row: the download link it always was, plus a View toggle that plays it in place. The
+ * backend already serves `?inline=1` for video (it refuses inline for logs and archives on purpose),
+ * so this is the only kind besides screenshots that can be viewed rather than downloaded. The
+ * <video> mounts only once View is pressed so a run with several recordings doesn't preload them.
+ */
+function VideoEvidenceRow({
+  cycleId,
+  executionId,
+  file,
+}: {
+  cycleId: string;
+  executionId: string;
+  file: ExecutionEvidence;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <li className="space-y-1.5">
+      <div className="flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-secondary)] px-2.5 py-1.5 text-[12.5px]">
+        <span className="truncate text-[var(--foreground)]">{file.fileName}</span>
+        {file.fileSize != null && (
+          <span className="ml-auto shrink-0 font-mono text-[11px] text-[var(--muted-soft)]">
+            {formatFileSizeShort(file.fileSize)}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          data-testid="evidence-view-video"
+          className="shrink-0 rounded-md px-1.5 py-0.5 text-[11.5px] text-[var(--accent-light)] hover:underline"
+        >
+          {open ? "Hide" : "View"}
+        </button>
+        <a
+          href={evidenceDownloadUrl(cycleId, executionId, file.id)}
+          aria-label={`Download ${file.fileName}`}
+          title="Download"
+          className="shrink-0 text-[var(--muted)] hover:text-[var(--foreground)]"
+        >
+          <IconDownload size={13} />
+        </a>
+      </div>
+      {open && (
+        <video
+          controls
+          autoPlay
+          src={evidenceDownloadUrl(cycleId, executionId, file.id, true)}
+          data-testid="evidence-video-player"
+          className="max-h-[360px] w-full rounded-lg border border-[var(--border-subtle)] bg-black"
+        />
+      )}
+    </li>
+  );
+}
+
 interface Props {
   cycleId: string;
   executionId: string;
@@ -276,6 +332,12 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
                       </a>
                     ))}
                   </div>
+                ) : kind === "video" ? (
+                  <ul className="space-y-1">
+                    {items.map((file) => (
+                      <VideoEvidenceRow key={file.id} cycleId={cycleId} executionId={executionId} file={file} />
+                    ))}
+                  </ul>
                 ) : (
                   <ul className="space-y-1">
                     {items.map((file) => (

@@ -2183,6 +2183,67 @@ test.describe("execution evidence and automation provenance", () => {
     }
   });
 
+  /*
+   * "[Test Run] Evidence > No view evidence button available only able to download."
+   * Video and log rows were download-only. Video can be played in place (the backend serves it
+   * inline); a log stays a download on purpose -- the backend refuses inline for anything that is
+   * not an image or video, so nothing in an uploaded file is ever interpreted by the browser.
+   */
+  test("a video can be viewed in place, while a log stays download-only", async ({ page }) => {
+    const { runId, testcase } = await seedAutomatedRun("view-evidence");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const base = `/api/projects/${ctx.projectId}/automation/runs/${runId}/results/${testcase.externalId}/evidence`;
+      await api.post(base, {
+        multipart: { kind: "video", files: { name: "repro.mp4", mimeType: "video/mp4", buffer: Buffer.from("not-a-real-mp4") } },
+      });
+      await api.post(base, {
+        multipart: { kind: "log", files: { name: "run.log", mimeType: "text/plain", buffer: Buffer.from("<script>1</script>") } },
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByText("repro.mp4")).toBeVisible();
+      await expect(page.getByText("run.log")).toBeVisible();
+
+      // Only the video offers View; the player is not mounted until it is pressed.
+      await expect(page.getByTestId("evidence-view-video")).toHaveCount(1);
+      await expect(page.getByTestId("evidence-video-player")).toHaveCount(0);
+
+      await page.getByTestId("evidence-view-video").click();
+      const player = page.getByTestId("evidence-video-player");
+      await expect(player).toBeVisible();
+      const src = (await player.getAttribute("src")) ?? "";
+      expect(src).toMatch(/\/attachments\/[0-9a-f-]{36}\/download\?inline=1$/);
+
+      // The inline request is really served inline, as video.
+      const inline = await api.get(src);
+      expect(inline.status()).toBe(200);
+      expect(inline.headers()["content-type"]).toContain("video/mp4");
+      expect(inline.headers()["content-disposition"]).toMatch(/^inline/);
+
+      // Same flag on the log is refused: still an attachment, never rendered by the browser.
+      const logHref = await page.getByRole("link", { name: /run\.log/ }).getAttribute("href");
+      const logInline = await api.get(`${logHref}?inline=1`);
+      expect(logInline.headers()["content-disposition"]).toMatch(/^attachment/);
+
+      // The same URL without a session is not reachable.
+      const anon = await pwRequest.newContext({ baseURL: env.apiBaseUrl });
+      try {
+        expect([401, 403]).toContain((await anon.get(src, { failOnStatusCode: false })).status());
+      } finally {
+        await anon.dispose();
+      }
+
+      // Hide unmounts the player again.
+      await page.getByTestId("evidence-view-video").click();
+      await expect(page.getByTestId("evidence-video-player")).toHaveCount(0);
+    } finally {
+      await api.dispose();
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
   test("opening a result fetches its evidence once, and stops", async ({ page }) => {
     /*
      * The regression for a drawer that never left "Loading evidence…".
