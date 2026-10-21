@@ -1,6 +1,7 @@
 "use client";
 
 import type { BugItem } from "@/lib/api";
+import { renderMarkdown } from "@/lib/markdown";
 import { formatDate, formatDateTime } from "@/lib/date";
 import BugAttachments from "@/components/bugs/BugAttachments";
 import { BugAssignee, BugPriorityBadge, BugSeverityBadge, BugStatusBadge } from "@/components/bugs/BugBadges";
@@ -36,9 +37,13 @@ export default function BugDetailsBody({
             Description
           </p>
           <div className="rounded-lg bg-[var(--background)] border border-[var(--border-subtle)] p-3">
-            <p className="text-sm text-[var(--foreground)] whitespace-pre-wrap break-words">
-              {bug.description}
-            </p>
+            {/* Pasted descriptions (BetterBugs, Jira, AI drafts) arrive as Markdown. renderMarkdown
+                escapes the text before adding any markup, so this is safe to inject. */}
+            <div
+              data-testid="bug-description"
+              className="zyra-prose text-sm text-[var(--foreground)] break-words"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(bug.description) }}
+            />
           </div>
         </div>
       )}

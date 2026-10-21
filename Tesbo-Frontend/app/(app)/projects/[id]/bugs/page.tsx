@@ -40,6 +40,7 @@ import SelfLoggedTrackerField, { type SelfLoggedSystem } from "@/components/Self
 import IssuePickerModal from "@/components/IssuePickerModal";
 import BugEvidenceField, { type EvidenceMode } from "@/components/BugEvidenceField";
 import { formatDate, toLocalDay } from "@/lib/date";
+import { markdownToPlainText } from "@/lib/markdown";
 import {
   BUG_PRIORITIES,
   BUG_SEVERITIES,
@@ -196,7 +197,7 @@ function KanbanCard({
 
       {bug.description && (
         <p className="text-xs text-[var(--muted)] line-clamp-2 mb-2">
-          {bug.description}
+          {markdownToPlainText(bug.description)}
         </p>
       )}
 

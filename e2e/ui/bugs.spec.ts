@@ -4133,3 +4133,108 @@ test.describe("bug search by bug id", () => {
     }
   });
 });
+
+/*
+ * "[Bug] Description shows markdown format when copy paste content" — a description pasted from
+ * BetterBugs, Jira or an AI draft is Markdown, and Bug Details printed it raw ("**Bug:**", backticks).
+ * It is now rendered; the text is still escaped first, so pasted HTML is shown, never run.
+ */
+test.describe("bug description markdown", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  const MARKDOWN = [
+    "**Bug:** `[Task] Review Board > Saved changes are lost`",
+    "",
+    "**Expected Result:**",
+    "- first thing",
+    "- second thing",
+    "",
+    "Plain closing line",
+  ].join("\n");
+
+  test("BUG-U-125 a Markdown description is rendered in Bug Details, not shown as raw syntax", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Md Desc ${uniqueSuffix()}`, description: MARKDOWN } })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const description = page.getByTestId("bug-description");
+      await expect(description).toBeVisible();
+
+      await expect(description.locator("strong").first()).toHaveText("Bug:");
+      await expect(description.locator("code")).toContainText("[Task] Review Board > Saved changes are lost");
+      await expect(description.locator("li")).toHaveText(["first thing", "second thing"]);
+      await expect(description).toContainText("Plain closing line");
+      // The markers are gone from what the reader sees.
+      await expect(description).not.toContainText("**");
+      await expect(description).not.toContainText("`");
+
+      // Rendering is display-only: what is stored is still the Markdown exactly as pasted.
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).description).toBe(MARKDOWN);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-126 plain text and pasted HTML in a description are shown as text, never run", async ({ page }) => {
+    const html = `<img src=x onerror="window.__pwned = true"> <b>not bold</b>`;
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: { title: `E2E Md Desc Html ${uniqueSuffix()}`, description: `First line\nSecond line\n${html}` },
+      })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const description = page.getByTestId("bug-description");
+      await expect(description).toContainText("First line");
+      await expect(description).toContainText("Second line");
+      // The markup is visible as text and creates no element.
+      await expect(description).toContainText(html);
+      await expect(description.locator("img, b")).toHaveCount(0);
+      expect(await page.evaluate(() => (window as unknown as { __pwned?: boolean }).__pwned)).toBeUndefined();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-127 the Bug Details panel and the Board card preview drop the Markdown syntax too", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Md Desc Panel ${uniqueSuffix()}`, description: MARKDOWN } })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      // The Board card clamps the description to two lines of plain text.
+      const card = page.locator("[draggable=true], article, li").filter({ hasText: bug.title }).first();
+      await expect(card).toBeVisible();
+      await expect(card).not.toContainText("**");
+      await expect(card).not.toContainText("`");
+      await expect(card).toContainText("Bug: [Task] Review Board");
+
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      const panel = page.getByRole("region", { name: "Bug details" });
+      await expect(panel.getByTestId("bug-description").locator("strong").first()).toHaveText("Bug:");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
