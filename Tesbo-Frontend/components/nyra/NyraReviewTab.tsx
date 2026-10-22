@@ -201,7 +201,9 @@ export default function NyraReviewTab({
           className={`mt-3 text-[12px] ${embeddings.available ? "text-[var(--muted)]" : "text-[var(--warning-foreground,var(--muted))]"}`}
         >
           {embeddings.available
-            ? `Search vectors will be created with your ${embeddings.provider} key.`
+            ? embeddings.provider === "voyage"
+              ? "Search vectors will be created with the platform's Voyage AI key."
+              : `Search vectors will be created with your ${embeddings.provider} key.`
             : "No AI key that can create vectors is set up (OpenAI, Google or Mistral; Anthropic cannot). The approved document is saved and found by keyword search. Add such a key under AI Providers and it is indexed automatically."}
         </p>
         <div className="mt-3 flex flex-wrap gap-1.5 text-[12px]">

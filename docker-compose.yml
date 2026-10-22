@@ -90,6 +90,9 @@ services:
       LINEAR_CLIENT_SECRET: ${LINEAR_CLIENT_SECRET:-}
       NOTION_CLIENT_ID: ${NOTION_CLIENT_ID:-}
       NOTION_CLIENT_SECRET: ${NOTION_CLIENT_SECRET:-}
+      # Optional: platform embeddings key (Voyage AI). When set it supplies every embedding, whatever
+      # chat provider a project uses. Unset = fall back to workspace OpenAI/Google/Mistral keys.
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID_PRO_MONTHLY: ${STRIPE_PRICE_ID_PRO_MONTHLY:-}

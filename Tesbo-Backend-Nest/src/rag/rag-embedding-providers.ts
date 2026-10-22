@@ -49,6 +49,13 @@ export const EMBEDDING_CAPABLE_PROVIDERS: Record<string, EmbeddingCapability> = 
   mistral: { model: "mistral-embed", nativeDimension: 1024, sendDimensionParam: false }
 };
 
+// Platform-level embeddings key, read from VOYAGE_API_KEY (see resolveEmbeddingAllocation). Not in the
+// map above on purpose: it is not a workspace key and has no PROVIDER_CATALOG entry, so a workspace
+// cannot pick "voyage" in the AI keys form. voyage-3.5 is natively 1024 wide; Voyage's width parameter
+// is `output_dimension`, not OpenAI's `dimensions`, so none is sent.
+export const VOYAGE_BASE_URL = "https://api.voyageai.com/v1";
+export const VOYAGE_EMBEDDING: EmbeddingCapability = { model: "voyage-3.5", nativeDimension: 1024, sendDimensionParam: false };
+
 /*
  * Deliberately NOT listed yet, despite having embeddings endpoints: Together AI and Fireworks.
  * Both serve open models whose exact ids and widths need verifying against their live catalogs

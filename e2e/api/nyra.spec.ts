@@ -1366,12 +1366,37 @@ test.describe("NYRA agent", () => {
         exec(`DELETE FROM project_ai_key_allocations WHERE project_id IN (${literal(tenant!.mainProjectId)}, ${literal(tenant!.secondProjectId)});`);
         exec(`DELETE FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)} AND name LIKE 'E2E NYRA embeddings%';`);
       };
-      test.beforeEach(clearKeys);
       test.afterAll(() => tenant && clearKeys());
 
       const embeddingsOf = async (runId: string) => (await items(runId)).embeddings;
+      // A platform VOYAGE_API_KEY on the stack outranks every workspace key, so the tests about which
+      // workspace key is used cannot hold there; the one about the platform key takes their place.
+      let platform = false;
+      const NEEDS_NO_PLATFORM_KEY = "the stack has VOYAGE_API_KEY, which outranks every workspace key.";
+      test.beforeEach(async () => {
+        clearKeys();
+        platform = (await embeddingsOf(await finishedRun())).provider === "voyage";
+        fake!.runs.length = 0;
+      });
+
+      test("a platform VOYAGE_API_KEY supplies the vectors whatever workspace keys exist, and is never shown", async () => {
+        test.skip(!platform, "needs VOYAGE_API_KEY set on the stack.");
+        addKey("anthropic");
+        const openai = addKey("openai");
+        exec(`INSERT INTO project_ai_key_allocations (project_id, workspace_ai_key_id) VALUES (${literal(tenant!.mainProjectId)}, ${literal(openai)});`);
+        const runId = await finishedRun();
+        expect(await embeddingsOf(runId)).toEqual({ available: true, provider: "voyage" });
+        await decide(runId, { ...SCREEN, status: "correct" });
+        const approved = await approve(runId);
+        expect((await approved.json()).embeddings).toEqual({ available: true, provider: "voyage" });
+        for (const text of [await approved.text(), await (await asOwner.get(at(`/runs/${runId}/items`))).text(), JSON.stringify(await preview(runId))]) {
+          expect(text).not.toMatch(/pa-[A-Za-z0-9_-]{20,}/);
+          expect(text).not.toContain("e2e-not-a-real-key");
+        }
+      });
 
       test("without an AI key that can embed, the findings page and the approval both say so", async () => {
+        test.skip(platform, NEEDS_NO_PLATFORM_KEY);
         const runId = await finishedRun();
         expect(await embeddingsOf(runId)).toEqual({ available: false, provider: null });
         await decide(runId, { ...SCREEN, status: "correct" });
@@ -1382,11 +1407,13 @@ test.describe("NYRA agent", () => {
       });
 
       test("an Anthropic key alone cannot make vectors", async () => {
+        test.skip(platform, NEEDS_NO_PLATFORM_KEY);
         addKey("anthropic");
         expect(await embeddingsOf(await finishedRun())).toEqual({ available: false, provider: null });
       });
 
       test("an OpenAI, Google or Mistral key in the workspace is used, whatever the project's chat key is", async () => {
+        test.skip(platform, NEEDS_NO_PLATFORM_KEY);
         const anthropic = addKey("anthropic");
         exec(`INSERT INTO project_ai_key_allocations (project_id, workspace_ai_key_id) VALUES (${literal(tenant!.mainProjectId)}, ${literal(anthropic)});`);
         for (const provider of ["openai", "google", "mistral"]) {
@@ -1398,6 +1425,7 @@ test.describe("NYRA agent", () => {
       });
 
       test("a project whose own key can embed uses that key", async () => {
+        test.skip(platform, NEEDS_NO_PLATFORM_KEY);
         const openai = addKey("openai");
         exec(`INSERT INTO project_ai_key_allocations (project_id, workspace_ai_key_id) VALUES (${literal(tenant!.mainProjectId)}, ${literal(openai)});`);
         const runId = await finishedRun();
@@ -1406,6 +1434,7 @@ test.describe("NYRA agent", () => {
       });
 
       test("an inactive key does not count", async () => {
+        test.skip(platform, NEEDS_NO_PLATFORM_KEY);
         addKey("openai", false);
         expect(await embeddingsOf(await finishedRun())).toEqual({ available: false, provider: null });
       });

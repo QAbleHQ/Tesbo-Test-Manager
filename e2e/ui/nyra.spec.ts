@@ -713,6 +713,11 @@ test.describe("NYRA agent (UI)", () => {
       try {
         const page = await pageAs(browser, "owner");
         await openReview(page);
+        // A platform VOYAGE_API_KEY on the stack outranks every workspace key: the page names it, and the key tests cannot apply.
+        if ((await page.getByTestId("nyra-embeddings").textContent())?.includes("platform")) {
+          await expect(page.getByTestId("nyra-embeddings")).toHaveText("Search vectors will be created with the platform's Voyage AI key.");
+          return;
+        }
         await expect(page.getByTestId("nyra-embeddings")).toContainText("No AI key that can create vectors is set up");
         await expect(page.getByTestId("nyra-embeddings")).toContainText("Add such a key under AI Providers");
 
