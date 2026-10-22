@@ -2,7 +2,7 @@ import { expect, test, type APIRequestContext, type Browser, type BrowserContext
 import { resetToLaunch, setProPlan } from "../utils/billing-db";
 import { env } from "../utils/env";
 import { NYRA_FAKE_SKIP_REASON, nyraFakeIsWired, startFakeNyraServer, type FakeNyraServer } from "../utils/fake-nyra-server";
-import { exec, literal } from "../utils/psql";
+import { exec, literal, scalar } from "../utils/psql";
 import { loginAs, provisionRbacTenant, rbacSuiteSkipReason, writeStorageState, type RbacTenant } from "../utils/rbac-tenant";
 
 /*
@@ -50,7 +50,13 @@ test.describe("NYRA agent (UI)", () => {
   });
 
   function purge(t: RbacTenant): void {
-    exec(`DELETE FROM nyra_projects WHERE project_id IN (${literal(t.mainProjectId)}, ${literal(t.secondProjectId)});`);
+    const projects = `${literal(t.mainProjectId)}, ${literal(t.secondProjectId)}`;
+    // The Knowledge Base documents approvals wrote, then the review state and links.
+    exec(`DELETE FROM knowledge_documents WHERE id IN (SELECT document_id FROM nyra_kb_documents WHERE project_id IN (${projects}));`);
+    exec(`DELETE FROM nyra_item_reviews WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM nyra_run_approvals WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM nyra_kb_documents WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM nyra_projects WHERE project_id IN (${projects});`);
   }
 
   async function pageAs(browser: Browser, label: string): Promise<Page> {
@@ -344,6 +350,39 @@ test.describe("NYRA agent (UI)", () => {
       await expect(video).toHaveAttribute("src", new RegExp(`/runs/${runId}/files/recordings/session-1\\.webm$`));
     });
 
+    // Regression: the frame was an <img> whose src changed every 1.5s. A frame slower than that was cancelled
+    // before it painted, and NYRA's 204 (no frame yet) fired onError, which removed the card for good.
+    test("the live browser waits through 204, shows a frame slower than the poll, and never cancels one", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      const cancelled: string[] = [];
+      page.on("requestfailed", (r) => r.url().includes("/live.jpg") && cancelled.push(r.failure()?.errorText ?? ""));
+      await page.goto(workspaceUrl());
+      const runId = await startScan(page);
+
+      // No frame yet: the card stays and says so, rather than disappearing.
+      await expect(page.getByText("Live browser")).toBeVisible();
+      await expect(page.getByText("Waiting for the first frame…")).toBeVisible();
+
+      // First frame arrives, and takes longer than the old 1.5s timer.
+      fake!.serveFrame(runId, 2500);
+      const frame = page.getByRole("img", { name: "NYRA's browser" });
+      await expect(frame).toBeVisible({ timeout: 15_000 });
+      await expect(frame).toHaveAttribute("src", /^blob:/);
+      await expect.poll(() => frame.evaluate((el: HTMLImageElement) => el.naturalWidth)).toBeGreaterThan(0);
+      expect(cancelled).toEqual([]);
+
+      // The scan ends: the last frame stays, relabelled, and polling stops.
+      fake!.finishRun(runId);
+      await expect(page.getByText("Last frame")).toBeVisible({ timeout: 15_000 });
+      await expect(frame).toBeVisible();
+      const before = fake!.calls.filter((c) => c.path.endsWith("/live.jpg")).length;
+      await page.waitForTimeout(4000);
+      // At most the request in flight at the end plus the one that fetches the final frame; a running scan makes about four in 4s.
+      expect(fake!.calls.filter((c) => c.path.endsWith("/live.jpg")).length - before).toBeLessThanOrEqual(2);
+      // The scan ending must not abort a frame in flight either (it showed as a cancelled live.jpg as the results loaded).
+      expect(cancelled).toEqual([]);
+    });
+
     test("the report filters by kind and search, and the CSV it downloads cannot run a formula", async ({ browser }) => {
       const page = await pageAs(browser, "owner");
       await page.goto(workspaceUrl());
@@ -435,6 +474,259 @@ test.describe("NYRA agent (UI)", () => {
       await page.goto(`${nyraUrl()}/00000000-0000-4000-8000-000000000000`);
       await expect(page.getByText("NYRA project not found").first()).toBeVisible();
       await expect(page.getByTestId("nyra-run")).toHaveCount(0);
+    });
+
+    // ─── Review and approval ───────────────────────────────────────────────
+
+    /** Opens a finished scan on the Review tab, with every filter widened so decided findings stay visible. */
+    async function openReview(page: Page): Promise<void> {
+      await page.goto(workspaceUrl());
+      const runId = await (async () => {
+        const res = await api.post(`/api/projects/${tenant!.mainProjectId}/agents/nyra/projects/${nyraId}/runs`, {
+          data: { environmentId: fake!.projects[0].environments[0].id },
+        });
+        return (await res.json()).id as string;
+      })();
+      fake!.finishRun(runId);
+      await page.reload();
+      await expect(page.getByTestId("nyra-run").first()).toContainText("completed");
+      await tab(page, "Review").click();
+      await page.getByLabel("Show findings that are").selectOption("all");
+      await expect(page.getByTestId("nyra-item")).toHaveCount(6);
+    }
+    const card = (page: Page, title: string) => page.getByTestId("nyra-item").filter({ hasText: title });
+
+    test("an unfinished scan says Review opens when it ends", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await page.goto(workspaceUrl());
+      await page.getByRole("button", { name: "New scan" }).first().click();
+      await page.getByRole("button", { name: "Start scan" }).click();
+      await tab(page, "Review").click();
+      await expect(page.getByText("NYRA saves its findings when the scan finishes. Review opens then.")).toBeVisible();
+    });
+
+    test("the Review tab lists only the findings that explain the product, and the report keeps the rest", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      const kinds = page.getByRole("tablist", { name: "Kind of finding" });
+      for (const name of ["All 6", "Screens 1", "Features 1", "Workflows 1", "Business rules 1", "Forms 1", "Tech 1"]) {
+        await expect(kinds.getByRole("tab", { name, exact: true })).toBeVisible();
+      }
+      // Test cases, API calls and issues are QA data, not product knowledge: no tab, no cards, nothing to approve.
+      for (const gone of [/^Test cases/, /^API calls/, /^Issues/]) await expect(kinds.getByRole("tab", { name: gone })).toHaveCount(0);
+      await expect(page.getByTestId("nyra-item").filter({ hasText: "HYPERLINK" })).toHaveCount(0);
+
+      await tab(page, "Report").click();
+      await expect(tab(page, "Test cases 1")).toBeVisible();
+    });
+
+    test("Correct, Edit, Reject and Undo save immediately and update the counts", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      await expect(page.getByTestId("nyra-count-waiting")).toHaveText("Waiting 6");
+
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      await expect(page.getByTestId("nyra-count-correct")).toHaveText("Correct 1");
+      await expect(page.getByTestId("nyra-count-waiting")).toHaveText("Waiting 5");
+
+      await card(page, "Login flow").getByRole("button", { name: "Reject" }).click();
+      await expect(page.getByTestId("nyra-count-rejected")).toHaveText("Rejected 1");
+
+      // Edit: a modal, a changed title, and NYRA's original shown beside it.
+      await card(page, "Account sign in").getByRole("button", { name: "Edit" }).click();
+      await expect(page.getByRole("heading", { name: "Edit finding" })).toBeVisible();
+      await page.locator("#nyra-edit-title").fill("Sign in works");
+      await page.locator("#nyra-edit-description").fill("Log in with email and password");
+      await page.getByRole("button", { name: "Save edit" }).click();
+      await expect(page.getByRole("heading", { name: "Edit finding" })).toHaveCount(0);
+      await expect(card(page, "Sign in works")).toContainText("Edited");
+      await expect(card(page, "Sign in works")).toContainText("NYRA found:");
+      await expect(page.getByTestId("nyra-count-edited")).toHaveText("Edited 1");
+
+      // Undo puts it back to what NYRA found.
+      await card(page, "Sign in works").getByRole("button", { name: "Undo" }).click();
+      await expect(page.getByTestId("nyra-count-edited")).toHaveText("Edited 0");
+      await expect(page.getByTestId("nyra-count-waiting")).toHaveText("Waiting 4");
+    });
+
+    test("the Waiting filter hides what has been decided, and bulk Correct covers what is shown", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      await page.getByLabel("Show findings that are").selectOption("waiting");
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      await expect(page.getByTestId("nyra-item")).toHaveCount(5);
+
+      await page.getByRole("button", { name: "Mark 5 shown Correct" }).click();
+      await expect(page.getByText("Nothing is waiting for review here.")).toBeVisible();
+      await expect(page.getByTestId("nyra-count-correct")).toHaveText("Correct 6");
+    });
+
+    test("an edit with a blank title is refused in the form, and saves once fixed", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      await card(page, "Login flow").getByRole("button", { name: "Edit" }).click();
+      await page.locator("#nyra-edit-title").fill("   ");
+      await page.getByRole("button", { name: "Save edit" }).click();
+      await expect(page.getByText("A finding needs a title")).toBeVisible();
+      await page.locator("#nyra-edit-title").fill("Same steps");
+      await page.locator("#nyra-edit-steps").fill("");
+      await page.locator("#nyra-edit-goal").fill("g".repeat(2000));
+      await page.getByRole("button", { name: "Save edit" }).click();
+      await expect(page.getByRole("heading", { name: "Edit finding" })).toHaveCount(0);
+    });
+
+    test("the document preview follows every decision, and hides and shows", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      const doc = page.getByTestId("nyra-doc-preview");
+      await expect(doc).toContainText("Nothing is marked Correct yet");
+
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      await expect(doc.getByRole("region", { name: "Screens" })).toContainText("Purpose: Sign in to the shop");
+      await expect(doc).not.toContainText("Nothing is marked Correct yet");
+
+      await card(page, "Login flow").getByRole("button", { name: "Edit" }).click();
+      await page.locator("#nyra-edit-title").fill("Getting in");
+      await page.getByRole("button", { name: "Save edit" }).click();
+      await expect(doc.getByRole("region", { name: "Journeys" })).toContainText("Getting in");
+      await expect(doc.getByRole("region", { name: "Journeys" })).toContainText("1. Open /login");
+
+      await card(page, "Sign in").first().getByRole("button", { name: "Reject" }).click();
+      await expect(doc.getByRole("region", { name: "Screens" })).toHaveCount(0);
+
+      await page.getByRole("button", { name: "Hide document preview" }).click();
+      await expect(doc).toHaveCount(0);
+      await page.getByRole("button", { name: "Show document preview" }).click();
+      await expect(page.getByTestId("nyra-doc-preview")).toContainText("Getting in");
+    });
+
+    test("approving adds the Correct and edited findings to the Knowledge Base as one document", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      const approveButton = page.getByRole("button", { name: "Approve and add to Knowledge Base" });
+      await expect(approveButton).toBeDisabled();
+
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      await card(page, "Login flow").getByRole("button", { name: "Edit" }).click();
+      await page.locator("#nyra-edit-title").fill("Login works");
+      await page.getByRole("button", { name: "Save edit" }).click();
+      await expect(page.getByTestId("nyra-count-edited")).toHaveText("Edited 1");
+      await expect(page.getByText("4 findings are still waiting and will not be added.")).toBeVisible();
+
+      const approved = page.waitForResponse((r) => r.url().endsWith("/approve") && r.request().method() === "POST");
+      await approveButton.click();
+      expect((await approved).status()).toBe(200);
+
+      const status = page.getByRole("status");
+      await expect(status).toContainText("2 findings are in the Knowledge Base");
+      await expect(status.getByRole("link")).toHaveCount(1);
+      const link = status.getByRole("link", { name: /NYRA · .* · Product knowledge/ });
+      await expect(link).toBeVisible();
+
+      // It is a real Knowledge Base document, with the approved text in it.
+      await link.click();
+      await expect(page).toHaveURL(new RegExp(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/`));
+      await expect(page.getByText("Purpose: Sign in to the shop")).toBeVisible();
+      await expect(page.getByText("Login works").first()).toBeVisible();
+    });
+
+    test("Approve stays disabled until a screen, feature, workflow or business rule is marked Correct", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      const approveButton = page.getByRole("button", { name: "Approve and add to Knowledge Base" });
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      await card(page, "Sign in").first().getByRole("button", { name: "Undo" }).click();
+      await expect(page.getByTestId("nyra-count-waiting")).toHaveText("Waiting 6");
+      await expect(approveButton).toBeDisabled();
+
+      // A form and the tech profile are only the appendix: they cannot be the whole document.
+      await card(page, "Login form").getByRole("button", { name: "Correct" }).click();
+      await card(page, "Technical profile").getByRole("button", { name: "Correct" }).click();
+      await expect(page.getByTestId("nyra-count-correct")).toHaveText("Correct 2");
+      await expect(approveButton).toBeDisabled();
+      await expect(page.getByText("Mark at least one screen, feature, workflow or business rule Correct to approve.")).toBeVisible();
+
+      await card(page, "Account sign in").getByRole("button", { name: "Correct" }).click();
+      await expect(approveButton).toBeEnabled();
+    });
+
+    test("a document edited in the Knowledge Base is only replaced after the page asks", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await openReview(page);
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      const approveButton = page.getByRole("button", { name: "Approve and add to Knowledge Base" });
+      await approveButton.click();
+      await expect(page.getByRole("status")).toContainText("1 finding is in the Knowledge Base");
+      await expect(page.getByTestId("nyra-replace-warning")).toHaveCount(0);
+
+      // A person edits the document in the Knowledge Base.
+      exec(`UPDATE knowledge_documents SET content_text = content_text || ' Hand-written note.' WHERE project_id = ${literal(tenant!.mainProjectId)} AND title LIKE 'NYRA · %';`);
+      await page.reload();
+      await tab(page, "Review").click();
+      await page.getByLabel("Show findings that are").selectOption("all");
+
+      const posts: string[] = [];
+      page.on("request", (r) => r.method() === "POST" && r.url().endsWith("/approve") && posts.push(r.postData() ?? ""));
+      await approveButton.click();
+      const warning = page.getByTestId("nyra-replace-warning");
+      await expect(warning).toContainText("edited in the Knowledge Base after it was last approved");
+      expect(posts).toHaveLength(0);
+
+      // Cancel changes nothing.
+      await warning.getByRole("button", { name: "Cancel" }).click();
+      await expect(warning).toHaveCount(0);
+      expect(posts).toHaveLength(0);
+      expect(scalar(`SELECT count(*) FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND content_text LIKE '%Hand-written note.%';`)).toBe("1");
+
+      await approveButton.click();
+      const replaced = page.waitForResponse((r) => r.url().endsWith("/approve") && r.request().method() === "POST");
+      await warning.getByRole("button", { name: "Replace and approve" }).click();
+      expect((await replaced).status()).toBe(200);
+      expect(posts.map((p) => JSON.parse(p))).toEqual([{ replaceEdits: true }]);
+      await expect(warning).toHaveCount(0);
+      expect(scalar(`SELECT count(*) FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND content_text LIKE '%Hand-written note.%';`)).toBe("0");
+    });
+
+    test("a QA engineer can review but is not offered approval", async ({ browser }) => {
+      const page = await pageAs(browser, "qa");
+      await openReview(page);
+      await expect(page.getByText("Only owners and managers can approve.")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Approve and add to Knowledge Base" })).toHaveCount(0);
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      await expect(page.getByTestId("nyra-count-correct")).toHaveText("Correct 1");
+      await expect(page.getByTestId("nyra-doc-preview").getByRole("region", { name: "Screens" })).toBeVisible();
+    });
+
+    test("when the preview cannot be built the page says so and review still works", async ({ browser }) => {
+      const page = await pageAs(browser, "owner");
+      await page.route("**/document-preview", (route) => route.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "NYRA is unreachable. Try again later." }) }));
+      await openReview(page);
+      await expect(page.getByTestId("nyra-doc-preview")).toHaveCount(0);
+      await expect(page.getByText("NYRA is unreachable. Try again later.")).toBeVisible();
+      await card(page, "Sign in").first().getByRole("button", { name: "Correct" }).click();
+      await expect(page.getByTestId("nyra-count-correct")).toHaveText("Correct 1");
+    });
+
+    test("the Review tab says whether approved findings will get vectors", async ({ browser }) => {
+      const keys = `organization_id = ${literal(tenant!.organizationId)} AND name LIKE 'E2E NYRA UI embeddings%'`;
+      exec(`DELETE FROM workspace_ai_keys WHERE ${keys};`);
+      try {
+        const page = await pageAs(browser, "owner");
+        await openReview(page);
+        await expect(page.getByTestId("nyra-embeddings")).toContainText("No AI key that can create vectors is set up");
+        await expect(page.getByTestId("nyra-embeddings")).toContainText("Add such a key under AI Providers");
+
+        // With an OpenAI key in the workspace, the same screen names the provider after a reload.
+        exec(
+          `INSERT INTO workspace_ai_keys (organization_id, name, provider, api_key, is_active)
+           VALUES (${literal(tenant!.organizationId)}, 'E2E NYRA UI embeddings ${Date.now()}', 'openai', 'e2e-not-a-real-key', true);`,
+        );
+        await page.reload();
+        await tab(page, "Review").click();
+        await expect(page.getByTestId("nyra-embeddings")).toHaveText("Search vectors will be created with your openai key.");
+      } finally {
+        exec(`DELETE FROM workspace_ai_keys WHERE ${keys};`);
+      }
     });
   });
 });

@@ -52,7 +52,7 @@ export class NyraClient {
     let res: Response;
     try {
       res = await safeFetch(
-        `${this.config.nyraBaseUrl}/api/v1${path}`,
+        `${this.config.nyraBaseUrl}${path}`,
         {
           method,
           headers: {

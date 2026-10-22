@@ -1,6 +1,7 @@
-import { Body, Controller, Get, HttpCode, Param, Patch, Post, Req, Res } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Put, Req, Res } from "@nestjs/common";
 import type { Response } from "express";
 import { AuthenticatedRequest } from "../common/request.types";
+import { NyraReviewService } from "./nyra-review.service";
 import { NyraRunsService } from "./nyra-runs.service";
 import { NyraService } from "./nyra.service";
 
@@ -11,7 +12,8 @@ import { NyraService } from "./nyra.service";
 export class NyraRunsController {
   constructor(
     private readonly nyra: NyraService,
-    private readonly runs: NyraRunsService
+    private readonly runs: NyraRunsService,
+    private readonly review: NyraReviewService
   ) {}
 
   @Get()
@@ -54,6 +56,46 @@ export class NyraRunsController {
   @Get("/runs/:runId/items")
   items(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("nyraId") nyraId: string, @Param("runId") runId: string) {
     return this.runs.items(req.userId, projectId, nyraId, runId);
+  }
+
+  @Put("/runs/:runId/items/review")
+  reviewItem(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("nyraId") nyraId: string,
+    @Param("runId") runId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.review.review(req.userId, projectId, nyraId, runId, body);
+  }
+
+  @Post("/runs/:runId/items/review-bulk")
+  @HttpCode(200)
+  reviewItems(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("nyraId") nyraId: string,
+    @Param("runId") runId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.review.reviewMany(req.userId, projectId, nyraId, runId, body);
+  }
+
+  @Get("/runs/:runId/document-preview")
+  documentPreview(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("nyraId") nyraId: string, @Param("runId") runId: string) {
+    return this.review.documentPreview(req.userId, projectId, nyraId, runId);
+  }
+
+  @Post("/runs/:runId/approve")
+  @HttpCode(200)
+  approve(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("nyraId") nyraId: string,
+    @Param("runId") runId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.review.approve(req.userId, projectId, nyraId, runId, body);
   }
 
   @Get("/runs/:runId/recordings")

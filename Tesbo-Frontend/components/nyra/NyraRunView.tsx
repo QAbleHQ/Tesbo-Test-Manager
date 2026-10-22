@@ -13,6 +13,8 @@ import {
   nyraLiveFrameUrl,
   stopNyraRun,
   useNyraRunStream,
+  type NyraApproval,
+  type NyraEmbeddings,
   type NyraExport,
   type NyraItem,
   type NyraKind,
@@ -22,11 +24,13 @@ import {
 import { Button, Card, FieldError, Input, PageLoader, StatusChip } from "@/components/ui";
 import { formatDateTime } from "@/lib/date";
 import NyraItemCard from "@/components/nyra/NyraItemCard";
+import NyraReviewTab from "@/components/nyra/NyraReviewTab";
 
-type Tab = "overview" | "findings" | "knowledge" | "rules" | "report" | "recording" | "log";
+type Tab = "overview" | "findings" | "review" | "knowledge" | "rules" | "report" | "recording" | "log";
 const TABS: Array<{ key: Tab; label: string }> = [
   { key: "overview", label: "Overview" },
   { key: "findings", label: "Findings" },
+  { key: "review", label: "Review" },
   { key: "knowledge", label: "Knowledge file" },
   { key: "rules", label: "Business rules" },
   { key: "report", label: "Report" },
@@ -39,14 +43,15 @@ export const runTone = (s: NyraRun["status"]) =>
 
 const errText = (err: unknown, fallback: string) => (err instanceof Error ? err.message : fallback);
 
-export default function NyraRunView({ projectId, nyraId, run }: { projectId: string; nyraId: string; run: NyraRun }) {
+export default function NyraRunView({ projectId, nyraId, run, canApprove }: { projectId: string; nyraId: string; run: NyraRun; canApprove: boolean }) {
   const [tab, setTab] = useState<Tab>("overview");
   const active = NYRA_ACTIVE.has(run.status);
   // Live events while the scan runs. For a finished scan the same stream replays its log, so it opens only for the Log tab.
   const stream = useNyraRunStream(projectId, nyraId, run.id, active || tab === "log");
 
-  const [saved, setSaved] = useState<NyraItem[] | null>(null);
+  const [saved, setSaved] = useState<{ list: NyraItem[]; approval: NyraApproval | null; embeddings: NyraEmbeddings } | null>(null);
   const [savedError, setSavedError] = useState<string | null>(null);
+  const [reloads, setReloads] = useState(0);
   useEffect(() => {
     setSaved(null);
     setSavedError(null);
@@ -57,14 +62,14 @@ export default function NyraRunView({ projectId, nyraId, run }: { projectId: str
     if (active) return;
     let cancelled = false;
     listNyraItems(projectId, nyraId, run.id)
-      .then((r) => !cancelled && setSaved(r.list))
+      .then((r) => !cancelled && setSaved({ list: r.list, approval: r.approval, embeddings: r.embeddings }))
       .catch((err) => !cancelled && setSavedError(errText(err, "Could not load the results.")));
     return () => {
       cancelled = true;
     };
-  }, [projectId, nyraId, run.id, active]);
+  }, [projectId, nyraId, run.id, active, reloads]);
 
-  const items = active ? stream.items : saved;
+  const items = active ? stream.items : (saved?.list ?? null);
   const counts = useMemo(() => {
     const c: Partial<Record<NyraKind, number>> = {};
     for (const i of items ?? []) c[i.kind] = (c[i.kind] ?? 0) + 1;
@@ -92,6 +97,27 @@ export default function NyraRunView({ projectId, nyraId, run }: { projectId: str
 
       {tab === "overview" && <Overview projectId={projectId} nyraId={nyraId} run={run} active={active} stream={stream} counts={counts} />}
       {tab === "findings" && <Findings items={items} error={savedError} active={active} projectId={projectId} nyraId={nyraId} runId={run.id} />}
+      {tab === "review" && (
+        <>
+          {active && <Card className="p-5 text-sm text-[var(--muted)]">NYRA saves its findings when the scan finishes. Review opens then.</Card>}
+          {!active && savedError && <FieldError>{savedError}</FieldError>}
+          {!active && !savedError && !saved && <PageLoader label="Loading findings…" />}
+          {!active && saved && (
+            <NyraReviewTab
+              projectId={projectId}
+              nyraId={nyraId}
+              runId={run.id}
+              items={saved.list}
+              approval={saved.approval}
+              embeddings={saved.embeddings}
+              canApprove={canApprove}
+              onItem={(item) => setSaved((cur) => cur && { ...cur, list: cur.list.map((i) => (i.kind === item.kind && i.key === item.key ? item : i)) })}
+              onApproved={(approval, embeddings) => setSaved((cur) => cur && { ...cur, approval, embeddings })}
+              onReload={() => setReloads((n) => n + 1)}
+            />
+          )}
+        </>
+      )}
       {tab === "knowledge" && <ExportText key={`k-${run.id}`} projectId={projectId} nyraId={nyraId} run={run} file="knowledge.md" empty="NYRA found nothing to put in a knowledge file." />}
       {tab === "rules" && <ExportText key={`r-${run.id}`} projectId={projectId} nyraId={nyraId} run={run} file="business-rules.md" empty="NYRA found no business rules in this scan." />}
       {tab === "report" && <Report items={items} error={savedError} active={active} projectId={projectId} nyraId={nyraId} run={run} />}
@@ -120,15 +146,6 @@ function Overview({
 }) {
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
-  const [frameOk, setFrameOk] = useState(true);
-
-  // One frame a second is NYRA's own rate. A finished scan keeps its last frame, so it is requested once.
-  useEffect(() => {
-    if (!active) return;
-    const id = setInterval(() => setTick((t) => t + 1), 1500);
-    return () => clearInterval(id);
-  }, [active]);
 
   async function stop() {
     setStopping(true);
@@ -180,17 +197,8 @@ function Overview({
         )}
       </Card>
 
-      {frameOk && (active || run.status === "completed" || run.status === "partial" || run.status === "stopped") && (
-        <Card className="p-4">
-          <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted-soft)]">{active ? "Live browser" : "Last frame"}</div>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            src={`${nyraLiveFrameUrl(projectId, nyraId, run.id)}?t=${tick}`}
-            alt="NYRA's browser"
-            onError={() => setFrameOk(false)}
-            className="w-full rounded-md border border-[var(--border-subtle)]"
-          />
-        </Card>
+      {(active || run.status === "completed" || run.status === "partial" || run.status === "stopped") && (
+        <LiveFrame key={run.id} url={nyraLiveFrameUrl(projectId, nyraId, run.id)} active={active} />
       )}
 
       {active && stream.digest && (
@@ -201,6 +209,81 @@ function Overview({
         </Card>
       )}
     </div>
+  );
+}
+
+/**
+ * NYRA's browser, one frame at a time. The next frame is requested only after the last one answered:
+ * a fixed timer plus a changing <img> src cancelled every frame slower than the timer, so the picture
+ * could stay blank. 204 means NYRA has no frame yet, which is not a failure while the scan runs.
+ * A finished scan keeps its last frame, so it is requested once.
+ */
+function LiveFrame({ url, active }: { url: string; active: boolean }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const current = useRef<string | null>(null);
+  // Read inside the loop, so the scan ending does not restart it: that aborted the request in flight,
+  // which showed up as a cancelled live.jpg at the very moment the results loaded.
+  const activeNow = useRef(active);
+  activeNow.current = active;
+
+  useEffect(() => {
+    const abort = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let misses = 0;
+    async function pull() {
+      const startedAt = Date.now();
+      const wasActive = activeNow.current;
+      try {
+        const res = await fetch(url, { credentials: "include", signal: abort.signal });
+        if (res.status === 200) {
+          const next = URL.createObjectURL(await res.blob());
+          if (current.current) URL.revokeObjectURL(current.current);
+          current.current = next;
+          setSrc(next);
+          setFailed(false);
+          misses = 0;
+        } else {
+          misses++;
+        }
+      } catch {
+        if (abort.signal.aborted) return;
+        misses++;
+      }
+      if (abort.signal.aborted) return;
+      if (activeNow.current) {
+        // NYRA makes one frame a second: count the request's own time towards that second.
+        timer = setTimeout(pull, misses ? Math.min(1500 * misses, 5000) : Math.max(0, 1000 - (Date.now() - startedAt)));
+      } else if (wasActive) {
+        void pull(); // the scan ended while this request was in flight: fetch its last frame once
+      } else if (misses) {
+        setFailed(true);
+      }
+    }
+    void pull();
+    return () => {
+      abort.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [url]);
+  useEffect(
+    () => () => {
+      if (current.current) URL.revokeObjectURL(current.current);
+    },
+    []
+  );
+
+  if (failed && !src) return null;
+  return (
+    <Card className="p-4">
+      <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted-soft)]">{active ? "Live browser" : "Last frame"}</div>
+      {src ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={src} alt="NYRA's browser" className="w-full rounded-md border border-[var(--border-subtle)]" />
+      ) : (
+        <div className="text-[13px] text-[var(--muted)]">Waiting for the first frame…</div>
+      )}
+    </Card>
   );
 }
 

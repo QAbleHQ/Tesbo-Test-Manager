@@ -3,6 +3,7 @@ import type { Request, Response as ExpressResponse } from "express";
 import { Readable } from "stream";
 import { neutralizeFormula } from "../common/spreadsheet-safe";
 import { NyraClient } from "./nyra.client";
+import { NyraReviewService } from "./nyra-review.service";
 import { NyraService } from "./nyra.service";
 
 type Row = Record<string, any>;
@@ -34,7 +35,8 @@ export function neutralizeCsv(csv: string): string {
 export class NyraRunsService {
   constructor(
     private readonly nyra: NyraService,
-    private readonly client: NyraClient
+    private readonly client: NyraClient,
+    private readonly review: NyraReviewService
   ) {}
 
   private runPath(nyraId: string, runId: string): string {
@@ -78,18 +80,11 @@ export class NyraRunsService {
     return { status: String(res?.status ?? "stopping") };
   }
 
+  /** NYRA's findings with this project's review decisions laid over them. */
   async items(userId: string | null | undefined, projectId: string, nyraId: string, runId: string) {
     await this.nyra.requireLinked(userId, projectId, nyraId);
     const items = await this.client.json("GET", `${this.runPath(nyraId, runId)}/items`);
-    return {
-      list: (Array.isArray(items) ? items : []).map((i: Row) => ({
-        kind: i.kind,
-        key: i.key,
-        title: i.title,
-        data: i.data ?? {},
-        reviewStatus: i.review_status ?? "waiting"
-      }))
-    };
+    return this.review.overlay(projectId, nyraId, runId, Array.isArray(items) ? items : []);
   }
 
   async recordings(userId: string | null | undefined, projectId: string, nyraId: string, runId: string) {

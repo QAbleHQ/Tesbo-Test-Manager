@@ -182,7 +182,7 @@ export default function NyraWorkspace({ projectId, nyraId }: { projectId: string
               </button>
             ))}
           </aside>
-          <div className="min-w-0">{selectedRun && <NyraRunView key={selectedRun.id} projectId={projectId} nyraId={nyraId} run={selectedRun} />}</div>
+          <div className="min-w-0">{selectedRun && <NyraRunView key={selectedRun.id} projectId={projectId} nyraId={nyraId} run={selectedRun} canApprove={canManage} />}</div>
         </div>
       )}
 

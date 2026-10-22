@@ -55,13 +55,61 @@ export interface NyraRun {
   finishedAt: string | null;
 }
 
+export type NyraReviewStatus = "waiting" | "correct" | "edited" | "rejected";
+
 export interface NyraItem {
   kind: NyraKind;
   key: string;
+  /** What a person approved: NYRA's text, or the edited text. */
   title: string;
   data: Record<string, any>;
-  reviewStatus: string;
+  reviewStatus: NyraReviewStatus;
+  reviewedAt?: string | null;
+  /** NYRA's own text, present only when a person edited the finding. */
+  original?: { title: string; data: Record<string, any> } | null;
 }
+
+/** Whether approved findings will get vectors: a key that can embed exists for this project. */
+export interface NyraEmbeddings {
+  available: boolean;
+  provider: string | null;
+}
+
+export interface NyraApproval {
+  approvedAt: string;
+  itemCount: number;
+  documents: Array<{ kind: string; documentId: string; title: string }>;
+}
+
+/** The kinds a person reviews: the ones that explain the product. The rest stays in the report. */
+export const NYRA_DOC_KINDS: ReadonlySet<NyraKind> = new Set(["screen", "feature", "workflow", "business_rule", "form", "tech"]);
+
+export interface NyraDocBlock {
+  heading: string;
+  facts: Array<[string, string]>;
+  steps: string[];
+}
+/** The Knowledge Base document the approved findings become, as the server will write it. */
+export interface NyraDocPreview {
+  title: string;
+  intro: string[];
+  sections: Array<{ id: string; heading: string; groups: Array<{ heading: string | null; blocks: NyraDocBlock[] }> }>;
+  counts: Record<string, number>;
+  clipped: boolean;
+  /** Findings of the kinds that tell the story; approving needs at least one. */
+  approvable: number;
+  documentId: string | null;
+  /** A person changed the document in the Knowledge Base after it was last approved. */
+  editedInKb: boolean;
+}
+
+/** What a person may change per kind. Mirrors the server (nyra-review.ts), which enforces it. */
+export const NYRA_EDITABLE: Partial<Record<NyraKind, { text?: Array<{ key: string; label: string; long?: boolean }>; list?: Array<{ key: string; label: string }>; oneOf?: Array<{ key: string; label: string; options: string[] }> }>> = {
+  screen: { text: [{ key: "purpose", label: "Purpose", long: true }] },
+  feature: { text: [{ key: "module", label: "Module" }, { key: "description", label: "Description", long: true }] },
+  workflow: { text: [{ key: "goal", label: "Goal", long: true }], list: [{ key: "steps", label: "Steps" }] },
+  business_rule: { text: [{ key: "explanation", label: "Why", long: true }] },
+};
 
 export interface NyraRecording {
   name: string;
@@ -77,7 +125,29 @@ export const startNyraRun = (projectId: string, nyraId: string, data: { environm
   api<NyraRun>(`${base(projectId, nyraId)}/runs`, { method: "POST", body: data });
 export const stopNyraRun = (projectId: string, nyraId: string, runId: string) =>
   api<{ status: string }>(`${base(projectId, nyraId)}/runs/${runId}/stop`, { method: "POST" });
-export const listNyraItems = (projectId: string, nyraId: string, runId: string) => api<{ list: NyraItem[] }>(`${base(projectId, nyraId)}/runs/${runId}/items`);
+export const listNyraItems = (projectId: string, nyraId: string, runId: string) =>
+  api<{ list: NyraItem[]; approval: NyraApproval | null; embeddings: NyraEmbeddings }>(`${base(projectId, nyraId)}/runs/${runId}/items`);
+export const reviewNyraItem = (
+  projectId: string,
+  nyraId: string,
+  runId: string,
+  data: { kind: NyraKind; key: string; status: NyraReviewStatus; title?: string; data?: Record<string, unknown> }
+) => api<NyraItem>(`${base(projectId, nyraId)}/runs/${runId}/items/review`, { method: "PUT", body: data });
+export const reviewNyraItems = (
+  projectId: string,
+  nyraId: string,
+  runId: string,
+  data: { items: Array<{ kind: NyraKind; key: string }>; status: "correct" | "rejected" | "waiting" }
+) => api<{ updated: number; skipped: number }>(`${base(projectId, nyraId)}/runs/${runId}/items/review-bulk`, { method: "POST", body: data });
+export const approveNyraRun = (projectId: string, nyraId: string, runId: string, replaceEdits = false) =>
+  api<{ approvedAt: string; itemCount: number; clipped: boolean; embeddings: NyraEmbeddings; documents: Array<{ kind: string; documentId: string; title: string; count: number; label: string }> }>(
+    `${base(projectId, nyraId)}/runs/${runId}/approve`,
+    { method: "POST", body: { replaceEdits } }
+  );
+// A signal is always passed: it also keeps api() from sharing one in-flight GET between two calls, so a
+// preview asked for after a decision is never answered with the one that was already on its way.
+export const getNyraDocumentPreview = (projectId: string, nyraId: string, runId: string, signal: AbortSignal) =>
+  api<NyraDocPreview>(`${base(projectId, nyraId)}/runs/${runId}/document-preview`, { signal });
 export const listNyraRecordings = (projectId: string, nyraId: string, runId: string) =>
   api<{ list: NyraRecording[] }>(`${base(projectId, nyraId)}/runs/${runId}/recordings`);
 export const updateNyraEnvironment = (
@@ -202,7 +272,7 @@ export function useNyraRunStream(projectId: string, nyraId: string, runId: strin
       const m = parse(e as MessageEvent);
       const d = m?.data;
       if (d?.kind && d?.key) {
-        items.set(`${d.kind}:${d.key}`, { kind: d.kind, key: String(d.key), title: String(d.title ?? ""), data: d.data ?? {}, reviewStatus: String(d.review_status ?? "waiting") });
+        items.set(`${d.kind}:${d.key}`, { kind: d.kind, key: String(d.key), title: String(d.title ?? ""), data: d.data ?? {}, reviewStatus: "waiting" });
         schedule();
       }
     });

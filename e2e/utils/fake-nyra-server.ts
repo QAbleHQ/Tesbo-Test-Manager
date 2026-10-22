@@ -7,7 +7,7 @@ import { env } from "./env";
  * creating projects or scans in a real NYRA.
  *
  * The backend reads NYRA_BASE_URL once at boot and runs in a container, so the fake only receives
- * traffic when the stack was started with NYRA_BASE_URL=http://host.docker.internal:<NYRA_FAKE_PORT>
+ * traffic when the stack was started with NYRA_BASE_URL=http://host.docker.internal:<NYRA_FAKE_PORT>/api/v1
  * (default 2906). nyraFakeIsWired() says whether it was; specs that need it skip, with that reason,
  * when it was not. Never point this at a real NYRA: the gate is what stops a test run creating real
  * projects, and it compares the exact address.
@@ -23,7 +23,8 @@ import { env } from "./env";
  */
 
 export const NYRA_FAKE_PORT = Number(process.env.NYRA_FAKE_PORT || 2906);
-export const NYRA_FAKE_BASE_URL = `http://host.docker.internal:${NYRA_FAKE_PORT}`;
+// NYRA_BASE_URL carries the /api/v1 prefix; the backend appends only the resource path.
+export const NYRA_FAKE_BASE_URL = `http://host.docker.internal:${NYRA_FAKE_PORT}/api/v1`;
 
 export function nyraFakeIsWired(): boolean {
   return env.nyraBaseUrl.replace(/\/+$/, "") === NYRA_FAKE_BASE_URL;
@@ -55,6 +56,8 @@ export interface FakeNyraServer {
   runs: any[];
   /** Ends a scan the way NYRA does: results saved first, then the status set. */
   finishRun(runId: string, status?: string): void;
+  /** Makes a RUNNING scan answer live.jpg with a frame after `delayMs` (otherwise 204, as before its first frame). */
+  serveFrame(runId: string, delayMs?: number): void;
   /** Sends one event down every open events stream of a run. */
   emit(runId: string, event: string, data: Record<string, unknown>): void;
   reset(): void;
@@ -86,6 +89,9 @@ export const FAKE_ITEMS = [
     data: { priority: "high", steps: ["Open /login"], expected: "Dashboard", screen: "/login" },
     review_status: "waiting",
   },
+  // The appendix of the product document: reviewed like the rest, but never enough on their own to approve.
+  { kind: "form", key: "login-form", title: "Login form", data: { method: "post", action: "/api/login", screens: ["/login"], fields: [{ label: "Email", required: true }, { name: "password" }] }, review_status: "waiting" },
+  { kind: "tech", key: "tech", title: "Technical profile", data: { frameworks: { next: "15" }, missing_security_headers: ["content-security-policy"] }, review_status: "waiting" },
 ];
 
 export async function startFakeNyraServer(): Promise<FakeNyraServer> {
@@ -94,6 +100,7 @@ export async function startFakeNyraServer(): Promise<FakeNyraServer> {
   const runs: any[] = [];
   const itemsByRun = new Map<string, any[]>();
   const streams = new Map<string, Set<ServerResponse>>();
+  const frameDelay = new Map<string, number>();
 
   const sse = (res: ServerResponse, id: number, event: string, data: unknown) =>
     res.write(`id: ${Date.now()}-${id}\r\nevent: ${event}\r\ndata: ${JSON.stringify({ ts: new Date().toISOString(), data })}\r\n\r\n`);
@@ -221,12 +228,15 @@ export async function startFakeNyraServer(): Promise<FakeNyraServer> {
           return send(200, run.status === "running" ? [] : [{ name: "session-1.webm", url, size_bytes: FAKE_RECORDING.length }]);
         }
         if (rest === "live.jpg") {
-          if (run.status === "running") {
+          const delay = frameDelay.get(run.id);
+          if (run.status === "running" && delay === undefined) {
             res.writeHead(204);
             return res.end();
           }
-          res.writeHead(200, { "content-type": "image/jpeg" });
-          return res.end(FAKE_JPEG);
+          return void setTimeout(() => {
+            res.writeHead(200, { "content-type": "image/jpeg" });
+            res.end(FAKE_JPEG);
+          }, run.status === "running" ? (delay ?? 0) : 0);
         }
         const file = /^files\/(recordings|screens)\/([A-Za-z0-9_.-]+)$/.exec(rest ?? "");
         if (file) {
@@ -317,7 +327,10 @@ export async function startFakeNyraServer(): Promise<FakeNyraServer> {
       itemsByRun.set(runId, FAKE_ITEMS);
       run.status = status;
       run.finished_at = new Date().toISOString();
-      run.summary = { reason: null, pages_visited: 1, counts: { screen: 1, feature: 1, workflow: 1, business_rule: 1, test_case: 1 }, recordings: 1 };
+      run.summary = { reason: null, pages_visited: 1, counts: { screen: 1, feature: 1, workflow: 1, business_rule: 1, test_case: 1, form: 1, tech: 1 }, recordings: 1 };
+    },
+    serveFrame(runId, delayMs = 0) {
+      frameDelay.set(runId, delayMs);
     },
     emit(runId, event, data) {
       let n = 100;
@@ -328,6 +341,7 @@ export async function startFakeNyraServer(): Promise<FakeNyraServer> {
       projects.length = 0;
       runs.length = 0;
       itemsByRun.clear();
+      frameDelay.clear();
       for (const set of streams.values()) for (const res of set) res.end();
       streams.clear();
     },

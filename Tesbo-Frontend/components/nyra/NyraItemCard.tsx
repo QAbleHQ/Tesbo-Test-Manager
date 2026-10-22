@@ -33,7 +33,25 @@ function Line({ name, children }: { name: string; children: React.ReactNode }) {
 const severityTone = (s: string) => (s === "high" ? "error" : s === "medium" ? "warning" : "neutral");
 
 /** One finding, laid out for its kind. Everything shown is page-derived text, rendered as text only. */
-export default function NyraItemCard({ item, projectId, nyraId, runId }: { item: NyraItem; projectId: string; nyraId: string; runId: string }) {
+const STATUS_CHIP: Record<string, { tone: "success" | "warning" | "error"; label: string }> = {
+  correct: { tone: "success", label: "Correct" },
+  edited: { tone: "warning", label: "Edited" },
+  rejected: { tone: "error", label: "Rejected" },
+};
+
+export default function NyraItemCard({
+  item,
+  projectId,
+  nyraId,
+  runId,
+  footer,
+}: {
+  item: NyraItem;
+  projectId: string;
+  nyraId: string;
+  runId: string;
+  footer?: React.ReactNode;
+}) {
   const d = item.data ?? {};
   let badge: React.ReactNode = null;
   let body: React.ReactNode = null;
@@ -161,9 +179,14 @@ export default function NyraItemCard({ item, projectId, nyraId, runId }: { item:
     <div className="tesbo-card p-4" data-testid="nyra-item">
       <div className="flex items-start justify-between gap-3">
         <h4 className="min-w-0 break-words text-[14px] font-semibold text-[var(--foreground)]">{item.title}</h4>
-        {badge}
+        <div className="flex shrink-0 flex-wrap justify-end gap-1">
+          {STATUS_CHIP[item.reviewStatus] && <StatusChip tone={STATUS_CHIP[item.reviewStatus].tone}>{STATUS_CHIP[item.reviewStatus].label}</StatusChip>}
+          {badge}
+        </div>
       </div>
       {body}
+      {item.original && item.original.title !== item.title && <div className={`${muted} mt-2`}>NYRA found: {item.original.title}</div>}
+      {footer}
     </div>
   );
 }
