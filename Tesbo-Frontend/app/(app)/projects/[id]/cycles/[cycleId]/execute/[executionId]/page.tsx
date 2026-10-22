@@ -72,6 +72,8 @@ export default function ExecutionDetailPage() {
   const [actualResult, setActualResult] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   /* Bug Key / Bug Title shown for a Failed execution — read from the real bug(s) filed via "Log
      bug" (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row.
      An execution can have more than one bug linked to it, so this is every bug linked to THIS
@@ -159,17 +161,33 @@ export default function ExecutionDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cycleId, executionId, projectId, router, currentUser]);
 
+  // "Saved" describes the values as stored, so any further edit retires it. Save itself leaves the
+  // three values unchanged, so it does not trip this.
+  useEffect(() => {
+    setSaved(false);
+  }, [status, actualResult, assigneeId]);
+
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
+    setSaved(false);
+    setSaveError(null);
     try {
       await updateExecution(cycleId, executionId, {
         status,
         actualResult,
         assigneeId: assigneeId || null,
       });
-      router.push(`/projects/${projectId}/cycles/${cycleId}`);
-      router.refresh();
+      // Stays on the page: evidence is uploaded the moment it is picked, so Save is often the last
+      // step of a session on this screen but not the end of it — someone adding evidence, or logging
+      // a bug against the status they just set, should not be thrown back to the run list. "Back to
+      // run" is the way out. Keep the page's own copy of the result in step with what was stored.
+      setExecution((prev) =>
+        prev ? { ...prev, status, actualResult, assigneeId: assigneeId || null } : prev
+      );
+      setSaved(true);
+    } catch (err) {
+      setSaveError(err instanceof Error && err.message ? err.message : "Couldn't save this result.");
     } finally {
       setSaving(false);
     }
@@ -386,8 +404,18 @@ export default function ExecutionDetailPage() {
               href={`/projects/${projectId}/cycles/${cycleId}`}
               className="rounded-lg border border-[var(--border)] py-2 px-5 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
             >
-              Cancel
+              {saved ? "Back to run" : "Cancel"}
             </Link>
+            {saved && (
+              <p role="status" className="self-center text-sm text-[var(--success-foreground)]">
+                Saved
+              </p>
+            )}
+            {saveError && (
+              <p role="alert" className="self-center text-sm text-[var(--error-foreground)]">
+                {saveError}
+              </p>
+            )}
           </div>
         </form>
       </main>

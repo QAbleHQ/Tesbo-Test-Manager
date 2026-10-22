@@ -1282,7 +1282,10 @@ test.describe("assigning a test execution", () => {
       await expect(assignSelect).toBeVisible();
       await assignSelect.selectOption(me.userId);
       await page.getByRole("button", { name: "Save" }).first().click();
-      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+      // Save used to close the drawer, which this waited on. It now stays open and says "Saved"
+      // (see the drawer test below); Escape closes it so the re-open steps below start clean.
+      await expect(page.getByRole("status").filter({ hasText: "Saved" })).toBeVisible({ timeout: 10_000 });
+      await page.keyboard.press("Escape");
 
       const [afterAssign] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
       expect(afterAssign.assigneeId).toBe(me.userId);
@@ -1294,7 +1297,8 @@ test.describe("assigning a test execution", () => {
       await expect(page.getByRole("combobox", { name: "Assigned to" })).toHaveValue(me.userId);
       await page.getByRole("button", { name: "Passed", exact: true }).first().click();
       await page.getByRole("button", { name: "Save" }).first().click();
-      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+      await expect(page.getByRole("status").filter({ hasText: "Saved" })).toBeVisible({ timeout: 10_000 });
+      await page.keyboard.press("Escape");
 
       const [afterStatus] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
       expect(afterStatus.status).toBe("Passed");
@@ -1304,7 +1308,7 @@ test.describe("assigning a test execution", () => {
       await page.getByText(testcase.title).first().click();
       await page.getByRole("combobox", { name: "Assigned to" }).selectOption("");
       await page.getByRole("button", { name: "Save" }).first().click();
-      await expect(page.getByText(testcase.title)).toBeHidden({ timeout: 10_000 });
+      await expect(page.getByRole("status").filter({ hasText: "Saved" })).toBeVisible({ timeout: 10_000 });
 
       const [afterUnassign] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
       expect(afterUnassign.assigneeId).toBeNull();
@@ -1326,10 +1330,143 @@ test.describe("assigning a test execution", () => {
       await expect(assignSelect).toBeVisible();
       await assignSelect.selectOption(me.userId);
       await page.getByRole("button", { name: "Save" }).first().click();
-      await page.waitForURL(`**/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      // Save used to redirect to the run list, which this waited on. It now stays on the page
+      // (see the test below), so the expectation moved with the product: "Saved" is the signal.
+      await expect(page.getByRole("status")).toHaveText("Saved");
 
       const [after] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
       expect(after.assigneeId).toBe(me.userId);
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  /*
+   * "[Test Run] Evidence > once add any evidence and click save it's redirecting to test run
+   * listing page, it should stay on same page."
+   */
+  /*
+   * Same card, run drawer ("do for side window also"): Save used to close the drawer, so adding
+   * evidence and then saving dumped the person back on the list.
+   */
+  test("the run drawer stays open on Save, keeps its evidence, and reports failures", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Drawer Save Stays ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const stored = async () => (await (await api.get(`/api/cycles/${cycle.id}/executions`)).json())[0];
+      const saved = page.getByRole("status").filter({ hasText: "Saved" });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycle.id}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("heading", { name: testcase.title })).toBeVisible();
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "drawer-shot.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+          "base64",
+        ),
+      });
+      await expect(page.getByRole("img", { name: "drawer-shot.png" })).toBeVisible({ timeout: 10_000 });
+
+      await page.getByRole("button", { name: "Passed", exact: true }).first().click();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+
+      // Still open, still on the same case with its evidence, confirmation shown, value stored.
+      await expect(saved).toBeVisible();
+      await expect(page.getByRole("heading", { name: testcase.title })).toBeVisible();
+      await expect(page.getByRole("img", { name: "drawer-shot.png" })).toBeVisible();
+      expect((await stored()).status).toBe("Passed");
+
+      // Editing again retires the confirmation; a second Save on the same open drawer works.
+      await page.getByRole("button", { name: "Blocked", exact: true }).first().click();
+      await expect(saved).toHaveCount(0);
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(saved).toBeVisible();
+      expect((await stored()).status).toBe("Blocked");
+
+      // Failure path: the drawer itself reports it (the row's marker is behind the backdrop).
+      await page.route(/\/api\/cycles\/[0-9a-f-]{36}\/executions\/[0-9a-f-]{36}$/, (route) =>
+        route.request().method() === "PATCH"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "boom" }) })
+          : route.continue(),
+      );
+      await page.getByRole("button", { name: "Retest", exact: true }).first().click();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      // Next's route announcer is also role=alert (and empty), hence the non-empty filter.
+      await expect(page.locator("[role=alert]").filter({ hasText: /\S/ }).first()).toBeVisible();
+      await expect(saved).toHaveCount(0);
+      await expect(page.getByRole("heading", { name: testcase.title })).toBeVisible();
+      expect((await stored()).status, "a failed save must not change the stored status").toBe("Blocked");
+      await page.unroute(/\/api\/cycles\/[0-9a-f-]{36}\/executions\/[0-9a-f-]{36}$/);
+    } finally {
+      await api.dispose();
+      await cleanUp(cycle.id, testcase.id);
+    }
+  });
+
+  test("the full-page execute view stays put on Save, keeps its evidence, and reports failures", async ({ page }) => {
+    const { cycle, testcase } = await setUpCycleWithOneCase(`UI Execute Save Stays ${Date.now()}`);
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const [execution] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+      const pageUrl = `/projects/${ctx.projectId}/cycles/${cycle.id}/execute/${execution.id}`;
+      const stored = async () => (await (await api.get(`/api/cycles/${cycle.id}/executions`)).json())[0];
+
+      await page.goto(pageUrl);
+      await expect(page.getByText(/No evidence attached/)).toBeVisible();
+      await page.locator('input[type="file"]').setInputFiles({
+        name: "stay-shot.png",
+        mimeType: "image/png",
+        buffer: Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+          "base64",
+        ),
+      });
+      await expect(page.getByRole("img", { name: "stay-shot.png" })).toBeVisible({ timeout: 10_000 });
+
+      await page.getByRole("button", { name: "Passed", exact: true }).click();
+      await page.getByPlaceholder("Describe what actually happened…").fill("stays on the page");
+      await page.getByRole("button", { name: "Save" }).click();
+
+      // Same page, confirmation shown, the way back is offered, and the evidence is still there.
+      await expect(page.getByRole("status")).toHaveText("Saved");
+      await expect(page).toHaveURL(new RegExp(`${pageUrl}$`));
+      await expect(page.getByRole("link", { name: "Back to run" })).toBeVisible();
+      await expect(page.getByRole("img", { name: "stay-shot.png" })).toBeVisible();
+      const afterSave = await stored();
+      expect(afterSave.status).toBe("Passed");
+      expect(afterSave.actualResult).toBe("stays on the page");
+
+      // Any further edit retires the confirmation, since it no longer describes what is stored.
+      await page.getByRole("button", { name: "Failed", exact: true }).click();
+      await expect(page.getByRole("status")).toHaveCount(0);
+      await expect(page.getByRole("link", { name: "Cancel" })).toBeVisible();
+
+      // A second Save on the same page works too (no navigation to reset anything).
+      await page.getByRole("button", { name: "Save" }).click();
+      await expect(page.getByRole("status")).toHaveText("Saved");
+      expect((await stored()).status).toBe("Failed");
+
+      // Failure path: the error is shown, the page stays, and nothing claims it was saved.
+      await page.route(/\/api\/cycles\/[0-9a-f-]{36}\/executions\/[0-9a-f-]{36}$/, (route) =>
+        route.request().method() === "PUT" || route.request().method() === "PATCH"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "boom" }) })
+          : route.continue(),
+      );
+      await page.getByRole("button", { name: "Blocked", exact: true }).click();
+      await page.getByRole("button", { name: "Save" }).click();
+      // Next's route announcer is also role=alert (and empty), hence the non-empty filter.
+      await expect(page.locator("[role=alert]").filter({ hasText: /\S/ })).toBeVisible();
+      await expect(page.getByRole("status")).toHaveCount(0);
+      await expect(page).toHaveURL(new RegExp(`${pageUrl}$`));
+      expect((await stored()).status, "a failed save must not change the stored status").toBe("Failed");
+
+      // Back to run: the explicit way out still goes to the run list.
+      await page.unroute(/\/api\/cycles\/[0-9a-f-]{36}\/executions\/[0-9a-f-]{36}$/);
+      await page.getByRole("link", { name: "Cancel" }).click();
+      await page.waitForURL(`**/projects/${ctx.projectId}/cycles/${cycle.id}`);
     } finally {
       await api.dispose();
       await cleanUp(cycle.id, testcase.id);
@@ -1879,7 +2016,7 @@ test.describe("run detail — progress, defects and the bug modal", () => {
       await page.getByRole("button", { name: "Failed", exact: true }).first().click();
       await page.getByRole("button", { name: "Save", exact: true }).click();
 
-      // Marking Failed and saving auto-opens the bug dialog; the drawer closes behind it.
+      // Marking Failed and saving auto-opens the bug dialog; the drawer stays open behind it.
       await expect(page.getByRole("heading", { name: "Report a Bug" })).toBeVisible();
       await page.getByRole("button", { name: "Yes, link existing" }).click();
       await page.getByRole("button", { name: "Existing Tesbo bug" }).click();
@@ -2179,6 +2316,121 @@ test.describe("execution evidence and automation provenance", () => {
         new RegExp(`/api/cycles/${runId}/executions/[0-9a-f-]{36}/attachments/[0-9a-f-]{36}/download$`),
       );
     } finally {
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  /*
+   * "[Test Run] Evidence > No view evidence button available only able to download."
+   * Video and log rows were download-only. Video can be played in place (the backend serves it
+   * inline); a log stays a download on purpose -- the backend refuses inline for anything that is
+   * not an image or video, so nothing in an uploaded file is ever interpreted by the browser.
+   */
+  test("a video can be viewed in place, while a log stays download-only", async ({ page }) => {
+    const { runId, testcase } = await seedAutomatedRun("view-evidence");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const base = `/api/projects/${ctx.projectId}/automation/runs/${runId}/results/${testcase.externalId}/evidence`;
+      await api.post(base, {
+        multipart: { kind: "video", files: { name: "repro.mp4", mimeType: "video/mp4", buffer: Buffer.from("not-a-real-mp4") } },
+      });
+      await api.post(base, {
+        multipart: { kind: "log", files: { name: "run.log", mimeType: "text/plain", buffer: Buffer.from("<script>1</script>") } },
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByText("repro.mp4")).toBeVisible();
+      await expect(page.getByText("run.log")).toBeVisible();
+
+      // Only the video offers View; the player is not mounted until it is pressed.
+      await expect(page.getByTestId("evidence-view-video")).toHaveCount(1);
+      await expect(page.getByTestId("evidence-video-player")).toHaveCount(0);
+
+      await page.getByTestId("evidence-view-video").click();
+      const player = page.getByTestId("evidence-video-player");
+      await expect(player).toBeVisible();
+      const src = (await player.getAttribute("src")) ?? "";
+      expect(src).toMatch(/\/attachments\/[0-9a-f-]{36}\/download\?inline=1$/);
+
+      // The inline request is really served inline, as video.
+      const inline = await api.get(src);
+      expect(inline.status()).toBe(200);
+      expect(inline.headers()["content-type"]).toContain("video/mp4");
+      expect(inline.headers()["content-disposition"]).toMatch(/^inline/);
+
+      // Same flag on the log is refused: still an attachment, never rendered by the browser.
+      const logHref = await page.getByRole("link", { name: /run\.log/ }).getAttribute("href");
+      const logInline = await api.get(`${logHref}?inline=1`);
+      expect(logInline.headers()["content-disposition"]).toMatch(/^attachment/);
+
+      // The same URL without a session is not reachable.
+      const anon = await pwRequest.newContext({ baseURL: env.apiBaseUrl });
+      try {
+        expect([401, 403]).toContain((await anon.get(src, { failOnStatusCode: false })).status());
+      } finally {
+        await anon.dispose();
+      }
+
+      // Hide unmounts the player again.
+      await page.getByTestId("evidence-view-video").click();
+      await expect(page.getByTestId("evidence-video-player")).toHaveCount(0);
+    } finally {
+      await api.dispose();
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  /*
+   * "[Test Run] Evidence > Not able to delete evidence once attached." Each file gets a delete
+   * control behind a confirm. Asserted against the persisted list, not just the DOM.
+   */
+  test("evidence can be deleted after a confirm; cancelling and a failed delete both keep the file", async ({ page }) => {
+    const { runId, testcase } = await seedAutomatedRun("delete-evidence");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const executions = await (await api.get(`/api/cycles/${runId}/executions`)).json();
+      const listUrl = `/api/cycles/${runId}/executions/${executions[0].id}/attachments`;
+      const names = async () =>
+        ((await (await api.get(listUrl)).json()).list as { fileName: string }[]).map((f) => f.fileName);
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+
+      // Cancel: nothing is deleted.
+      await page.getByRole("button", { name: "Delete cart-failure.png" }).click();
+      await expect(page.getByText(/will be permanently deleted/)).toBeVisible();
+      await page.getByRole("button", { name: "Cancel", exact: true }).click();
+      await expect(page.getByText(/will be permanently deleted/)).toHaveCount(0);
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toBeVisible();
+      expect(await names()).toContain("cart-failure.png");
+
+      // Failure path: a 500 keeps the dialog open with the error, and the file stays.
+      await page.route(/\/attachments\/[0-9a-f-]{36}$/, (route) =>
+        route.request().method() === "DELETE"
+          ? route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "boom" }) })
+          : route.continue(),
+      );
+      await page.getByRole("button", { name: "Delete cart-failure.png" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.locator("[role=alert]").filter({ hasText: /\S/ })).toBeVisible();
+      expect(await names()).toContain("cart-failure.png");
+      await page.unroute(/\/attachments\/[0-9a-f-]{36}$/);
+
+      // Confirm: the screenshot goes, the trace is untouched.
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByRole("img", { name: "cart-failure.png" })).toHaveCount(0);
+      await expect(page.getByText("cart-trace.zip")).toBeVisible();
+      expect(await names()).toEqual(["cart-trace.zip"]);
+
+      // Deleting the last file returns to the empty state.
+      await page.getByRole("button", { name: "Delete cart-trace.zip" }).click();
+      await page.getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByText(/No evidence attached/)).toBeVisible();
+      expect(await names()).toEqual([]);
+    } finally {
+      await api.dispose();
       await cleanUp(runId, testcase.id);
     }
   });

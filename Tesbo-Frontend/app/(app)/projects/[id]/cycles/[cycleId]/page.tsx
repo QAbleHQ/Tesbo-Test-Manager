@@ -459,6 +459,15 @@ export default function TestRunDetailPage() {
   const [panelActualResult, setPanelActualResult] = useState("");
   const [panelAssigneeId, setPanelAssigneeId] = useState("");
   const [panelSaving, setPanelSaving] = useState(false);
+  const [panelSaved, setPanelSaved] = useState(false);
+  const [panelSaveError, setPanelSaveError] = useState<string | null>(null);
+  // "Saved" / the error describe the values as last submitted, so editing them — or switching to
+  // another row — retires both. Save itself leaves these values untouched, so it does not trip this.
+  const panelExecutionId = panelExecution?.id;
+  useEffect(() => {
+    setPanelSaved(false);
+    setPanelSaveError(null);
+  }, [panelStatus, panelActualResult, panelAssigneeId, panelExecutionId]);
   /* Bug Key / Bug Title shown for a Failed execution — read from the real bug(s) filed via "Log
      bug" (bugs/bug_links), not the old free-text defectKey/defectUrl columns on the execution row.
      An execution can have more than one bug linked to it, so this is every bug linked to THIS
@@ -786,6 +795,8 @@ export default function TestRunDetailPage() {
   async function handlePanelSave() {
     if (!panelExecution) return;
     setPanelSaving(true);
+    setPanelSaved(false);
+    setPanelSaveError(null);
     // Optimistic: the row behind this panel reflects the pick immediately rather than only after
     // the PATCH resolves — same fix, and same revert-on-failure below, as handleStatusChange.
     const prev = panelExecution;
@@ -803,7 +814,15 @@ export default function TestRunDetailPage() {
         assigneeId: panelAssigneeId || null,
       });
       const wasFailed = prev.status === "Failed";
-      closeExecutionPanel();
+      // The drawer stays open: someone adding evidence or logging a bug against this result is
+      // mid-task, and a Save that dismisses it throws them back to the list. Keep the drawer's own
+      // copy (header chip, wasFailed check on the next Save) in step with what was stored.
+      setPanelExecution((cur) =>
+        cur && cur.id === prev.id
+          ? { ...cur, status: panelStatus, actualResult: panelActualResult, assigneeId: panelAssigneeId || null }
+          : cur
+      );
+      setPanelSaved(true);
       if (panelStatus === "Failed" && !wasFailed) {
         openBugDialogFor({ ...prev, status: panelStatus }, "Failed");
       }
@@ -815,10 +834,10 @@ export default function TestRunDetailPage() {
             : e
         )
       );
-      setStatusError({
-        id: prev.id,
-        message: err instanceof Error ? err.message : "Failed to update status. Please try again.",
-      });
+      const message = err instanceof Error ? err.message : "Failed to update status. Please try again.";
+      setStatusError({ id: prev.id, message });
+      // The row's error marker is behind the drawer's backdrop, so say it here too.
+      setPanelSaveError(message);
     } finally {
       setPanelSaving(false);
     }
@@ -1283,7 +1302,7 @@ export default function TestRunDetailPage() {
                 data-testid="run-filter-priority"
                 value={runFilterPriority}
                 onChange={(e) => setRunFilterPriority(e.target.value)}
-                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+                className="!h-[30px] !w-auto rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
               >
                 <option value="">All priorities</option>
                 {runPriorityOptions.map((p) => (
@@ -1295,7 +1314,7 @@ export default function TestRunDetailPage() {
                 data-testid="run-filter-type"
                 value={runFilterType}
                 onChange={(e) => setRunFilterType(e.target.value)}
-                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+                className="!h-[30px] !w-auto rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
               >
                 <option value="">All types</option>
                 {runTypeOptions.map((t) => (
@@ -1307,7 +1326,7 @@ export default function TestRunDetailPage() {
                 data-testid="run-filter-assignee"
                 value={runFilterAssignee}
                 onChange={(e) => setRunFilterAssignee(e.target.value)}
-                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+                className="!h-[30px] !w-auto rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
               >
                 <option value="">All assignees</option>
                 <option value="__unassigned__">Unassigned</option>
@@ -2151,6 +2170,16 @@ export default function TestRunDetailPage() {
                 <IconBug size={14} />
                 Log bug
               </Button>
+              {panelSaved && (
+                <span role="status" className="text-[12.5px] text-[var(--success-foreground)]">
+                  Saved
+                </span>
+              )}
+              {panelSaveError && (
+                <span role="alert" className="min-w-0 truncate text-[12.5px] text-[var(--error-foreground)]" title={panelSaveError}>
+                  {panelSaveError}
+                </span>
+              )}
               <Link
                 href={`/projects/${projectId}/cycles/${cycleId}/execute/${panelExecution.id}`}
                 className="ml-auto text-[12.5px] font-medium hover:underline"

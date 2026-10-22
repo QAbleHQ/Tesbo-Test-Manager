@@ -7482,7 +7482,9 @@ export class LegacyService implements OnModuleInit {
 
   private bugSelect(where: string): string {
     return `
-      SELECT b.*, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
+      -- to_char after b.*: the pg driver parses a DATE into a JS Date shifted by the server's
+      -- timezone, so the day is selected as text; the later column of the same name wins.
+      SELECT b.*, to_char(b.due_date, 'YYYY-MM-DD') AS due_date, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
              COALESCE(ap.display_name, ap.email) AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
              COALESCE(atts.items, '[]') AS attachments
       FROM bugs b
@@ -7764,6 +7766,34 @@ export class LegacyService implements OnModuleInit {
     return match;
   }
 
+  private parseBugDueDate(dueDate: unknown): string | null {
+    // Absent, null and "" all mean "no due date", the same convention as priority/severity.
+    if (dueDate === undefined || dueDate === null || dueDate === "") return null;
+    const text = typeof dueDate === "string" ? dueDate.trim() : "";
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+    // Round-trip through Date so an impossible day such as 2026-02-30 is refused rather than rolled
+    // over to March by Postgres or JS.
+    const valid =
+      !!match &&
+      new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))).toISOString().slice(0, 10) === text;
+    if (!valid) throw new BadRequestException({ error: "dueDate must be a valid date in YYYY-MM-DD format", field: "dueDate" });
+    return text;
+  }
+
+  /**
+   * A due date earlier than the day the bug was reported is refused: it would be overdue from the
+   * moment it was set. The floor is the reporting day in UTC minus one day, because the form
+   * compares in the reporter's local calendar and a caller behind UTC can legitimately pick a day
+   * that is still "yesterday" in UTC.
+   */
+  private assertBugDueDateNotBeforeReport(dueDate: string | null, reportedAt: Date): void {
+    if (!dueDate) return;
+    const floor = new Date(Date.UTC(reportedAt.getUTCFullYear(), reportedAt.getUTCMonth(), reportedAt.getUTCDate() - 1)).toISOString().slice(0, 10);
+    if (dueDate < floor) {
+      throw new BadRequestException({ error: "dueDate cannot be earlier than the day the bug was reported", field: "dueDate" });
+    }
+  }
+
   /**
    * The assignee a caller asked for, refused as caller error when they aren't a member of this
    * project. Mirrors bulkAssignExecutions' membership check so bugs and executions share one rule:
@@ -7796,6 +7826,8 @@ export class LegacyService implements OnModuleInit {
     const severity = this.parseBugSeverity(body.severity);
     const priority = this.parseBugPriority(body.priority);
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
+    const dueDate = this.parseBugDueDate(body.dueDate);
+    this.assertBugDueDateNotBeforeReport(dueDate, new Date());
 
     // nextBugExternalId reads MAX(trailing number) + 1 in a separate statement from the INSERT
     // below, so two bugs filed for the same project at once can both compute the same id;
@@ -7811,8 +7843,8 @@ export class LegacyService implements OnModuleInit {
           await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`bug-external-id:${projectId}`]);
           const externalId = await this.nextBugExternalId(projectId, client);
           const res = await client.query(
-            `INSERT INTO bugs (project_id, external_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+            `INSERT INTO bugs (project_id, external_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id, due_date)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::date) RETURNING id`,
             [
               projectId,
               externalId,
@@ -7829,7 +7861,8 @@ export class LegacyService implements OnModuleInit {
               body.integrationProvider || null,
               body.integrationIssueKey || null,
               body.betterbugsUrl || null,
-              assigneeId
+              assigneeId,
+              dueDate
             ]
           );
           const id = res.rows[0].id;
@@ -7983,7 +8016,7 @@ export class LegacyService implements OnModuleInit {
         .map((l: Body) => `${l.testcaseId ?? ""}|${l.cycleId ?? ""}|${l.executionId ?? ""}`)
         .sort()
         .join(",");
-    const fields = ["title", "description", "externalUrl", "integrationProvider", "integrationIssueKey", "betterbugsUrl"].filter(
+    const fields = ["title", "description", "externalUrl", "integrationProvider", "integrationIssueKey", "betterbugsUrl", "dueDate"].filter(
       (field) => !same(before[field], after[field])
     );
     if (linkKey(before) !== linkKey(after)) fields.push("links");
@@ -8499,13 +8532,18 @@ export class LegacyService implements OnModuleInit {
     // hidden from the picker.
     const clearsAssignee = body.assigneeId === null || body.assigneeId === "";
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
+    // Same explicit-clear convention: null or "" removes the date, an absent key leaves it alone.
+    const clearsDueDate = body.dueDate === null || body.dueDate === "";
+    const dueDate = this.parseBugDueDate(body.dueDate);
     const before = await this.getBug(bugId);
+    this.assertBugDueDateNotBeforeReport(dueDate, new Date((before as Body).createdAt as string | Date));
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
        status=COALESCE($5,status), severity=CASE WHEN $14::boolean THEN NULL ELSE COALESCE($6,severity) END, priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
        integration_provider=COALESCE($7,integration_provider), integration_issue_key=COALESCE($8,integration_issue_key),
        betterbugs_url=COALESCE($9,betterbugs_url),
        assignee_id=CASE WHEN $12::boolean THEN NULL ELSE COALESCE($13,assignee_id) END,
+       due_date=CASE WHEN $15::boolean THEN NULL ELSE COALESCE($16::date,due_date) END,
        updated_at=now() WHERE id=$1`,
       [
         bugId,
@@ -8521,7 +8559,9 @@ export class LegacyService implements OnModuleInit {
         priority,
         clearsAssignee,
         assigneeId,
-        clearsSeverity
+        clearsSeverity,
+        clearsDueDate,
+        dueDate
       ]
     );
     if (Array.isArray(body.links)) {
@@ -8892,6 +8932,47 @@ export class LegacyService implements OnModuleInit {
       contentType: mimeType
     });
     return { ...access, mimeType, originalFileName: file.file_name, inline: safeInline };
+  }
+
+  /**
+   * Deletes one evidence file from a run's result.
+   *
+   * Evidence could be uploaded and billed against the storage allowance but never removed, so a
+   * wrong or sensitive file (a trace that captured a secret) was permanent. Any project member may
+   * delete, including files the automation ingest attached. Mirrors deleteBugAttachment: the stored
+   * object is destroyed and the row is soft-deleted (who/when), which also releases the storage
+   * allowance. The lookup is scoped to this execution, so another execution's attachment id is a 404.
+   */
+  async deleteExecutionAttachment(
+    cycleId: string,
+    userId: string | null | undefined,
+    executionId: string,
+    attachmentId: string
+  ) {
+    const uid = this.requireUser(userId);
+    const execution = await this.executionOwner(cycleId, executionId);
+    const projectId = String(execution.project_id);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
+    const res = await this.db.query(
+      `SELECT * FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
+      [attachmentId, executionId, projectId]
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Attachment not found" });
+    if (file.storage_path) await this.storage.delete(file.storage_path);
+    const deleted = await this.db.query(
+      "UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+      [attachmentId, uid]
+    );
+    if (deleted.rows[0]) {
+      await this.logProjectActivity(projectId, uid, "execution_evidence_deleted", "execution", executionId, null, {
+        attachmentId,
+        fileName: String(file.file_name)
+      });
+    }
+    return { ok: true };
   }
 
   /**
