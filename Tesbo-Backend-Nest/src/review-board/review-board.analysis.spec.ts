@@ -1,4 +1,4 @@
-import { analyse, parseSteps, rescorePair, stateFingerprintOf, stepAgreement, toComparable, type TestcaseSource } from "./review-board.analysis";
+import { analyse, descriptionDifference, diffCases, parseSteps, rescorePair, stateFingerprintOf, stepAgreement, toComparable, type TestcaseSource } from "./review-board.analysis";
 import { SIMILAR_THRESHOLD } from "./review-board.constants";
 
 let n = 0;
@@ -338,5 +338,86 @@ describe("match score: wording similarity blended with identical steps", () => {
 
   it("a case with steps against one without shares none of them", () => {
     expect(stepAgreement(toComparable(tc({})), toComparable(tc({ steps: [] })))).toEqual({ identical: 0, total: 2 });
+  });
+});
+
+describe("explanation text lists only the fields that actually resemble each other", () => {
+  const zero = /\b(title|steps|expected results|preconditions|test data) (0|1)%/;
+
+  it("a pair with nothing in common has no wall of 0% fields (reported after an edit moved two cases fully apart)", () => {
+    const base = toComparable(tc({}));
+    const apart = toComparable(
+      tc({
+        title: "zzz qqq",
+        preconditions: "aaa",
+        test_data: "bbb",
+        steps: [{ action: "xxx yyy", expectedResult: "ppp" }]
+      })
+    );
+    const f = rescorePair(base, apart);
+    expect(f.similarity).toBeLessThan(0.1);
+    expect(f.explanation).not.toMatch(zero);
+    expect(f.explanation).not.toMatch(/wording similarity/);
+    expect(f.explanation).toMatch(/^\d+% match \(0 of 2 steps identical\)\. Differs in: /);
+  });
+
+  it("shows only the fields with real similarity, not the zero ones beside them", () => {
+    const base = toComparable(tc({}));
+    const titleOnly = toComparable(
+      tc({ title: "Login flow", preconditions: "aaa", test_data: "bbb", steps: [{ action: "xxx yyy", expectedResult: "ppp" }] })
+    );
+    const f = rescorePair(base, titleOnly);
+    expect(f.explanation).toMatch(/wording similarity: title \d+%\)/); // title is the only field listed
+    expect(f.explanation).not.toMatch(/steps \d+%|expected results \d+%|preconditions \d+%|test data \d+%/);
+  });
+
+  it("keeps the full breakdown when every field resembles the other", () => {
+    const f = rescorePair(toComparable(tc({})), toComparable(tc({ test_data: "user=bob" })));
+    expect(f.explanation).toMatch(/wording similarity: title \d+%, steps \d+%, expected results \d+%, preconditions \d+%, test data \d+%/);
+  });
+
+  it("cases with no steps get no steps clause, and a zero-only breakdown disappears cleanly", () => {
+    const a = toComparable(tc({ steps: [], title: "alpha beta", preconditions: null, test_data: null }));
+    const b = toComparable(tc({ steps: [], title: "gamma delta", preconditions: null, test_data: null }));
+    const f = rescorePair(a, b);
+    expect(f.explanation).toBe("0% match. Differs in: title.");
+  });
+});
+
+describe("description in 'What is different' (shown, never compared)", () => {
+  const withDesc = (description: string | null) => toComparable(tc({ description }));
+
+  it("lists a differing description, trimmed, with each side's text", () => {
+    expect(descriptionDifference(withDesc("  Checks the happy path  "), withDesc("Checks the error path"))).toEqual({
+      field: "description",
+      a: "Checks the happy path",
+      b: "Checks the error path"
+    });
+  });
+
+  it("does not list it when the descriptions only differ in case, spacing or punctuation, or are both empty", () => {
+    expect(descriptionDifference(withDesc("Checks the happy path"), withDesc("  CHECKS   the happy path!! "))).toBeNull();
+    expect(descriptionDifference(withDesc(null), withDesc(""))).toBeNull();
+  });
+
+  it("shows an empty side as empty when only one case has a description", () => {
+    expect(descriptionDifference(withDesc(null), withDesc("Now described"))).toEqual({ field: "description", a: "", b: "Now described" });
+  });
+
+  it("never affects matching: exact duplicates with different descriptions are still exact, at 100%, with equal fingerprints", () => {
+    const a = toComparable(tc({ description: "One wording" }));
+    const b = toComparable(tc({ description: "A completely different description" }));
+    expect(a.fingerprint).toBe(b.fingerprint);
+    const [f] = analyse([a, b]).findings;
+    expect(f).toMatchObject({ classification: "exact_duplicate", similarity: 1 });
+    expect(f.differences).toEqual([]); // the analysis' own list never contains it; the API adds it for display
+    expect(diffCases(a, b)).toEqual([]);
+  });
+
+  it("does not change the score of a similar pair", () => {
+    const same = rescorePair(toComparable(tc({ description: "x" })), toComparable(tc({ test_data: "user=bob", description: "x" })));
+    const differ = rescorePair(toComparable(tc({ description: "x" })), toComparable(tc({ test_data: "user=bob", description: "something else entirely" })));
+    expect(differ.similarity).toBe(same.similarity);
+    expect(differ.explanation).toBe(same.explanation);
   });
 });

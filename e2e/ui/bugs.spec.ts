@@ -1,5 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+import { dbControlAvailable, exec, literal } from "../utils/psql";
 import { filesForm, filesFormWith, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 import {
   createBug,
@@ -2220,7 +2221,7 @@ test.describe("bug details panel", () => {
       await expect(body.getByText("Not linked", { exact: true })).toBeVisible();
       // No description was given, so the section is omitted rather than rendered empty.
       await expect(body.getByText("Description", { exact: true })).toHaveCount(0);
-      await expect(body.getByText(/^Last updated:/)).toHaveCount(0);
+      await expect(body.getByText("Last Updated", { exact: true })).toHaveCount(0);
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
@@ -3395,6 +3396,22 @@ test.describe("bug attachments in Bug Details", () => {
       .toBe(true);
   }
 
+  test("the Attachments section sits below Reported On, as the last section of Bug Details", async ({ page }) => {
+    const bug = await bugWith("Order", [pngFile("order.png")]);
+    try {
+      await openPanel(page, bug.title);
+      const body = panelBody(page);
+      const attachments = (await body.getByText(/^Attachments/).first().boundingBox())!;
+      for (const label of ["Description", "Severity", "Linked Test Cases & Runs", "Reported By", "Assigned To", "Reported On"]) {
+        const box = await body.getByText(label, { exact: true }).boundingBox();
+        // Description is only rendered when the bug has one; skip a label that isn't on screen.
+        if (box) expect(attachments.y, `Attachments should be below ${label}`).toBeGreaterThan(box.y);
+      }
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("BUG-U-71 images show as thumbnails and other files as filename links, each with Open/View and Delete", async ({ page }) => {
     const bug = await bugWith("Mixed", [
       pngFile("shot-one.png"),
@@ -3853,3 +3870,371 @@ async function openComposer(section: Locator): Promise<void> {
   const opener = section.getByTestId("bug-comment-open");
   if (await opener.isVisible()) await opener.click();
 }
+
+/*
+ * Bug due date — "[Bug] Need due date field for Bugs".
+ *
+ * The date travels as a plain "YYYY-MM-DD", so what is asserted here is the persisted API value after
+ * the UI action, plus what Bug Details shows: the formatted day, "Not set" when empty, and an
+ * Overdue marker only while a past-due bug is still open.
+ */
+test.describe("bug due date", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  async function seed(label: string, data: Record<string, unknown> = {}): Promise<{ id: string; title: string }> {
+    const res = await api.post(`/api/projects/${projectId}/bugs`, {
+      data: { title: `E2E Bug Due UI ${label} ${uniqueSuffix()}`, ...data },
+    });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return res.json();
+  }
+
+  async function openDetails(page: Page, bugId: string): Promise<Locator> {
+    await page.goto(`/projects/${projectId}/bugs/${bugId}`);
+    const due = page.getByTestId("bug-due-date");
+    await expect(due).toBeVisible();
+    return due;
+  }
+
+  test("BUG-U-118 the report form's Due date is what gets saved, and left empty it saves none", async ({ page }) => {
+    const withDate = `E2E Due Report ${uniqueSuffix()}`;
+    const withoutDate = `E2E No Due Report ${uniqueSuffix()}`;
+    try {
+      for (const [title, date] of [[withDate, "2031-04-12"], [withoutDate, ""]] as const) {
+        await openReportModal(page, projectId);
+        await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+        if (date) await page.getByLabel("Due date").fill(date);
+        await page.getByRole("button", { name: "Report Bug" }).last().click();
+        await expect(page.getByText("Report a Bug", { exact: true })).toBeHidden();
+      }
+      const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+      expect(bugs.find((b: { title: string }) => b.title === withDate)?.dueDate).toBe("2031-04-12");
+      expect(bugs.find((b: { title: string }) => b.title === withoutDate)?.dueDate).toBeNull();
+    } finally {
+      const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+      for (const b of bugs.filter((x: { title: string }) => [withDate, withoutDate].includes(x.title))) {
+        await api.delete(`/api/bugs/${b.id}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
+  test("BUG-U-119 Edit Bug sets, changes and clears the due date, and Bug Details reflects each", async ({ page }) => {
+    const bug = await seed("Edit");
+    try {
+      await openDetails(page, bug.id).then((due) => expect(due).toHaveText("Not set"));
+
+      // Set.
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      await expect(form.getByLabel("Due date")).toHaveValue("");
+      await form.getByLabel("Due date").fill("2031-06-20");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect.poll(async () => (await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBe("2031-06-20");
+      await expect(await openDetails(page, bug.id)).toContainText("20 Jun 2031");
+
+      // The form reopens with the stored value, and clearing it removes the date.
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const reopened = page.getByRole("region", { name: "Edit bug" }).getByLabel("Due date");
+      await expect(reopened).toHaveValue("2031-06-20");
+      await reopened.fill("");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect.poll(async () => (await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBeNull();
+      await expect(await openDetails(page, bug.id)).toHaveText("Not set");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-120 Overdue shows only for a past-due bug that is still open", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs DB access to back-date a due date");
+    const past = "2001-01-01";
+    const future = "2099-01-01";
+    // The API refuses a due date before the report day, so a bug can only become overdue as time
+    // passes. Back-date the stored column directly to stand in for that; these rows belong to this
+    // suite's own disposable project.
+    const overdueOpen = await seed("Overdue", { dueDate: future });
+    const pastClosed = await seed("PastClosed", { dueDate: future });
+    const upcoming = await seed("Upcoming", { dueDate: future });
+    const none = await seed("None");
+    try {
+      await api.patch(`/api/bugs/${pastClosed.id}`, { data: { status: "Closed" } });
+      exec(`UPDATE bugs SET due_date = ${literal(past)}::date WHERE id IN (${literal(overdueOpen.id)}, ${literal(pastClosed.id)})`);
+
+      await openDetails(page, overdueOpen.id);
+      await expect(page.getByTestId("bug-overdue-badge")).toBeVisible();
+
+      for (const bug of [pastClosed, upcoming, none]) {
+        await openDetails(page, bug.id);
+        await expect(page.getByTestId("bug-overdue-badge"), bug.title).toHaveCount(0);
+      }
+    } finally {
+      for (const bug of [overdueOpen, pastClosed, upcoming, none]) {
+        await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
+  test("BUG-U-122 the report form will not take a due date before today", async ({ page }) => {
+    const title = `E2E Past Due Report ${uniqueSuffix()}`;
+    await openReportModal(page, projectId);
+    await page.getByPlaceholder("Brief summary of the bug…").fill(title);
+
+    const due = page.getByLabel("Due date");
+    const today = await page.evaluate(() => {
+      const d = new Date();
+      const pad = (n: number) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    });
+    // The picker greys out earlier days...
+    await expect(due).toHaveAttribute("min", today);
+
+    // ...and typing one anyway is refused with a reason and cannot be submitted.
+    await due.fill("2001-01-01");
+    await expect(page.getByTestId("due-date-error")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Report Bug" }).last()).toBeDisabled();
+
+    // Today itself is fine.
+    await due.fill(today);
+    await expect(page.getByTestId("due-date-error")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Report Bug" }).last()).toBeEnabled();
+    const bugs = await (await api.get(`/api/projects/${projectId}/bugs`)).json();
+    expect(bugs.some((b: { title: string }) => b.title === title), "nothing was filed by the refused attempt").toBe(false);
+  });
+
+  test("BUG-U-123 Edit Bug will not take a due date before the day the bug was reported", async ({ page }) => {
+    const bug = await seed("EditMin", { dueDate: "2031-06-20" });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      const due = form.getByLabel("Due date");
+      const reportedDay = (await (await api.get(`/api/bugs/${bug.id}`)).json()).createdAt as string;
+      await expect(due).toHaveAttribute("min", /^\d{4}-\d{2}-\d{2}$/);
+      // The reported day is the floor: it is the same calendar day as createdAt in the browser's zone.
+      const expectedMin = await page.evaluate((iso) => {
+        const d = new Date(iso);
+        const pad = (n: number) => String(n).padStart(2, "0");
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      }, reportedDay);
+      await expect(due).toHaveAttribute("min", expectedMin);
+
+      await due.fill("2001-01-01");
+      await expect(form.getByTestId("due-date-error")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate, "nothing was saved").toBe("2031-06-20");
+
+      await due.fill("2031-07-01");
+      await expect(form.getByTestId("due-date-error")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Save Changes" })).toBeEnabled();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-121 a rejected due date is shown on the edit form, and the stored date is unchanged", async ({ page }) => {
+    const bug = await seed("Reject", { dueDate: "2031-02-02" });
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      // Simulate the server refusing the save (as it does for a malformed date).
+      await page.route(`**/api/bugs/${bug.id}`, (route) =>
+        route.request().method() === "PATCH"
+          ? route.fulfill({ status: 400, json: { error: "dueDate must be a valid date in YYYY-MM-DD format", field: "dueDate" } })
+          : route.continue(),
+      );
+      const form = page.getByRole("region", { name: "Edit bug" });
+      await form.getByLabel("Due date").fill("2031-03-03");
+      await page.getByRole("button", { name: "Save Changes" }).click();
+      await expect(page.getByText(/dueDate must be a valid date|valid date/i)).toBeVisible();
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBe("2031-02-02");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * "[Bug] Bug search not working if try to find with Bug Id number" — the Bugs list search matched
+ * only the title and linked test-case fields, so typing a bug's own key ("PRO-BUG-60") found
+ * nothing even though that bug was on screen.
+ */
+test.describe("bug search by bug id", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  test("BUG-U-124 searching a bug's key, in any case or by its number, finds that bug", async ({ page }) => {
+    const first = await createBug(api, projectId, { title: `E2E Search Id A ${uniqueSuffix()}` });
+    const second = await createBug(api, projectId, { title: `E2E Search Id B ${uniqueSuffix()}` });
+    try {
+      const firstKey = (await (await api.get(`/api/bugs/${first.id}`)).json()).externalId as string;
+      const secondKey = (await (await api.get(`/api/bugs/${second.id}`)).json()).externalId as string;
+      expect(firstKey).not.toBe(secondKey);
+
+      await openBugsList(page, projectId);
+      const search = page.getByPlaceholder("Search bugs…");
+      const rowFor = (title: string) => page.locator("tbody tr").filter({ hasText: title });
+
+      // Full key, lower-cased, with stray whitespace — what people paste or type.
+      await search.fill(`  ${firstKey.toLowerCase()}  `);
+      await expect(rowFor(first.title)).toBeVisible();
+      await expect(rowFor(second.title), "the other bug's key is different").toHaveCount(0);
+
+      // The trailing number alone, as the card puts it ("Bug Id number").
+      const number = firstKey.split("-").pop()!;
+      await search.fill(number);
+      await expect(rowFor(first.title)).toBeVisible();
+
+      // A key that exists nowhere finds nothing, and says so.
+      await search.fill("ZZZ-BUG-999999");
+      await expect(page.getByText("No bugs match your filter.")).toBeVisible();
+
+      // Clearing it brings both back.
+      await search.fill("");
+      await expect(rowFor(first.title)).toBeVisible();
+      await expect(rowFor(second.title)).toBeVisible();
+    } finally {
+      await api.delete(`/api/bugs/${first.id}`, { failOnStatusCode: false });
+      await api.delete(`/api/bugs/${second.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * "[Bug] Description shows markdown format when copy paste content" — a description pasted from
+ * BetterBugs, Jira or an AI draft is Markdown, and Bug Details printed it raw ("**Bug:**", backticks).
+ * It is now rendered; the text is still escaped first, so pasted HTML is shown, never run.
+ */
+test.describe("bug description markdown", () => {
+  let api: APIRequestContext;
+  let projectId: string;
+
+  test.beforeAll(async () => {
+    if (skipReason) return;
+    api = await screensApi();
+    const project = await createProject(api);
+    projectId = project.id;
+  });
+
+  test.afterAll(async () => {
+    if (api) {
+      await deleteProjects(api, [projectId]);
+      await api.dispose();
+    }
+  });
+
+  test.beforeEach(() => {
+    test.skip(skipReason !== null, skipReason ?? "");
+  });
+
+  const MARKDOWN = [
+    "**Bug:** `[Task] Review Board > Saved changes are lost`",
+    "",
+    "**Expected Result:**",
+    "- first thing",
+    "- second thing",
+    "",
+    "Plain closing line",
+  ].join("\n");
+
+  test("BUG-U-125 a Markdown description is rendered in Bug Details, not shown as raw syntax", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Md Desc ${uniqueSuffix()}`, description: MARKDOWN } })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const description = page.getByTestId("bug-description");
+      await expect(description).toBeVisible();
+
+      await expect(description.locator("strong").first()).toHaveText("Bug:");
+      await expect(description.locator("code")).toContainText("[Task] Review Board > Saved changes are lost");
+      await expect(description.locator("li")).toHaveText(["first thing", "second thing"]);
+      await expect(description).toContainText("Plain closing line");
+      // The markers are gone from what the reader sees.
+      await expect(description).not.toContainText("**");
+      await expect(description).not.toContainText("`");
+
+      // Rendering is display-only: what is stored is still the Markdown exactly as pasted.
+      expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).description).toBe(MARKDOWN);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-126 plain text and pasted HTML in a description are shown as text, never run", async ({ page }) => {
+    const html = `<img src=x onerror="window.__pwned = true"> <b>not bold</b>`;
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, {
+        data: { title: `E2E Md Desc Html ${uniqueSuffix()}`, description: `First line\nSecond line\n${html}` },
+      })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}`);
+      const description = page.getByTestId("bug-description");
+      await expect(description).toContainText("First line");
+      await expect(description).toContainText("Second line");
+      // The markup is visible as text and creates no element.
+      await expect(description).toContainText(html);
+      await expect(description.locator("img, b")).toHaveCount(0);
+      expect(await page.evaluate(() => (window as unknown as { __pwned?: boolean }).__pwned)).toBeUndefined();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-127 the Bug Details panel and the Board card preview drop the Markdown syntax too", async ({ page }) => {
+    const bug = await (
+      await api.post(`/api/projects/${projectId}/bugs`, { data: { title: `E2E Md Desc Panel ${uniqueSuffix()}`, description: MARKDOWN } })
+    ).json();
+    try {
+      await page.goto(`/projects/${projectId}/bugs`);
+      // The Board card clamps the description to two lines of plain text.
+      const card = page.locator("[draggable=true], article, li").filter({ hasText: bug.title }).first();
+      await expect(card).toBeVisible();
+      await expect(card).not.toContainText("**");
+      await expect(card).not.toContainText("`");
+      await expect(card).toContainText("Bug: [Task] Review Board");
+
+      await page.getByRole("button", { name: "List", exact: true }).click();
+      await page.locator("tbody tr").filter({ hasText: bug.title }).click();
+      const panel = page.getByRole("region", { name: "Bug details" });
+      await expect(panel.getByTestId("bug-description").locator("strong").first()).toHaveText("Bug:");
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});

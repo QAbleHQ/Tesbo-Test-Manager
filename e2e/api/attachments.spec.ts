@@ -917,6 +917,74 @@ test.describe("attachments", () => {
     expect(attachmentRows(tenant!)).toHaveLength(1);
   });
 
+  // ─── Deleting execution evidence ───────────────────────────────────────────
+  // "[Test Run] Evidence > Not able to delete evidence once attached": the execution routes had
+  // upload, list and download but no delete, so a wrong file was permanent and kept its storage.
+
+  test("a project member can delete a run's evidence: it leaves the list, stops downloading and frees storage", async () => {
+    const before = await reportedStorageBytes();
+    const file = sizedFile(`run-evidence-${Date.now()}.png`, 32 * 1024, "image/png");
+    const uploaded = await (await upload(asQa, executionUploadUrl(), [file])).json();
+    const id = uploaded.list[0].id as string;
+    expect(await reportedStorageBytes()).toBe(before + file.body.length);
+
+    const res = await asQa.delete(`${executionUploadUrl()}/${id}`, { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+
+    const list = await (await asQa.get(executionUploadUrl())).json();
+    expect(list.list.map((f: { id: string }) => f.id)).not.toContain(id);
+    expect((await asQa.get(`${executionUploadUrl()}/${id}/download`, { failOnStatusCode: false })).status()).toBe(404);
+    expect(attachmentRows(tenant!), "the live row is gone").toHaveLength(0);
+    expect(await reportedStorageBytes(), "deleting must release the allowance").toBe(before);
+
+    // Second delete of the same file, and a re-click from a stale tab, is a clean 404.
+    const again = await asQa.delete(`${executionUploadUrl()}/${id}`, { failOnStatusCode: false });
+    expect(again.status()).toBe(404);
+  });
+
+  test("deleting one file of several leaves the others in place", async () => {
+    const stamp = Date.now();
+    const uploaded = await (
+      await upload(asQa, executionUploadUrl(), [textFile(`keep-${stamp}.txt`), textFile(`drop-${stamp}.txt`)])
+    ).json();
+    const drop = uploaded.list.find((f: { fileName: string }) => f.fileName === `drop-${stamp}.txt`);
+    expect((await asQa.delete(`${executionUploadUrl()}/${drop.id}`)).ok()).toBeTruthy();
+
+    const names = (await (await asQa.get(executionUploadUrl())).json()).list.map((f: { fileName: string }) => f.fileName);
+    expect(names).toEqual([`keep-${stamp}.txt`]);
+  });
+
+  test("run evidence cannot be deleted by an anonymous caller or a non-member", async () => {
+    const uploaded = await (await upload(asQa, executionUploadUrl(), [textFile(`guarded-${Date.now()}.txt`)])).json();
+    const url = `${executionUploadUrl()}/${uploaded.list[0].id}`;
+
+    const byAnon = await anon.delete(url, { failOnStatusCode: false });
+    expect([401, 403], "an anonymous caller must not delete evidence").toContain(byAnon.status());
+    const byGuest = await asGuest.delete(url, { failOnStatusCode: false });
+    expect([403, 404], "a non-member must not delete evidence").toContain(byGuest.status());
+    expect(attachmentRows(tenant!), "the file must survive both attempts").toHaveLength(1);
+  });
+
+  test("the execution delete route only reaches that execution's own evidence, and fails cleanly on bad ids", async () => {
+    // A bug attachment's id is a real attachment id, but it is not this execution's evidence.
+    const bugFile = await (await upload(asQa, bugUploadUrl(), [textFile(`bug-${Date.now()}.txt`)])).json();
+    const bugAttachmentId = bugFile.list[0].id as string;
+    const cross = await asQa.delete(`${executionUploadUrl()}/${bugAttachmentId}`, { failOnStatusCode: false });
+    expect(cross.status()).toBe(404);
+    expect(attachmentRows(tenant!), "the bug's file must be untouched").toHaveLength(1);
+
+    const missing = "00000000-0000-0000-0000-000000000000";
+    for (const url of [
+      `${executionUploadUrl()}/${missing}`,
+      `${executionUploadUrl()}/not-a-uuid`,
+      `/api/cycles/${cycleId}/executions/not-a-uuid/attachments/${missing}`,
+      `/api/cycles/not-a-uuid/executions/${executionId}/attachments/${missing}`,
+    ]) {
+      const res = await asQa.delete(url, { failOnStatusCode: false });
+      expect(res.status(), `${url} should be a clean 404`).toBe(404);
+    }
+  });
+
   // ─── Missing and malformed targets ─────────────────────────────────────────
 
   test("uploading to something that doesn't exist is a clean 404", { tag: '@tesbo.testId("TES-TC-15")' }, async () => {

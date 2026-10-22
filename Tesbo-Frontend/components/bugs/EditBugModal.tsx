@@ -12,6 +12,7 @@ import {
   type BugPriority,
   type IssueSearchResult,
 } from "@/lib/api";
+import { toLocalDay } from "@/lib/date";
 import { Button, Input, Field, FieldLabel, Modal, Textarea, Select } from "@/components/ui";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import TestCaseRunPicker, { type LinkRow } from "@/components/TestCaseRunPicker";
@@ -113,6 +114,10 @@ export default function EditBugModal({
   const [editBetterbugsUrl, setEditBetterbugsUrl] = useState(bug.betterbugsUrl || "");
   const [editStatus, setEditStatus] = useState(bug.status);
   const [editAssigneeId, setEditAssigneeId] = useState(bug.assigneeId || "");
+  const [editDueDate, setEditDueDate] = useState(bug.dueDate || "");
+  // A due date can be no earlier than the day the bug was reported (the server enforces it too).
+  const minDueDate = toLocalDay(bug.createdAt);
+  const dueDateTooEarly = !!editDueDate && editDueDate < minDueDate;
   const [saving, setSaving] = useState(false);
   /*
    * Basecamp 10226296533: updateBug succeeded, uploadBugAttachments then threw, and the throw went
@@ -140,7 +145,7 @@ export default function EditBugModal({
 
   /* save edit */
   async function handleEditSave() {
-    if (!editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired) return;
+    if (!editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired || dueDateTooEarly) return;
     const selfLogged = (jiraConnected || linearConnected) && editDestination === "SELF";
     setSaving(true);
     setEditError(null);
@@ -153,6 +158,8 @@ export default function EditBugModal({
         severity: editSeverity || null,
         priority: editPriority || null,
         assigneeId: editAssigneeId || null,
+        // null removes the due date, the same explicit-clear convention as assigneeId.
+        dueDate: editDueDate || null,
         externalUrl: selfLogged ? editUrl.trim() : undefined,
         integrationProvider: selfLogged && editSelfSystem !== "OTHER" ? editSelfSystem : null,
         integrationIssueKey: selfLogged && editSelfSystem !== "OTHER" ? editSelectedIssue?.key || null : null,
@@ -180,7 +187,7 @@ export default function EditBugModal({
     }
   }
 
-  const saveDisabled = saving || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired;
+  const saveDisabled = saving || !editTitle.trim() || (hasTestRuns && !editLinks.length) || editIssueRequired || dueDateTooEarly;
 
   const fields = (
     <div className="space-y-4">
@@ -211,21 +218,22 @@ export default function EditBugModal({
         />
       </Field>
       {/* Status is edit-only (Create Bug always starts "Open"), so it has no equivalent slot in
-          that form's Severity/Priority/Assign-to row. Kept as its own field right before them
-          rather than disrupting that row's order. */}
-      <Field>
-        <FieldLabel>Status</FieldLabel>
-        <Select
-          value={editStatus}
-          onChange={(e) => setEditStatus(e.target.value)}
-        >
-          <option value="Open">Open</option>
-          <option value="In Progress">In Progress</option>
-          <option value="Closed">Closed</option>
-          <option value="Reopened">Reopened</option>
-        </Select>
-      </Field>
-      <div className="grid grid-cols-3 gap-3">
+          that form's Severity/Priority/Assign-to row. It leads the same row here, rather than
+          taking a full-width row of its own that left the row below it floating. */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+        <Field>
+          <FieldLabel>Status</FieldLabel>
+          <Select
+            value={editStatus}
+            onChange={(e) => setEditStatus(e.target.value)}
+            aria-label="Status"
+          >
+            <option value="Open">Open</option>
+            <option value="In Progress">In Progress</option>
+            <option value="Closed">Closed</option>
+            <option value="Reopened">Reopened</option>
+          </Select>
+        </Field>
         <Field>
           <FieldLabel>Severity</FieldLabel>
           <Select
@@ -278,6 +286,22 @@ export default function EditBugModal({
               </option>
             )}
           </Select>
+        </Field>
+        <Field>
+          <FieldLabel>Due date</FieldLabel>
+          <Input
+            type="date"
+            value={editDueDate}
+            min={minDueDate}
+            onChange={(e) => setEditDueDate(e.target.value)}
+            aria-label="Due date"
+            aria-invalid={dueDateTooEarly || undefined}
+          />
+          {dueDateTooEarly && (
+            <p role="alert" data-testid="due-date-error" className="text-[13px] text-[var(--error-foreground)]">
+              Due date cannot be before the day this bug was reported.
+            </p>
+          )}
         </Field>
       </div>
       <BugEvidenceField

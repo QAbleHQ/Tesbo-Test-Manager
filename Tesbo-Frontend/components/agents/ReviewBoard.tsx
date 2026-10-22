@@ -14,6 +14,7 @@ import {
   DIFFERENCE_LABEL,
   EDITED_FIELD_LABEL,
   STALE_HINT,
+  matchExplanation,
   getReviewAnalysis,
   keepReviewRecommendation,
   listReviewHistory,
@@ -24,6 +25,7 @@ import {
   type AnalysisRun,
   type RecommendationList,
   type ReviewHistory,
+  type ReviewEditSummary,
   type ReviewHistoryItem,
   type ReviewRecommendation,
   type ReviewStatus,
@@ -32,7 +34,7 @@ import {
 const PAGE_SIZE = 25;
 const POLL_MS = 2500;
 
-// Open findings only. Removed ones live in the History tab, which has its own list (a removed finding by
+// Open findings only. Removed ones live in the Deleted tab, which has its own list (a removed finding by
 // definition has a deleted test case, so the findings list cannot show it).
 const FILTERS: Array<{ key: ReviewStatus; label: string }> = [
   { key: "pending", label: "To review" },
@@ -332,7 +334,7 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
 
       {analysis !== undefined && analysis !== null && (
         <div role="tablist" aria-label="Filter findings" className="flex flex-wrap gap-1 border-b border-[var(--border)]">
-          {[...FILTERS, { key: "history" as const, label: "History" }].map((f) => (
+          {[...FILTERS, { key: "history" as const, label: "Deleted" }].map((f) => (
             <button
               key={f.key}
               type="button"
@@ -441,7 +443,7 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
         recommendation={removeFor}
         onClose={() => setRemoveFor(null)}
         onRemoved={(label) => {
-          setNotice(`${label} was removed from the project. You can see it under the History tab.`);
+          setNotice(`${label} was removed from the project. You can see it under the Deleted tab.`);
           setRemoveFor(null);
           void loadList();
         }}
@@ -461,31 +463,72 @@ function ReviewWorkspace({ projectId }: { projectId: string }) {
  * the original even if the test case is changed again later.
  */
 function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
-  const edit = rec.edit;
-  if (!edit) return null;
-  const edited = edit.testcaseId === rec.testcaseA.id ? rec.testcaseA : edit.testcaseId === rec.testcaseB.id ? rec.testcaseB : null;
-  const moved = edit.similarityBefore !== null && edit.similarityAfter !== null;
+  const edits = rec.edits;
+  if (edits.length === 0) return null;
+  const caseOf = (id: string) => (id === rec.testcaseA.id ? rec.testcaseA : id === rec.testcaseB.id ? rec.testcaseB : null);
+  // The match numbers recorded when an edit was saved from the board are only worth showing while they still describe this
+  // finding. The match on screen is always the current one, so a recorded figure that no longer agrees with it is left out
+  // rather than contradicting the headline.
+  const matchNote = (edit: ReviewEditSummary) => {
+    const { similarityBefore: before, similarityAfter: after } = edit;
+    if (before === null || after === null || Math.abs(after - rec.similarity) >= 0.0005) return null;
+    return before === after ? "Match unchanged (" + Math.round(after * 100) + "%)" : "Match " + Math.round(before * 100) + "% → " + Math.round(after * 100) + "%";
+  };
+  const byLine = (edit: ReviewEditSummary) => {
+    const note = matchNote(edit);
+    return (edit.editedBy ? "by " + edit.editedBy + " " : "") + "on " + (fmtDate(edit.editedAt) || "—") + (note ? " · " + note : "");
+  };
+  const keyChip = "rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs font-normal text-[var(--foreground)] ring-1 ring-[var(--border)]";
+  const single = edits.length === 1 ? edits[0] : null;
+  const singleCase = single ? caseOf(single.testcaseId) : null;
+  return (
+    <details aria-label="What was edited" className="rounded-lg border border-[var(--border)]">
+      <summary className="cursor-pointer px-3.5 py-2.5 text-sm font-medium text-[var(--foreground)]">
+        What was edited
+        {single ? (
+          <>
+            {singleCase && <span className={"ml-2 " + keyChip}>{singleCase.externalId}</span>}
+            <span className="ml-2 font-normal text-[var(--muted)]">{byLine(single)}</span>
+          </>
+        ) : (
+          <span className="ml-2 font-normal text-[var(--muted)]">{edits.length} test cases edited</span>
+        )}
+      </summary>
+
+      <div className="space-y-4 border-t border-[var(--border)] p-3.5">
+        {edits.map((edit) => {
+          const edited = caseOf(edit.testcaseId);
+          return (
+            <EditBlock key={edit.testcaseId} edit={edit}>
+              {!single && (
+                <p className="flex flex-wrap items-center gap-2 text-sm">
+                  {edited && <span className={keyChip}>{edited.externalId}</span>}
+                  <span className="text-[var(--muted)]">{byLine(edit)}</span>
+                </p>
+              )}
+            </EditBlock>
+          );
+        })}
+      </div>
+    </details>
+  );
+}
+
+/** One edited test case: its optional heading (shown when several were edited) and the Before / After of each changed field. */
+function EditBlock({ edit, children }: { edit: ReviewEditSummary; children?: React.ReactNode }) {
+  // The description (and other details such as status or priority) are not part of the comparison, so editing only
+  // those can never change the match — say so instead of implying the edit should have.
+  const onlyOutsideComparison = edit.changes.length > 0 && edit.changes.every((c) => c.field === "description");
   const cell = "min-w-0 whitespace-pre-wrap break-words rounded-md px-3 py-2.5 text-sm leading-relaxed [overflow-wrap:anywhere]";
   return (
-    <section aria-label="What was edited" className="space-y-3 rounded-lg border border-[var(--border)] p-3.5">
-      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <IconPencil size={15} stroke={1.9} className="text-[var(--accent-light)]" />
-          <h4 className="text-sm font-semibold text-[var(--foreground)]">What was edited</h4>
-          {edited && <span className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-xs text-[var(--foreground)] ring-1 ring-[var(--border)]">{edited.externalId}</span>}
-        </div>
-        <p className="text-xs text-[var(--muted)]">
-          {edit.editedBy ? (<>by <span className="font-medium text-[var(--foreground)]">{edit.editedBy}</span> </>) : null}on {fmtDate(edit.editedAt) || "—"}
-          {moved && (
-            <span className="ml-3 font-medium text-[var(--foreground)]">
-              Match {Math.round((edit.similarityBefore as number) * 100)}% → {Math.round((edit.similarityAfter as number) * 100)}%
-            </span>
-          )}
-        </p>
-      </header>
-
+    <div className="space-y-3">
+      {children}
       {!edit.recorded && <p className="text-sm text-[var(--muted)]">The before and after of this edit were not recorded.</p>}
       {edit.recorded && edit.changes.length === 0 && <p className="text-sm text-[var(--muted)]">No visible change to the text (only spacing was different).</p>}
+
+      {onlyOutsideComparison && (
+        <p className="text-xs text-[var(--muted)]">Only the description changed. It is not part of the comparison, so this edit does not change the match.</p>
+      )}
 
       {edit.changes.length > 0 && (
         <div className="space-y-2">
@@ -497,11 +540,11 @@ function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
           {edit.changes.map((c) => (
             <div key={c.field} className="grid gap-2 md:grid-cols-[130px_minmax(0,1fr)_minmax(0,1fr)]">
               <div className="pt-1 text-xs font-semibold text-[var(--foreground)]">{EDITED_FIELD_LABEL[c.field]}</div>
-              <div className={`${cell} bg-[var(--error-soft)] text-[var(--foreground)]`}>
+              <div className={cell + " bg-[var(--error-soft)] text-[var(--foreground)]"}>
                 <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--error-foreground)] md:hidden">Before</span>
                 {c.before.trim() ? c.before : <span className="text-[var(--muted-soft)]">— (empty)</span>}
               </div>
-              <div className={`${cell} bg-[var(--success-soft)] text-[var(--foreground)]`}>
+              <div className={cell + " bg-[var(--success-soft)] text-[var(--foreground)]"}>
                 <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--success-foreground)] md:hidden">After</span>
                 {c.after.trim() ? c.after : <span className="text-[var(--muted-soft)]">— (empty)</span>}
               </div>
@@ -509,11 +552,33 @@ function EditedPanel({ rec }: { rec: ReviewRecommendation }) {
           ))}
         </div>
       )}
-    </section>
+    </div>
   );
 }
 
-/** One removal in the History tab. Read-only: it records what happened, it offers no actions. */
+/**
+ * "Why they match" as a dropdown like "What is different": the match and step count are visible on the summary line, the
+ * full sentence opens on demand.
+ */
+function WhyTheyMatch({ label, text, similarity }: { label: string; text: string; similarity: number }) {
+  const { notMatching, text: full } = matchExplanation(text, similarity);
+  // First sentence only ("0% match (0 of 1 step identical)"), so the closed line stays short. A pair at 0% is not
+  // matching at all, so it says so instead of offering a "why they match".
+  const preview = notMatching ? "0% match" : full.split(". ")[0].replace(/\.$/, "");
+  return (
+    <details className="rounded-lg border border-[var(--border)]">
+      <summary className="cursor-pointer px-3.5 py-2.5 text-sm font-medium text-[var(--foreground)]">
+        {notMatching ? "They are not matching" : label}
+        <span className="ml-2 font-normal text-[var(--muted)]">{preview}</span>
+      </summary>
+      <div className="border-t border-[var(--border)] px-3.5 py-3">
+        <p className={"pl-3 text-sm leading-relaxed text-[var(--foreground)] border-l-2 " + (notMatching ? "border-[var(--warning-foreground)]" : "border-[var(--brand-primary)]")}>{full}</p>
+      </div>
+    </details>
+  );
+}
+
+/** One removal in the Deleted tab. Read-only: it records what happened, it offers no actions. */
 function HistoryRow({ item }: { item: ReviewHistoryItem }) {
   const exact = item.classification === "exact_duplicate";
   const pct = Math.round(item.similarity * 100);
@@ -554,10 +619,7 @@ function HistoryRow({ item }: { item: ReviewHistoryItem }) {
         </div>
       </div>
 
-      <div className="rounded-lg border-l-2 border-[var(--brand-primary)] bg-[var(--surface-secondary)] px-3.5 py-2.5">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Why they matched</p>
-        <p className="mt-0.5 text-sm leading-relaxed text-[var(--foreground)]">{item.explanation}</p>
-      </div>
+      <WhyTheyMatch label="Why they matched" text={item.explanation} similarity={item.similarity} />
     </article>
   );
 }
@@ -610,13 +672,10 @@ function RecommendationRow({
   // An outdated finding must not stay actionable: once either case changed after the analysis, only
   // Compare is available until the analysis is re-run. The API refuses the destructive actions regardless.
   const actionable = rec.reviewStatus === "pending" && !rec.stale && !busy;
-  const whyDisabled = actionable
-    ? undefined
-    : rec.reviewStatus !== "pending"
-      ? "This finding has already been reviewed."
-      : rec.stale
-        ? "This finding is out of date — analyse again first."
-        : "Working…";
+  // Kept and Edited findings are finished: Keep as is, Edit and Remove no longer apply, so they are not shown at all
+  // (only Compare is). On a finding still to review they stay visible and, when out of date, say why they are disabled.
+  const reviewed = rec.reviewStatus !== "pending";
+  const whyDisabled = actionable ? undefined : rec.stale ? "This finding is out of date — analyse again first." : "Working…";
   const exact = rec.classification === "exact_duplicate";
 
   return (
@@ -650,12 +709,9 @@ function RecommendationRow({
         <TestcaseCard label="Test case B" t={rec.testcaseB} />
       </div>
 
-      {rec.reviewStatus === "edited" && rec.edit && <EditedPanel rec={rec} />}
+      {rec.edits.length > 0 && <EditedPanel rec={rec} />}
 
-      <div className="rounded-lg border-l-2 border-[var(--brand-primary)] bg-[var(--surface-secondary)] px-3.5 py-2.5">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">Why they match</p>
-        <p className="mt-0.5 text-sm leading-relaxed text-[var(--foreground)]">{rec.explanation}</p>
-      </div>
+      <WhyTheyMatch label="Why they match" text={rec.explanation} similarity={rec.similarity} />
 
       {rec.differences.length > 0 && (
         <details className="rounded-lg border border-[var(--border)]" open={rec.differences.length <= 2}>
@@ -694,21 +750,25 @@ function RecommendationRow({
         <Button type="button" size="sm" variant="secondary" onClick={onCompare}>
           <span className="inline-flex items-center gap-1.5"><IconEye size={15} stroke={1.9} />Compare</span>
         </Button>
-        <span title={whyDisabled}>
-          <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onKeep}>
-            <span className="inline-flex items-center gap-1.5"><IconCheck size={15} stroke={1.9} />Keep as is</span>
-          </Button>
-        </span>
-        <span title={whyDisabled}>
-          <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onEdit}>
-            <span className="inline-flex items-center gap-1.5"><IconPencil size={15} stroke={1.9} />Edit</span>
-          </Button>
-        </span>
-        <span className="ml-auto" title={whyDisabled}>
-          <Button type="button" size="sm" variant="destructive" disabled={!actionable} onClick={onRemove}>
-            <span className="inline-flex items-center gap-1.5"><IconTrash size={15} stroke={1.9} />Remove from project</span>
-          </Button>
-        </span>
+        {!reviewed && (
+          <>
+            <span title={whyDisabled}>
+              <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onKeep}>
+                <span className="inline-flex items-center gap-1.5"><IconCheck size={15} stroke={1.9} />Keep as is</span>
+              </Button>
+            </span>
+            <span title={whyDisabled}>
+              <Button type="button" size="sm" variant="secondary" disabled={!actionable} onClick={onEdit}>
+                <span className="inline-flex items-center gap-1.5"><IconPencil size={15} stroke={1.9} />Edit</span>
+              </Button>
+            </span>
+            <span className="ml-auto" title={whyDisabled}>
+              <Button type="button" size="sm" variant="destructive" disabled={!actionable} onClick={onRemove}>
+                <span className="inline-flex items-center gap-1.5"><IconTrash size={15} stroke={1.9} />Remove from project</span>
+              </Button>
+            </span>
+          </>
+        )}
         <p className="basis-full text-[11px] text-[var(--muted-soft)]">
           Found by the analysis on {fmtDate(rec.lastAnalysis.finishedAt) || "—"}
           {rec.lastAnalysis.status && rec.lastAnalysis.status !== "completed" ? ` (${rec.lastAnalysis.status})` : ""}.

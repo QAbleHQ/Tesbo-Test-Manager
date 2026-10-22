@@ -1216,7 +1216,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "create_bug",
       description:
-        "Report a bug in the token's project. Required: title. Optional: description, status, externalUrl, links (array of {testcaseId, cycleId, executionId}). Reported-by is the token's owning user.",
+        "Report a bug in the token's project. Required: title. Optional: description, status, externalUrl, dueDate (YYYY-MM-DD), links (array of {testcaseId, cycleId, executionId}). Reported-by is the token's owning user.",
       requiredScope: "write",
       inputSchema: {
         type: "object",
@@ -1225,6 +1225,7 @@ export function buildMcpTools(): McpTool[] {
           description: { type: "string" },
           status: { type: "string" },
           externalUrl: { type: "string" },
+          dueDate: { type: "string" },
           links: { type: "array" }
         },
         required: ["title"],
@@ -1239,7 +1240,7 @@ export function buildMcpTools(): McpTool[] {
     {
       name: "update_bug",
       description:
-        "Update a bug in the token's project. Required: bugId. Optional: title, description, status, severity (Critical/High/Medium/Low — pass null or \"\" to clear it back to not selected), priority (P0/P1/P2/P3 — pass null or \"\" to clear it back to untriaged), externalUrl, assigneeId (must already be a member of this project; pass null or \"\" to unassign), links (array of {testcaseId, cycleId, executionId} — replaces the bug's existing links entirely when present, it does not merge with them). Fields you omit keep their current value, except severity/priority/assigneeId which use the explicit-clear convention above.",
+        "Update a bug in the token's project. Required: bugId. Optional: title, description, status, severity (Critical/High/Medium/Low — pass null or \"\" to clear it back to not selected), priority (P0/P1/P2/P3 — pass null or \"\" to clear it back to untriaged), externalUrl, assigneeId (must already be a member of this project; pass null or \"\" to unassign), dueDate (YYYY-MM-DD — pass null or \"\" to remove it), links (array of {testcaseId, cycleId, executionId} — replaces the bug's existing links entirely when present, it does not merge with them). Fields you omit keep their current value, except severity/priority/assigneeId/dueDate which use the explicit-clear convention above.",
       requiredScope: "write",
       inputSchema: {
         type: "object",
@@ -1252,6 +1253,7 @@ export function buildMcpTools(): McpTool[] {
           priority: { type: ["string", "null"] },
           externalUrl: { type: "string" },
           assigneeId: { type: ["string", "null"] },
+          dueDate: { type: ["string", "null"] },
           links: { type: "array" }
         },
         required: ["bugId"],

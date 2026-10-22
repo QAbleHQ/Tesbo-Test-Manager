@@ -2895,6 +2895,8 @@ export interface BugItem {
   assigneeId: string | null;
   assigneeName: string | null;
   assigneeType?: "user" | "agent" | null;
+  /** Calendar day as "YYYY-MM-DD" (no time, no timezone); null = no due date. */
+  dueDate: string | null;
   integrationProvider: "JIRA" | "LINEAR" | null;
   integrationIssueKey: string | null;
   betterbugsUrl: string | null;
@@ -3017,6 +3019,7 @@ export async function createBug(projectId: string, data: {
   priority?: BugPriority | null;
   // null/omitted both mean unassigned on create; there is no "clear" distinction to make yet.
   assigneeId?: string | null;
+  dueDate?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;
@@ -3036,6 +3039,8 @@ export async function updateBug(bugId: string, data: {
   priority?: BugPriority | null;
   // null clears the assignee; omitted leaves the stored value alone.
   assigneeId?: string | null;
+  // null clears the due date; omitted leaves the stored value alone.
+  dueDate?: string | null;
   integrationProvider?: "JIRA" | "LINEAR" | null;
   integrationIssueKey?: string | null;
   betterbugsUrl?: string | null;
@@ -3089,6 +3094,14 @@ export async function uploadBugAttachments(
     onBatchUploaded?.(batch);
   }
   return { list, total: list.length };
+}
+
+export async function deleteExecutionEvidence(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<void> {
+  await api(`/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}`, { method: "DELETE" });
 }
 
 export async function deleteBugAttachment(attachmentId: string): Promise<void> {

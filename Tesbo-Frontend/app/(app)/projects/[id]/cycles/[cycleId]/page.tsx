@@ -1283,7 +1283,7 @@ export default function TestRunDetailPage() {
                 data-testid="run-filter-priority"
                 value={runFilterPriority}
                 onChange={(e) => setRunFilterPriority(e.target.value)}
-                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+                className="!h-[30px] !w-auto rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
               >
                 <option value="">All priorities</option>
                 {runPriorityOptions.map((p) => (
@@ -1295,7 +1295,7 @@ export default function TestRunDetailPage() {
                 data-testid="run-filter-type"
                 value={runFilterType}
                 onChange={(e) => setRunFilterType(e.target.value)}
-                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+                className="!h-[30px] !w-auto rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
               >
                 <option value="">All types</option>
                 {runTypeOptions.map((t) => (
@@ -1307,7 +1307,7 @@ export default function TestRunDetailPage() {
                 data-testid="run-filter-assignee"
                 value={runFilterAssignee}
                 onChange={(e) => setRunFilterAssignee(e.target.value)}
-                className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+                className="!h-[30px] !w-auto rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] px-2 text-[12.5px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
               >
                 <option value="">All assignees</option>
                 <option value="__unassigned__">Unassigned</option>

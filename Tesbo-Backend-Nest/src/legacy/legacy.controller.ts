@@ -751,6 +751,16 @@ export class LegacyController {
    * the browser, cross-origin and without credentials, so it cannot use the download route above.
    * This hands back a signed token instead; /api/public/trace/:token below is what redeems it.
    */
+  @Delete("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId")
+  deleteExecutionAttachment(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.deleteExecutionAttachment(cycleId, req.userId, executionId, attachmentId);
+  }
+
   @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/trace-link")
   createExecutionTraceLink(
     @Req() req: AuthenticatedRequest,
