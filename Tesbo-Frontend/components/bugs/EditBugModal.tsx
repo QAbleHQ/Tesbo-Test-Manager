@@ -115,9 +115,11 @@ export default function EditBugModal({
   const [editStatus, setEditStatus] = useState(bug.status);
   const [editAssigneeId, setEditAssigneeId] = useState(bug.assigneeId || "");
   const [editDueDate, setEditDueDate] = useState(bug.dueDate || "");
-  // A due date can be no earlier than the day the bug was reported (the server enforces it too).
-  const minDueDate = toLocalDay(bug.createdAt);
-  const dueDateTooEarly = !!editDueDate && editDueDate < minDueDate;
+  // A due date being set can be no earlier than today (the server enforces it too). An existing date
+  // that has since gone by is left alone: only a changed value is checked, so an overdue bug can
+  // still be edited.
+  const minDueDate = toLocalDay();
+  const dueDateTooEarly = !!editDueDate && editDueDate !== (bug.dueDate || "") && editDueDate < minDueDate;
   const [saving, setSaving] = useState(false);
   /*
    * Basecamp 10226296533: updateBug succeeded, uploadBugAttachments then threw, and the throw went
@@ -299,7 +301,7 @@ export default function EditBugModal({
           />
           {dueDateTooEarly && (
             <p role="alert" data-testid="due-date-error" className="text-[13px] text-[var(--error-foreground)]">
-              Due date cannot be before the day this bug was reported.
+              Due date cannot be before today.
             </p>
           )}
         </Field>

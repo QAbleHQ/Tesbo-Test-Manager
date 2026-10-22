@@ -9,7 +9,7 @@ import {
   resetRbacMembership,
   type RbacTenant,
 } from "../utils/rbac-tenant";
-import { exec, literal, scalar } from "../utils/psql";
+import { dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 import { filesForm, filesFormWith, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -755,7 +755,7 @@ test.describe("bug due date", () => {
     }
   });
 
-  test("a due date earlier than the day the bug was reported is refused on create and on edit", async ({ request }) => {
+  test("a due date in the past is refused on create and on edit", async ({ request }) => {
     const before = (await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json()).length;
     // Two days back is outside the one-day timezone allowance the server gives a caller behind UTC.
     const past = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString().slice(0, 10);
@@ -767,7 +767,7 @@ test.describe("bug due date", () => {
       expect(res.status(), `create with dueDate ${bad}`).toBe(400);
       const body = await res.json();
       expect(body.field).toBe("dueDate");
-      expect(body.error).toContain("earlier than the day the bug was reported");
+      expect(body.error).toContain("earlier than today");
     }
     expect((await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json()).length, "a refused create must not leave a bug behind").toBe(before);
 
@@ -780,8 +780,34 @@ test.describe("bug due date", () => {
         expect(res.status(), `edit to dueDate ${bad}`).toBe(400);
       }
       expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).dueDate, "a refused edit keeps the stored date").toBe("2031-06-06");
-      // Clearing is always allowed, whatever the report date.
+      // Clearing is always allowed.
       expect((await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: null } })).json()).dueDate).toBeNull();
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a bug whose due date has gone by stays editable, but cannot be moved to another past date", async ({ request }) => {
+    test.skip(!dbControlAvailable(), "needs DB access to back-date a due date");
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Overdue Edit ${Date.now()}`, dueDate: "2031-06-06" } })
+    ).json();
+    try {
+      // The API refuses a past date, so back-date the column to stand in for time passing.
+      exec(`UPDATE bugs SET due_date = ${literal("2020-01-01")}::date WHERE id = ${literal(bug.id)}`);
+
+      // Re-saving the unchanged (now past) date alongside another edit is not a new past date.
+      const resent = await request.patch(`/api/bugs/${bug.id}`, { data: { title: `${bug.title} v2`, dueDate: "2020-01-01" }, failOnStatusCode: false });
+      expect(resent.status()).toBe(200);
+      expect((await resent.json()).dueDate).toBe("2020-01-01");
+
+      // Choosing a different past date is.
+      const moved = await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2020-02-02" }, failOnStatusCode: false });
+      expect(moved.status()).toBe(400);
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBe("2020-01-01");
+
+      // And it can be moved forward.
+      expect((await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-07-07" } })).json()).dueDate).toBe("2031-07-07");
     } finally {
       await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }

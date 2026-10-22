@@ -7878,16 +7878,18 @@ export class LegacyService implements OnModuleInit {
   }
 
   /**
-   * A due date earlier than the day the bug was reported is refused: it would be overdue from the
-   * moment it was set. The floor is the reporting day in UTC minus one day, because the form
-   * compares in the reporter's local calendar and a caller behind UTC can legitimately pick a day
-   * that is still "yesterday" in UTC.
+   * A due date being set must not be in the past: it would be overdue from the moment it was
+   * chosen. The floor is today in UTC minus one day, because the form compares in the user's local
+   * calendar and a caller behind UTC can legitimately pick a day that is still "yesterday" in UTC.
+   * Callers only pass a date that is new or changed — a bug whose existing date has since gone by
+   * (it is overdue) must stay editable without touching it.
    */
-  private assertBugDueDateNotBeforeReport(dueDate: string | null, reportedAt: Date): void {
+  private assertBugDueDateNotInPast(dueDate: string | null): void {
     if (!dueDate) return;
-    const floor = new Date(Date.UTC(reportedAt.getUTCFullYear(), reportedAt.getUTCMonth(), reportedAt.getUTCDate() - 1)).toISOString().slice(0, 10);
+    const now = new Date();
+    const floor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1)).toISOString().slice(0, 10);
     if (dueDate < floor) {
-      throw new BadRequestException({ error: "dueDate cannot be earlier than the day the bug was reported", field: "dueDate" });
+      throw new BadRequestException({ error: "dueDate cannot be earlier than today", field: "dueDate" });
     }
   }
 
@@ -7924,7 +7926,7 @@ export class LegacyService implements OnModuleInit {
     const priority = this.parseBugPriority(body.priority);
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
     const dueDate = this.parseBugDueDate(body.dueDate);
-    this.assertBugDueDateNotBeforeReport(dueDate, new Date());
+    this.assertBugDueDateNotInPast(dueDate);
 
     // nextBugExternalId reads MAX(trailing number) + 1 in a separate statement from the INSERT
     // below, so two bugs filed for the same project at once can both compute the same id;
@@ -8633,7 +8635,7 @@ export class LegacyService implements OnModuleInit {
     const clearsDueDate = body.dueDate === null || body.dueDate === "";
     const dueDate = this.parseBugDueDate(body.dueDate);
     const before = await this.getBug(bugId);
-    this.assertBugDueDateNotBeforeReport(dueDate, new Date((before as Body).createdAt as string | Date));
+    if (dueDate !== ((before as Body).dueDate ?? null)) this.assertBugDueDateNotInPast(dueDate);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
        status=COALESCE($5,status), severity=CASE WHEN $14::boolean THEN NULL ELSE COALESCE($6,severity) END, priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
