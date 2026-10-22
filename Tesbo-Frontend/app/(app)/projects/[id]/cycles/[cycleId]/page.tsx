@@ -63,6 +63,7 @@ import Modal from "@/components/ui/Modal";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { AutomationResultMeta, AutomationRunProvenance } from "@/components/AutomationResultMeta";
 import { formatSpent, RunTags } from "@/components/testruns/runDisplay";
+import { DateRangeSummary } from "@/components/testplans/DueDates";
 import { useLogBugDialog } from "@/components/LogBugDialog";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
@@ -1193,6 +1194,9 @@ export default function TestRunDetailPage() {
               <AutomationRunProvenance run={run} />
             </div>
           )}
+          <div className="mt-2">
+            <DateRangeSummary startDate={run.startDate} dueDate={run.dueDate} dueState={run.dueState} />
+          </div>
           <div className="mt-2.5 flex flex-wrap items-center gap-4">
             {planName && (
               <span className="flex items-center gap-1.5 text-[12px] text-[var(--muted)]">

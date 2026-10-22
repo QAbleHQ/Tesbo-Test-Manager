@@ -22,6 +22,7 @@ import { AutomationModule } from "./automation/automation.module";
 import { AnalyticsReportModule } from "./analytics-report/analytics-report.module";
 import { ReviewBoardModule } from "./review-board/review-board.module";
 import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
+import { DueDateSweepModule } from "./due-date-sweep/due-date-sweep.module";
 
 @Module({
   imports: [
@@ -46,6 +47,7 @@ import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.
     PlanLimitsModule,
     AutomationModule,
     ZyraArchiveSweepModule,
+    DueDateSweepModule,
     AnalyticsReportModule,
     ReviewBoardModule
   ],

@@ -8,6 +8,7 @@ import {
 import { Card } from "@/components/ui";
 import type { PlanListItem } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
+import { DateRangeSummary } from "@/components/testplans/DueDates";
 
 export type PlanStatus = "active" | "draft";
 
@@ -172,6 +173,10 @@ export function PlanCard({ plan, projectId, ownerName, canManage, onDelete }: Pl
             </button>
           )}
         </div>
+      </div>
+
+      <div className="mb-3">
+        <DateRangeSummary startDate={plan.startDate} dueDate={plan.dueDate} dueState={plan.dueState} />
       </div>
 
       <div className="mb-3.5">
