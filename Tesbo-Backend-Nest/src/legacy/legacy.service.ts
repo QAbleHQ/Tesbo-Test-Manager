@@ -21,6 +21,7 @@ import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
 import { writeNotifications } from "./notification-writer";
+import { DEFAULT_WORKSPACE_TIMEZONE, assertDateRange, duePhase, isValidTimezone, parseDay, resolveDateChange, todayIn, type DuePhase } from "./due-dates";
 import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
@@ -2453,7 +2454,7 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
 
     const active = await this.db.query(
-      `SELECT o.id, o.name, o.slug, o.plan, o.country, om.role, o.created_at
+      `SELECT o.id, o.name, o.slug, o.plan, o.country, o.timezone, om.role, o.created_at
        FROM users u
        JOIN organizations o ON o.id = u.active_organization_id
        JOIN organization_members om ON om.organization_id = o.id AND om.user_id = u.id
@@ -2465,7 +2466,7 @@ export class LegacyService implements OnModuleInit {
     // active_organization_id is unset or stale (e.g. user was removed from
     // that org) — fall back to the earliest membership and self-heal.
     const res = await this.db.query(
-      `SELECT o.id, o.name, o.slug, o.plan, o.country, om.role, o.created_at
+      `SELECT o.id, o.name, o.slug, o.plan, o.country, o.timezone, om.role, o.created_at
        FROM organizations o
        JOIN organization_members om ON om.organization_id = o.id
        WHERE om.user_id = $1
@@ -2523,9 +2524,14 @@ export class LegacyService implements OnModuleInit {
 
     // `country` is optional here so a plain rename doesn't clear it; passing "" clears it explicitly.
     const country = body.country === undefined ? undefined : normalizeCountryCode(body.country);
+    // Optional too: the zone "due today" and "overdue" are judged in. A name that is not an IANA zone is refused.
+    if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+      throw new BadRequestException({ error: "timezone must be a valid IANA timezone, e.g. Asia/Kolkata", field: "timezone" });
+    }
+    const timezone = body.timezone === undefined ? null : String(body.timezone).trim();
     await this.db.query(
-      `UPDATE organizations SET name = $1, country = CASE WHEN $3 THEN $2 ELSE country END, updated_at = now() WHERE id = $4`,
-      [name, country, country !== undefined, workspace.id]
+      `UPDATE organizations SET name = $1, country = CASE WHEN $3 THEN $2 ELSE country END, timezone = COALESCE($5, timezone), updated_at = now() WHERE id = $4`,
+      [name, country, country !== undefined, workspace.id, timezone]
     );
     return this.workspace(uid);
   }
@@ -6264,9 +6270,38 @@ export class LegacyService implements OnModuleInit {
     return this.listPlans(projectId);
   }
 
+  /** The IANA timezone of the workspace a project belongs to — what "today" means for its due dates. */
+  private async projectTimezone(projectId: string): Promise<string> {
+    const res = await this.db.query<{ timezone: string | null }>(
+      "SELECT o.timezone FROM projects p JOIN organizations o ON o.id = p.organization_id WHERE p.id = $1",
+      [projectId]
+    );
+    const zone = res.rows[0]?.timezone;
+    return isValidTimezone(zone) ? zone : DEFAULT_WORKSPACE_TIMEZONE;
+  }
+
+  /**
+   * `dueState` / `isOverdue` for a plan or run, worked out at read time rather than stored: that is
+   * what makes "move an overdue item's due date into the future and the Overdue mark goes away" true
+   * with nothing to clear. A finished item (a completed run, a plan whose runs are all completed) is
+   * never due or overdue, whatever its date says.
+   */
+  private static withDueState(row: Body, today: string, finished: boolean): Body {
+    const dueState: DuePhase | null = finished ? null : duePhase((row.dueDate as string | null) ?? null, today);
+    return { ...row, dueState, isOverdue: dueState === "overdue" };
+  }
+
+  /** A plan is finished once it has runs and every one of them is Completed. */
+  private static planFinished(runCount: number, openRuns: number): boolean {
+    return runCount > 0 && openRuns === 0;
+  }
+
   async listPlans(projectId: string) {
+    const today = todayIn(await this.projectTimezone(projectId));
     const res = await this.db.query(
       `SELECT p.*,
+              to_char(p.start_date, 'YYYY-MM-DD') AS start_date, to_char(p.due_date, 'YYYY-MM-DD') AS due_date,
+              COALESCE(runs.open_runs, 0)::int AS open_runs,
               COALESCE(pi.case_count, 0)::int AS case_count,
               COALESCE(runs.run_count, 0)::int AS run_count,
               COALESCE(runs.passed, 0)::int AS passed,
@@ -6284,6 +6319,7 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN (
          SELECT c.plan_id,
                 COUNT(DISTINCT c.id)::int AS run_count,
+                COUNT(DISTINCT c.id) FILTER (WHERE c.status <> 'Completed')::int AS open_runs,
                 COUNT(e.id) FILTER (WHERE e.status = 'Passed')::int AS passed,
                 COUNT(e.id) FILTER (WHERE e.status = 'Failed')::int AS failed,
                 COUNT(e.id) FILTER (WHERE e.status = 'Blocked')::int AS blocked,
@@ -6299,34 +6335,66 @@ export class LegacyService implements OnModuleInit {
        ORDER BY p.created_at DESC`,
       [projectId]
     );
-    return res.rows.map(toCamel);
+    return res.rows.map((row) => {
+      const plan = toCamel(row);
+      const { openRuns, ...rest } = plan as Body & { openRuns?: number };
+      return LegacyService.withDueState(rest, today, LegacyService.planFinished(Number(plan.runCount) || 0, Number(openRuns) || 0));
+    });
   }
 
   async createPlan(userId: string | null | undefined, projectId: string, body: Body) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     validateBoundedField(body.name, "Plan name", PLAN_NAME_MAX_LENGTH);
     validateBoundedField(body.targetRelease, "Target release", PLAN_TARGET_RELEASE_MAX_LENGTH);
+    const today = todayIn(await this.projectTimezone(projectId));
+    // Start date is required: when the caller names none it is the day of creation (workspace time).
+    const startDate = parseDay(body.startDate, "startDate", "Start date") ?? today;
+    const dueDate = parseDay(body.dueDate, "dueDate", "Due date");
+    assertDateRange(startDate, dueDate);
     const res = await this.db.query(
-      "INSERT INTO plans (project_id, name, description, target_release, owner_id) VALUES ($1,$2,$3,$4,$5) RETURNING *",
-      [projectId, body.name || "Untitled plan", body.description || "", body.targetRelease || null, body.ownerId || null]
+      `INSERT INTO plans (project_id, name, description, target_release, owner_id, start_date, due_date)
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7::date)
+       RETURNING *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date`,
+      [projectId, body.name || "Untitled plan", body.description || "", body.targetRelease || null, body.ownerId || null, startDate, dueDate]
     );
-    return toCamel(res.rows[0]);
+    return LegacyService.withDueState(toCamel(res.rows[0]), today, false);
   }
 
   async getPlan(userId: string | null | undefined, planId: string) {
-    await this.requirePlanAccess(userId, planId);
-    const res = await this.db.query("SELECT * FROM plans WHERE id = $1", [planId]);
+    const projectId = await this.requirePlanAccess(userId, planId);
+    const res = await this.db.query(
+      "SELECT *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM plans WHERE id = $1",
+      [planId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan not found" });
-    return toCamel(res.rows[0]);
+    const runs = await this.db.query<{ run_count: number; open_runs: number }>(
+      `SELECT COUNT(*)::int AS run_count, COUNT(*) FILTER (WHERE status <> 'Completed')::int AS open_runs
+       FROM cycles WHERE plan_id = $1 AND deleted_at IS NULL`,
+      [planId]
+    );
+    const today = todayIn(await this.projectTimezone(projectId));
+    return LegacyService.withDueState(toCamel(res.rows[0]), today, LegacyService.planFinished(runs.rows[0]?.run_count ?? 0, runs.rows[0]?.open_runs ?? 0));
   }
 
   async updatePlan(userId: string | null | undefined, planId: string, body: Body) {
     await this.requirePlanAccess(userId, planId);
     validateBoundedField(body.name, "Plan name", PLAN_NAME_MAX_LENGTH);
     validateBoundedField(body.targetRelease, "Target release", PLAN_TARGET_RELEASE_MAX_LENGTH);
+    // Only read the stored dates when the body touches one: the range check needs the other side.
+    const touchesDates = body.startDate !== undefined || body.dueDate !== undefined;
+    const current = touchesDates
+      ? (await this.db.query<{ start_date: string | null; due_date: string | null }>(
+          "SELECT to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM plans WHERE id = $1",
+          [planId]
+        )).rows[0]
+      : undefined;
+    const dates = resolveDateChange(body, { startDate: current?.start_date ?? null, dueDate: current?.due_date ?? null });
     await this.db.query(
-      "UPDATE plans SET name=COALESCE($2,name), description=COALESCE($3,description), target_release=COALESCE($4,target_release), updated_at=now() WHERE id=$1",
-      [planId, body.name || null, body.description || null, body.targetRelease || null]
+      `UPDATE plans SET name=COALESCE($2,name), description=COALESCE($3,description), target_release=COALESCE($4,target_release),
+       start_date=COALESCE($5::date,start_date),
+       due_date=CASE WHEN $6::boolean THEN NULL ELSE COALESCE($7::date,due_date) END,
+       updated_at=now() WHERE id=$1`,
+      [planId, body.name || null, body.description || null, body.targetRelease || null, dates.startDate, dates.clearsDueDate, dates.dueDate]
     );
   }
 
@@ -6400,7 +6468,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       // Counted exactly like listCycles, so one run cannot report a different case count on the plan
       // screen than on the runs screen it links to.
-      `SELECT c.*,
+      `SELECT c.*, to_char(c.start_date, 'YYYY-MM-DD') AS start_date, to_char(c.due_date, 'YYYY-MM-DD') AS due_date,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
@@ -6410,7 +6478,9 @@ export class LegacyService implements OnModuleInit {
        ORDER BY c.created_at DESC`,
       [planId]
     );
-    return res.rows.map(toCamel);
+    if (!res.rows.length) return [];
+    const today = todayIn(await this.projectTimezone(res.rows[0].project_id));
+    return res.rows.map((row) => LegacyService.withDueState(toCamel(row), today, row.status === "Completed"));
   }
 
   async planProgress(userId: string | null | undefined, planId: string) {
@@ -6493,7 +6563,7 @@ export class LegacyService implements OnModuleInit {
       // on the run card can never disagree with the number of rows the run's own table renders.
       // Counting cycle_items instead let anything without a live execution inflate the card.
       `${limit ? "WITH recent AS (SELECT id FROM cycles WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT $2)" : ""}
-       SELECT c.*,
+       SELECT c.*, to_char(c.start_date, 'YYYY-MM-DD') AS start_date, to_char(c.due_date, 'YYYY-MM-DD') AS due_date,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
        ${limit ? "JOIN recent r ON r.id = c.id" : ""}
@@ -6504,7 +6574,8 @@ export class LegacyService implements OnModuleInit {
        ORDER BY c.created_at DESC, c.id DESC`,
       limit ? [projectId, limit] : [projectId]
     );
-    return res.rows.map(LegacyService.cycleRow);
+    const today = todayIn(await this.projectTimezone(projectId));
+    return res.rows.map((row) => LegacyService.withDueState(LegacyService.cycleRow(row), today, row.status === "Completed"));
   }
 
   async createCycleForUser(userId: string | null | undefined, projectId: string, body: Body) {
@@ -6523,9 +6594,15 @@ export class LegacyService implements OnModuleInit {
     validateBoundedField(body.environment, "Environment", CYCLE_LABEL_MAX_LENGTH);
     validateBoundedField(body.buildVersion, "Build version", CYCLE_LABEL_MAX_LENGTH);
     validateBoundedField(body.releaseName, "Release name", CYCLE_LABEL_MAX_LENGTH);
+    const today = todayIn(await this.projectTimezone(projectId));
+    // Start date is required: when the caller names none it is the day of creation (workspace time).
+    const startDate = parseDay(body.startDate, "startDate", "Start date") ?? today;
+    const dueDate = parseDay(body.dueDate, "dueDate", "Due date");
+    assertDateRange(startDate, dueDate);
     const res = await this.db.query(
-      `INSERT INTO cycles (project_id, plan_id, name, description, environment, build_version, release_name, owner_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      `INSERT INTO cycles (project_id, plan_id, name, description, environment, build_version, release_name, owner_id, start_date, due_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10::date)
+       RETURNING *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date`,
       [
         projectId,
         body.planId || null,
@@ -6534,10 +6611,12 @@ export class LegacyService implements OnModuleInit {
         body.environment || null,
         body.buildVersion || null,
         body.releaseName || null,
-        body.ownerId || null
+        body.ownerId || null,
+        startDate,
+        dueDate
       ]
     );
-    return toCamel(res.rows[0]);
+    return LegacyService.withDueState(toCamel(res.rows[0]), today, false);
   }
 
   /**
@@ -6572,10 +6651,14 @@ export class LegacyService implements OnModuleInit {
   }
 
   async getCycle(cycleId: string, userId?: string | null) {
-    await this.requireCycleAccess(userId, cycleId);
-    const res = await this.db.query("SELECT * FROM cycles WHERE id = $1 AND deleted_at IS NULL", [cycleId]);
+    const projectId = await this.requireCycleAccess(userId, cycleId);
+    const res = await this.db.query(
+      "SELECT *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
-    return LegacyService.cycleRow(res.rows[0]);
+    const today = todayIn(await this.projectTimezone(projectId));
+    return LegacyService.withDueState(LegacyService.cycleRow(res.rows[0]), today, res.rows[0].status === "Completed");
   }
 
   async shareCycle(cycleId: string, userId: string | null | undefined, body: Body) {
@@ -6716,6 +6799,15 @@ export class LegacyService implements OnModuleInit {
      *   → Planning     leaves the original start alone but clears the end: it is not finished
      */
     const status = typeof body.status === "string" ? body.status : null;
+    // Only read the stored dates when the body touches one: the range check needs the other side.
+    const touchesDates = body.startDate !== undefined || body.dueDate !== undefined;
+    const currentDates = touchesDates
+      ? (await this.db.query<{ start_date: string | null; due_date: string | null }>(
+          "SELECT to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM cycles WHERE id = $1",
+          [cycleId]
+        )).rows[0]
+      : undefined;
+    const dates = resolveDateChange(body, { startDate: currentDates?.start_date ?? null, dueDate: currentDates?.due_date ?? null });
     // A run with no cases has nothing to execute or complete; the UI disables both buttons, and
     // this keeps the API from being a way around it.
     if (status === "In Progress" || status === "Completed") {
@@ -6742,6 +6834,8 @@ export class LegacyService implements OnModuleInit {
        status=COALESCE($9,status),
        started_at=CASE WHEN $9 IN ('In Progress', 'Completed') THEN COALESCE(started_at, now()) ELSE started_at END,
        ended_at=CASE WHEN $9 = 'Completed' THEN now() WHEN $9 IN ('In Progress', 'Planning') THEN NULL ELSE ended_at END,
+       start_date=COALESCE($10::date,start_date),
+       due_date=CASE WHEN $11::boolean THEN NULL ELSE COALESCE($12::date,due_date) END,
        updated_at=now() WHERE id=$1`,
       [
         cycleId,
@@ -6752,7 +6846,10 @@ export class LegacyService implements OnModuleInit {
         body.releaseName || null,
         body.clearPlan === true,
         body.planId || null,
-        status
+        status,
+        dates.startDate,
+        dates.clearsDueDate,
+        dates.dueDate
       ]
     );
     if (beforeRun && status) await this.notifyRunLifecycle(cycleId, projectId, userId ?? null, beforeRun, status);
@@ -7863,16 +7960,18 @@ export class LegacyService implements OnModuleInit {
   }
 
   /**
-   * A due date earlier than the day the bug was reported is refused: it would be overdue from the
-   * moment it was set. The floor is the reporting day in UTC minus one day, because the form
-   * compares in the reporter's local calendar and a caller behind UTC can legitimately pick a day
-   * that is still "yesterday" in UTC.
+   * A due date being set must not be in the past: it would be overdue from the moment it was
+   * chosen. The floor is today in UTC minus one day, because the form compares in the user's local
+   * calendar and a caller behind UTC can legitimately pick a day that is still "yesterday" in UTC.
+   * Callers only pass a date that is new or changed — a bug whose existing date has since gone by
+   * (it is overdue) must stay editable without touching it.
    */
-  private assertBugDueDateNotBeforeReport(dueDate: string | null, reportedAt: Date): void {
+  private assertBugDueDateNotInPast(dueDate: string | null): void {
     if (!dueDate) return;
-    const floor = new Date(Date.UTC(reportedAt.getUTCFullYear(), reportedAt.getUTCMonth(), reportedAt.getUTCDate() - 1)).toISOString().slice(0, 10);
+    const now = new Date();
+    const floor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1)).toISOString().slice(0, 10);
     if (dueDate < floor) {
-      throw new BadRequestException({ error: "dueDate cannot be earlier than the day the bug was reported", field: "dueDate" });
+      throw new BadRequestException({ error: "dueDate cannot be earlier than today", field: "dueDate" });
     }
   }
 
@@ -7909,7 +8008,7 @@ export class LegacyService implements OnModuleInit {
     const priority = this.parseBugPriority(body.priority);
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
     const dueDate = this.parseBugDueDate(body.dueDate);
-    this.assertBugDueDateNotBeforeReport(dueDate, new Date());
+    this.assertBugDueDateNotInPast(dueDate);
 
     // nextBugExternalId reads MAX(trailing number) + 1 in a separate statement from the INSERT
     // below, so two bugs filed for the same project at once can both compute the same id;
@@ -8620,7 +8719,7 @@ export class LegacyService implements OnModuleInit {
     const clearsDueDate = body.dueDate === null || body.dueDate === "";
     const dueDate = this.parseBugDueDate(body.dueDate);
     const before = await this.getBug(bugId);
-    this.assertBugDueDateNotBeforeReport(dueDate, new Date((before as Body).createdAt as string | Date));
+    if (dueDate !== ((before as Body).dueDate ?? null)) this.assertBugDueDateNotInPast(dueDate);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
        status=COALESCE($5,status), severity=CASE WHEN $14::boolean THEN NULL ELSE COALESCE($6,severity) END, priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,

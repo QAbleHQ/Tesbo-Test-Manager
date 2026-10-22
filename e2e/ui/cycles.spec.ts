@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request as pwRequest, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { env } from "../utils/env";
+import { workspaceDays } from "../utils/due-dates";
 import { literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -1189,5 +1190,151 @@ test.describe("imported run history in the UI", () => {
       await cleanUpRun(api, cycleId, testcaseIds);
       await api.dispose();
     }
+  });
+});
+
+/*
+ * Start Date / optional Due Date on the Test Runs screen: the create and edit modals, the run card
+ * and the run detail header. Each test builds its own project (with one configured environment, which
+ * the create modal requires) so the list is exactly what it seeded.
+ */
+test.describe("Test Runs — start and due dates", () => {
+  let api: APIRequestContext;
+  const projectIds: string[] = [];
+
+  test.beforeAll(async () => {
+    api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+  });
+  test.afterAll(async () => {
+    for (const id of projectIds) await api.delete(`/api/projects/${id}`, { failOnStatusCode: false });
+    await api.dispose();
+  });
+
+  async function seedProject(): Promise<string> {
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    const created = await (await api.post("/api/projects", { data: { name: `E2E RunDates ${stamp}` } })).json();
+    projectIds.push(created.id);
+    const res = await api.patch(`/api/projects/${created.id}`, {
+      data: { settings: { testRunEnvironments: [{ name: "Staging", url: "https://staging.example.com" }] } },
+    });
+    expect(res.ok()).toBeTruthy();
+    return created.id;
+  }
+
+  async function runByName(projectId: string, name: string): Promise<any | undefined> {
+    return (await (await api.get(`/api/projects/${projectId}/cycles`)).json()).find((r: any) => r.name === name);
+  }
+
+  /** The create modal renders without role="dialog", so the controls are found by the ids DateRangeFields gives them. */
+  const startInput = (page: Page, prefix: string) => page.locator(`#${prefix}-start-date`);
+  const dueInput = (page: Page, prefix: string) => page.locator(`#${prefix}-due-date`);
+  const createButton = (page: Page) => page.getByRole("button", { name: "Create Test Run", exact: true });
+  const fillBasics = async (page: Page, name: string) => {
+    await page.locator('form input[type="text"]').first().fill(name);
+    await page.locator("select").filter({ has: page.locator("option", { hasText: "Select environment" }) }).selectOption("Staging");
+  };
+
+  test("RUN-D-U-01 the create form starts with today's date, lets a run be created with no due date, and the card says so", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run NoDue ${Date.now()}`;
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await expect(startInput(page, "new-run")).toHaveValue(d.today);
+    await expect(dueInput(page, "new-run")).toHaveValue("");
+    await fillBasics(page, name);
+    await expect(createButton(page)).toBeEnabled();
+    await createButton(page).click();
+
+    const card = page.locator("div.p-0").filter({ hasText: name }).first();
+    await expect(card).toBeVisible();
+    await expect(card.getByTestId("due-date-value")).toHaveText("Due: No due date");
+    // Persisted state, not just the toast: the API row has a start day and no due day.
+    const saved = await runByName(projectId, name);
+    expect({ startDate: saved.startDate, dueDate: saved.dueDate }).toEqual({ startDate: d.today, dueDate: null });
+  });
+
+  test("RUN-D-U-02 a due date before the start date shows an error, blocks Create, and clears once fixed", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run Inverted ${Date.now()}`;
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await fillBasics(page, name);
+    await startInput(page, "new-run").fill(d.today);
+    await dueInput(page, "new-run").fill(d.yesterday);
+    await expect(page.getByTestId("new-run-date-error")).toHaveText(/earlier than the start date/i);
+    await expect(createButton(page)).toBeDisabled();
+    expect(await runByName(projectId, name), "nothing may be saved while the range is inverted").toBeUndefined();
+
+    await dueInput(page, "new-run").fill(d.inDays(3));
+    await expect(page.getByTestId("new-run-date-error")).toHaveCount(0);
+    await expect(createButton(page)).toBeEnabled();
+    await createButton(page).click();
+    await expect.poll(async () => (await runByName(projectId, name))?.dueDate).toBe(d.inDays(3));
+  });
+
+  test("RUN-D-U-03 the Start Date is required: with it emptied Create stays disabled", async ({ page }) => {
+    const projectId = await seedProject();
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await fillBasics(page, `E2E Run NoStart ${Date.now()}`);
+    await startInput(page, "new-run").fill("");
+    await expect(createButton(page)).toBeDisabled();
+  });
+
+  test("RUN-D-U-04 an overdue run is marked Overdue; extending its due date in the edit form removes the mark, and Clear removes the date", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run Overdue ${Date.now()}`;
+    const run = await (
+      await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.inDays(-6), dueDate: d.yesterday } })
+    ).json();
+    await page.goto(`/projects/${projectId}/cycles`);
+    const card = runCard(page, run.id);
+    await expect(card.getByTestId("overdue-badge")).toHaveText("Overdue");
+    await expect(card.getByTestId("due-date-value")).toHaveText(/Due: \d{2} \w{3} \d{4}/);
+
+    await card.getByTitle("Edit run").click();
+    await expect(dueInput(page, "edit-run")).toHaveValue(d.yesterday);
+    await expect(startInput(page, "edit-run")).toHaveValue(d.inDays(-6));
+    await dueInput(page, "edit-run").fill(d.inDays(10));
+    await page.getByRole("button", { name: "Save Changes" }).click();
+
+    await expect(runCard(page, run.id).getByTestId("overdue-badge")).toHaveCount(0);
+    expect((await runByName(projectId, name)).dueDate).toBe(d.inDays(10));
+    expect((await runByName(projectId, name)).isOverdue).toBe(false);
+
+    // Back to "no due date": the Clear button empties the field and the save persists the removal.
+    await runCard(page, run.id).getByTitle("Edit run").click();
+    await page.getByTestId("edit-run-clear-due-date").click();
+    await expect(dueInput(page, "edit-run")).toHaveValue("");
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect(runCard(page, run.id).getByTestId("due-date-value")).toHaveText("Due: No due date");
+    expect((await runByName(projectId, name)).dueDate).toBeNull();
+  });
+
+  test("RUN-D-U-05 the edit form refuses a due date earlier than the start date and saves nothing", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run EditInverted ${Date.now()}`;
+    const run = await (
+      await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.today, dueDate: d.inDays(5) } })
+    ).json();
+    await page.goto(`/projects/${projectId}/cycles`);
+    await runCard(page, run.id).getByTitle("Edit run").click();
+    await dueInput(page, "edit-run").fill(d.yesterday);
+    await expect(page.getByTestId("edit-run-date-error")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+    expect((await runByName(projectId, name)).dueDate).toBe(d.inDays(5));
+  });
+
+  test("RUN-D-U-06 the run detail header shows the start date, due date and Overdue mark", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const run = await (
+      await api.post(`/api/projects/${projectId}/cycles`, { data: { name: `E2E Run Detail ${Date.now()}`, environment: "Staging", startDate: d.inDays(-4), dueDate: d.yesterday } })
+    ).json();
+    await page.goto(`/projects/${projectId}/cycles/${run.id}`);
+    await expect(page.getByTestId("start-date-value")).toHaveText(/Start: \d{2} \w{3} \d{4}/);
+    await expect(page.getByTestId("due-date-value")).toHaveText(/Due: \d{2} \w{3} \d{4}/);
+    await expect(page.getByTestId("overdue-badge")).toBeVisible();
   });
 });

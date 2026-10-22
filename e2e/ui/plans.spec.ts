@@ -1,5 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+import { workspaceDays } from "../utils/due-dates";
 import {
   cleanupRun,
   createPlan,
@@ -713,6 +714,138 @@ test.describe("test plans — header count, plan items and editing", () => {
     } finally {
       await deleteProjects(api, [project.id]);
       await api.dispose();
+    }
+  });
+});
+
+/*
+ * Start Date / optional Due Date on the Test Plans screen: the create form, the plan card, and the
+ * edit form on the plan detail page. Own project per test, as above.
+ */
+test.describe("test plans — start and due dates", () => {
+  test.skip(!!skipReason, skipReason ?? "");
+
+  let api: APIRequestContext;
+  test.beforeAll(async () => {
+    api = await screensApi();
+  });
+  test.afterAll(async () => {
+    await api?.dispose();
+  });
+
+  const startInput = (page: Page, prefix: string) => page.locator(`#${prefix}-start-date`);
+  const dueInput = (page: Page, prefix: string) => page.locator(`#${prefix}-due-date`);
+  const submit = (page: Page) => page.getByRole("button", { name: "Create Test Plan", exact: true });
+  const planByName = async (projectId: string, name: string) =>
+    (await (await api.get(`/api/projects/${projectId}/plans`)).json()).find((p: any) => p.name === name);
+
+  test("PLN-D-U-01 the create form starts on today's date, and a plan can be created with no due date", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const project = await createProject(api);
+    const name = `E2E Plan NoDue ${uniqueSuffix()}`;
+    try {
+      await page.goto(`/projects/${project.id}/plans?create=1`);
+      await expect(startInput(page, "new-plan")).toHaveValue(d.today);
+      await expect(dueInput(page, "new-plan")).toHaveValue("");
+      await page.getByPlaceholder("e.g. Sprint 12 Regression").fill(name);
+      await submit(page).click();
+      await page.waitForURL(/\/plans\/[0-9a-f-]{36}/);
+
+      await expect(page.getByTestId("due-date-value")).toHaveText("Due: No due date");
+      await expect(page.getByTestId("start-date-value")).toHaveText(/Start: \d{2} \w{3} \d{4}/);
+      const saved = await planByName(project.id, name);
+      expect({ startDate: saved.startDate, dueDate: saved.dueDate }).toEqual({ startDate: d.today, dueDate: null });
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PLN-D-U-02 a due date before the start date shows an error and blocks Create until fixed", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const project = await createProject(api);
+    const name = `E2E Plan Inverted ${uniqueSuffix()}`;
+    try {
+      await page.goto(`/projects/${project.id}/plans?create=1`);
+      await page.getByPlaceholder("e.g. Sprint 12 Regression").fill(name);
+      await startInput(page, "new-plan").fill(d.today);
+      await dueInput(page, "new-plan").fill(d.yesterday);
+      await expect(page.getByTestId("new-plan-date-error")).toHaveText(/earlier than the start date/i);
+      await expect(submit(page)).toBeDisabled();
+      expect(await planByName(project.id, name), "nothing may be saved while the range is inverted").toBeUndefined();
+
+      await dueInput(page, "new-plan").fill(d.inDays(7));
+      await expect(page.getByTestId("new-plan-date-error")).toHaveCount(0);
+      await submit(page).click();
+      await page.waitForURL(/\/plans\/[0-9a-f-]{36}/);
+      expect((await planByName(project.id, name)).dueDate).toBe(d.inDays(7));
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PLN-D-U-03 a past-due plan card is marked Overdue; extending the date on the detail page removes it, and Clear removes the date", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const project = await createProject(api);
+    try {
+      const plan = await createPlan(api, project.id, { name: `E2E Plan Overdue ${uniqueSuffix()}` });
+      const res = await api.patch(`/api/plans/${plan.id}`, { data: { startDate: d.inDays(-8), dueDate: d.yesterday } });
+      expect(res.ok(), await res.text()).toBeTruthy();
+
+      await page.goto(`/projects/${project.id}/plans`);
+      const card = planCard(page, plan.name);
+      await expect(card.getByTestId("overdue-badge")).toHaveText("Overdue");
+      await expect(card.getByTestId("start-date-value")).toBeVisible();
+
+      await page.goto(`/projects/${project.id}/plans/${plan.id}`);
+      await expect(page.getByTestId("overdue-badge")).toBeVisible();
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await expect(dueInput(page, "plan-edit")).toHaveValue(d.yesterday);
+      await dueInput(page, "plan-edit").fill(d.inDays(14));
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+
+      await expect(page.getByTestId("overdue-badge")).toHaveCount(0);
+      await expect(page.getByTestId("due-date-value")).toHaveText(/Due: \d{2} \w{3} \d{4}/);
+      expect((await planByName(project.id, plan.name)).dueDate).toBe(d.inDays(14));
+
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await page.getByTestId("plan-edit-clear-due-date").click();
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(page.getByTestId("due-date-value")).toHaveText("Due: No due date");
+      expect((await planByName(project.id, plan.name)).dueDate).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PLN-D-U-04 the plan edit form refuses a due date earlier than the start date and saves nothing", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const project = await createProject(api);
+    try {
+      const plan = await createPlan(api, project.id);
+      await api.patch(`/api/plans/${plan.id}`, { data: { startDate: d.today, dueDate: d.inDays(5) } });
+      await page.goto(`/projects/${project.id}/plans/${plan.id}`);
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await dueInput(page, "plan-edit").fill(d.yesterday);
+      await expect(page.getByTestId("plan-edit-date-error")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+      expect((await planByName(project.id, plan.name)).dueDate).toBe(d.inDays(5));
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PLN-D-U-05 a due-tomorrow plan is flagged on its card without being called Overdue", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const project = await createProject(api);
+    try {
+      const plan = await createPlan(api, project.id);
+      await api.patch(`/api/plans/${plan.id}`, { data: { startDate: d.today, dueDate: d.tomorrow } });
+      await page.goto(`/projects/${project.id}/plans`);
+      const card = planCard(page, plan.name);
+      await expect(card.getByTestId("due-soon-badge")).toHaveText("Due tomorrow");
+      await expect(card.getByTestId("overdue-badge")).toHaveCount(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
     }
   });
 });

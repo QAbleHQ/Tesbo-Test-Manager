@@ -50,6 +50,8 @@ function resolveNotificationHref(n: AppNotification): string | null {
       return `/projects/${id}/members`;
     case "test_run":
       return projectId && entityId ? `/projects/${projectId}/cycles/${entityId}` : null;
+    case "test_plan":
+      return projectId && entityId ? `/projects/${projectId}/plans/${entityId}` : null;
     case "project_integration":
       // "<projectId>:<provider>" — the provider is one of the three integration pages that exist.
       return projectId && (entityId === "jira" || entityId === "linear" || entityId === "notion")
@@ -74,6 +76,22 @@ function resolveNotificationHref(n: AppNotification): string | null {
     default:
       return null;
   }
+}
+
+/**
+ * The project a notification belongs to, read from the same link the click-through uses: the
+ * project-scoped types store "<projectId>:<entityId>", the page-level ones store the project id
+ * alone. Workspace-level types (members, integrations, projects list, invitations) belong to no
+ * project and yield null.
+ */
+const PROJECT_ID_ONLY_TYPES = new Set(["project", "project_members", "knowledge_base", "requirements", "zyra_chat", "zyra_task_board"]);
+const PROJECT_PREFIXED_TYPES = new Set(["test_run", "test_plan", "project_integration", "testcase", "zyra_task", "knowledge_document", "bug"]);
+function notificationProjectId(n: AppNotification): string | null {
+  const id = n.link_entity_id;
+  if (!id) return null;
+  if (PROJECT_ID_ONLY_TYPES.has(n.link_entity_type ?? "")) return id;
+  if (PROJECT_PREFIXED_TYPES.has(n.link_entity_type ?? "")) return id.split(":")[0] || null;
+  return null;
 }
 
 function getInitials(name: string): string {
@@ -434,14 +452,30 @@ export default function TopBar() {
                   </div>
                 {notifItems.map((n) => {
                   const href = resolveNotificationHref(n);
+                  // Which project it came from, so two projects raising similar notifications can be
+                  // told apart. A project the user can no longer see simply shows no label.
+                  const notifProjectId = notificationProjectId(n);
+                  const notifProject = notifProjectId ? projects.find((p) => p.id === notifProjectId) : undefined;
                   const body = (
                     <>
                       <p className="font-medium text-[var(--foreground)]">{n.title}</p>
                       {n.body && <p className="mt-0.5 text-[var(--muted-soft)]">{n.body}</p>}
                       {/* When it happened — through lib/date like every other timestamp in the app. */}
-                      <time dateTime={n.created_at} className="mt-1 block text-[11px] text-[var(--muted-soft)]">
-                        {formatDateTime(n.created_at)}
-                      </time>
+                      <p className="mt-1 flex items-center gap-1.5 text-[11px] text-[var(--muted-soft)]">
+                        <time dateTime={n.created_at}>{formatDateTime(n.created_at)}</time>
+                        {notifProject && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span
+                              data-testid="notification-project"
+                              title={notifProject.name}
+                              className="max-w-[120px] truncate rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-medium text-[var(--muted)]"
+                            >
+                              {notifProject.key}
+                            </span>
+                          </>
+                        )}
+                      </p>
                     </>
                   );
                   // No resolvable link (an unrecognized type, or an older/malformed row missing

@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, test } from "@playwright/test";
-import { dbControlAvailable, literal, scalar } from "../utils/psql";
+import { expect, request as newRequestContext, test, type APIRequestContext } from "@playwright/test";
+import { env } from "../utils/env";
+import { workspaceDays } from "../utils/due-dates";
+import { dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 import { softDeleteExecutions } from "../utils/screens-tenant";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -781,5 +783,272 @@ test.describe("plan and plan-item soft-delete (hard-delete remediation Phase 4)"
       await request.delete(`/api/plans/${plan.id}`, { failOnStatusCode: false });
       await request.delete(`/api/projects/${ctx.projectId}/testcases/${testcase.id}`, { failOnStatusCode: false });
     }
+  });
+});
+
+/*
+ * Start Date / optional Due Date on test plans.
+ *
+ * Rules pinned here: Start Date is required (the API defaults it to the creation day in the
+ * workspace's timezone), Due Date is optional and removable, Due Date may not precede Start Date,
+ * and "overdue" is worked out at read time from the stored due date against the workspace's today
+ * and from whether the plan is finished (it has runs and every one is Completed) — so moving the
+ * date or finishing the runs removes the mark with nothing to clear.
+ */
+test.describe("plan start / due dates", () => {
+  const dateKeys = (p: any) => ({ startDate: p.startDate, dueDate: p.dueDate });
+
+  async function mkPlan(request: APIRequestContext, data: Record<string, unknown>) {
+    const res = await request.post(`/api/projects/${ctx.projectId}/plans`, {
+      data: { name: `E2E Plan Dates ${Date.now()}-${Math.floor(Math.random() * 1e6)}`, ...data },
+      failOnStatusCode: false,
+    });
+    return { res, body: await res.json().catch(() => ({})) };
+  }
+  const rm = (request: APIRequestContext, id?: string) => (id ? request.delete(`/api/plans/${id}`, { failOnStatusCode: false }) : Promise.resolve());
+
+  test("PLN-D-01 a plan created with a start and due date returns both as plain days, from get and from the list", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { res, body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(7) });
+    try {
+      expect(res.status(), JSON.stringify(body)).toBeLessThan(300);
+      expect(dateKeys(body)).toEqual({ startDate: d.today, dueDate: d.inDays(7) });
+      const got = await (await request.get(`/api/plans/${body.id}`)).json();
+      expect(dateKeys(got), "a DATE must come back as YYYY-MM-DD, never an ISO timestamp").toEqual({ startDate: d.today, dueDate: d.inDays(7) });
+      const listed = (await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json()).find((p: any) => p.id === body.id);
+      expect(dateKeys(listed)).toEqual({ startDate: d.today, dueDate: d.inDays(7) });
+      expect(scalar(`SELECT due_date::text FROM plans WHERE id = ${literal(body.id)};`)).toBe(d.inDays(7));
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-02 with no dates given the start defaults to today in the workspace timezone and there is no due date", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, {});
+    try {
+      expect(body.startDate).toBe(d.today);
+      expect(body.dueDate).toBeNull();
+      expect(body.dueState).toBeNull();
+      expect(body.isOverdue).toBe(false);
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-03 a due date before the start date is refused on create, with the field named, and nothing is saved", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const name = `E2E Plan Inverted ${Date.now()}`;
+    const { res, body } = await mkPlan(request, { name, startDate: d.today, dueDate: d.yesterday });
+    try {
+      expect(res.status()).toBe(400);
+      expect(body.field).toBe("dueDate");
+      expect(body.error).toMatch(/earlier than the start date/i);
+      const list = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
+      expect(list.some((p: any) => p.name === name)).toBe(false);
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-04 a due date equal to the start date is allowed (a one-day plan)", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { res, body } = await mkPlan(request, { startDate: d.today, dueDate: d.today });
+    try {
+      expect(res.status()).toBeLessThan(300);
+      expect(body.dueState).toBe("due_today");
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  for (const bad of ["2026-02-30", "25/10/2026", "2026-1-5", "tomorrow", 20261025]) {
+    test(`PLN-D-05 a malformed due date (${JSON.stringify(bad)}) is a 400 on the field, not a 500`, async ({ request }) => {
+      const { res, body } = await mkPlan(request, { dueDate: bad });
+      try {
+        expect(res.status()).toBe(400);
+        expect(body.field).toBe("dueDate");
+      } finally {
+        await rm(request, body.id);
+      }
+    });
+  }
+
+  test("PLN-D-06 a malformed start date is a 400 on the field", async ({ request }) => {
+    const { res, body } = await mkPlan(request, { startDate: "not-a-date" });
+    try {
+      expect(res.status()).toBe(400);
+      expect(body.field).toBe("startDate");
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-07 dates can be changed after creation, and an update that names neither leaves them alone", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(3) });
+    try {
+      const patch = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.yesterday, dueDate: d.inDays(10) } });
+      expect(patch.ok(), await patch.text()).toBeTruthy();
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+
+      // A rename must not clear, reset or re-default either date.
+      await request.patch(`/api/plans/${body.id}`, { data: { name: `E2E Plan Renamed ${Date.now()}` } });
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-08 the due date can be cleared back to none with null, or with an empty string; the start date stays", async ({ request }) => {
+    const d = await workspaceDays(request);
+    for (const clear of [null, ""]) {
+      const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(5) });
+      try {
+        const patch = await request.patch(`/api/plans/${body.id}`, { data: { dueDate: clear } });
+        expect(patch.ok(), await patch.text()).toBeTruthy();
+        expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.today, dueDate: null });
+        expect(scalar(`SELECT due_date IS NULL FROM plans WHERE id = ${literal(body.id)};`)).toBe("t");
+      } finally {
+        await rm(request, body.id);
+      }
+    }
+  });
+
+  test("PLN-D-09 an update that would put the due date before the start date is refused and changes nothing, whichever side moves", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(5) });
+    try {
+      // Due moved before the STORED start…
+      const a = await request.patch(`/api/plans/${body.id}`, { data: { dueDate: d.yesterday }, failOnStatusCode: false });
+      expect(a.status()).toBe(400);
+      // …and start moved after the STORED due.
+      const b = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.inDays(6) }, failOnStatusCode: false });
+      expect(b.status()).toBe(400);
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json()), "refused updates must not land").toEqual({ startDate: d.today, dueDate: d.inDays(5) });
+      // Both given together are judged together, not each against the old value of the other.
+      const c = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.inDays(20), dueDate: d.inDays(25) } });
+      expect(c.ok(), await c.text()).toBeTruthy();
+      // A start moved past the due date is fine when the due date is cleared in the same call.
+      const e = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.inDays(40), dueDate: null } });
+      expect(e.ok(), await e.text()).toBeTruthy();
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.inDays(40), dueDate: null });
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-10 the start date cannot be removed once given", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today });
+    try {
+      for (const empty of [null, ""]) {
+        const res = await request.patch(`/api/plans/${body.id}`, { data: { startDate: empty }, failOnStatusCode: false });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).field).toBe("startDate");
+      }
+      expect((await (await request.get(`/api/plans/${body.id}`)).json()).startDate).toBe(d.today);
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-11 the database itself refuses an inverted range, so no other write path can store one", async ({ request }) => {
+    test.skip(!dbControlAvailable(), "needs psql access to the .env database");
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today });
+    try {
+      expect(() => exec(`UPDATE plans SET due_date = start_date - 1 WHERE id = ${literal(body.id)};`), "the CHECK constraint must reject it").toThrow();
+      expect(scalar(`SELECT due_date IS NULL FROM plans WHERE id = ${literal(body.id)};`)).toBe("t");
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-12 a plan with a past due date and no runs is Overdue; moving the date forward removes it; due today and tomorrow are flagged but not overdue", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.inDays(-5), dueDate: d.yesterday });
+    const read = async () => {
+      const got = await (await request.get(`/api/plans/${body.id}`)).json();
+      const listed = (await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json()).find((p: any) => p.id === body.id);
+      expect({ dueState: listed.dueState, isOverdue: listed.isOverdue }, "list and detail must agree").toEqual({ dueState: got.dueState, isOverdue: got.isOverdue });
+      return got;
+    };
+    try {
+      expect(await read()).toMatchObject({ dueState: "overdue", isOverdue: true });
+      await request.patch(`/api/plans/${body.id}`, { data: { dueDate: d.today } });
+      expect(await read()).toMatchObject({ dueState: "due_today", isOverdue: false });
+      await request.patch(`/api/plans/${body.id}`, { data: { dueDate: d.tomorrow } });
+      expect(await read()).toMatchObject({ dueState: "due_soon", isOverdue: false });
+      await request.patch(`/api/plans/${body.id}`, { data: { dueDate: d.inDays(30) } });
+      expect(await read()).toMatchObject({ dueState: null, isOverdue: false });
+      await request.patch(`/api/plans/${body.id}`, { data: { dueDate: d.yesterday } });
+      expect((await read()).isOverdue).toBe(true);
+      await request.patch(`/api/plans/${body.id}`, { data: { dueDate: null } });
+      expect(await read()).toMatchObject({ dueState: null, isOverdue: false });
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-13 a plan whose runs are all Completed is never Overdue; one open run makes it Overdue again", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body: plan } = await mkPlan(request, { startDate: d.inDays(-10), dueDate: d.yesterday });
+    const runIds: string[] = [];
+    const caseIds: string[] = [];
+    const mkRun = async () => {
+      const run = await (
+        await request.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Plan Dates Run ${Date.now()}`, environment: "staging", planId: plan.id } })
+      ).json();
+      runIds.push(run.id);
+      const tc = await (await request.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `E2E Plan Dates Case ${Date.now()}` } })).json();
+      caseIds.push(tc.id);
+      await request.post(`/api/cycles/${run.id}/testcases`, { data: { testcaseIds: [tc.id] } });
+      return run.id as string;
+    };
+    const overdue = async () => (await (await request.get(`/api/plans/${plan.id}`)).json()).isOverdue as boolean;
+    try {
+      const first = await mkRun();
+      expect(await overdue(), "a plan with an unfinished run past its due date is overdue").toBe(true);
+      await request.patch(`/api/cycles/${first}`, { data: { status: "In Progress" } });
+      await request.patch(`/api/cycles/${first}`, { data: { status: "Completed" } });
+      expect(await overdue(), "every run Completed means the plan is finished").toBe(false);
+      const listed = (await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json()).find((p: any) => p.id === plan.id);
+      expect(listed.isOverdue).toBe(false);
+      await mkRun();
+      expect(await overdue(), "a new open run reopens the plan").toBe(true);
+    } finally {
+      for (const id of runIds) await request.delete(`/api/cycles/${id}`, { failOnStatusCode: false });
+      for (const id of caseIds) await request.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await rm(request, plan.id);
+    }
+  });
+
+  test("PLN-D-14 another tenant, and a caller with no session, cannot read or change a plan's dates", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(4) });
+    const asB = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: path.join(__dirname, "../.auth/state-b.json") });
+    const anon = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    try {
+      for (const [who, api] of [["another tenant", asB], ["no session", anon]] as const) {
+        const patch = await api.patch(`/api/plans/${body.id}`, { data: { dueDate: d.inDays(99), startDate: d.inDays(90) }, failOnStatusCode: false });
+        expect([400, 401, 403, 404], `${who} must be refused`).toContain(patch.status());
+        const get = await api.get(`/api/plans/${body.id}`, { failOnStatusCode: false });
+        expect([400, 401, 403, 404], `${who} must not read it`).toContain(get.status());
+      }
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json()), "the refused writes must not have landed").toEqual({ startDate: d.today, dueDate: d.inDays(4) });
+    } finally {
+      await asB.dispose();
+      await anon.dispose();
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-15 deleting a plan takes it, and its dates, out of the list", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.yesterday });
+    await rm(request, body.id);
+    const list = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
+    expect(list.some((p: any) => p.id === body.id)).toBe(false);
   });
 });

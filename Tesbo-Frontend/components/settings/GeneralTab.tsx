@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { updateWorkspace } from "@/lib/api";
 import { countryOptions } from "@/lib/countries";
+import { timezoneOptions } from "@/lib/timezones";
 import { Button, Card, Field, FieldError, FieldHint, FieldLabel, Input, Select } from "@/components/ui";
 import { useAppData } from "@/components/app/AppDataProvider";
 
@@ -17,6 +18,9 @@ export default function GeneralTab() {
   const [country, setCountry] = useState(() => workspace?.country || "");
   const [savedCountry] = useState(() => workspace?.country || "");
   const countries = useMemo(() => countryOptions(), []);
+  const [timezone, setTimezone] = useState(() => workspace?.timezone || "Asia/Kolkata");
+  const [savedTimezone] = useState(() => workspace?.timezone || "Asia/Kolkata");
+  const timezones = useMemo(() => timezoneOptions(workspace?.timezone), [workspace?.timezone]);
   const [saving, setSaving] = useState(false);
   const [nameError, setNameError] = useState("");
   const [formError, setFormError] = useState(() => (workspace ? "" : "Failed to load workspace"));
@@ -36,10 +40,10 @@ export default function GeneralTab() {
       setNameError("Workspace name is required");
       return;
     }
-    if (trimmed === savedName && country === savedCountry) return;
+    if (trimmed === savedName && country === savedCountry && timezone === savedTimezone) return;
     setSaving(true);
     try {
-      await updateWorkspace({ name: trimmed, country });
+      await updateWorkspace({ name: trimmed, country, timezone });
       showToast("Workspace details updated");
       // Sidebar, workspace switcher, and this page's header all read the name
       // from separate client-side fetches — reload so they all pick it up.
@@ -105,12 +109,26 @@ export default function GeneralTab() {
             </FieldHint>
           </Field>
 
+          <Field>
+            <FieldLabel htmlFor="workspace-timezone">Timezone</FieldLabel>
+            <Select id="workspace-timezone" value={timezone} onChange={(e) => setTimezone(e.target.value)} disabled={saving}>
+              {timezones.map((zone) => (
+                <option key={zone} value={zone}>
+                  {zone}
+                </option>
+              ))}
+            </Select>
+            <FieldHint>
+              Plan and test run due dates, and their upcoming and overdue reminders, follow this timezone.
+            </FieldHint>
+          </Field>
+
           {formError && <FieldError>{formError}</FieldError>}
 
           <div className="flex justify-end">
             <Button
               type="submit"
-              disabled={saving || !name.trim() || (name.trim() === savedName && country === savedCountry)}
+              disabled={saving || !name.trim() || (name.trim() === savedName && country === savedCountry && timezone === savedTimezone)}
             >
               {saving ? "Saving…" : "Save changes"}
             </Button>

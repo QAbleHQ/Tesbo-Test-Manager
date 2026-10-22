@@ -73,3 +73,28 @@ export function toLocalDay(input: DateInput = new Date()): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
+
+/** A stored calendar day ("YYYY-MM-DD", no time, no zone) as "05 Oct 2026". Parsed as a plain day, never
+ *  through the viewer's timezone — `new Date("2026-10-05")` is UTC midnight and would render as the
+ *  4th west of Greenwich. Anything that is not a plain day falls through to formatDate. */
+export function formatDay(day: string | null | undefined, locale?: string): string {
+  if (!day) return "—";
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!match) return formatDate(day, locale);
+  const d = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  const p = partsOf(d, locale, { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
+  return `${p.day} ${p.month} ${p.year}`;
+}
+
+/** Today's calendar day ("YYYY-MM-DD") in an IANA timezone — what a workspace's "today" is, whatever the
+ *  viewer's own clock says. Falls back to the viewer's local day for a missing or unknown zone. */
+export function todayInZone(timeZone?: string | null, now: Date = new Date()): string {
+  if (timeZone) {
+    try {
+      return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
+    } catch {
+      // unknown zone — fall through to the local day
+    }
+  }
+  return toLocalDay(now);
+}
