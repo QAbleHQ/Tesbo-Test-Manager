@@ -355,12 +355,12 @@ test.describe("self-serve signup", () => {
     }
   });
 
-  test("SGN-OTP-05 the eleventh code in an hour is refused with 429, on both entry points", async () => {
+  test("SGN-OTP-05 the twenty-first code in an hour is refused with 429, on both entry points", async () => {
     const email = signupEmail("otp-cap");
     const normalized = email.toLowerCase();
     exec(
       `INSERT INTO otp_codes (email, code_hash, expires_at, used_at) ` +
-        `SELECT ${literal(normalized)}, 'e2e-cap-' || g, now() + interval '10 minutes', now() FROM generate_series(1, 10) g;`,
+        `SELECT ${literal(normalized)}, 'e2e-cap-' || g, now() + interval '10 minutes', now() FROM generate_series(1, 20) g;`,
     );
     try {
       const login = await anon.post("/api/auth/otp/request", { data: { email }, failOnStatusCode: false });
@@ -372,7 +372,7 @@ test.describe("self-serve signup", () => {
       expect(signup.status()).toBe(429);
       expect(JSON.stringify(await signup.json())).toContain("otp_rate_limited");
 
-      expect(Number(scalar(`SELECT COUNT(*) FROM otp_codes WHERE email = ${literal(normalized)};`)), "a refused request still issued a code").toBe(10);
+      expect(Number(scalar(`SELECT COUNT(*) FROM otp_codes WHERE email = ${literal(normalized)};`)), "a refused request still issued a code").toBe(20);
       // A refused request is not a failed login: it must not feed the 24-hour password lockout.
       expect(Number(scalar(`SELECT COUNT(*) FROM otp_rate_limit WHERE email = ${literal(`login:${normalized}`)};`))).toBe(0);
     } finally {

@@ -12,6 +12,7 @@ import {
   IconBug,
   IconClipboardCheck,
   IconClock,
+  IconCompass,
   IconDatabase,
   IconGitCompare,
   IconListCheck,
@@ -178,7 +179,7 @@ export default function AgentsPage() {
     );
   }
 
-  const totalAgentCount = 1 + futureAgents.length;
+  const totalAgentCount = 2 + futureAgents.length; // Zyra, NYRA, and the placeholders
 
   return (
     <ListWorkspaceLayout
@@ -256,6 +257,39 @@ export default function AgentsPage() {
             </div>
           </div>
         </button>
+
+        {/* Plan gating lives on the NYRA page and the API, so the card is the same for every plan. */}
+        <Link
+          href={`/projects/${projectId}/agents/nyra`}
+          data-testid="agent-card-nyra"
+          className="group flex h-full flex-col overflow-hidden rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface)] text-left transition hover:border-[var(--brand-primary)] hover:shadow-[var(--shadow-card)]"
+        >
+          <div className="h-[3px] shrink-0" style={{ background: "linear-gradient(90deg, var(--brand-primary), var(--accent-light))" }} />
+          <div className="flex flex-1 flex-col p-5">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl"
+                style={{ background: "linear-gradient(135deg, var(--brand-primary), var(--accent-light))" }}
+              >
+                <IconCompass size={22} stroke={1.75} className="text-white" />
+              </div>
+              <StatusChip tone="neutral">Pro</StatusChip>
+            </div>
+
+            <h3 className="text-[15px] font-semibold text-[var(--foreground)]">NYRA</h3>
+            <p className="mt-0.5 text-xs text-[var(--muted-soft)]">App exploration agent</p>
+            <p className="mt-3 flex-1 text-[13px] leading-6 text-[var(--muted)]">
+              Explores your app, with an optional test account to sign in, and records what it finds. Each NYRA project covers one app.
+            </p>
+
+            <div className="mt-4 flex items-center justify-end border-t border-[var(--border-subtle)] pt-3">
+              <span className="inline-flex items-center gap-1 text-[12px] font-medium text-[var(--accent-light)]">
+                Open agent
+                <IconArrowRight size={13} stroke={1.75} />
+              </span>
+            </div>
+          </div>
+        </Link>
 
         {futureAgents.map((agent) => (
           <div key={agent.name} className="flex h-full flex-col overflow-hidden rounded-[10px] border border-[var(--border-subtle)] bg-[var(--surface)] opacity-70">

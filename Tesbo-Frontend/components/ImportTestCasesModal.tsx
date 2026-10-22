@@ -10,6 +10,7 @@ import {
   type CustomFieldDefinition,
 } from "@/lib/api";
 import { validateCustomFieldValue } from "@/components/customFields/customFieldTypes";
+import { restoreNeutralized } from "@/lib/spreadsheet";
 
 type ImportStep = "upload" | "mapping" | "result";
 type ParsedSheet = {
@@ -287,7 +288,8 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
     // here instead and handed over as a string, which SheetJS leaves alone. Invalid UTF-8 means a
     // legacy Windows export — Russian Excel writes windows-1251 — so fall back to that.
     let workbook: import("xlsx").WorkBook;
-    if (/\.csv$/i.test(inputFile.name)) {
+    const isCsv = /\.csv$/i.test(inputFile.name);
+    if (isCsv) {
       let text: string;
       try {
         text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
@@ -307,7 +309,13 @@ export default function ImportTestCasesModal({ projectId, open, onClose, onImpor
         raw: false,
       });
       const rows = rawRows
-        .map((row) => row.map((cell) => String(cell ?? "").trim()))
+        // A CSV exported by Tesbo has a quote in front of any cell that could be read as a formula;
+        // taking it off here is what makes export -> import give back the original text. Headers go
+        // through it too. Not applied to .xlsx, whose export writes no such quote.
+        .map((row) => row.map((cell) => {
+          const text = String(cell ?? "");
+          return (isCsv ? restoreNeutralized(text) : text).trim();
+        }))
         .filter((row) => row.some(Boolean));
       const headerRowIndex = rows.findIndex((row) => row.some((cell) => {
         const normalized = normalizeHeader(cell);

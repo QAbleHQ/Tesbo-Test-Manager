@@ -4020,30 +4020,50 @@ test.describe("bug due date", () => {
     expect(bugs.some((b: { title: string }) => b.title === title), "nothing was filed by the refused attempt").toBe(false);
   });
 
-  test("BUG-U-123 Edit Bug will not take a due date before the day the bug was reported", async ({ page }) => {
+  test("BUG-U-123 Edit Bug will not take a due date before today", async ({ page }) => {
     const bug = await seed("EditMin", { dueDate: "2031-06-20" });
     try {
       await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
       const form = page.getByRole("region", { name: "Edit bug" });
       const due = form.getByLabel("Due date");
-      const reportedDay = (await (await api.get(`/api/bugs/${bug.id}`)).json()).createdAt as string;
-      await expect(due).toHaveAttribute("min", /^\d{4}-\d{2}-\d{2}$/);
-      // The reported day is the floor: it is the same calendar day as createdAt in the browser's zone.
-      const expectedMin = await page.evaluate((iso) => {
-        const d = new Date(iso);
+      // Today, not the day the bug was reported: a bug filed last week cannot be given a past date.
+      const today = await page.evaluate(() => {
+        const d = new Date();
         const pad = (n: number) => String(n).padStart(2, "0");
         return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-      }, reportedDay);
-      await expect(due).toHaveAttribute("min", expectedMin);
+      });
+      await expect(due).toHaveAttribute("min", today);
 
       await due.fill("2001-01-01");
       await expect(form.getByTestId("due-date-error")).toBeVisible();
       await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
       expect((await (await api.get(`/api/bugs/${bug.id}`)).json()).dueDate, "nothing was saved").toBe("2031-06-20");
 
-      await due.fill("2031-07-01");
+      await due.fill(today);
       await expect(form.getByTestId("due-date-error")).toHaveCount(0);
       await expect(page.getByRole("button", { name: "Save Changes" })).toBeEnabled();
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("BUG-U-128 a bug whose due date has passed can still be edited, as long as the date is left alone", async ({ page }) => {
+    test.skip(!dbControlAvailable(), "needs DB access to back-date a due date");
+    const bug = await seed("EditOverdue", { dueDate: "2031-06-20" });
+    try {
+      // Stands in for time passing — the API refuses to set a past date.
+      exec(`UPDATE bugs SET due_date = ${literal("2020-01-01")}::date WHERE id = ${literal(bug.id)}`);
+      await page.goto(`/projects/${projectId}/bugs/${bug.id}?edit=1`);
+      const form = page.getByRole("region", { name: "Edit bug" });
+      const due = form.getByLabel("Due date");
+      await expect(due).toHaveValue("2020-01-01");
+      // Untouched, the old date is not an error and the form saves.
+      await expect(form.getByTestId("due-date-error")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Save Changes" })).toBeEnabled();
+      // Picking a different past date is.
+      await due.fill("2020-02-02");
+      await expect(form.getByTestId("due-date-error")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
     } finally {
       await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }

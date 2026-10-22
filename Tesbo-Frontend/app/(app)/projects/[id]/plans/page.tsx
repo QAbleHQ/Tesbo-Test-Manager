@@ -10,6 +10,8 @@ import {
   type PlanListItem,
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
+import { todayInZone } from "@/lib/date";
+import { DateRangeFields, dateRangeError } from "@/components/testplans/DueDates";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import {
@@ -117,7 +119,7 @@ export default function PlansPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const projectId = params.id as string;
-  const { currentUser } = useAppData();
+  const { currentUser, workspace } = useAppData();
   const { project, projectMembers } = useProjectData();
   const projectName = String(project.name || "");
   const canManagePlans = useMemo(() => {
@@ -142,6 +144,9 @@ export default function PlansPage() {
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
   const [newRelease, setNewRelease] = useState("");
+  // Start Date is required and defaults to today in the workspace's timezone; Due Date is optional.
+  const [newStartDate, setNewStartDate] = useState(() => todayInZone(workspace?.timezone));
+  const [newDueDate, setNewDueDate] = useState("");
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
@@ -188,7 +193,7 @@ export default function PlansPage() {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    if (!newName.trim()) return;
+    if (!newName.trim() || !newStartDate || dateRangeError(newStartDate, newDueDate)) return;
     setCreating(true);
     setCreateError(null);
     try {
@@ -196,6 +201,8 @@ export default function PlansPage() {
         name: newName.trim(),
         description: newDesc.trim() || undefined,
         targetRelease: newRelease.trim() || undefined,
+        startDate: newStartDate,
+        dueDate: newDueDate || null,
       });
       router.push(`/projects/${projectId}/plans/${p.id}`);
       router.refresh();
@@ -328,6 +335,16 @@ export default function PlansPage() {
                   placeholder="e.g. v2.1.0"
                 />
               </Field>
+              <div className="sm:col-span-2">
+                <DateRangeFields
+                  idPrefix="new-plan"
+                  startDate={newStartDate}
+                  dueDate={newDueDate}
+                  onStartDateChange={setNewStartDate}
+                  onDueDateChange={setNewDueDate}
+                  disabled={creating}
+                />
+              </div>
             </div>
             {createError && (
               <p className="mt-3 rounded-lg border border-[var(--error)]/30 bg-[var(--error)]/10 px-3 py-2 text-sm text-[var(--error-foreground)]">
@@ -335,13 +352,13 @@ export default function PlansPage() {
               </p>
             )}
             <div className="flex items-center gap-3 mt-4">
-              <Button type="submit" disabled={creating || !newName.trim()}>
+              <Button type="submit" disabled={creating || !newName.trim() || !newStartDate || !!dateRangeError(newStartDate, newDueDate)}>
                 {creating ? "Creating..." : "Create Test Plan"}
               </Button>
               <Button
                 type="button"
                 variant="secondary"
-                onClick={() => { setShowCreate(false); setNewName(""); setNewDesc(""); setNewRelease(""); setCreateError(null); }}
+                onClick={() => { setShowCreate(false); setNewName(""); setNewDesc(""); setNewRelease(""); setNewStartDate(todayInZone(workspace?.timezone)); setNewDueDate(""); setCreateError(null); }}
               >
                 Cancel
               </Button>

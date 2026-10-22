@@ -55,6 +55,14 @@ export class PasswordResetService {
     // whoever (or whatever) stole the old password would keep their session alive right through it.
     await this.db.query("DELETE FROM sessions WHERE user_id = $1", [row.user_id]);
     await this.sessionCache.invalidateAllForUser(row.user_id);
+    // The same reasoning covers API tokens. A reset is what someone does once they suspect the account
+    // is compromised, and a token an attacker minted would otherwise outlive it: sessions die here, a
+    // token (90-day expiry) would not. Every project's tokens for this user go, because the attacker
+    // could have minted one on any project the user belongs to. The cost is deliberate: a pipeline
+    // running on a token its owner issued stops until a new one is created. Only a reset does this; a
+    // password CHANGE keeps tokens, as it keeps the session that made it, because the caller proved
+    // they hold the current password.
+    await this.db.query("DELETE FROM api_tokens WHERE user_id = $1", [row.user_id]);
 
     // Forgot Password exception: completing a reset clears this email's failed-login lockout too,
     // so a blocked account isn't still blocked from using the very password it just set.

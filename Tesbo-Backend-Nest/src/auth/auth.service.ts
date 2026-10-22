@@ -16,6 +16,7 @@ import { SuperAdminService } from "../admin/super-admin.service";
 import { validateMobileNumber } from "../common/mobile-number.util";
 import { EmailService } from "./email.service";
 import { LoginLockoutService } from "./login-lockout.service";
+import { LIMITS, RateLimitService, clientKey } from "../rate-limit/rate-limit.service";
 import { OtpRateLimitedException, OtpService } from "./otp.service";
 import { PasswordResetService } from "./password-reset.service";
 import { PasswordService } from "./password.service";
@@ -31,7 +32,8 @@ export class AuthService {
     private readonly email: EmailService,
     private readonly audit: AuditService,
     private readonly superAdmin: SuperAdminService,
-    private readonly lockout: LoginLockoutService
+    private readonly lockout: LoginLockoutService,
+    private readonly rateLimit: RateLimitService
   ) {}
 
   /*
@@ -49,6 +51,9 @@ export class AuthService {
     if (activeLock) {
       throw new HttpException({ error: this.lockedMessage(activeLock) }, HttpStatus.TOO_MANY_REQUESTS);
     }
+    // Mail-bombing many addresses from one place. Counted per request because a code email has no
+    // "failure" to wait for; the cap is far above anyone signing in.
+    await this.rateLimit.hit(LIMITS.otpRequestsPerIp, clientKey(this.ip(req)));
 
     let sent = false;
     try {
@@ -80,14 +85,21 @@ export class AuthService {
       throw new HttpException({ error: this.lockedMessage(activeLock) }, HttpStatus.TOO_MANY_REQUESTS);
     }
 
+    // One address trying codes against many accounts. Only failures are counted, so a correct code is
+    // never held up by it, and the account's own 5-failure lockout is untouched.
+    const source = clientKey(this.ip(req));
+    await this.rateLimit.assertAllowed(LIMITS.otpLoginFailuresPerIp, source);
+
     const token = await this.otp.verifyOtp(email.trim(), code, this.ip(req), req.get("user-agent"));
     if (!token) {
       await this.lockout.recordFailedAttempt(normalizedEmail);
+      await this.rateLimit.recordFailure(LIMITS.otpLoginFailuresPerIp, source);
       throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
     }
     const userId = await this.otp.resolveSession(token);
     if (!userId) {
       await this.lockout.recordFailedAttempt(normalizedEmail);
+      await this.rateLimit.recordFailure(LIMITS.otpLoginFailuresPerIp, source);
       throw new UnauthorizedException({ error: "invalid_or_expired_otp" });
     }
     await this.lockout.clear(normalizedEmail);
@@ -97,17 +109,30 @@ export class AuthService {
   }
 
   async loginWithPassword(email: string | undefined, password: string | undefined, req: AuthenticatedRequest, res: Response) {
-    if (!email || !password) throw new BadRequestException({ error: "email and password required" });
+    // typeof, not truthiness: a number or object used to reach .trim() and answer 500. The length caps
+    // keep an absurd value from being hashed at all; no real email or password is anywhere near them.
+    if (typeof email !== "string" || typeof password !== "string" || !email || !password) {
+      throw new BadRequestException({ error: "email and password required" });
+    }
+    if (email.length > 255 || password.length > 1024) throw new BadRequestException({ error: "email or password is too long" });
     const normalizedEmail = email.trim().toLowerCase();
+
+    // Credential stuffing: one address trying many accounts. The per-account lockout cannot see that,
+    // because every account gets only one or two tries. Only FAILED logins are counted, so signing in
+    // successfully never uses any of the allowance, however many people share an address.
+    const source = clientKey(this.ip(req));
+    await this.rateLimit.assertAllowed(LIMITS.loginFailuresPerIp, source);
 
     const result = await this.password.verifyLogin(email, password);
     if (result.outcome === "not_found") {
+      await this.rateLimit.recordFailure(LIMITS.loginFailuresPerIp, source);
       throw new UnauthorizedException({ error: "No account found with that email address" });
     }
     if (result.outcome === "locked") {
       throw new HttpException({ error: this.lockedMessage(result.lockedUntil) }, HttpStatus.TOO_MANY_REQUESTS);
     }
     if (result.outcome === "invalid_password") {
+      await this.rateLimit.recordFailure(LIMITS.loginFailuresPerIp, source);
       throw new UnauthorizedException({ error: "invalid_email_or_password" });
     }
     const userId = result.userId;
@@ -119,22 +144,46 @@ export class AuthService {
   }
 
   async forgotPassword(email: string | undefined, req: AuthenticatedRequest): Promise<void> {
-    if (!email) throw new BadRequestException({ error: "email required" });
+    if (typeof email !== "string" || !email.trim()) throw new BadRequestException({ error: "email required" });
+    if (email.length > 255) throw new BadRequestException({ error: "email is too long" });
+    const source = clientKey(this.ip(req));
+    // One address asking about many emails to learn which are registered (the answer below names them).
+    await this.rateLimit.assertAllowed(LIMITS.forgotUnknownPerIp, source);
+    // Mail-bombing one address. The tight cap is per email AND source, so a stranger asking for your
+    // email cannot use up your allowance; the loose one across all sources only stops a botnet.
+    const emailKey = email.trim().toLowerCase();
+    await this.rateLimit.hit(LIMITS.forgotPerEmailPerIp, `${emailKey}|${source}`);
+    await this.rateLimit.hit(LIMITS.forgotPerEmail, emailKey);
     const outcome = await this.passwordReset.requestReset(email);
-    if (outcome === "not_found") throw new NotFoundException({ error: "No account found with that email address" });
+    if (outcome === "not_found") {
+      await this.rateLimit.recordFailure(LIMITS.forgotUnknownPerIp, source);
+      throw new NotFoundException({ error: "No account found with that email address" });
+    }
     await this.audit.log(null, "password_reset_requested", "auth", email.trim().toLowerCase(), "{}", this.ip(req), req.get("user-agent"));
   }
 
-  async checkResetToken(token: string | undefined): Promise<{ valid: boolean }> {
+  async checkResetToken(token: string | undefined, req: AuthenticatedRequest): Promise<{ valid: boolean }> {
     if (!token) return { valid: false };
-    return { valid: await this.passwordReset.verifyResetToken(token) };
+    // Guessing reset links. A valid link, or the user's own, never counts against the address.
+    const source = clientKey(this.ip(req));
+    await this.rateLimit.assertAllowed(LIMITS.resetTokenFailuresPerIp, source);
+    const valid = await this.passwordReset.verifyResetToken(token);
+    if (!valid) await this.rateLimit.recordFailure(LIMITS.resetTokenFailuresPerIp, source);
+    return { valid };
   }
 
   async resetPassword(token: string | undefined, password: string | undefined, req: AuthenticatedRequest): Promise<{ ok: true }> {
-    if (!token || !password) throw new BadRequestException({ error: "token and password required" });
+    if (typeof token !== "string" || typeof password !== "string" || !token || !password) {
+      throw new BadRequestException({ error: "token and password required" });
+    }
     this.password.assertValidPassword(password);
+    const source = clientKey(this.ip(req));
+    await this.rateLimit.assertAllowed(LIMITS.resetTokenFailuresPerIp, source);
     const userId = await this.passwordReset.resetPassword(token, password);
-    if (!userId) throw new UnauthorizedException({ error: "invalid_or_expired_token" });
+    if (!userId) {
+      await this.rateLimit.recordFailure(LIMITS.resetTokenFailuresPerIp, source);
+      throw new UnauthorizedException({ error: "invalid_or_expired_token" });
+    }
     await this.audit.log(userId, "password_reset", "auth", null, "{}", this.ip(req), req.get("user-agent"));
     return { ok: true };
   }
@@ -153,9 +202,17 @@ export class AuthService {
     // this doubles as "set a password for the first time" for them. Anyone with a password
     // already must prove they know it before it can be changed.
     if (await this.password.hasPassword(userId)) {
-      if (!currentPassword) throw new BadRequestException({ error: "current password required" });
+      if (typeof currentPassword !== "string" || !currentPassword) throw new BadRequestException({ error: "current password required" });
+      if (currentPassword.length > 1024) throw new BadRequestException({ error: "current password is too long" });
+      // A stolen session guessing the account's password through this form: the one place a password
+      // could be tried with no lockout at all. Ten wrong tries in 15 minutes is far beyond a person
+      // who forgot, and only wrong tries count.
+      await this.rateLimit.assertAllowed(LIMITS.changePasswordFailuresPerUser, userId);
       const valid = await this.password.verifyCurrentPassword(userId, currentPassword);
-      if (!valid) throw new UnauthorizedException({ error: "invalid_current_password" });
+      if (!valid) {
+        await this.rateLimit.recordFailure(LIMITS.changePasswordFailuresPerUser, userId);
+        throw new UnauthorizedException({ error: "invalid_current_password" });
+      }
       if (newPassword === currentPassword) {
         throw new BadRequestException({ error: "New password must be different from your current password" });
       }

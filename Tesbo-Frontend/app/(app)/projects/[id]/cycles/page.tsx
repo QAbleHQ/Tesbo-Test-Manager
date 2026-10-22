@@ -32,6 +32,8 @@ import {
   getTestRunEnvironments,
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
+import { todayInZone } from "@/lib/date";
+import { DateRangeFields, DateRangeSummary, dateRangeError } from "@/components/testplans/DueDates";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import {
@@ -106,7 +108,7 @@ export default function TestRunsPage() {
   const params = useParams();
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { currentUser } = useAppData();
+  const { currentUser, workspace } = useAppData();
   const { project, projectMembers } = useProjectData();
   const projectId = params.id as string;
   const projectName = String(project.name || "");
@@ -134,6 +136,9 @@ export default function TestRunsPage() {
   const [description, setDescription] = useState("");
   const [environment, setEnvironment] = useState("");
   const [buildVersion, setBuildVersion] = useState("");
+  // Start Date is required (defaults to today in the workspace's timezone); Due Date is optional.
+  const [startDate, setStartDate] = useState(() => todayInZone(workspace?.timezone));
+  const [dueDate, setDueDate] = useState("");
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -229,11 +234,11 @@ export default function TestRunsPage() {
   /* create */
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    if (!name.trim() || !environment.trim()) return;
+    if (!name.trim() || !environment.trim() || !startDate || dateRangeError(startDate, dueDate)) return;
     setSaving(true);
     setFormError(null);
     try {
-      await createTestRun(projectId, { name, description, environment, buildVersion });
+      await createTestRun(projectId, { name, description, environment, buildVersion, startDate, dueDate: dueDate || null });
       setShowCreate(false);
       resetForm();
       load();
@@ -251,15 +256,18 @@ export default function TestRunsPage() {
     setDescription(r.description);
     setEnvironment(r.environment);
     setBuildVersion(r.buildVersion);
+    setStartDate(r.startDate ?? todayInZone(workspace?.timezone));
+    setDueDate(r.dueDate ?? "");
   }
 
   async function handleEdit(e: React.FormEvent) {
     e.preventDefault();
-    if (!editRun || !environment.trim()) return;
+    if (!editRun || !environment.trim() || !startDate || dateRangeError(startDate, dueDate)) return;
     setSaving(true);
     setFormError(null);
     try {
-      await updateTestRun(editRun.id, { name, description, environment, buildVersion });
+      // dueDate null removes the due date; the server recomputes reminders from whatever is stored.
+      await updateTestRun(editRun.id, { name, description, environment, buildVersion, startDate, dueDate: dueDate || null });
       setEditRun(null);
       resetForm();
       load();
@@ -291,6 +299,8 @@ export default function TestRunsPage() {
     setDescription("");
     setEnvironment("");
     setBuildVersion("");
+    setStartDate(todayInZone(workspace?.timezone));
+    setDueDate("");
   }
 
   if (loading) {
@@ -478,6 +488,11 @@ export default function TestRunsPage() {
                           {formatDate(r.createdAt)}
                         </span>
                       </div>
+                      {(r.startDate || r.dueDate) && (
+                        <div className="mt-1">
+                          <DateRangeSummary startDate={r.startDate} dueDate={r.dueDate} dueState={r.dueState} className="inline-flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-[var(--muted-soft)]" />
+                        </div>
+                      )}
                     </div>
 
                     {ownerName && <OwnerAvatar name={ownerName} seed={r.ownerId} />}
@@ -634,6 +649,14 @@ export default function TestRunsPage() {
               />
             </Field>
           </div>
+          <DateRangeFields
+            idPrefix="new-run"
+            startDate={startDate}
+            dueDate={dueDate}
+            onStartDateChange={setStartDate}
+            onDueDateChange={setDueDate}
+            disabled={saving}
+          />
           {formError && (
             <p className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">
               {formError}
@@ -649,7 +672,7 @@ export default function TestRunsPage() {
             </Button>
             <Button
               type="submit"
-              disabled={saving || !name.trim() || !environment.trim() || environmentOptions.length === 0}
+              disabled={saving || !name.trim() || !environment.trim() || environmentOptions.length === 0 || !startDate || !!dateRangeError(startDate, dueDate)}
             >
               {saving ? "Creating…" : "Create Test Run"}
             </Button>
@@ -716,6 +739,14 @@ export default function TestRunsPage() {
               />
             </Field>
           </div>
+          <DateRangeFields
+            idPrefix="edit-run"
+            startDate={startDate}
+            dueDate={dueDate}
+            onStartDateChange={setStartDate}
+            onDueDateChange={setDueDate}
+            disabled={saving}
+          />
           {formError && (
             <p className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">
               {formError}
@@ -735,7 +766,7 @@ export default function TestRunsPage() {
             </Button>
             <Button
               type="submit"
-              disabled={saving || !environment.trim()}
+              disabled={saving || !environment.trim() || !startDate || !!dateRangeError(startDate, dueDate)}
             >
               {saving ? "Saving…" : "Save Changes"}
             </Button>

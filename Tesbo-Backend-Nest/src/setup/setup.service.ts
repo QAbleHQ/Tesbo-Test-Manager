@@ -47,7 +47,7 @@ export class SetupService {
     const email = body.email.trim().toLowerCase();
     const orgName = body.orgName.trim();
     const orgSlug = this.slugify(orgName);
-    const passwordHash = this.password.hashPassword(body.password);
+    const passwordHash = await this.password.hashPassword(body.password);
 
     try {
       const result = await this.db.transaction(async (client) => {

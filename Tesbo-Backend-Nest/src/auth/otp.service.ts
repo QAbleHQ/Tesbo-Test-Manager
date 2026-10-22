@@ -9,9 +9,9 @@ import { ACTIVITY_TZ } from "./user-activity.service";
 
 // A 6-digit code has 1M values, so the guess budget has to be per code, not per caller: signup and
 // invite verification share verifyOtpCode and have no other limiter. Five guesses per code, and at
-// most ten codes per email per hour, caps a blind attacker at 50 guesses an hour per email (0.005%).
+// most twenty codes per email per hour, caps a blind attacker at 100 guesses an hour per email (0.01%).
 const MAX_VERIFY_ATTEMPTS = 5;
-const MAX_REQUESTS_PER_HOUR = 10;
+const MAX_REQUESTS_PER_HOUR = 20;
 const MAX_CODE_LENGTH = 64;
 
 /** Too many codes requested for one email. Callers must let this through, not report it as a delivery failure. */

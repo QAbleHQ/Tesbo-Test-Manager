@@ -2,6 +2,9 @@ import { createHash } from "crypto";
 import { ApiTokenService } from "./api-token.service";
 import { DatabaseService } from "../database/database.service";
 
+// Nest's HttpException keeps the { error } body on `.response`; `.message` is only the class name.
+const refusal = (pattern: RegExp) => ({ response: { error: expect.stringMatching(pattern) } });
+
 function makeDb(rows: Record<string, unknown>[] = [], rowCount?: number) {
   const query = jest.fn().mockResolvedValue({ rows, rowCount: rowCount ?? rows.length });
   return { db: { query } as unknown as DatabaseService, query };
@@ -50,13 +53,78 @@ describe("ApiTokenService", () => {
       expect(result.scopes).toEqual(["read", "write"]);
     });
 
-    it("defaults to read+write when no valid scopes supplied", async () => {
-      const { db, query } = makeDb([
-        { id: "t", name: "n", scopes: "read,write", token_hash: "a".repeat(64), last_used_at: null, created_at: "now" }
-      ]);
-      const svc = new ApiTokenService(db);
-      await svc.issueToken("u", "p", "n", "bogus,delete");
-      expect(query.mock.calls[0][1][4]).toBe("read,write");
+    const tokenRow = { id: "t", name: "n", scopes: "read,write", token_hash: "a".repeat(64), last_used_at: null, created_at: "now", expires_at: "later" };
+
+    it("defaults to read+write when no scopes are supplied", async () => {
+      for (const absent of [undefined, null, "", [], " , "]) {
+        const { db, query } = makeDb([tokenRow]);
+        await new ApiTokenService(db).issueToken("u", "p", "n", absent);
+        expect(query.mock.calls[0][1][4]).toBe("read,write");
+      }
+    });
+
+    it("refuses a scope that is not read or write instead of quietly granting read+write", async () => {
+      // This used to fall back to read+write, so a typo or an attempt at "admin" got MORE than asked.
+      for (const bad of ["bogus,delete", "admin", ["reed"], "read,admin"]) {
+        const { db, query } = makeDb([tokenRow]);
+        await expect(new ApiTokenService(db).issueToken("u", "p", "n", bad)).rejects.toMatchObject(refusal(/Unknown scope/));
+        expect(query).not.toHaveBeenCalled();
+      }
+    });
+
+    it("normalises case and duplicates", async () => {
+      const { db, query } = makeDb([tokenRow]);
+      await new ApiTokenService(db).issueToken("u", "p", "n", [" READ ", "read"]);
+      expect(query.mock.calls[0][1][4]).toBe("read");
+    });
+
+    it("expires in 90 days unless told otherwise", async () => {
+      const { db, query } = makeDb([tokenRow]);
+      await new ApiTokenService(db).issueToken("u", "p", "n");
+      expect(query.mock.calls[0][1][5]).toBe(90);
+    });
+
+    it("accepts 1 to 365 days, as a number or a numeric string", async () => {
+      for (const [input, expected] of [[1, 1], [365, 365], ["30", 30], [" 7 ", 7]] as const) {
+        const { db, query } = makeDb([tokenRow]);
+        await new ApiTokenService(db).issueToken("u", "p", "n", undefined, input);
+        expect(query.mock.calls[0][1][5]).toBe(expected);
+      }
+    });
+
+    it("refuses an expiry that is zero, negative, fractional, too long or not a number", async () => {
+      for (const bad of [0, -1, 1.5, 366, 10_000, "abc", NaN, Infinity, {}, [], true]) {
+        const { db, query } = makeDb([tokenRow]);
+        await expect(new ApiTokenService(db).issueToken("u", "p", "n", undefined, bad)).rejects.toMatchObject(refusal(/expiresInDays/));
+        expect(query).not.toHaveBeenCalled();
+      }
+    });
+
+    it("refuses a name longer than the column instead of surfacing a Postgres 500", async () => {
+      const { db, query } = makeDb([tokenRow]);
+      await expect(new ApiTokenService(db).issueToken("u", "p", "x".repeat(129))).rejects.toMatchObject(refusal(/at most 128/));
+      expect(query).not.toHaveBeenCalled();
+      await expect(new ApiTokenService(makeDb([tokenRow]).db).issueToken("u", "p", "x".repeat(128))).resolves.toBeTruthy();
+    });
+
+    it("answers 409 when the project already has the maximum active tokens (the INSERT returns no row)", async () => {
+      const { db, query } = makeDb([]);
+      await expect(new ApiTokenService(db).issueToken("u", "p", "n")).rejects.toMatchObject(refusal(/25 active API tokens/));
+      // The cap lives in the same statement as the insert, so there is no count-then-insert gap.
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(query.mock.calls[0][0]).toMatch(/INSERT INTO api_tokens[\s\S]*WHERE \(SELECT count\(\*\)/);
+      expect(query.mock.calls[0][1][6]).toBe(25);
+    });
+
+    it("counts only unexpired tokens against the cap, so expired ones never block a new one", async () => {
+      const { db, query } = makeDb([tokenRow]);
+      await new ApiTokenService(db).issueToken("u", "p", "n");
+      expect(query.mock.calls[0][0]).toMatch(/expires_at IS NULL OR expires_at > now\(\)/);
+    });
+
+    it("returns the expiry with the summary", async () => {
+      const { db } = makeDb([tokenRow]);
+      expect((await new ApiTokenService(db).issueToken("u", "p", "n")).expiresAt).toBe("later");
     });
   });
 
@@ -81,6 +149,23 @@ describe("ApiTokenService", () => {
     it("returns null when no matching token row exists", async () => {
       const { db } = makeDb([]);
       expect(await new ApiTokenService(db).authenticate("tsbo_missing")).toBeNull();
+    });
+
+    it("only accepts a token that is unexpired, whose user is still on an unarchived project", async () => {
+      const { db, query } = makeDb([]);
+      await new ApiTokenService(db).authenticate("tsbo_x");
+      const sql = query.mock.calls[0][0] as string;
+      // Expiry, membership and archive state are all decided in the lookup, so there is no path that
+      // authenticates first and checks later.
+      expect(sql).toMatch(/expires_at IS NULL OR t\.expires_at > now\(\)/);
+      expect(sql).toMatch(/JOIN project_members pm ON pm\.project_id = t\.project_id AND pm\.user_id = t\.user_id/);
+      expect(sql).toMatch(/JOIN projects p ON p\.id = t\.project_id AND p\.archived_at IS NULL/);
+    });
+
+    it("does not stamp last_used_at for a token that failed to authenticate", async () => {
+      const { db, query } = makeDb([]);
+      await new ApiTokenService(db).authenticate("tsbo_expired");
+      expect(query).toHaveBeenCalledTimes(1);
     });
 
     it("maps a matching row to a principal and stamps last_used_at", async () => {

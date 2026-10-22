@@ -44,8 +44,8 @@ export class AuthController {
   }
 
   @Get("/password/reset/:token")
-  checkResetToken(@Param("token") token: string) {
-    return this.auth.checkResetToken(token);
+  checkResetToken(@Param("token") token: string, @Req() req: AuthenticatedRequest) {
+    return this.auth.checkResetToken(token, req);
   }
 
   @Post("/password/reset")

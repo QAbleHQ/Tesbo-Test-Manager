@@ -405,6 +405,15 @@ export class PlanLimitsService {
     }
   }
 
+  async assertNyraEnabled(organizationId: string): Promise<void> {
+    const { effectivePlan } = await this.getEntitlement(organizationId);
+    if (effectivePlan !== "pro") {
+      throw new ForbiddenException({
+        error: "NYRA is a Pro plan feature. Upgrade to Pro to create and manage NYRA projects."
+      });
+    }
+  }
+
   async assertIntegrationAllowed(organizationId: string, provider: string): Promise<void> {
     const { effectivePlan } = await this.getEntitlement(organizationId);
     if (effectivePlan === "pro" || LAUNCH_ALLOWED_INTEGRATIONS.has(provider)) return;

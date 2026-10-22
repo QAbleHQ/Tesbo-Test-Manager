@@ -234,6 +234,9 @@ export const env = {
   stripePriceIdProAnnual: backendValue("STRIPE_PRICE_ID_PRO_ANNUAL"),
   stripePriceIdProMonthlyInr: backendValue("STRIPE_PRICE_ID_PRO_MONTHLY_INR"),
   stripePriceIdProAnnualInr: backendValue("STRIPE_PRICE_ID_PRO_ANNUAL_INR"),
+  // The NYRA address the backend was booted with. Specs that create NYRA projects run only when this
+  // is the fake server (utils/fake-nyra-server.ts), so a run can never create projects in a real NYRA.
+  nyraBaseUrl: backendValue("NYRA_BASE_URL"),
   planGraceDays: Number(backendValue("PLAN_GRACE_DAYS") || 30),
 
   /*
@@ -285,4 +288,11 @@ export const env = {
    * The repo's CLAUDE.md carries this as a standing rule: no local database, for any reason.
    */
   dbUrl: backendValue("DATABASE_URL"),
+
+  /**
+   * The stack's RATE_LIMIT_IP_MULTIPLIER (1 on a hosted stack). The brute-force caps are per source address
+   * and scaled by it, and this suite shares one address, so the local stack widens them; the rate-limit
+   * specs read it to know how many failures that takes. Set E2E_RATE_LIMIT_IP_MULTIPLIER for a remote target.
+   */
+  rateLimitIpMultiplier: Math.max(1, Math.floor(Number(backendValue("RATE_LIMIT_IP_MULTIPLIER")) || 1)),
 };

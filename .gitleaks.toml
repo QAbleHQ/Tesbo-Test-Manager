@@ -1,0 +1,20 @@
+# Secret scan, run by Jenkinsfile, Jenkinsfile.stage and .github/workflows/ci.yml.
+# Scans the committed tree AND history, so a secret that was committed and then deleted still shows up.
+title = "Tesbo secret scan"
+
+[extend]
+# Every built-in rule (cloud keys, private keys, tokens, generic high-entropy API keys ...).
+useDefault = true
+
+# The only exception, and a narrow one. e2e/tesbo.config.json is committed ON PURPOSE with a project API
+# token so every CI runner has baseUrl, projectId and token with no credential plumbing; the decision and
+# its cost are written up in the comment in .gitignore. Both conditions must hold, so this allows ONE
+# line shape in ONE file: a tsbo_ token in that file. Any other secret in that file, or a tsbo_ token
+# anywhere else, is still reported. When the token is rotated the new one matches the same pattern.
+[[allowlists]]
+description = "the deliberately committed Playwright reporter token"
+condition = "AND"
+paths = ['''(^|/)e2e/tesbo\.config\.json$''']
+# The default target is the matched secret alone, which cannot see the "token" key; match the whole line.
+regexTarget = "line"
+regexes = ['''"token"\s*:\s*"tsbo_[0-9a-f]{48}"''']

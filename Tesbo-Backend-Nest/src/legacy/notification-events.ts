@@ -25,6 +25,12 @@ export type NotificationType =
   | "test_run_started"
   | "test_run_completed"
   | "test_run_reopened"
+  | "test_run_due_soon"
+  | "test_run_due_today"
+  | "test_run_overdue"
+  | "test_plan_due_soon"
+  | "test_plan_due_today"
+  | "test_plan_overdue"
   | "bug_assigned"
   | "bug_reassigned"
   | "bug_status_changed"
@@ -77,6 +83,14 @@ export const NOTIFICATION_PRIORITY: Record<NotificationType, NotificationPriorit
   test_run_started: "Medium",
   test_run_completed: "Medium",
   test_run_reopened: "Medium",
+  // Due-date reminders for plans and runs (see due-date-sweep): a heads-up is Medium, the day itself
+  // and a missed date are High.
+  test_run_due_soon: "Medium",
+  test_run_due_today: "High",
+  test_run_overdue: "High",
+  test_plan_due_soon: "Medium",
+  test_plan_due_today: "High",
+  test_plan_overdue: "High",
   bug_assigned: "High",
   bug_reassigned: "High",
   bug_status_changed: "Medium",
@@ -180,6 +194,11 @@ export const notificationMessages = {
   testRunStarted: (runName: string) => `Test run ${runName} has started.`,
   testRunCompleted: (runName: string) => `Test run ${runName} has been completed.`,
   testRunReopened: (runName: string) => `Test run ${runName} has been reopened.`,
+  /** "Test run Sprint 4 is due tomorrow." — `what` is "Test run" or "Test plan". */
+  dueReminder: (what: "Test run" | "Test plan", name: string, phase: "due_soon" | "due_today" | "overdue"): string =>
+    phase === "due_soon" ? `${what} ${name} is due tomorrow.` : phase === "due_today" ? `${what} ${name} is due today.` : `${what} ${name} is overdue.`,
+  /** The second line: project, due date and where the item stands. */
+  dueReminderBody: (projectName: string, dueDay: string, status: string) => `Project: ${projectName} · Due: ${dueDay} · Status: ${status}`,
   testCaseStatusChanged: (tcId: string, status: string, runName: string) => `${tcId} status changed to ${status} in test run ${runName}.`,
   /** One bulk status change, however many of the assignee's cases it covered. */
   testCasesStatusChangedBulk: (count: number, status: string, runName: string) =>
@@ -275,6 +294,7 @@ export const notificationLinks = {
   project: (projectId: string): NotificationLink => ({ linkEntityType: "project", linkEntityId: projectId }),
   projectMembers: (projectId: string): NotificationLink => ({ linkEntityType: "project_members", linkEntityId: projectId }),
   testRun: (projectId: string, cycleId: string): NotificationLink => ({ linkEntityType: "test_run", linkEntityId: `${projectId}:${cycleId}` }),
+  testPlan: (projectId: string, planId: string): NotificationLink => ({ linkEntityType: "test_plan", linkEntityId: `${projectId}:${planId}` }),
   /** The project's Requirements page (the id is the project's). */
   requirements: (projectId: string): NotificationLink => ({ linkEntityType: "requirements", linkEntityId: projectId }),
   /** The Zyra chat page (the id is the project's). */

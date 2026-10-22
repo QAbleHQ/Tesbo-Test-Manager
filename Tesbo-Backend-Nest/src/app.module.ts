@@ -8,6 +8,7 @@ import { AppConfigService } from "./config/app-config.service";
 import { DatabaseModule } from "./database/database.module";
 import { RequestCacheModule } from "./request-cache/request-cache.module";
 import { RedisCacheModule } from "./cache/redis-cache.module";
+import { RateLimitModule } from "./rate-limit/rate-limit.module";
 import { AuditModule } from "./audit/audit.module";
 import { AuthModule } from "./auth/auth.module";
 import { SetupModule } from "./setup/setup.module";
@@ -21,7 +22,9 @@ import { CustomTagsModule } from "./custom-tags/custom-tags.module";
 import { AutomationModule } from "./automation/automation.module";
 import { AnalyticsReportModule } from "./analytics-report/analytics-report.module";
 import { ReviewBoardModule } from "./review-board/review-board.module";
+import { NyraModule } from "./nyra/nyra.module";
 import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
+import { DueDateSweepModule } from "./due-date-sweep/due-date-sweep.module";
 
 @Module({
   imports: [
@@ -29,6 +32,7 @@ import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.
     DatabaseModule,
     RequestCacheModule,
     RedisCacheModule,
+    RateLimitModule,
     BullModule.forRootAsync({
       inject: [AppConfigService],
       useFactory: (config: AppConfigService) => ({ connection: { url: config.redisUrl } })
@@ -46,8 +50,10 @@ import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.
     PlanLimitsModule,
     AutomationModule,
     ZyraArchiveSweepModule,
+    DueDateSweepModule,
     AnalyticsReportModule,
-    ReviewBoardModule
+    ReviewBoardModule,
+    NyraModule
   ],
   // Global so every current and future mutating /api/projects/:id route is covered; the guard
   // itself no-ops on reads and on workspaces that are within their limits.

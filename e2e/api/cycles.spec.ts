@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, request as newRequestContext, test } from "@playwright/test";
+import { expect, request as newRequestContext, test, type APIRequestContext } from "@playwright/test";
 import { env } from "../utils/env";
+import { workspaceDays } from "../utils/due-dates";
 import { column, exec, literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -1446,5 +1447,261 @@ test.describe("run history import", () => {
       await asB.dispose();
       await anon.dispose();
     }
+  });
+});
+
+/*
+ * Start Date / optional Due Date on test runs.
+ *
+ * cycles.started_at / ended_at already exist and record when execution actually began and finished;
+ * these are the PLANNED start and due days (DATE columns) and are independent of them. Overdue is
+ * read-time: past due date AND status not Completed, in the workspace's timezone.
+ */
+test.describe("run start / due dates", () => {
+  const dateKeys = (r: any) => ({ startDate: r.startDate, dueDate: r.dueDate });
+
+  async function mkRun(api: APIRequestContext, data: Record<string, unknown>) {
+    const res = await api.post(`/api/projects/${ctx.projectId}/cycles`, {
+      data: { name: `E2E Run Dates ${Date.now()}-${Math.floor(Math.random() * 1e6)}`, environment: "staging", ...data },
+      failOnStatusCode: false,
+    });
+    return { res, body: await res.json().catch(() => ({})) };
+  }
+  const rm = (api: APIRequestContext, id?: string) => (id ? api.delete(`/api/cycles/${id}`, { failOnStatusCode: false }) : Promise.resolve());
+  const getRun = async (api: APIRequestContext, id: string) => (await api.get(`/api/cycles/${id}`)).json();
+  const listed = async (api: APIRequestContext, id: string) =>
+    (await (await api.get(`/api/projects/${ctx.projectId}/cycles`)).json()).find((r: any) => r.id === id);
+
+  test("RUN-D-01 a run created with a start and due date returns both as plain days from create, get and the list", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { res, body } = await mkRun(request, { startDate: d.today, dueDate: d.inDays(7) });
+    try {
+      expect(res.status(), JSON.stringify(body)).toBeLessThan(300);
+      expect(dateKeys(body)).toEqual({ startDate: d.today, dueDate: d.inDays(7) });
+      expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.today, dueDate: d.inDays(7) });
+      expect(dateKeys(await listed(request, body.id))).toEqual({ startDate: d.today, dueDate: d.inDays(7) });
+      expect(scalar(`SELECT due_date::text FROM cycles WHERE id = ${literal(body.id)};`)).toBe(d.inDays(7));
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-02 saving without a due date works; the start defaults to today in the workspace timezone", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { res, body } = await mkRun(request, {});
+    try {
+      expect(res.status()).toBeLessThan(300);
+      expect(body.startDate).toBe(d.today);
+      expect(body.dueDate).toBeNull();
+      expect(body.dueState).toBeNull();
+      expect(body.isOverdue).toBe(false);
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-03 a due date before the start date is refused on create, with the field named, and no run is made", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const name = `E2E Run Inverted ${Date.now()}`;
+    const { res, body } = await mkRun(request, { name, startDate: d.today, dueDate: d.yesterday });
+    try {
+      expect(res.status()).toBe(400);
+      expect(body.field).toBe("dueDate");
+      const all = await (await request.get(`/api/projects/${ctx.projectId}/cycles`)).json();
+      expect(all.some((r: any) => r.name === name)).toBe(false);
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-04 a due date equal to the start date is allowed", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { res, body } = await mkRun(request, { startDate: d.today, dueDate: d.today });
+    try {
+      expect(res.status()).toBeLessThan(300);
+      expect(body.dueState).toBe("due_today");
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  for (const bad of ["2026-02-30", "25/10/2026", "soon", 20261025]) {
+    test(`RUN-D-05 a malformed due date (${JSON.stringify(bad)}) is a 400 on the field, not a 500`, async ({ request }) => {
+      const { res, body } = await mkRun(request, { dueDate: bad });
+      try {
+        expect(res.status()).toBe(400);
+        expect(body.field).toBe("dueDate");
+      } finally {
+        await rm(request, body.id);
+      }
+    });
+  }
+
+  test("RUN-D-06 dates can be edited after creation; the due date can be removed; an unrelated edit leaves them alone", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today, dueDate: d.inDays(3) });
+    try {
+      const patch = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.yesterday, dueDate: d.inDays(10) } });
+      expect(patch.ok(), await patch.text()).toBeTruthy();
+      expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+
+      await request.patch(`/api/cycles/${body.id}`, { data: { buildVersion: "9.9.9" } });
+      expect(dateKeys(await getRun(request, body.id)), "an edit that names no date must not touch them").toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+
+      for (const clear of [null, ""]) {
+        await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.inDays(10) } });
+        const res = await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: clear } });
+        expect(res.ok(), await res.text()).toBeTruthy();
+        expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.yesterday, dueDate: null });
+      }
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-07 an update that would invert the range is refused and changes nothing, whichever side moves", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today, dueDate: d.inDays(5) });
+    try {
+      expect((await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.yesterday }, failOnStatusCode: false })).status()).toBe(400);
+      expect((await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.inDays(6) }, failOnStatusCode: false })).status()).toBe(400);
+      expect(dateKeys(await getRun(request, body.id)), "refused updates must not land").toEqual({ startDate: d.today, dueDate: d.inDays(5) });
+      const both = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.inDays(20), dueDate: d.inDays(25) } });
+      expect(both.ok(), await both.text()).toBeTruthy();
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-08 the start date cannot be removed once given", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today });
+    try {
+      for (const empty of [null, ""]) {
+        const res = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: empty }, failOnStatusCode: false });
+        expect(res.status()).toBe(400);
+        expect((await res.json()).field).toBe("startDate");
+      }
+      expect((await getRun(request, body.id)).startDate).toBe(d.today);
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-09 the database refuses an inverted range, so MCP and automation writes cannot store one", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today });
+    try {
+      expect(() => exec(`UPDATE cycles SET due_date = start_date - 1 WHERE id = ${literal(body.id)};`), "the CHECK constraint must reject it").toThrow();
+      expect(scalar(`SELECT due_date IS NULL FROM cycles WHERE id = ${literal(body.id)};`)).toBe("t");
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-10 an open run past its due date is Overdue; moving the date forward removes it; due today / tomorrow are flagged, not overdue", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.inDays(-5), dueDate: d.yesterday });
+    const read = async () => {
+      const got = await getRun(request, body.id);
+      const row = await listed(request, body.id);
+      expect({ dueState: row.dueState, isOverdue: row.isOverdue }, "list and detail must agree").toEqual({ dueState: got.dueState, isOverdue: got.isOverdue });
+      return got;
+    };
+    try {
+      expect(await read()).toMatchObject({ dueState: "overdue", isOverdue: true });
+      await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.today } });
+      expect(await read()).toMatchObject({ dueState: "due_today", isOverdue: false });
+      await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.tomorrow } });
+      expect(await read()).toMatchObject({ dueState: "due_soon", isOverdue: false });
+      await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.inDays(30) } });
+      expect(await read()).toMatchObject({ dueState: null, isOverdue: false });
+      await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.yesterday } });
+      expect((await read()).isOverdue).toBe(true);
+      await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: null } });
+      expect(await read()).toMatchObject({ dueState: null, isOverdue: false });
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-11 a Completed run is never Overdue, and reopening it brings the mark back", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.inDays(-10), dueDate: d.yesterday });
+    let caseId: string | undefined;
+    try {
+      caseId = await addCase(request, body.id);
+      expect((await getRun(request, body.id)).isOverdue).toBe(true);
+      await request.patch(`/api/cycles/${body.id}`, { data: { status: "In Progress" } });
+      expect((await getRun(request, body.id)).isOverdue, "still open, so still overdue").toBe(true);
+      const done = await request.patch(`/api/cycles/${body.id}`, { data: { status: "Completed" } });
+      expect(done.ok(), await done.text()).toBeTruthy();
+      const completed = await getRun(request, body.id);
+      expect({ isOverdue: completed.isOverdue, dueState: completed.dueState }).toEqual({ isOverdue: false, dueState: null });
+      expect((await listed(request, body.id)).isOverdue).toBe(false);
+      expect(completed.dueDate, "completing a run must not erase its due date").toBe(d.yesterday);
+      await request.patch(`/api/cycles/${body.id}`, { data: { status: "In Progress" } });
+      expect((await getRun(request, body.id)).isOverdue, "reopened, so overdue again").toBe(true);
+    } finally {
+      await rm(request, body.id);
+      if (caseId) await request.delete(`/api/projects/${ctx.projectId}/testcases/${caseId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("RUN-D-12 starting execution does not disturb the planned dates (started_at is a separate, actual-time column)", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.inDays(2), dueDate: d.inDays(9) });
+    let caseId: string | undefined;
+    try {
+      caseId = await addCase(request, body.id);
+      await request.patch(`/api/cycles/${body.id}`, { data: { status: "In Progress" } });
+      const run = await getRun(request, body.id);
+      expect(run.startedAt, "execution start is stamped").toBeTruthy();
+      expect(dateKeys(run)).toEqual({ startDate: d.inDays(2), dueDate: d.inDays(9) });
+    } finally {
+      await rm(request, body.id);
+      if (caseId) await request.delete(`/api/projects/${ctx.projectId}/testcases/${caseId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("RUN-D-13 a run linked to a plan carries its dates in the plan's run list", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const plan = await (await request.post(`/api/projects/${ctx.projectId}/plans`, { data: { name: `E2E Run Dates Plan ${Date.now()}` } })).json();
+    const { body } = await mkRun(request, { planId: plan.id, startDate: d.today, dueDate: d.yesterday });
+    try {
+      const runs = await (await request.get(`/api/plans/${plan.id}/runs`)).json();
+      const row = runs.find((r: any) => r.id === body.id);
+      expect(row).toBeTruthy();
+      expect(row).toMatchObject({ startDate: d.today, dueDate: d.yesterday, dueState: "overdue", isOverdue: true });
+    } finally {
+      await rm(request, body.id);
+      await request.delete(`/api/plans/${plan.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("RUN-D-14 another tenant, and a caller with no session, cannot change a run's dates", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today, dueDate: d.inDays(4) });
+    const asB = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: path.join(__dirname, "../.auth/state-b.json") });
+    const anon = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    try {
+      for (const [who, api] of [["another tenant", asB], ["no session", anon]] as const) {
+        const patch = await api.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.inDays(99), startDate: d.inDays(90) }, failOnStatusCode: false });
+        expect([400, 401, 403, 404], `${who} must be refused`).toContain(patch.status());
+      }
+      expect(dateKeys(await getRun(request, body.id)), "the refused writes must not have landed").toEqual({ startDate: d.today, dueDate: d.inDays(4) });
+    } finally {
+      await asB.dispose();
+      await anon.dispose();
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-15 a deleted run drops out of the list with its dates", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today, dueDate: d.yesterday });
+    await rm(request, body.id);
+    expect(await listed(request, body.id)).toBeUndefined();
+    expect((await request.get(`/api/cycles/${body.id}`, { failOnStatusCode: false })).status()).toBe(404);
   });
 });

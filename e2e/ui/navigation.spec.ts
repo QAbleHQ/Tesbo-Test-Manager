@@ -1000,6 +1000,82 @@ test.describe("top bar — notifications", () => {
     }
   });
 
+  /*
+   * "[Notification] need to show project Key or name next to date": every row shows which project it
+   * came from beside its date, read from the link the click-through already uses. The list response
+   * is stubbed so each link shape can be covered without seeding rows; the project is the screens
+   * tenant's real one, so its key comes from the real /api/projects.
+   */
+  async function stubNotifications(page: Page, rows: Array<{ title: string; type: string | null; id: string | null }>) {
+    await page.route((url) => url.pathname === "/api/notifications", (route) =>
+      route.request().method() === "GET"
+        ? route.fulfill({
+            json: rows.map((r, i) => ({
+              id: `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`,
+              type: "test",
+              title: r.title,
+              body: null,
+              link_entity_type: r.type,
+              link_entity_id: r.id,
+              read_at: null,
+              created_at: new Date(Date.now() - i * 60_000).toISOString(),
+            })),
+          })
+        : route.continue(),
+    );
+  }
+
+  async function projectKeyAndName(): Promise<{ key: string; name: string }> {
+    const api = await screensApi();
+    try {
+      const projects = await (await api.get("/api/projects")).json();
+      const mine = projects.find((p: { id: string }) => p.id === tenant!.projectId);
+      expect(mine, "the screens tenant's project is listed").toBeTruthy();
+      return { key: mine.key, name: mine.name };
+    } finally {
+      await api.dispose();
+    }
+  }
+
+  test("NOTIF-UI-16 a project notification shows its project key beside the date, with the name on hover", async ({ page }) => {
+    const { key, name } = await projectKeyAndName();
+    const pid = tenant!.projectId;
+    // One of each link shape: id-only, and "<projectId>:<entityId>".
+    await stubNotifications(page, [
+      { title: "Board notice", type: "zyra_task_board", id: pid },
+      { title: "Bug notice", type: "bug", id: `${pid}:11111111-1111-4111-8111-111111111111` },
+      { title: "Run notice", type: "test_run", id: `${pid}:22222222-2222-4222-8222-222222222222` },
+      // A plan due-date reminder (test_plan_due_soon/due_today/overdue) uses this same shape; it must
+      // not be the one type left out.
+      { title: "Plan notice", type: "test_plan", id: `${pid}:33333333-3333-4333-8333-333333333333` },
+    ]);
+    await bell(page).click();
+
+    for (const title of ["Board notice", "Bug notice", "Run notice", "Plan notice"]) {
+      const item = panel(page).getByRole("menuitem", { name: new RegExp(title) });
+      const label = item.getByTestId("notification-project");
+      await expect(label, title).toHaveText(key);
+      await expect(label, title).toHaveAttribute("title", name);
+      // Beside the date, in the same line, not elsewhere in the row.
+      await expect(item.locator("time").locator("xpath=following-sibling::*[@data-testid='notification-project']"), title).toHaveCount(1);
+    }
+  });
+
+  test("NOTIF-UI-17 workspace-level notifications and unknown projects show no project label", async ({ page }) => {
+    await stubNotifications(page, [
+      { title: "Members notice", type: "workspace_members", id: "33333333-3333-4333-8333-333333333333" },
+      { title: "Integrations notice", type: "integrations_settings", id: "33333333-3333-4333-8333-333333333333" },
+      { title: "Projects list notice", type: "projects_list", id: "33333333-3333-4333-8333-333333333333" },
+      { title: "Other project notice", type: "bug", id: "44444444-4444-4444-8444-444444444444:11111111-1111-4111-8111-111111111111" },
+      { title: "Untyped notice", type: null, id: null },
+    ]);
+    await bell(page).click();
+    await expect(panel(page).getByRole("menuitem")).toHaveCount(5);
+    await expect(panel(page).getByTestId("notification-project"), "none of these belongs to a project the user can see").toHaveCount(0);
+    // Their dates are still shown.
+    await expect(panel(page).locator("time")).toHaveCount(5);
+  });
+
   test("NOTIF-UI-10 the bell shows an unread badge that counts down as notifications are read", async ({ page }) => {
     test.skip(!dbControlAvailable(), "needs psql access to seed a real notification row");
     const first = seedNotification({ title: `Unread one ${Date.now()}`, linkEntityType: "project", linkEntityId: tenant!.projectId });

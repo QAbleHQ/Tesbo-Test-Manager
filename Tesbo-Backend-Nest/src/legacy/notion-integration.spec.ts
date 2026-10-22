@@ -684,10 +684,14 @@ describe("Notion pages, snapshots and linking", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("zyraTicketFromKnowledgeSelection resolves a Notion mirror document to its page id", async () => {
-    const { db, calls } = makeDb([{ match: "FROM knowledge_documents d", rows: [{ provider: "notion", issue_key: PAGE_ID }] }]);
-    const out = await (makeLegacy(db) as any).zyraTicketFromKnowledgeSelection(PROJECT_ID, ["5f9c1f2e-6f3a-4a7e-8b21-0000000000aa"]);
-    expect(out.linked).toEqual({ provider: "notion", issueKey: PAGE_ID });
+  it("zyraTicketsFromKnowledgeSelection resolves a Notion mirror document to its page id", async () => {
+    // The method was renamed from zyraTicketFromKnowledgeSelection (one ticket, `.linked`) when a task
+    // could mirror several: it now returns one entry per ticket, de-duplicated and sorted, and the query
+    // also returns the document id it maps each row back to.
+    const documentId = "5f9c1f2e-6f3a-4a7e-8b21-0000000000aa";
+    const { db, calls } = makeDb([{ match: "FROM knowledge_documents d", rows: [{ id: documentId, provider: "notion", issue_key: PAGE_ID }] }]);
+    const out = await (makeLegacy(db) as any).zyraTicketsFromKnowledgeSelection(PROJECT_ID, [documentId]);
+    expect(out).toEqual([{ provider: "notion", issueKey: PAGE_ID }]);
     expect(calls[0].sql).toContain("LEFT JOIN notion_pages n");
     expect(calls[0].sql).toContain("'notion'");
   });
@@ -811,7 +815,10 @@ describe("test case writes carry the Notion link", () => {
       await svc.updateTestCaseWithClient(client, PROJECT_ID, "tc-1", CALLER_ID, body);
       const update = statements.find((s) => s.sql.includes("UPDATE testcases SET"))!;
       expect(maxPlaceholder(update.sql)).toBe(update.params.length);
-      expect(update.params.slice(-3)).toEqual([...link, clears]);
+      // $31 page id, $32 url, $33 the clear flag, then $34 external_id, which was added after these three:
+      // the link is no longer the last parameters, so it is read from just before the final one.
+      expect(update.params.slice(-4, -1)).toEqual([...link, clears]);
+      expect(update.params[update.params.length - 1]).toBeNull();
     }
   });
 

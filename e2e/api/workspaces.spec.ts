@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request, test, type APIRequestContext } from "@playwright/test";
 import { env } from "../utils/env";
+import { dayIn, shiftDay } from "../utils/due-dates";
 import { column, dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 
 /*
@@ -184,5 +185,107 @@ test.describe("workspace creation — duplicate names across and within accounts
     expect(active.id).toBe(first.body.organizationId);
     expect(active.id).not.toBe(second.body.organizationId);
     expect(active.name).toBe(name);
+  });
+});
+
+/*
+ * Workspace timezone — the zone a plan's / run's "due today" and "overdue" are judged in.
+ *
+ * Runs on the disposable workspaces tenant: changing a workspace's timezone moves "today" for every
+ * due date in it, which would race the other specs if it were done on the shared smoke workspace.
+ */
+test.describe("workspace timezone", () => {
+  test.skip(!dbControlAvailable(), "needs `docker compose exec postgres psql` to tear down the workspaces it creates");
+  test.skip(!owner, "needs the disposable workspaces tenant provisioned by global-setup");
+
+  let api: APIRequestContext;
+  test.beforeAll(async () => {
+    api = await request.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+  });
+  test.afterAll(async () => {
+    await api?.dispose();
+    if (!owner) return;
+    // Put the tenant back on the workspace global-setup gave it, with the default zone.
+    exec(
+      `UPDATE organizations SET timezone = 'Asia/Kolkata' WHERE id = ${literal(owner.organizationId)};
+       UPDATE users SET active_organization_id = ${literal(owner.organizationId)} WHERE email = ${literal(owner.email)};`,
+    );
+  });
+
+  async function useOriginalWorkspace() {
+    const res = await api.post(`/api/workspaces/${owner!.organizationId}/switch`);
+    expect(res.ok(), await res.text()).toBeTruthy();
+    return (await api.get("/api/workspace")).json();
+  }
+
+  test("WS-TZ-01 a workspace has a timezone, defaulting to Asia/Kolkata", async () => {
+    const ws = await useOriginalWorkspace();
+    expect(typeof ws.timezone).toBe("string");
+    expect(scalar(`SELECT timezone FROM organizations WHERE id = ${literal(owner!.organizationId)};`)).toBe(ws.timezone);
+  });
+
+  test("WS-TZ-02 an owner can change the timezone; it persists, and a rename does not reset it", async () => {
+    const ws = await useOriginalWorkspace();
+    const res = await api.patch("/api/workspace", { data: { name: ws.name, timezone: "America/Los_Angeles" } });
+    expect(res.ok(), await res.text()).toBeTruthy();
+    expect((await res.json()).timezone).toBe("America/Los_Angeles");
+    expect((await (await api.get("/api/workspace")).json()).timezone).toBe("America/Los_Angeles");
+
+    // An update that does not name the timezone must leave it alone.
+    await api.patch("/api/workspace", { data: { name: ws.name } });
+    expect((await (await api.get("/api/workspace")).json()).timezone).toBe("America/Los_Angeles");
+  });
+
+  test("WS-TZ-03 a name that is not an IANA timezone is refused, with the field named, and nothing changes", async () => {
+    const ws = await useOriginalWorkspace();
+    const before = ws.timezone;
+    for (const bad of ["Mars/Olympus", "", "UTC+5", 5]) {
+      const res = await api.patch("/api/workspace", { data: { name: ws.name, timezone: bad }, failOnStatusCode: false });
+      expect(res.status(), `timezone ${JSON.stringify(bad)}`).toBe(400);
+      expect((await res.json()).field).toBe("timezone");
+    }
+    expect((await (await api.get("/api/workspace")).json()).timezone).toBe(before);
+  });
+
+  test("WS-TZ-04 'today' for a due date is the workspace's day: the same plan is due today in one zone and overdue in another", async () => {
+    const ws = await useOriginalWorkspace();
+    const behind = "Pacific/Pago_Pago"; // UTC-11
+    const ahead = "Pacific/Kiritimati"; // UTC+14 — always at least a calendar day ahead of Pago Pago
+    const dayBehind = dayIn(behind);
+    expect(dayIn(ahead) > dayBehind, "Kiritimati is always a day or more ahead of Pago Pago").toBe(true);
+
+    const setZone = async (timezone: string) => {
+      const res = await api.patch("/api/workspace", { data: { name: ws.name, timezone } });
+      expect(res.ok(), await res.text()).toBeTruthy();
+    };
+    const created = await api.post(`/api/projects/${owner!.projectId}/plans`, {
+      data: { name: `E2E TZ Plan ${Date.now()}`, startDate: shiftDay(dayBehind, -3), dueDate: dayBehind },
+    });
+    const plan = await created.json();
+    try {
+      expect(created.ok(), JSON.stringify(plan)).toBeTruthy();
+      await setZone(behind);
+      expect(await (await api.get(`/api/plans/${plan.id}`)).json()).toMatchObject({ dueState: "due_today", isOverdue: false });
+      await setZone(ahead);
+      expect(await (await api.get(`/api/plans/${plan.id}`)).json()).toMatchObject({ dueState: "overdue", isOverdue: true });
+      const listed = (await (await api.get(`/api/projects/${owner!.projectId}/plans`)).json()).find((p: any) => p.id === plan.id);
+      expect(listed).toMatchObject({ dueState: "overdue", isOverdue: true });
+    } finally {
+      await api.delete(`/api/plans/${plan.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("WS-TZ-05 a caller with no session cannot change the timezone", async () => {
+    // The role gate (a QA engineer cannot rename the workspace) is pinned in rbac.spec.ts and the
+    // zone rides the same updateWorkspace check; this covers the unauthenticated edge.
+    const ws = await useOriginalWorkspace();
+    const anon = await request.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    try {
+      const res = await anon.patch("/api/workspace", { data: { name: ws.name, timezone: "Asia/Tokyo" }, failOnStatusCode: false });
+      expect([400, 401, 403, 404]).toContain(res.status());
+      expect((await (await api.get("/api/workspace")).json()).timezone).not.toBe("Asia/Tokyo");
+    } finally {
+      await anon.dispose();
+    }
   });
 });

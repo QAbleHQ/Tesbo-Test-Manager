@@ -124,4 +124,34 @@ describe("resolveEmbeddingAllocation", () => {
     const result = await resolveEmbeddingAllocation(fakeDb({ allocated: openaiKey }), "p1");
     expect(result.reason.trim().length).toBeGreaterThan(0);
   });
+  describe("tier 0 — platform VOYAGE_API_KEY", () => {
+    const saved = process.env.VOYAGE_API_KEY;
+    afterEach(() => {
+      if (saved === undefined) delete process.env.VOYAGE_API_KEY;
+      else process.env.VOYAGE_API_KEY = saved;
+    });
+
+    it("supplies embeddings for an Anthropic project that has no embedding-capable key of its own", async () => {
+      process.env.VOYAGE_API_KEY = "pa-test";
+      const result = await resolveEmbeddingAllocation(fakeDb({ allocated: anthropicKey }), "p1");
+      expect(result.allocation?.provider).toBe("voyage");
+      expect(result.allocation?.api_key).toBe("pa-test");
+      expect(result.allocation?.base_url).toBe("https://api.voyageai.com/v1");
+      expect(result.allocation?.dimension).toBe(RAG_EMBEDDING_DIMENSION);
+      expect(result.allocation?.sendDimensionParam).toBe(false);
+    });
+
+    it("wins over a workspace OpenAI key, so every vector shares one embedding space", async () => {
+      process.env.VOYAGE_API_KEY = "pa-test";
+      const result = await resolveEmbeddingAllocation(fakeDb({ allocated: openaiKey, workspaceKeys: [openaiKey] }), "p1");
+      expect(result.allocation?.provider).toBe("voyage");
+    });
+
+    it("is ignored when blank, falling back to the workspace keys", async () => {
+      process.env.VOYAGE_API_KEY = "   ";
+      const result = await resolveEmbeddingAllocation(fakeDb({ allocated: anthropicKey, workspaceKeys: [mistralKey] }), "p1");
+      expect(result.allocation?.provider).toBe("mistral");
+    });
+  });
+
 });

@@ -358,6 +358,8 @@ export interface WorkspaceInfo {
   role?: string;
   /** Self-reported ISO 3166-1 alpha-2 country; null when never provided. */
   country?: string | null;
+  /** IANA zone that plan/run due dates ("due today", "overdue") are judged in. */
+  timezone?: string;
   createdAt: string;
 }
 
@@ -375,8 +377,8 @@ export async function getWorkspace(): Promise<WorkspaceInfo> {
   return api<WorkspaceInfo>("/api/workspace");
 }
 
-// Omit `country` to leave it untouched; pass "" to clear it.
-export async function updateWorkspace(data: { name: string; country?: string }): Promise<WorkspaceInfo> {
+// Omit `country` / `timezone` to leave them untouched; pass "" to clear country.
+export async function updateWorkspace(data: { name: string; country?: string; timezone?: string }): Promise<WorkspaceInfo> {
   return api<WorkspaceInfo>("/api/workspace", {
     method: "PATCH",
     body: data,
@@ -1222,6 +1224,34 @@ export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
   return api<ZyraAgentState>(`/api/projects/${projectId}/agents/zyra`);
 }
 
+export interface NyraProject {
+  id: string;
+  name: string;
+  appUrl: string | null;
+  hasTestAccount: boolean;
+  username: string | null;
+  loginMethod: string | null;
+  createdAt: string | null;
+}
+
+export interface NyraCreateInput {
+  name: string;
+  appUrl: string;
+  testAccount?: { loginUrl?: string; username?: string; loginMethod?: "password"; password?: string };
+}
+
+export async function getNyraAgent(projectId: string): Promise<{ configured: boolean }> {
+  return api(`/api/projects/${projectId}/agents/nyra`);
+}
+
+export async function listNyraProjects(projectId: string): Promise<{ list: NyraProject[] }> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`);
+}
+
+export async function createNyraProject(projectId: string, data: NyraCreateInput): Promise<NyraProject> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`, { method: "POST", body: data });
+}
+
 export async function testZyraAiConnection(projectId: string): Promise<{ ok: boolean; provider: string; model: string; error?: string; latencyMs: number }> {
   return api(`/api/projects/${projectId}/agents/zyra/test`);
 }
@@ -1507,6 +1537,8 @@ export interface ApiToken {
   tokenPrefix: string;
   lastUsedAt: string | null;
   createdAt: string;
+  /** Null only for a token that predates expiry; new tokens always carry one. */
+  expiresAt: string | null;
 }
 export interface ApiTokenWithSecret extends ApiToken {
   token: string;
@@ -1518,7 +1550,7 @@ export async function listApiKeys(projectId: string): Promise<ApiToken[]> {
 
 export async function createApiKey(
   projectId: string,
-  data: { name: string; scopes?: string[] }
+  data: { name: string; scopes?: string[]; expiresInDays?: number }
 ): Promise<ApiTokenWithSecret> {
   return api<ApiTokenWithSecret>(`/api/projects/${projectId}/apikeys`, { method: "POST", body: data });
 }
@@ -2354,11 +2386,12 @@ export async function getPlan(planId: string): Promise<Record<string, unknown>> 
   return api(`/api/plans/${planId}`);
 }
 
-export async function createPlan(projectId: string, data: { name: string; description?: string; targetRelease?: string }): Promise<{ id: string }> {
+export async function createPlan(projectId: string, data: { name: string; description?: string; targetRelease?: string; startDate?: string; dueDate?: string | null }): Promise<{ id: string }> {
   return api(`/api/projects/${projectId}/plans`, { method: "POST", body: data });
 }
 
-export async function updatePlan(planId: string, data: { name?: string; description?: string; targetRelease?: string }): Promise<void> {
+// dueDate: a day sets it, null clears it, omitted leaves it. startDate cannot be cleared.
+export async function updatePlan(planId: string, data: { name?: string; description?: string; targetRelease?: string; startDate?: string; dueDate?: string | null }): Promise<void> {
   await api(`/api/plans/${planId}`, { method: "PATCH", body: data });
 }
 
@@ -2404,6 +2437,12 @@ export interface PlanRunItem {
   endedAt: string | null;
   ownerId: string | null;
   createdAt: string;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
   totalCases: number;
   passed: number;
   failed: number;
@@ -2442,6 +2481,12 @@ export interface PlanListItem {
   blocked: number;
   skipped: number;
   lastRunAt: string | null;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
 }
 
 export async function listPlanRuns(planId: string): Promise<PlanRunItem[]> {
@@ -2475,6 +2520,12 @@ export interface TestRunListItem {
   endedAt: string | null;
   ownerId: string | null;
   createdAt: string;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
   totalCases: number;
   passed: number;
   failed: number;
@@ -2515,6 +2566,12 @@ export interface TestRunDetail {
   ownerId: string | null;
   shareToken: string | null;
   shareEnabled: boolean;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
   createdAt: string;
   updatedAt: string;
   /**
@@ -2677,11 +2734,12 @@ export async function getTestRun(cycleId: string): Promise<TestRunDetail> {
   return api(`/api/cycles/${cycleId}`);
 }
 
-export async function createTestRun(projectId: string, data: { name: string; description?: string; environment: string; buildVersion?: string }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
+export async function createTestRun(projectId: string, data: { name: string; description?: string; environment: string; buildVersion?: string; startDate?: string; dueDate?: string | null }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
   return api(`/api/projects/${projectId}/cycles`, { method: "POST", body: data });
 }
 
-export async function updateTestRun(cycleId: string, data: { name?: string; description?: string; environment?: string; buildVersion?: string; status?: string }): Promise<void> {
+// dueDate: a day sets it, null clears it, omitted leaves it. startDate cannot be cleared.
+export async function updateTestRun(cycleId: string, data: { name?: string; description?: string; environment?: string; buildVersion?: string; status?: string; startDate?: string; dueDate?: string | null }): Promise<void> {
   await api(`/api/cycles/${cycleId}`, { method: "PATCH", body: data });
 }
 
