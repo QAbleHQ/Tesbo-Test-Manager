@@ -1,3 +1,11 @@
+// Provider calls go through safeFetch (common/safe-fetch.ts), which refuses non-public addresses and so
+// could never reach the stubs below. Route it to the global fetch these tests already mock; the real
+// behaviour of safeFetch is covered in common/safe-fetch.spec.ts.
+jest.mock("../common/safe-fetch", () => ({
+  ...jest.requireActual("../common/safe-fetch"),
+  safeFetch: (input: unknown, init?: unknown) => (globalThis.fetch as unknown as (a: unknown, b?: unknown) => Promise<Response>)(input, init)
+}));
+
 import { LegacyService } from "./legacy.service";
 import type { DatabaseService } from "../database/database.service";
 import type { EmailService } from "../auth/email.service";

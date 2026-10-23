@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request, test, type APIRequestContext } from "@playwright/test";
 import { env } from "../utils/env";
-import { literal, scalar } from "../utils/psql";
+import { dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 
 /*
  * Automation ingest -- Basecamp 10189985971, slices 1 and 2.
@@ -977,8 +977,8 @@ test.describe("automation ingest - authorization", () => {
     /*
      * The reason the controller checks this itself. requireProjectAccess authorizes the token's
      * *user*, who may be a member of several projects -- so on its own it would let a token issued
-     * for project A drive project B. McpService makes the same check; the rest of the REST surface
-     * does not, which is a wider gap recorded in docs/automation-integration-plan.md.
+     * for project A drive project B. McpService makes the same check, and AuthMiddleware now refuses
+     * a token outside its own project before any controller runs (AUT-55..57 cover that layer).
      *
      * Account A is a Launch workspace limited to 2 projects and its smoke project holds one slot,
      * so this skips rather than failing if the allowance is already full.
@@ -1035,6 +1035,265 @@ test.describe("automation ingest - authorization", () => {
       expect(REFUSED).toContain(viaOtherProject.status());
     } finally {
       await cleanup(api, runIds, []);
+    }
+  });
+
+  /*
+   * ── What a token may reach at all ─────────────────────────────────────────
+   *
+   * A token used to BE its user: AuthMiddleware set req.userId from it and every route trusted that,
+   * so a token minted for CI could read the owner's other projects, change the workspace and mint more
+   * tokens. Only /mcp and /automation checked the token's project. The middleware now refuses, before
+   * any controller runs, everything outside: /api/mcp, the mcp and automation routes of the token's own
+   * project, and that project's testcases / suites / cycles routes (scope taken from the method).
+   * The allowlist is src/auth/api-token-policy.ts; its unit spec holds the path tricks.
+   */
+  test("AUT-55 a token cannot reach the account, the workspace, other projects' routes or token management", async ({
+    request: api,
+  }) => {
+    let token: { ctx: APIRequestContext; tokenId: string } | null = null;
+    try {
+      token = await tokenContext(api, ctxA.projectId, ["read", "write"]);
+      const refused = [
+        "/api/workspace",
+        "/api/auth/me",
+        "/api/projects",
+        `/api/projects/${ctxA.projectId}`,
+        `/api/projects/${ctxA.projectId}/apikeys`,
+        `/api/projects/${ctxA.projectId}/members`,
+        `/api/projects/${ctxA.projectId}/ai/keys`,
+        `/api/projects/${ctxA.projectId}/knowledge-base/folders`,
+      ];
+      for (const route of refused) {
+        // The same GET with a browser session works (or is at worst a 404 on a route that needs more),
+        // so the 403 below is the token's, not a typo in the path.
+        const asToken = await token.ctx.get(route, { failOnStatusCode: false });
+        expect(asToken.status(), `a token reached GET ${route}: ${await asToken.text()}`).toBe(403);
+      }
+      const session = await api.get("/api/workspace", { failOnStatusCode: false });
+      expect(session.status(), "control: the same GET works with a session").toBe(200);
+
+      // A token minting a token is the escalation that matters most: a leaked CI token could
+      // otherwise mint itself a successor and outlive its own revocation.
+      const before = (await (await api.get(`/api/projects/${ctxA.projectId}/apikeys`)).json()).length;
+      const minted = await token.ctx.post(`/api/projects/${ctxA.projectId}/apikeys`, {
+        data: { name: "successor" },
+        failOnStatusCode: false,
+      });
+      expect(minted.status()).toBe(403);
+      expect((await (await api.get(`/api/projects/${ctxA.projectId}/apikeys`)).json()).length, "a token minted a token").toBe(before);
+
+      // Writing to those routes is refused as well, not only reading.
+      for (const [method, route] of [
+        ["PATCH", "/api/workspace"],
+        ["DELETE", `/api/projects/${ctxA.projectId}`],
+        ["POST", `/api/projects/${ctxA.projectId}/members`],
+      ] as const) {
+        const res = await token.ctx.fetch(route, { method, data: {}, failOnStatusCode: false });
+        expect(res.status(), `a token reached ${method} ${route}`).toBe(403);
+      }
+    } finally {
+      await token?.ctx.dispose();
+      if (token) await api.delete(`/api/projects/${ctxA.projectId}/apikeys/${token.tokenId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("AUT-56 a token reaches its own project's testcases, suites and cycles, with the scope the method needs", async ({
+    request: api,
+  }) => {
+    const created: Array<{ ctx: APIRequestContext; tokenId: string }> = [];
+    try {
+      const reader = await tokenContext(api, ctxA.projectId, ["read"]);
+      created.push(reader);
+      const writer = await tokenContext(api, ctxA.projectId, ["write"]);
+      created.push(writer);
+
+      for (const segment of ["testcases", "suites", "cycles"]) {
+        const read = await reader.ctx.get(`/api/projects/${ctxA.projectId}/${segment}`, { failOnStatusCode: false });
+        expect(read.status(), `read token on GET ${segment}: ${await read.text()}`).toBe(200);
+
+        // Scopes are not cumulative: a write-only token cannot read, and says why.
+        const writerRead = await writer.ctx.get(`/api/projects/${ctxA.projectId}/${segment}`, { failOnStatusCode: false });
+        expect(writerRead.status()).toBe(403);
+        expect((await writerRead.json()).error).toContain('requires the "read" scope');
+
+        // The read-only token cannot write, whatever the body (refused before it is validated).
+        const readerWrite = await reader.ctx.post(`/api/projects/${ctxA.projectId}/${segment}`, {
+          data: {},
+          failOnStatusCode: false,
+        });
+        expect(readerWrite.status()).toBe(403);
+        expect((await readerWrite.json()).error).toContain('requires the "write" scope');
+      }
+      const readerDelete = await reader.ctx.delete(`/api/projects/${ctxA.projectId}/testcases/${ctxA.projectId}`, {
+        failOnStatusCode: false,
+      });
+      expect(readerDelete.status()).toBe(403);
+    } finally {
+      for (const t of created) {
+        await t.ctx.dispose();
+        await api.delete(`/api/projects/${ctxA.projectId}/apikeys/${t.tokenId}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
+  test("AUT-57 a token cannot reach another tenant's project on any allowed route", async ({ request: api }) => {
+    // Account B's project is not even in A's workspace, so this needs no second project of A's.
+    let token: { ctx: APIRequestContext; tokenId: string } | null = null;
+    try {
+      token = await tokenContext(api, ctxA.projectId, ["read", "write"]);
+      for (const route of ["testcases", "suites", "cycles", "mcp", "automation/runs"]) {
+        const res = await token.ctx.get(`/api/projects/${ctxB.projectId}/${route}`, { failOnStatusCode: false });
+        expect(res.status(), `a token reached B's ${route}`).toBe(403);
+        expect((await res.json()).error).toContain("not scoped to this project");
+      }
+      // The project id is compared case-insensitively, not lowercased into a match with someone else's.
+      const shouted = await token.ctx.get(`/api/projects/${ctxA.projectId.toUpperCase()}/testcases`, {
+        failOnStatusCode: false,
+      });
+      expect(shouted.status(), "the token's own project, in upper case, should still be its own").toBeLessThan(500);
+    } finally {
+      await token?.ctx.dispose();
+      if (token) await api.delete(`/api/projects/${ctxA.projectId}/apikeys/${token.tokenId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("AUT-58 a token expires: 90 days by default, settable from 1 to 365, and an expired one stops working", async ({
+    request: api,
+  }) => {
+    test.skip(!dbControlAvailable(), "needs `docker compose exec postgres psql` to age a token past its expiry");
+    const ids: string[] = [];
+    const contexts: APIRequestContext[] = [];
+    try {
+      const day = 86_400_000;
+      const issue = async (data: Record<string, unknown>) =>
+        api.post(`/api/projects/${ctxA.projectId}/apikeys`, { data, failOnStatusCode: false });
+
+      const byDefault = await issue({ name: `E2E Token Default Expiry ${Date.now()}`, scopes: ["read"] });
+      expect(byDefault.status()).toBe(201);
+      const defaultBody = await byDefault.json();
+      ids.push(defaultBody.id);
+      const defaultDays = (Date.parse(defaultBody.expiresAt) - Date.now()) / day;
+      expect(defaultDays, "the default expiry is not 90 days").toBeGreaterThan(89);
+      expect(defaultDays).toBeLessThan(91);
+
+      const custom = await issue({ name: `E2E Token Custom Expiry ${Date.now()}`, scopes: ["read"], expiresInDays: 7 });
+      expect(custom.status()).toBe(201);
+      const customBody = await custom.json();
+      ids.push(customBody.id);
+      expect((Date.parse(customBody.expiresAt) - Date.now()) / day).toBeGreaterThan(6);
+      expect((Date.parse(customBody.expiresAt) - Date.now()) / day).toBeLessThan(8);
+
+      // The listing carries the expiry so a UI can show it; the secret never comes back.
+      const listed = (await (await api.get(`/api/projects/${ctxA.projectId}/apikeys`)).json()) as Array<Record<string, unknown>>;
+      const row = listed.find((t) => t.id === customBody.id);
+      expect(row?.expiresAt).toBe(customBody.expiresAt);
+      expect(JSON.stringify(row)).not.toContain(customBody.token);
+
+      // A live token authenticates; the same token one minute after its expiry does not.
+      const live = await request.newContext({
+        baseURL: env.apiBaseUrl,
+        storageState: undefined,
+        extraHTTPHeaders: { Authorization: `Bearer ${customBody.token}` },
+      });
+      contexts.push(live);
+      expect((await live.get(`${automationBase(ctxA.projectId)}/runs/${ctxA.projectId}`, { failOnStatusCode: false })).status()).not.toBe(401);
+
+      exec(`UPDATE api_tokens SET expires_at = now() - interval '1 minute' WHERE id = ${literal(customBody.id)};`);
+      const expired = await live.get(`${automationBase(ctxA.projectId)}/runs/${ctxA.projectId}`, { failOnStatusCode: false });
+      expect(expired.status(), "an expired token still authenticated").toBe(401);
+      // Not a 403 either: an expired token is simply not a credential, exactly like an unknown one.
+      const unknown = await request.newContext({
+        baseURL: env.apiBaseUrl,
+        storageState: undefined,
+        extraHTTPHeaders: { Authorization: "Bearer tsbo_0000000000000000000000000000000000000000deadbeef" },
+      });
+      contexts.push(unknown);
+      expect((await unknown.get(`${automationBase(ctxA.projectId)}/runs/${ctxA.projectId}`, { failOnStatusCode: false })).status()).toBe(401);
+    } finally {
+      for (const c of contexts) await c.dispose();
+      for (const id of ids) await api.delete(`/api/projects/${ctxA.projectId}/apikeys/${id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("AUT-59 issuing a token validates scopes, expiry and name instead of guessing", async ({ request: api }) => {
+    const issued: string[] = [];
+    try {
+      const issue = async (data: Record<string, unknown>) =>
+        api.post(`/api/projects/${ctxA.projectId}/apikeys`, { data, failOnStatusCode: false });
+      const countBefore = (await (await api.get(`/api/projects/${ctxA.projectId}/apikeys`)).json()).length;
+
+      const bad: Array<[string, Record<string, unknown>, RegExp]> = [
+        // These used to be quietly widened to read+write.
+        ["an unknown scope", { name: "x", scopes: ["admin"] }, /Unknown scope/],
+        ["a typo'd scope", { name: "x", scopes: ["reed"] }, /Unknown scope/],
+        ["one good scope and one bad", { name: "x", scopes: ["read", "delete"] }, /Unknown scope: delete/],
+        ["zero days", { name: "x", expiresInDays: 0 }, /expiresInDays/],
+        ["negative days", { name: "x", expiresInDays: -5 }, /expiresInDays/],
+        ["a fractional expiry", { name: "x", expiresInDays: 1.5 }, /expiresInDays/],
+        ["366 days", { name: "x", expiresInDays: 366 }, /expiresInDays/],
+        ["a non-numeric expiry", { name: "x", expiresInDays: "soon" }, /expiresInDays/],
+        // VARCHAR(128): this used to be a 500 from Postgres.
+        ["a 129-character name", { name: "n".repeat(129) }, /at most 128/],
+        ["no name", { scopes: ["read"] }, /name is required/],
+        ["a whitespace name", { name: "   " }, /name is required/],
+      ];
+      for (const [label, data, message] of bad) {
+        const res = await issue(data);
+        expect(res.status(), `${label} should be a 400, got ${res.status()}: ${await res.text()}`).toBe(400);
+        expect((await res.json()).error, label).toMatch(message);
+      }
+      const countAfter = (await (await api.get(`/api/projects/${ctxA.projectId}/apikeys`)).json()).length;
+      expect(countAfter, "a refused request left a token behind").toBe(countBefore);
+
+      // Boundaries that are fine, and the long-standing default when scopes are simply absent.
+      const edge = await issue({ name: "n".repeat(128), expiresInDays: 365 });
+      expect(edge.status()).toBe(201);
+      issued.push((await edge.json()).id);
+      const defaulted = await issue({ name: `E2E Token Default Scopes ${Date.now()}` });
+      expect(defaulted.status()).toBe(201);
+      const defaultedBody = await defaulted.json();
+      issued.push(defaultedBody.id);
+      expect(defaultedBody.scopes).toEqual(["read", "write"]);
+    } finally {
+      for (const id of issued) await api.delete(`/api/projects/${ctxA.projectId}/apikeys/${id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("AUT-62 archiving the project kills its tokens at once", async ({ request: api }) => {
+    // Membership and archive state are decided in the token lookup itself, so a credential does not
+    // outlive the access it was minted for. Needs a second project, like AUT-53, so it skips when the
+    // workspace's allowance is full.
+    let otherProjectId: string | null = null;
+    let live: APIRequestContext | null = null;
+    try {
+      const created = await api.post("/api/projects", {
+        data: { name: `E2E Token Archive ${Date.now()}`, description: "token lifetime fixture" },
+        failOnStatusCode: false,
+      });
+      test.skip(!created.ok(), `could not create a second project (${created.status()}) - the allowance is full`);
+      otherProjectId = (await created.json()).id as string;
+
+      const issued = await api.post(`/api/projects/${otherProjectId}/apikeys`, { data: { name: `E2E Archive ${Date.now()}` } });
+      expect(issued.ok(), await issued.text()).toBeTruthy();
+      const { token } = await issued.json();
+      live = await request.newContext({
+        baseURL: env.apiBaseUrl,
+        storageState: undefined,
+        extraHTTPHeaders: { Authorization: `Bearer ${token}` },
+      });
+      const before = await live.get(`/api/projects/${otherProjectId}/testcases`, { failOnStatusCode: false });
+      expect(before.status(), `the token should work before the archive: ${await before.text()}`).toBe(200);
+
+      await api.delete(`/api/projects/${otherProjectId}`, { failOnStatusCode: false });
+      const after = await live.get(`/api/projects/${otherProjectId}/testcases`, { failOnStatusCode: false });
+      // 401, not 404: a 404 would mean the token still authenticated and only the project was gone.
+      expect(after.status(), "an archived project's token still authenticated").toBe(401);
+    } finally {
+      await live?.dispose();
+      // Already archived by the happy path; this is for a failure before that point. A repeat
+      // DELETE on an archived project is harmless.
+      if (otherProjectId) await api.delete(`/api/projects/${otherProjectId}`, { failOnStatusCode: false });
     }
   });
 });

@@ -70,12 +70,16 @@ function makeService(opts: {
         ? jest.fn().mockRejectedValue(opts.invitation)
         : jest.fn().mockResolvedValue(opts.invitation),
     logWorkspaceActivity: jest.fn().mockResolvedValue(undefined),
-    logProjectActivity: jest.fn().mockResolvedValue(undefined)
+    logProjectActivity: jest.fn().mockResolvedValue(undefined),
+    // Called at the end of invite registration (SignupService.completeInviteRegistration); the stub had
+    // predated it, so the "creates the user..." test failed with "notifyInvitationAccepted is not a function".
+    notifyInvitationAccepted: jest.fn().mockResolvedValue(undefined)
   } as unknown as LegacyService;
 
   const welcomeEmail = { schedule: jest.fn().mockResolvedValue(undefined) } as unknown as WelcomeEmailService;
 
-  const svc = new SignupService(db, config, otp, password, auth, audit, legacy, welcomeEmail);
+  const rateLimit = { assertAllowed: jest.fn().mockResolvedValue(undefined), recordFailure: jest.fn().mockResolvedValue(undefined) };
+  const svc = new SignupService(db, config, otp, password, auth, audit, legacy, welcomeEmail, rateLimit as never);
   return { svc, query, txQuery, otp, password, auth, audit, legacy, welcomeEmail };
 }
 

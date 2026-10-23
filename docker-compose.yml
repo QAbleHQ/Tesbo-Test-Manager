@@ -90,6 +90,9 @@ services:
       LINEAR_CLIENT_SECRET: ${LINEAR_CLIENT_SECRET:-}
       NOTION_CLIENT_ID: ${NOTION_CLIENT_ID:-}
       NOTION_CLIENT_SECRET: ${NOTION_CLIENT_SECRET:-}
+      # Optional: platform embeddings key (Voyage AI). When set it supplies every embedding, whatever
+      # chat provider a project uses. Unset = fall back to workspace OpenAI/Google/Mistral keys.
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID_PRO_MONTHLY: ${STRIPE_PRICE_ID_PRO_MONTHLY:-}
@@ -104,6 +107,9 @@ services:
       # (openssl rand -base64 32) for any shared/non-local environment.
       SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:-QtqFfNpvzyRZvBpFeXYIFmQMTwQHVXHQYbH85YvhlvE=}
       OTP_EXPIRY_MINUTES: ${OTP_EXPIRY_MINUTES:-10}
+      ALLOW_PRIVATE_AI_HOSTS: ${ALLOW_PRIVATE_AI_HOSTS:-false}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_IP_MULTIPLIER: ${RATE_LIMIT_IP_MULTIPLIER:-1}
       SESSION_DAYS: ${SESSION_DAYS:-30}
       UPLOAD_DIR: /app/uploads
       MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-104857600}
@@ -129,6 +135,10 @@ services:
       LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
       LANGFUSE_ENVIRONMENT: ${LANGFUSE_ENVIRONMENT:-development}
       LANGFUSE_ALLOW_CLOUD: ${LANGFUSE_ALLOW_CLOUD:-}
+      # NYRA agent (Pro). Key is server-side only. From this container NYRA on the host is
+      # http://host.docker.internal:2905; leave both empty to show the agent as not configured.
+      NYRA_API_KEY: ${NYRA_API_KEY:-}
+      NYRA_BASE_URL: ${NYRA_BASE_URL:-}
     ports:
       - "${BACKEND_PORT:-1011}:7000"
     volumes:

@@ -1224,6 +1224,34 @@ export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
   return api<ZyraAgentState>(`/api/projects/${projectId}/agents/zyra`);
 }
 
+export interface NyraProject {
+  id: string;
+  name: string;
+  appUrl: string | null;
+  hasTestAccount: boolean;
+  username: string | null;
+  loginMethod: string | null;
+  createdAt: string | null;
+}
+
+export interface NyraCreateInput {
+  name: string;
+  appUrl: string;
+  testAccount?: { loginUrl?: string; username?: string; loginMethod?: "password"; password?: string };
+}
+
+export async function getNyraAgent(projectId: string): Promise<{ configured: boolean }> {
+  return api(`/api/projects/${projectId}/agents/nyra`);
+}
+
+export async function listNyraProjects(projectId: string): Promise<{ list: NyraProject[] }> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`);
+}
+
+export async function createNyraProject(projectId: string, data: NyraCreateInput): Promise<NyraProject> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`, { method: "POST", body: data });
+}
+
 export async function testZyraAiConnection(projectId: string): Promise<{ ok: boolean; provider: string; model: string; error?: string; latencyMs: number }> {
   return api(`/api/projects/${projectId}/agents/zyra/test`);
 }
@@ -1509,6 +1537,8 @@ export interface ApiToken {
   tokenPrefix: string;
   lastUsedAt: string | null;
   createdAt: string;
+  /** Null only for a token that predates expiry; new tokens always carry one. */
+  expiresAt: string | null;
 }
 export interface ApiTokenWithSecret extends ApiToken {
   token: string;
@@ -1520,7 +1550,7 @@ export async function listApiKeys(projectId: string): Promise<ApiToken[]> {
 
 export async function createApiKey(
   projectId: string,
-  data: { name: string; scopes?: string[] }
+  data: { name: string; scopes?: string[]; expiresInDays?: number }
 ): Promise<ApiTokenWithSecret> {
   return api<ApiTokenWithSecret>(`/api/projects/${projectId}/apikeys`, { method: "POST", body: data });
 }

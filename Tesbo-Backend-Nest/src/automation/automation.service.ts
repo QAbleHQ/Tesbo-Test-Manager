@@ -1,3 +1,4 @@
+import { safeContentType } from "../common/file-delivery";
 import { BadRequestException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { randomUUID } from "crypto";
 import * as path from "path";
@@ -771,7 +772,8 @@ export class AutomationService {
     for (const file of files) {
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
       const storageKey = `executions/${projectId}/${executionId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
-      await this.storage.put(storageKey, file.buffer, file.mimetype);
+      const contentType = safeContentType(file.mimetype, file.originalname);
+      await this.storage.put(storageKey, file.buffer, contentType);
       const res = await this.db.query(
         `INSERT INTO attachments
            (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by, evidence_kind)
@@ -781,7 +783,7 @@ export class AutomationService {
           projectId,
           executionId,
           LegacyService.displayFileName(file.originalname),
-          file.mimetype,
+          contentType,
           file.size,
           storageKey,
           actorId,

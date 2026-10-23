@@ -21,6 +21,8 @@ import { FilesInterceptor } from "@nestjs/platform-express";
 import type { Response } from "express";
 import ExcelJS from "exceljs";
 import { filter, interval, map, merge, Observable, of } from "rxjs";
+import { sendStoredFile } from "../common/file-delivery";
+import { cellValue, csvEscape, rowsToCsv } from "../common/spreadsheet-safe";
 import { AuthenticatedRequest } from "../common/request.types";
 import { LegacyService } from "./legacy.service";
 import { CustomFieldsService } from "../custom-fields/custom-fields.service";
@@ -154,21 +156,6 @@ export class LegacyController {
     return process.env.ZYRA_PROGRESS_STREAMING_ENABLED !== "false";
   }
 
-  private csvEscape(value: unknown): string {
-    const text = String(value ?? "");
-    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-  }
-
-  // Excel/Sheets treats a cell starting with =, +, -, @, tab or CR as a formula, regardless of
-  // format (CSV or XLSX). csvEscape/cellValue never guarded against that because every string they
-  // handled up to now was either static or already-validated app data. This fix is the first place
-  // a custom field's freeform NAME and its option LABELs get written into a generated file, so both
-  // now pass through here first. Prefixing with a single quote is the standard mitigation: it forces
-  // the cell to display as text in both Excel and Sheets without changing what the user typed.
-  private sanitizeFormulaCell(value: string): string {
-    return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
-  }
-
   // A custom field's column, named for the file rather than the API: its display name, unless that
   // name would collide with a fixed base column once normalized the same way the import modal's
   // auto-mapper normalizes headers (lowercase, strip non-alphanumeric) — e.g. a field literally
@@ -178,7 +165,7 @@ export class LegacyController {
   // A Russian template's base columns are Russian words, which normalizeTestcaseHeader folds to ""
   // — so a custom field named e.g. "Статус" is checked against the localized headers as well.
   private sampleColumnName(definition: CustomFieldDefinitionDto, locale: ExportLocale = "en", baseKeys: string[] = []): string {
-    const name = this.sanitizeFormulaCell(definition.name);
+    const name = definition.name;
     if (RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name))) return `${name} (Custom Field)`;
     if (collidesWithLocalizedHeader(locale, name, baseKeys)) return `${name} (Пользовательское поле)`;
     return name;
@@ -195,9 +182,7 @@ export class LegacyController {
       case "text":
       case "long_text": {
         const sample = "Sample value";
-        return this.sanitizeFormulaCell(
-          config.maxLength != null && config.maxLength < sample.length ? sample.slice(0, config.maxLength) : sample
-        );
+        return config.maxLength != null && config.maxLength < sample.length ? sample.slice(0, config.maxLength) : sample;
       }
       case "boolean":
         return config.displayFormat === "true_false" ? "True" : "Yes";
@@ -212,14 +197,14 @@ export class LegacyController {
         return new Date().toISOString().slice(0, 10);
       case "single_select": {
         const active = (config.options || []).find((o) => o.active);
-        return active ? this.sanitizeFormulaCell(active.label) : "";
+        return active ? active.label : "";
       }
       case "multi_select": {
         const activeOptions = (config.options || []).filter((o) => o.active);
         const count = Math.min(Math.max(1, config.minSelected ?? 1), config.maxSelected ?? (activeOptions.length || 1));
         return activeOptions
           .slice(0, count)
-          .map((o) => this.sanitizeFormulaCell(o.label))
+          .map((o) => o.label)
           .join(", ");
       }
       default:
@@ -238,24 +223,7 @@ export class LegacyController {
   private sendCsv(res: Response, locale: ExportLocale, fileName: string, headers: string[], rows: Record<string, unknown>[]) {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
-    res.send((locale === "en" ? "" : UTF8_BOM) + this.rowsToCsv(headers, rows));
-  }
-
-  private rowsToCsv(headers: string[], rows: Record<string, unknown>[]): string {
-    return [
-      headers.join(","),
-      ...rows.map((row) => headers.map((header) => this.csvEscape(row[header])).join(","))
-    ].join("\n");
-  }
-
-  // exceljs writes whatever it is handed, and a plain object or an array would land as a formula or
-  // rich-text cell rather than a value. Numbers, booleans and dates have to stay typed — a real 0
-  // must survive as the number 0 (see longRow) — so only those pass through untouched; null and
-  // undefined become an empty cell, and anything else is stringified.
-  private cellValue(value: unknown): ExcelJS.CellValue {
-    if (value == null) return null;
-    if (typeof value === "number" || typeof value === "boolean" || value instanceof Date) return value;
-    return String(value);
+    res.send((locale === "en" ? "" : UTF8_BOM) + rowsToCsv(headers, rows));
   }
 
   private async sendWorkbook(
@@ -274,7 +242,7 @@ export class LegacyController {
     const columns = headers ?? Object.keys(rows[0] ?? {});
     worksheet.addRow(columns);
     for (const row of rows) {
-      worksheet.addRow(columns.map((column) => this.cellValue(row[column])));
+      worksheet.addRow(columns.map((column) => cellValue(row[column])));
     }
     const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
@@ -773,15 +741,7 @@ export class LegacyController {
       attachmentId,
       inline === "1" || inline === "true"
     );
-    if ("redirectUrl" in access) return res.redirect(302, access.redirectUrl);
-    res.setHeader("Content-Type", access.mimeType);
-    res.setHeader(
-      "Content-Disposition",
-      `${access.inline ? "inline" : "attachment"}; filename="${encodeURIComponent(access.originalFileName)}"`
-    );
-    if ("buffer" in access && access.buffer) return res.send(access.buffer);
-    if ("localPath" in access && access.localPath) return res.sendFile(access.localPath);
-    throw new Error("Attachment content unavailable");
+    return sendStoredFile(res, access);
   }
 
   /** The parsed JSON of one `api` evidence file, for the in-place request/response viewer. */
@@ -1041,12 +1001,7 @@ export class LegacyController {
     @Param("attachmentId") attachmentId: string
   ) {
     const access = await this.legacy.getBugAttachmentAccess(projectId, req.userId, attachmentId, false);
-    if ("redirectUrl" in access) return res.redirect(302, access.redirectUrl);
-    res.setHeader("Content-Type", access.mimeType);
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(access.originalFileName)}"`);
-    if ("buffer" in access && access.buffer) return res.send(access.buffer);
-    if ("localPath" in access && access.localPath) return res.sendFile(access.localPath);
-    throw new Error("Attachment content unavailable");
+    return sendStoredFile(res, access);
   }
 
   @Delete("/api/bugs/attachments/:attachmentId")
@@ -1326,9 +1281,9 @@ export class LegacyController {
       if (format === "csv") {
         res.setHeader("Content-Type", "text/csv; charset=utf-8");
         res.setHeader("Content-Disposition", `attachment; filename="report-matrix.csv"`);
-        await write((locale === "en" ? "" : UTF8_BOM) + headers.join(","));
+        await write((locale === "en" ? "" : UTF8_BOM) + headers.map((h) => csvEscape(h)).join(","));
         for (let offset = 0, page = first; ; ) {
-          const lines = page.rows.map((row) => "\n" + headers.map((h) => this.csvEscape(row[h])).join(","));
+          const lines = page.rows.map((row) => "\n" + headers.map((h) => csvEscape(row[h])).join(","));
           if (lines.length) await write(lines.join(""));
           offset += PAGE;
           if (offset >= first.total || res.destroyed) break;
@@ -1344,7 +1299,7 @@ export class LegacyController {
       const sheet = workbook.addWorksheet(exportSheetName(locale, REPORT_VIEW_SHEET_NAMES.matrix));
       sheet.addRow(headers).commit();
       for (let offset = 0, page = first; ; ) {
-        for (const row of page.rows) sheet.addRow(headers.map((h) => this.cellValue(row[h]))).commit();
+        for (const row of page.rows) sheet.addRow(headers.map((h) => cellValue(row[h]))).commit();
         offset += PAGE;
         if (offset >= first.total || res.destroyed) break;
         page = await readPage(offset);
@@ -2042,12 +1997,7 @@ export class LegacyController {
     @Param("fileId") fileId: string
   ) {
     const access = await this.legacy.getKnowledgeFileAccess(projectId, req.userId, fileId, false);
-    if ("redirectUrl" in access) return res.redirect(302, access.redirectUrl);
-    res.setHeader("Content-Type", access.mimeType);
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(access.originalFileName)}"`);
-    if ("buffer" in access && access.buffer) return res.send(access.buffer);
-    if ("localPath" in access && access.localPath) return res.sendFile(access.localPath);
-    throw new Error("Knowledge file content unavailable");
+    return sendStoredFile(res, access);
   }
 
   @Get("/api/projects/:projectId/knowledge-base/files/:fileId/preview")
@@ -2058,11 +2008,7 @@ export class LegacyController {
     @Param("fileId") fileId: string
   ) {
     const access = await this.legacy.getKnowledgeFileAccess(projectId, req.userId, fileId, true);
-    if ("redirectUrl" in access) return res.redirect(302, access.redirectUrl);
-    res.setHeader("Content-Type", access.mimeType);
-    res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(access.originalFileName)}"`);
-    if ("buffer" in access) return res.send(access.buffer);
-    res.sendFile(access.localPath);
+    return sendStoredFile(res, access);
   }
 
   @Get("/api/projects/:projectId/knowledge-base/files/:fileId")

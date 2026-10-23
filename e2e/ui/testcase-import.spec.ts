@@ -1039,4 +1039,107 @@ test.describe("test case import wizard", () => {
       await disposeProject(target);
     }
   });
+
+  /* ───────────── spreadsheet formula neutralisation: export -> import is exact ─────────────
+   *
+   * The CSV export puts a single quote in front of any cell a spreadsheet could read as a formula
+   * (src/common/spreadsheet-safe.ts), and the wizard takes it off again for CSV uploads only
+   * (lib/spreadsheet.ts). Without that, every title that began with = + - or @ would come back from a
+   * round trip with a stray quote. XLSX exports add no quote, so xlsx uploads are left exactly as typed.
+   */
+  const FORMULA_TITLES = [
+    '=HYPERLINK("http://evil.example/steal","click me")',
+    "+1 (415) 555-0100 callback",
+    "-2+3 totals",
+    "@smoke login works",
+    "'=already quoted",
+  ];
+
+  test("a CSV Tesbo exported, with formula-looking titles, imports back as exactly the same text", async ({ browser }) => {
+    const stamp = Date.now();
+    const source = await withProject(browser, "Formula source");
+    const target = await withProject(browser, "Formula target");
+    try {
+      const titles = FORMULA_TITLES.map((t, i) => `${t} ${stamp}-${i}`);
+      for (const [i, title] of titles.entries()) {
+        const res = await api.post(`/api/projects/${source.projectId}/testcases`, {
+          data: { title, description: `=desc ${i}`, preconditions: `+pre ${i}` },
+        });
+        expect(res.ok(), await res.text()).toBeTruthy();
+      }
+
+      const exported = await (await api.get(`/api/projects/${source.projectId}/testcases/export/csv`)).text();
+      // What was exported is the quoted form, so a spreadsheet opens it as text.
+      expect(exported).toContain('"\'=HYPERLINK(');
+      expect(exported).toContain(`'+1 (415) 555-0100 callback ${stamp}-1`);
+      expect(exported).toContain(`''=already quoted ${stamp}-4`);
+
+      await openWizard(target.page, target.projectId);
+      await chooseFile(target.page, "exported.csv", Buffer.from(exported), "text/csv");
+      await runImport(target.page, titles.length);
+
+      const imported = await listCases(target.projectId);
+      for (const [i, title] of titles.entries()) {
+        const match = imported.find((c) => c.title === title);
+        expect(match, `"${title}" did not survive the round trip`).toBeTruthy();
+        const full = await getCase(target.projectId, match!.id);
+        expect(full.description).toBe(`=desc ${i}`);
+        expect(full.preconditions).toBe(`+pre ${i}`);
+      }
+    } finally {
+      await disposeProject(source);
+      await disposeProject(target);
+    }
+  });
+
+  test("a CSV with ordinary leading quotes is left alone: only a quote in front of a formula character is removed", async ({ browser }) => {
+    const stamp = Date.now();
+    const { page, projectId } = await withProject(browser, "Formula plain");
+    try {
+      const titles = [`'quoted word ${stamp}`, `'5 apples ${stamp}`, `it's fine ${stamp}`, `-5 ${stamp}`];
+      await openWizard(page, projectId);
+      await uploadCsv(page, `Title\n${titles.map((t) => `"${t}"`).join("\n")}\n`);
+      await runImport(page, titles.length);
+      const imported = (await listCases(projectId)).map((c) => c.title);
+      for (const title of titles) expect(imported, title).toContain(title);
+    } finally {
+      await disposeProject({ page, projectId });
+    }
+  });
+
+  test("an .xlsx keeps a leading quote exactly as typed: only CSV exports add one, so only CSV imports remove it", async ({ browser }) => {
+    const stamp = Date.now();
+    const { page, projectId } = await withProject(browser, "Formula xlsx");
+    try {
+      const title = `'=literal quote ${stamp}`;
+      await openWizard(page, projectId);
+      await uploadWorkbook(page, { Sheet1: [["Title"], [title]] });
+      await runImport(page, 1);
+      expect((await listCases(projectId)).map((c) => c.title)).toContain(title);
+    } finally {
+      await disposeProject({ page, projectId });
+    }
+  });
+
+  test("an .xlsx Tesbo exported imports back unchanged, hostile titles included", async ({ browser }) => {
+    const stamp = Date.now();
+    const source = await withProject(browser, "Formula xlsx source");
+    const target = await withProject(browser, "Formula xlsx target");
+    try {
+      const titles = FORMULA_TITLES.slice(0, 4).map((t, i) => `${t} ${stamp}-${i}`);
+      for (const title of titles) {
+        const res = await api.post(`/api/projects/${source.projectId}/testcases`, { data: { title } });
+        expect(res.ok(), await res.text()).toBeTruthy();
+      }
+      const xlsx = await (await api.get(`/api/projects/${source.projectId}/testcases/export/xlsx`)).body();
+      await openWizard(target.page, target.projectId);
+      await chooseFile(target.page, "exported.xlsx", Buffer.from(xlsx), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      await runImport(target.page, titles.length);
+      const imported = (await listCases(target.projectId)).map((c) => c.title);
+      for (const title of titles) expect(imported, title).toContain(title);
+    } finally {
+      await disposeProject(source);
+      await disposeProject(target);
+    }
+  });
 });
