@@ -13401,16 +13401,6 @@ export class LegacyService implements OnModuleInit {
 
       const { clientId, clientSecret } = this.integrationOAuthConfig(provider);
       const providerLabel: "Jira" | "Linear" = provider === "jira" ? "Jira" : "Linear";
-      if (provider === "jira") {
-        const issuer = this.jiraTokenOAuthClientId(current);
-        if (issuer && issuer !== clientId) {
-          return {
-            refused:
-              "Jira needs to be reconnected from this Tesbo deployment: its authorization was granted to a different Atlassian OAuth app than the one this deployment uses, so this deployment can't renew it. Reconnect Jira in workspace settings (or run this deployment with the same Jira OAuth app as the one that connected it).",
-            row: current
-          };
-        }
-      }
       const refreshToken = decryptSecret(String(current.refresh_token || ""));
       let token: Body;
       try {
@@ -13514,37 +13504,12 @@ export class LegacyService implements OnModuleInit {
     if (recorded && recorded.rowCount) await this.notifyIntegrationAuthExpired(connection);
   }
 
-  // Atlassian access tokens are JWTs naming the OAuth app they were issued to (`client_id`). A
-  // refresh token only renews through that same app, so a mismatch is knowable without asking
-  // Atlassian. Returns null when the token isn't a readable JWT — then the check is simply skipped.
-  private jiraTokenOAuthClientId(connection: Body): string | null {
-    try {
-      const payload = decryptSecret(String(connection.access_token || "")).split(".")[1];
-      if (!payload) return null;
-      const claims = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Body;
-      const clientId = claims.client_id ?? claims["https://atlassian.com/oauthClientId"];
-      return typeof clientId === "string" && clientId ? clientId : null;
-    } catch {
-      return null;
-    }
-  }
-
   // Whether this deployment can keep using the connection, without contacting the provider — what
   // the status endpoints report alongside `connected`, so a connection that exists but can no longer
   // be renewed doesn't read as healthy.
   private integrationConnectionHealth(connection: Body, provider: IntegrationProvider): { needsReconnect: boolean; authError: string | null } {
     const refused = this.refusedRefreshReason(connection);
     if (refused) return { needsReconnect: true, authError: refused };
-    if (provider === "jira" && connection.refresh_token) {
-      const issuer = this.jiraTokenOAuthClientId(connection);
-      const ownClientId = this.envIntegrationConfig("jira")?.clientId;
-      if (issuer && ownClientId && issuer !== ownClientId) {
-        return {
-          needsReconnect: true,
-          authError: "This Jira connection was authorized through a different Atlassian OAuth app than the one this Tesbo deployment uses, so this deployment can't renew it once the current access token expires. Reconnect Jira in workspace settings."
-        };
-      }
-    }
     return { needsReconnect: false, authError: null };
   }
 
