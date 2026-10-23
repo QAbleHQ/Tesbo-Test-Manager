@@ -127,7 +127,12 @@ export class AppConfigService {
   // Kill switches for the Redis-backed session/entitlement caches (src/cache/). Independently
   // toggleable since they have different risk profiles — off, either falls straight through to
   // today's uncached Postgres read, exactly as if this feature had never shipped.
-  readonly sessionCacheEnabled = this.string("SESSION_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Brute-force limits (src/rate-limit/). They count failed guesses only, so they never affect a
+  // signed-in user or a successful login; off disables every counter. The multiplier scales the
+  // per-IP caps for a stack that shares one address between many clients (the e2e suite).
+  readonly rateLimitEnabled = this.string("RATE_LIMIT_ENABLED", "true").trim().toLowerCase() !== "false";
+  readonly rateLimitIpMultiplier = this.integer("RATE_LIMIT_IP_MULTIPLIER", 1);
+  readonly sessionCacheEnabled =this.string("SESSION_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
   readonly entitlementCacheEnabled = this.string("ENTITLEMENT_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
   // Kill switch for offloading knowledge-base XLSX/PDF/DOCX text extraction onto worker_threads
   // (src/legacy/kb-extraction-runner.service.ts). Off runs the identical extraction function inline
@@ -139,6 +144,13 @@ export class AppConfigService {
   // A pathological file could otherwise hang a worker (and, before this phase, the whole process)
   // indefinitely — this is a strict new protection, not a preserved timing contract.
   readonly kbExtractionTimeoutMs = this.integer("KB_EXTRACTION_TIMEOUT_MS", 30_000);
+  // NYRA agent. Server-to-server only: the key is never sent to the browser. One key is bound to one
+  // NYRA workspace and Tesbo project, so project isolation is enforced here (nyra_projects table).
+  // From the backend container, NYRA on the host is http://host.docker.internal:2905 (plain http only
+  // passes safeFetch while ALLOW_PRIVATE_AI_HOSTS=true; a hosted deployment needs an https URL).
+  readonly nyraApiKey = this.string("NYRA_API_KEY", "").trim();
+  readonly nyraBaseUrl = this.string("NYRA_BASE_URL", "").trim().replace(/\/+$/, "");
+
   // Kill switch for Zyra batch-save's set-based create path (legacy.service.ts's
   // processZyraSaveEntriesBatched/zyraBatchInsertTestCases). Defaults OFF, unlike this remediation's
   // other flags: this is the highest-risk change in the plan (no existing test coverage for

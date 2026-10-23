@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { getWorkspaceAnalytics, type WorkspaceAnalytics } from "@/lib/api";
+import { formatNumber } from "@/lib/number";
 import { Card, PageLoader } from "@/components/ui";
 import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
@@ -131,24 +132,24 @@ export default function DashboardPage() {
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
           <Link href="/projects" className="block">
             <Card className="p-4 transition hover:border-[var(--border-strong)]">
-              <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.projectCount}</p>
+              <p className="text-2xl font-semibold text-[var(--foreground)]">{formatNumber(analytics.projectCount)}</p>
               <p className="text-sm text-[var(--muted)]">Projects</p>
             </Card>
           </Link>
           <Card className="p-4">
-            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.testCaseCount}</p>
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{formatNumber(analytics.testCaseCount)}</p>
             <p className="text-sm text-[var(--muted)]">Test cases</p>
           </Card>
           <Card className="p-4">
-            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.suiteCount}</p>
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{formatNumber(analytics.suiteCount)}</p>
             <p className="text-sm text-[var(--muted)]">Total Suites</p>
           </Card>
           <Card className="p-4">
-            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.planCount}</p>
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{formatNumber(analytics.planCount)}</p>
             <p className="text-sm text-[var(--muted)]">Test plans</p>
           </Card>
           <Card className="p-4">
-            <p className="text-2xl font-semibold text-[var(--foreground)]">{analytics.cycleCount}</p>
+            <p className="text-2xl font-semibold text-[var(--foreground)]">{formatNumber(analytics.cycleCount)}</p>
             <p className="text-sm text-[var(--muted)]">Test runs</p>
           </Card>
         </div>
@@ -179,14 +180,14 @@ export default function DashboardPage() {
                       <div className="h-2 overflow-hidden rounded-full bg-[var(--surface-tertiary)]">
                         <div className="h-full rounded-full" style={{ width: `${pct}%`, background: style.fill }} />
                       </div>
-                      <p className="text-xs text-[var(--muted)]">{count} of {totalExec}</p>
+                      <p className="text-xs text-[var(--muted)]">{formatNumber(count)} of {formatNumber(totalExec)}</p>
                     </div>
                   );
                 })}
               </div>
               <div className="border-t border-[var(--border-subtle)] bg-[var(--surface-secondary)] px-4 py-3">
                 <p className="text-sm text-[var(--muted)]">
-                  Total executions across all projects: <strong>{totalExec}</strong>
+                  Total executions across all projects: <strong>{formatNumber(totalExec)}</strong>
                 </p>
                 <Link href="/projects" className="mt-1 inline-block text-sm text-[var(--accent-light)] hover:underline">
                   View projects →

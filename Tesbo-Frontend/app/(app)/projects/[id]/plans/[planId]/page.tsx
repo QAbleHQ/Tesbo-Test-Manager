@@ -49,6 +49,7 @@ import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { Breadcrumbs } from "@/components/workflows";
 import { planStatus, formatLastRun, OwnerAvatar, PlanStatusBadge } from "@/components/testplans/PlanCard";
+import { DateRangeFields, DateRangeSummary, dateRangeError, type DueState } from "@/components/testplans/DueDates";
 import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/testruns/runDisplay";
 
 /* ───── Helpers ───── */
@@ -166,6 +167,9 @@ export default function PlanDetailPage() {
   const [editName, setEditName] = useState("");
   const [editDesc, setEditDesc] = useState("");
   const [editRelease, setEditRelease] = useState("");
+  const [editStartDate, setEditStartDate] = useState("");
+  const [editDueDate, setEditDueDate] = useState("");
+  const [editError, setEditError] = useState<string | null>(null);
 
   const environmentOptions = useMemo(() => getTestRunEnvironments(project.settings), [project]);
   const ownerNames = useMemo(
@@ -250,11 +254,21 @@ export default function PlanDetailPage() {
   }
 
   async function handleSaveEdit() {
-    await updatePlan(planId, {
-      name: editName || undefined,
-      description: editDesc,
-      targetRelease: editRelease,
-    });
+    if (!editStartDate || dateRangeError(editStartDate, editDueDate)) return;
+    setEditError(null);
+    try {
+      await updatePlan(planId, {
+        name: editName || undefined,
+        description: editDesc,
+        targetRelease: editRelease,
+        startDate: editStartDate,
+        // null removes the due date; a plan can go back to having none.
+        dueDate: editDueDate || null,
+      });
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Failed to save the plan.");
+      return;
+    }
     setEditing(false);
     await loadData();
   }
@@ -305,6 +319,9 @@ export default function PlanDetailPage() {
   const planDescription = typeof plan.description === "string" ? plan.description : "";
   const planTargetRelease = typeof plan.targetRelease === "string" ? plan.targetRelease : "";
   const planOwnerId = typeof plan.ownerId === "string" ? plan.ownerId : null;
+  const planStartDate = typeof plan.startDate === "string" ? plan.startDate : "";
+  const planDueDate = typeof plan.dueDate === "string" ? plan.dueDate : "";
+  const planDueState = (typeof plan.dueState === "string" ? plan.dueState : null) as DueState;
   const currentPlanSummary = allPlans.find((p) => p.id === planId) ?? null;
   const status = currentPlanSummary ? planStatus(currentPlanSummary) : "draft";
   const ownerName = planOwnerId ? ownerNames[planOwnerId] : undefined;
@@ -335,7 +352,7 @@ export default function PlanDetailPage() {
                 <>
                   <button
                     type="button"
-                    onClick={() => { setEditName(planName); setEditDesc(planDescription); setEditRelease(planTargetRelease); setEditing(true); }}
+                    onClick={() => { setEditName(planName); setEditDesc(planDescription); setEditRelease(planTargetRelease); setEditStartDate(planStartDate); setEditDueDate(planDueDate); setEditError(null); setEditing(true); }}
                     className="flex h-[30px] cursor-pointer items-center gap-1.5 rounded-[6px] border border-[var(--ink-200)] bg-transparent px-3 text-[12px] font-medium text-[var(--ink-600)] transition-colors hover:bg-[var(--ink-100)]"
                   >
                     <IconPencil size={13} stroke={1.75} />
@@ -400,8 +417,20 @@ export default function PlanDetailPage() {
                   placeholder="e.g. 2026.09"
                 />
               </Field>
+              <DateRangeFields
+                idPrefix="plan-edit"
+                startDate={editStartDate}
+                dueDate={editDueDate}
+                onStartDateChange={setEditStartDate}
+                onDueDateChange={setEditDueDate}
+              />
+              {editError && (
+                <p role="alert" data-testid="plan-edit-error" className="rounded-lg border border-[var(--error)]/30 bg-[var(--error)]/10 px-3 py-2 text-sm text-[var(--error-foreground)]">
+                  {editError}
+                </p>
+              )}
               <div className="flex gap-2">
-                <Button onClick={handleSaveEdit}>Save</Button>
+                <Button onClick={handleSaveEdit} disabled={!editStartDate || !!dateRangeError(editStartDate, editDueDate)}>Save</Button>
                 <Button variant="secondary" onClick={() => setEditing(false)}>Cancel</Button>
               </div>
             </div>
@@ -417,6 +446,9 @@ export default function PlanDetailPage() {
                 )}
               </div>
               {planDescription && <p className="mt-1 text-[13px] text-[var(--muted-soft)]">{planDescription}</p>}
+              <div className="mt-2">
+                <DateRangeSummary startDate={planStartDate} dueDate={planDueDate} dueState={planDueState} />
+              </div>
               <div className="mt-2.5 flex flex-wrap items-center gap-4">
                 <span className="flex items-center gap-1.5 text-[12px] text-[var(--muted)]">
                   <IconCalendarEvent size={13} stroke={1.75} className="text-[var(--muted-soft)]" />

@@ -1025,6 +1025,317 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     }
   });
 
+  // ─── AI provider base URL: the server must not be aimable at its own network ─
+  //
+  // A workspace owner types the base URL and the server then calls it with the stored key. Anyone can
+  // sign up and own a workspace, so http://169.254.169.254/ made this server read its own cloud
+  // metadata, and the reply came back as the provider's "error". src/common/safe-fetch.ts now refuses
+  // such addresses when the URL is saved AND on every call (a name can be re-pointed after it was
+  // checked), pins the connection to the address it checked, and never follows a redirect.
+  //
+  // This suite runs against a stack with ALLOW_PRIVATE_AI_HOSTS=true, because the fake providers the
+  // other specs start live on private addresses. So what is asserted here is what holds either way:
+  // the metadata, link-local, "this host" and multicast ranges, URL syntax, and key re-entry. Refusal
+  // of ordinary private addresses is covered by src/common/safe-fetch.spec.ts, and by ZYR-SSRF-05 when
+  // the target is a hosted stack (E2E_AI_PRIVATE_HOSTS_BLOCKED=true).
+
+  const keyName = (label: string) => `E2E SSRF ${label} ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const savedKeyCount = (name: string) =>
+    Number(scalar(`SELECT COUNT(*) FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)} AND name = ${literal(name)};`));
+
+  test("ZYR-SSRF-01 a base URL that points at the metadata service, this host or the link-local range is refused, and nothing is saved", async () => {
+    const urls = [
+      "https://169.254.169.254/latest/meta-data/",
+      "http://169.254.169.254/latest/meta-data/",
+      "https://169.254.170.2/v2/credentials",
+      "https://0.0.0.0/",
+      "https://0/",
+      "https://224.0.0.1/",
+      "https://255.255.255.255/",
+      "https://[fd00:ec2::254]/latest/",
+      "https://[fe80::1]/",
+      "https://[::ffff:169.254.169.254]/",
+      "https://[::ffff:a9fe:a9fe]/",
+      "https://100.100.100.200/latest/meta-data/",
+      // The same address in the spellings a URL parser folds together.
+      "http://2852039166/",
+      "http://0xa9.0xfe.0xa9.0xfe/",
+      "http://0251.0376.0251.0376/",
+      "http://169.254.43518/",
+      // A public name that resolves to the metadata address (needs DNS; an unresolvable name is refused the same way).
+      "https://169.254.169.254.nip.io/",
+    ];
+    for (const baseUrl of urls) {
+      const name = keyName("blocked");
+      const res = await asOwner.post("/api/workspace/ai-keys", {
+        data: { name, provider: "custom", apiKey: "sk-e2e-ssrf", baseUrl },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${baseUrl} was accepted: ${await res.text()}`).toBe(400);
+      const body = await res.json();
+      expect(body.code, baseUrl).toBe("ai_base_url_blocked");
+      expect(String(body.error), baseUrl).toMatch(/^Base URL not allowed:/);
+      expect(savedKeyCount(name), `${baseUrl} left a key behind`).toBe(0);
+    }
+  });
+
+  test("ZYR-SSRF-02 a base URL with credentials, a non-http scheme, or no real address is refused", async () => {
+    for (const baseUrl of [
+      "file:///etc/passwd",
+      "ftp://8.8.8.8/",
+      "gopher://8.8.8.8/",
+      "javascript:alert(1)",
+      "data:text/plain,hello",
+      "https://user:pass@8.8.8.8/v1",
+      "https://user@8.8.8.8/v1",
+      "https://8.8.8.8@169.254.169.254/",
+      "not a url",
+      "https://",
+      "//8.8.8.8/v1",
+      `https://${"a".repeat(3000)}.example.com/`,
+    ]) {
+      const name = keyName("syntax");
+      const res = await asOwner.post("/api/workspace/ai-keys", {
+        data: { name, provider: "custom", apiKey: "sk-e2e-ssrf", baseUrl },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${baseUrl.slice(0, 40)} was accepted: ${await res.text()}`).toBe(400);
+      expect(savedKeyCount(name)).toBe(0);
+    }
+  });
+
+  test("ZYR-SSRF-03 the refusal never says what the address was, so it cannot be used to map the network", async () => {
+    const res = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: keyName("quiet"), provider: "custom", apiKey: "sk-e2e-ssrf", baseUrl: "https://169.254.169.254/" },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+    expect(JSON.stringify(await res.json())).not.toMatch(/169\.254|169|254/);
+  });
+
+  test("ZYR-SSRF-04 the model list for a blocked address degrades to the built-in list with the reason, and never answers with what was there", async () => {
+    const res = await asOwner.post("/api/workspace/ai-keys/models", {
+      data: { provider: "custom", apiKey: "sk-typed", baseUrl: "https://169.254.169.254/latest/meta-data/" },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), await res.text()).toBe(200);
+    const body = await res.json();
+    expect(body.source).toBe("fallback");
+    expect(String(body.reason)).toContain("private or internal address");
+    // Whatever a metadata service would have said is nowhere in the answer.
+    expect(JSON.stringify(body)).not.toMatch(/ami-id|instance-id|iam|security-credentials/i);
+  });
+
+  test("ZYR-SSRF-05 on a hosted stack, ordinary private addresses and plain http are refused too", async () => {
+    test.skip(
+      process.env.E2E_AI_PRIVATE_HOSTS_BLOCKED !== "true",
+      "set E2E_AI_PRIVATE_HOSTS_BLOCKED=true when the target runs with ALLOW_PRIVATE_AI_HOSTS off; the local stack turns it on for its fake providers",
+    );
+    for (const baseUrl of [
+      "http://localhost:11434/v1",
+      "https://localhost/v1",
+      "https://127.0.0.1/",
+      "https://10.0.0.1/v1",
+      "https://192.168.1.1/",
+      "https://172.16.0.5/",
+      "https://[::1]/",
+      "https://backend:1021/",
+      "https://redis:6379/",
+      "https://host.docker.internal/",
+      "http://8.8.8.8/v1",
+    ]) {
+      const res = await asOwner.post("/api/workspace/ai-keys", {
+        data: { name: keyName("hosted"), provider: "custom", apiKey: "sk-e2e-ssrf", baseUrl },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${baseUrl} was accepted`).toBe(400);
+      expect((await res.json()).code).toBe("ai_base_url_blocked");
+    }
+    // Ollama's default address is the server's own localhost, so choosing it hosted has nowhere to go.
+    const ollama = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name: keyName("ollama"), provider: "ollama", apiKey: "" },
+      failOnStatusCode: false,
+    });
+    expect(ollama.status()).toBe(400);
+  });
+
+  test("ZYR-SSRF-06 a saved key is never sent to a different base URL: naming it and changing the address asks for the key again", async () => {
+    // Before this, POST ai-keys/models with {keyId, baseUrl: "https://attacker/"} made the server call
+    // that address with the stored secret: the one way to read a key the browser only ever sees masked.
+    const name = keyName("reentry");
+    const created = await asOwner.post("/api/workspace/ai-keys", {
+      data: { name, provider: "openai", apiKey: "sk-e2e-ssrf-secret" },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), await created.text()).toBeLessThan(300);
+    const keyId = (await created.json()).id as string;
+    try {
+      for (const baseUrl of ["https://attacker.example/v1", "https://8.8.8.8/v1", "http://127.0.0.1:9999/", "https://169.254.169.254/"]) {
+        const res = await asOwner.post("/api/workspace/ai-keys/models", {
+          data: { provider: "openai", keyId, baseUrl },
+          failOnStatusCode: false,
+        });
+        expect(res.status(), `${baseUrl} was allowed to receive the stored key`).toBe(400);
+        const body = await res.json();
+        expect(body.code).toBe("ai_key_reentry_required");
+        expect(JSON.stringify(body)).not.toContain("sk-e2e-ssrf-secret");
+      }
+
+      // The same key for the destination it was saved for still works, with and without the URL spelled out.
+      for (const data of [{ provider: "openai", keyId }, { provider: "openai", keyId, baseUrl: "https://api.openai.com/v1" }]) {
+        const ok = await asOwner.post("/api/workspace/ai-keys/models", { data, failOnStatusCode: false });
+        expect(ok.status(), await ok.text()).toBe(200);
+        expect(JSON.stringify(await ok.json())).not.toContain("sk-e2e-ssrf-secret");
+      }
+
+      // A key the owner types is theirs to send anywhere that is allowed.
+      const typed = await asOwner.post("/api/workspace/ai-keys/models", {
+        data: { provider: "openai", keyId, apiKey: "sk-typed-by-owner", baseUrl: "https://attacker.example/v1" },
+        failOnStatusCode: false,
+      });
+      expect(typed.status()).toBe(200);
+    } finally {
+      await asOwner.delete(`/api/workspace/ai-keys/${keyId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("ZYR-SSRF-07 a key saved BEFORE this protection, pointing at the metadata address, is refused when it is used", async () => {
+    // Rows written by an older build never went through the save-time check, so the call itself has to
+    // refuse. Inserted directly to stand in for such a row.
+    const name = keyName("legacy");
+    exec(
+      `INSERT INTO workspace_ai_keys (organization_id, name, provider, api_key, base_url, created_by) VALUES ` +
+        `(${literal(tenant!.organizationId)}, ${literal(name)}, 'custom', 'sk-legacy', 'https://169.254.169.254/latest/', ${literal(tenant!.owner.userId)});`,
+    );
+    const keyId = scalar(`SELECT id FROM workspace_ai_keys WHERE organization_id = ${literal(tenant!.organizationId)} AND name = ${literal(name)};`);
+    try {
+      const res = await asOwner.post("/api/workspace/ai-keys/models", { data: { provider: "custom", keyId }, failOnStatusCode: false });
+      expect(res.status(), await res.text()).toBe(200);
+      const body = await res.json();
+      expect(body.source).toBe("fallback");
+      expect(String(body.reason)).toContain("private or internal address");
+    } finally {
+      exec(`DELETE FROM workspace_ai_keys WHERE id = ${literal(keyId)};`);
+    }
+  });
+
+  test("ZYR-SSRF-08 only the workspace owner can reach any of this, and a member of another workspace cannot use this workspace's key", async () => {
+    const name = keyName("owneronly");
+    const created = await asOwner.post("/api/workspace/ai-keys", { data: { name, provider: "openai", apiKey: "sk-e2e-ssrf-x" } });
+    const keyId = (await created.json()).id as string;
+    try {
+      for (const [who, api] of [["manager", asManager], ["qa_engineer", asQa], ["guest", asGuest], ["anonymous", anon]] as const) {
+        const res = await api.post("/api/workspace/ai-keys/models", {
+          data: { provider: "openai", keyId, baseUrl: "https://attacker.example/v1" },
+          failOnStatusCode: false,
+        });
+        expect([401, 403], `${who} reached the key`).toContain(res.status());
+        const saved = await api.post("/api/workspace/ai-keys", {
+          data: { name: keyName("intruder"), provider: "custom", apiKey: "sk-x", baseUrl: "https://8.8.8.8/v1" },
+          failOnStatusCode: false,
+        });
+        expect([401, 403], `${who} saved a key`).toContain(saved.status());
+      }
+    } finally {
+      await asOwner.delete(`/api/workspace/ai-keys/${keyId}`, { failOnStatusCode: false });
+    }
+  });
+
+  // ─── AI key fields: the shape of every one is checked before it is used ───────
+  //
+  // The key, the header name and the scheme end up in an HTTP header; name and provider in fixed-width
+  // columns; the URL in a request. A value that is not text, is too long, or could break a header used
+  // to reach Postgres as a 500 or the request as a header it was never meant to send.
+
+  test("ZYR-IN-01 a name, provider or key over its limit, or not text, is a 400 that names the field", async () => {
+    const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+      ["a 129-character name", { name: "n".repeat(129) }, /name must be at most 128 characters/],
+      ["a 33-character provider", { provider: "p".repeat(33) }, /provider must be at most 32 characters/],
+      ["a provider with a space", { provider: "my provider", baseUrl: "https://8.8.8.8/v1" }, /provider may only contain/],
+      ["a provider with a slash", { provider: "a/b", baseUrl: "https://8.8.8.8/v1" }, /provider may only contain/],
+      ["a 4097-character key", { apiKey: "k".repeat(4097) }, /apiKey must be at most 4096 characters/],
+      ["a 129-character model", { defaultModel: "m".repeat(129) }, /defaultModel must be at most 128 characters/],
+      ["a numeric name", { name: 12345 }, /name must be text/],
+      ["an object key", { apiKey: { a: 1 } }, /apiKey must be text/],
+      ["an array provider", { provider: ["openai"] }, /provider must be text/],
+      ["a numeric base URL", { provider: "custom", baseUrl: 42 }, /baseUrl must be text/],
+    ];
+    for (const [label, override, message] of cases) {
+      const name = keyName("fields");
+      const res = await asOwner.post("/api/workspace/ai-keys", {
+        data: { name, provider: "openai", apiKey: "sk-e2e-fields", ...override },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${label} answered ${res.status()}: ${await res.text()}`).toBe(400);
+      expect(String((await res.json()).error), label).toMatch(message);
+      expect(savedKeyCount(String(override.name ?? name)), `${label} left a key behind`).toBe(0);
+    }
+  });
+
+  test("ZYR-IN-02 a line break or control character in the key, name, model or scheme is refused, so no header can be injected", async () => {
+    for (const [field, value] of [
+      ["apiKey", "sk-abc\r\nX-Injected: 1"],
+      ["apiKey", "sk-abc\nnext"],
+      ["apiKey", "sk-abc\u0000"],
+      ["name", "line1\nline2"],
+      ["defaultModel", "gpt\r\n"],
+      ["authScheme", "Bearer\r\nX: y"],
+    ] as const) {
+      const res = await asOwner.post("/api/workspace/ai-keys", {
+        data: { name: keyName("control"), provider: "custom", apiKey: "sk-e2e-control", baseUrl: "https://8.8.8.8/v1", [field]: value },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${field} with a control character was accepted`).toBe(400);
+      expect(String((await res.json()).error)).toMatch(/control characters or line breaks/);
+    }
+    // The model-listing call, which sends the key straight away, is held to the same rule.
+    const models = await asOwner.post("/api/workspace/ai-keys/models", {
+      data: { provider: "custom", apiKey: "sk-x\r\nX: 1", baseUrl: "https://8.8.8.8/v1" },
+      failOnStatusCode: false,
+    });
+    expect(models.status()).toBe(400);
+  });
+
+  test("ZYR-IN-03 an auth header that changes how the request is sent, or is not a valid header name, is refused", async () => {
+    for (const header of ["Host", "content-length", "Transfer-Encoding", "Connection", "Upgrade", "Cookie", "Proxy-Authorization", "Accept-Encoding"]) {
+      const res = await asOwner.post("/api/workspace/ai-keys", {
+        data: { name: keyName("header"), provider: "custom", apiKey: "sk-e2e", baseUrl: "https://8.8.8.8/v1", authHeaderName: header },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${header} was accepted`).toBe(400);
+      expect(String((await res.json()).error)).toMatch(/cannot be used/);
+    }
+    for (const header of ["x api key", "x-api-key:", "a(b)", "a@b", "ключ"]) {
+      const res = await asOwner.post("/api/workspace/ai-keys", {
+        data: { name: keyName("badheader"), provider: "custom", apiKey: "sk-e2e", baseUrl: "https://8.8.8.8/v1", authHeaderName: header },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `${JSON.stringify(header)} was accepted`).toBe(400);
+    }
+  });
+
+  test("ZYR-IN-04 ordinary custom gateways still save: a normal header name, a scheme, a model, and the longest allowed values", async () => {
+    const created: string[] = [];
+    try {
+      for (const extra of [
+        { authHeaderName: "x-api-key", authScheme: "" },
+        { authHeaderName: "Authorization", authScheme: "Token" },
+        { authHeaderName: "ocp-apim-subscription-key", authScheme: "" },
+        { defaultModel: "m".repeat(128) },
+        { apiKey: "k".repeat(4096) },
+      ]) {
+        const res = await asOwner.post("/api/workspace/ai-keys", {
+          data: { name: keyName("fine"), provider: "custom", apiKey: "sk-e2e-fine", baseUrl: "https://8.8.8.8/v1", ...extra },
+          failOnStatusCode: false,
+        });
+        expect(res.status(), `${JSON.stringify(Object.keys(extra))} was refused: ${await res.text()}`).toBeLessThan(300);
+        created.push((await res.json()).id);
+      }
+    } finally {
+      for (const id of created) await asOwner.delete(`/api/workspace/ai-keys/${id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("ZYR-A-28 the AI key routes refuse a caller with no session", { tag: '@tesbo.testId("TES-TC-622")' }, async () => {
     for (const [what, attempt] of [
       ["GET ai-keys", () => anon.get("/api/workspace/ai-keys", { failOnStatusCode: false })],

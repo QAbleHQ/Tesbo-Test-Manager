@@ -40,6 +40,13 @@ next-dev*.log
 # rotating it (Project -> Settings -> API & MCP) does not remove it from this repo's history. If the
 # repo is ever opened up, rotate first. Precedence is inline options, then env, then this file, so
 # a runner that sets TESBO_API_TOKEN still overrides the committed value without editing anything.
+#
+# Since V146 tokens EXPIRE (90 days by default; the one committed here was migrated to 90 days from
+# that migration). When it lapses the reporter's calls answer 401 and every CI run fails at
+# collection: mint a replacement under Project -> Settings -> API tokens and update the token in
+# e2e/tesbo.config.json. The "cannot read another project" limit above is enforced by
+# src/auth/api-token-policy.ts: a token reaches only its own project's testcases, suites, cycles,
+# mcp and automation routes.
 infra/kubernetes/**/secret.yaml
 infra/kubernetes/base/registry-secret.yaml
 *.pem
@@ -80,3 +87,6 @@ Zyra Workflow Agents/
 docs/superpowers/
 # Qase to Tesbo migration scripts and ledgers (local only)
 migration-nevvon/
+
+# CI: npm cache written inside the Jenkins workspace by the quality-gates container
+.npm-cache/

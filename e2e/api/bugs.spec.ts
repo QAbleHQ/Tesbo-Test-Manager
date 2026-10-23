@@ -9,7 +9,7 @@ import {
   resetRbacMembership,
   type RbacTenant,
 } from "../utils/rbac-tenant";
-import { exec, literal, scalar } from "../utils/psql";
+import { dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 import { filesForm, filesFormWith, pngFile, sizedFile, textFile, type UploadFile } from "../utils/uploads";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -641,6 +641,220 @@ test.describe("bug priority", () => {
     try {
       expect(bug.priority, "stored canonically whatever case it arrived in").toBe("P2");
     } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * Bug due date — "[Bug] Need due date field for Bugs".
+ *
+ * An optional calendar day (V146, a DATE column). It travels as "YYYY-MM-DD" in both directions, so
+ * these tests assert the exact string: a driver that parsed the DATE into a JS Date would hand back a
+ * timestamp shifted by the server's timezone. Absent, null and "" mean "no due date" on create; on
+ * edit an omitted key leaves it alone and an explicit null or "" clears it, like priority.
+ */
+test.describe("bug due date", () => {
+  test("a bug can be created with a due date, and one created without has none", async ({ request }) => {
+    const withDate = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Due ${Date.now()}`, dueDate: "2031-03-15" },
+      })
+    ).json();
+    const without = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug No Due ${Date.now()}` } })
+    ).json();
+
+    try {
+      expect(withDate.dueDate, "a plain calendar day, not a timestamp").toBe("2031-03-15");
+      expect(without.dueDate).toBeNull();
+
+      const fetched = await (await request.get(`/api/bugs/${withDate.id}`)).json();
+      expect(fetched.dueDate).toBe("2031-03-15");
+
+      const listed = await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json();
+      expect(
+        listed.find((b: { id: string }) => b.id === withDate.id).dueDate,
+        "the due date has to survive the list endpoint, not just the create response"
+      ).toBe("2031-03-15");
+      expect(listed.find((b: { id: string }) => b.id === without.id).dueDate).toBeNull();
+    } finally {
+      for (const bug of [withDate, without]) await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a due date can be set, changed, left alone by other edits, and cleared", async ({ request }) => {
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Due Edit ${Date.now()}` } })
+    ).json();
+
+    try {
+      const set = await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-01-02" } })).json();
+      expect(set.dueDate).toBe("2031-01-02");
+
+      const changed = await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-12-31" } })).json();
+      expect(changed.dueDate).toBe("2031-12-31");
+
+      // Omitting the key leaves it alone — an unrelated edit must not wipe the date.
+      const untouched = await (await request.patch(`/api/bugs/${bug.id}`, { data: { title: `${bug.title} v2` } })).json();
+      expect(untouched.dueDate).toBe("2031-12-31");
+
+      const cleared = await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: null } })).json();
+      expect(cleared.dueDate).toBeNull();
+
+      // "" is what an emptied date input submits, so it clears too.
+      await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-05-05" } });
+      const clearedByEmpty = await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "" } })).json();
+      expect(clearedByEmpty.dueDate).toBeNull();
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("today, a leap day and a far-future date are all stored exactly as sent", async ({ request }) => {
+    // Today is the earliest a new bug can be due: it is the day the bug is reported.
+    const dates = [new Date().toISOString().slice(0, 10), "2032-02-29", "2099-12-31"];
+    const bugs: Array<{ id: string; dueDate: string }> = [];
+    try {
+      for (const dueDate of dates) {
+        const bug = await (
+          await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+            data: { title: `E2E Bug Due Range ${Date.now()}`, dueDate },
+          })
+        ).json();
+        bugs.push(bug);
+        expect(bug.dueDate).toBe(dueDate);
+      }
+    } finally {
+      for (const bug of bugs) await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a malformed or impossible due date is a clean 400 on create and edit, and stores nothing", async ({ request }) => {
+    const before = (await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json()).length;
+
+    for (const bad of ["tomorrow", "2026-13-01", "2026-02-30", "2027-02-29", "31/12/2026", "2026-1-5", "2026-12-31T10:00:00Z", 20261231, true]) {
+      const res = await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Bad Due ${Date.now()}`, dueDate: bad },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `dueDate ${JSON.stringify(bad)} should be a clean 400, not a 500`).toBe(400);
+      expect((await res.json()).field).toBe("dueDate");
+    }
+    expect((await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json()).length, "a refused create must not leave a bug behind").toBe(before);
+
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Bad Due Edit ${Date.now()}`, dueDate: "2031-06-06" } })
+    ).json();
+    try {
+      const res = await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2026-02-30" }, failOnStatusCode: false });
+      expect(res.status()).toBe(400);
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).dueDate, "a refused edit keeps the stored date").toBe("2031-06-06");
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a due date in the past is refused on create and on edit", async ({ request }) => {
+    const before = (await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json()).length;
+    // Two days back is outside the one-day timezone allowance the server gives a caller behind UTC.
+    const past = new Date(Date.now() - 2 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    for (const bad of [past, "2001-09-09"]) {
+      const res = await request.post(`/api/projects/${ctx.projectId}/bugs`, {
+        data: { title: `E2E Bug Past Due ${Date.now()}`, dueDate: bad },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `create with dueDate ${bad}`).toBe(400);
+      const body = await res.json();
+      expect(body.field).toBe("dueDate");
+      expect(body.error).toContain("earlier than today");
+    }
+    expect((await (await request.get(`/api/projects/${ctx.projectId}/bugs`)).json()).length, "a refused create must not leave a bug behind").toBe(before);
+
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Past Due Edit ${Date.now()}`, dueDate: "2031-06-06" } })
+    ).json();
+    try {
+      for (const bad of [past, "2001-09-09"]) {
+        const res = await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: bad }, failOnStatusCode: false });
+        expect(res.status(), `edit to dueDate ${bad}`).toBe(400);
+      }
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).dueDate, "a refused edit keeps the stored date").toBe("2031-06-06");
+      // Clearing is always allowed.
+      expect((await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: null } })).json()).dueDate).toBeNull();
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a bug whose due date has gone by stays editable, but cannot be moved to another past date", async ({ request }) => {
+    test.skip(!dbControlAvailable(), "needs DB access to back-date a due date");
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Overdue Edit ${Date.now()}`, dueDate: "2031-06-06" } })
+    ).json();
+    try {
+      // The API refuses a past date, so back-date the column to stand in for time passing.
+      exec(`UPDATE bugs SET due_date = ${literal("2020-01-01")}::date WHERE id = ${literal(bug.id)}`);
+
+      // Re-saving the unchanged (now past) date alongside another edit is not a new past date.
+      const resent = await request.patch(`/api/bugs/${bug.id}`, { data: { title: `${bug.title} v2`, dueDate: "2020-01-01" }, failOnStatusCode: false });
+      expect(resent.status()).toBe(200);
+      expect((await resent.json()).dueDate).toBe("2020-01-01");
+
+      // Choosing a different past date is.
+      const moved = await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2020-02-02" }, failOnStatusCode: false });
+      expect(moved.status()).toBe(400);
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).dueDate).toBe("2020-01-01");
+
+      // And it can be moved forward.
+      expect((await (await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-07-07" } })).json()).dueDate).toBe("2031-07-07");
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("changing the due date is recorded in the bug's activity, and re-saving the same date is not", async ({ request }) => {
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Due Activity ${Date.now()}` } })
+    ).json();
+    try {
+      const updatedRows = async () => {
+        const res = await request.get(`/api/projects/${ctx.projectId}/activity`, {
+          params: { entityType: "bug", entityId: bug.id, limit: "100" },
+        });
+        expect(res.status(), await res.text()).toBe(200);
+        const rows: Array<{ action: string; diff: string | null }> = (await res.json()).list;
+        return rows.filter((r) => r.action === "bug_updated" && JSON.parse(r.diff || "{}").fields?.includes("dueDate"));
+      };
+      await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-07-07" } });
+      expect((await updatedRows()).length).toBe(1);
+      await request.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-07-07" } });
+      expect((await updatedRows()).length, "an unchanged date logs nothing").toBe(1);
+    } finally {
+      await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("an anonymous caller and another tenant cannot set or read a bug's due date", async ({ request }) => {
+    const bug = await (
+      await request.post(`/api/projects/${ctx.projectId}/bugs`, { data: { title: `E2E Bug Due Authz ${Date.now()}`, dueDate: "2031-08-08" } })
+    ).json();
+    const anon = await playwrightRequest.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+    const asB = await playwrightRequest.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: path.join(__dirname, "../.auth/state-b.json"),
+    });
+    try {
+      expect((await anon.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-09-09" }, failOnStatusCode: false })).status()).toBe(401);
+      const crossPatch = await asB.patch(`/api/bugs/${bug.id}`, { data: { dueDate: "2031-09-09" }, failOnStatusCode: false });
+      expect([403, 404]).toContain(crossPatch.status());
+      const crossGet = await asB.get(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+      expect([403, 404]).toContain(crossGet.status());
+
+      expect((await (await request.get(`/api/bugs/${bug.id}`)).json()).dueDate, "the refused writes changed nothing").toBe("2031-08-08");
+    } finally {
+      await anon.dispose();
+      await asB.dispose();
       await request.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
     }
   });

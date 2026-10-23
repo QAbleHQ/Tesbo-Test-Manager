@@ -1,25 +1,108 @@
+# Dependency update pull requests. This file used to set open-pull-requests-limit: 0 on every entry, which
+# switches version updates off entirely. They are on now, kept quiet three ways:
+#   - weekly, on Monday, so reviews happen once a week rather than as they trickle in;
+#   - minor and patch updates are grouped into ONE pull request per ecosystem, so a normal week is a
+#     single PR to review, while a major version arrives on its own where it can be judged alone;
+#   - at most five open PRs per ecosystem.
+#
+# Security updates (a vulnerable version, as opposed to a newer one) are a separate switch under
+# Settings > Advanced Security > Dependabot security updates; they open PRs regardless of this file's schedule.
+#
+# Every PR runs .github/workflows/ci.yml, and merging to main/dev runs the same gates again in Jenkins
+# before anything deploys, so an update that breaks the build or the tests is stopped, not shipped.
 version: 2
 updates:
-  - package-ecosystem: npm
-    directory: /Tesbo-Frontend
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 0
-
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 0
-
   - package-ecosystem: npm
     directory: /Tesbo-Backend-Nest
     schedule:
       interval: weekly
-    open-pull-requests-limit: 0
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(backend)
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
 
+  - package-ecosystem: npm
+    directory: /Tesbo-Frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(frontend)
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /e2e
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(e2e)
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /sdk/playwright-reporter
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(sdk)
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # The root package.json only carries Playwright for the repo-level scripts.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(root)
+
+  # Base images in the Dockerfiles (node:22-bookworm-slim ...).
+  - package-ecosystem: docker
+    directory: /Tesbo-Backend-Nest
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(docker)
+
+  - package-ecosystem: docker
+    directory: /Tesbo-Frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(docker)
+
+  # Keeps the actions used by .github/workflows/ci.yml current.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 0
+      day: monday
+    open-pull-requests-limit: 3
+    labels: [dependencies]
+    commit-message:
+      prefix: deps(actions)

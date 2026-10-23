@@ -1,4 +1,6 @@
 // Auto-deploy on main + SonarQube scan before deploy.
+// Gates: typecheck, lint ratchet, unit tests, critical-dependency audit and a secret scan must pass BEFORE anything
+// deploys (scripts/ci-check.sh, .gitleaks.toml). A failure there stops the build with nothing deployed.
 // Sonar secrets: Jenkins Managed file id = tesbo-test-manager-env
 // Sonar failure does NOT block deploy (catchError).
 //
@@ -18,6 +20,14 @@
 
 pipeline {
   agent any
+
+  parameters {
+    booleanParam(
+      name: 'SKIP_GATES',
+      defaultValue: false,
+      description: 'EMERGENCY ONLY: deploy without the quality gates and the secret scan. Only a person pressing "Build with Parameters" can set this; a push never does. The build is labelled so it cannot be missed.'
+    )
+  }
 
   options {
     timestamps()
@@ -54,6 +64,56 @@ pipeline {
           env.GIT_SHA = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
           echo "Pipeline ${env.GIT_SHA} -> prod blue/green deploy ${env.DEPLOY_USER}@${env.DEPLOY_HOST}:${env.DEPLOY_PATH}"
         }
+      }
+    }
+
+    // Nothing below the gates runs unless the code is fit to ship. Both stages run in throwaway containers
+    // as the Jenkins user (no root-owned files left in the workspace), with the npm cache kept inside the
+    // workspace so the second build onwards does not download everything again. A first build, or one that
+    // pre-dates the SKIP_GATES parameter, has params.SKIP_GATES unset, which is treated as "run the gates".
+    stage('Gates skipped') {
+      when { expression { params.SKIP_GATES } }
+      steps {
+        script {
+          currentBuild.description = 'QUALITY GATES SKIPPED (SKIP_GATES)'
+          echo '!!! SKIP_GATES was set: this build is deploying WITHOUT the quality gates or the secret scan. !!!'
+          unstable('Quality gates skipped by SKIP_GATES')
+        }
+      }
+    }
+
+    stage('Quality gates') {
+      when { expression { !params.SKIP_GATES } }
+      options { timeout(time: 30, unit: 'MINUTES') }
+      steps {
+        sh '''
+          set -eu
+          echo "==> typecheck, lint ratchet, unit tests, dependency audit, repo hygiene (scripts/ci-check.sh)"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e npm_config_cache=/work/.npm-cache \
+            -v "${WORKSPACE}:/work" \
+            -w /work \
+            node:22-bookworm-slim \
+            bash scripts/ci-check.sh
+        '''
+      }
+    }
+
+    stage('Secret scan') {
+      when { expression { !params.SKIP_GATES } }
+      options { timeout(time: 10, unit: 'MINUTES') }
+      steps {
+        sh '''
+          set -eu
+          echo "==> gitleaks over the committed tree and history (.gitleaks.toml, .gitleaksignore)"
+          docker run --rm \
+            --entrypoint sh \
+            -v "${WORKSPACE}:/repo:ro" \
+            zricethezav/gitleaks:v8.28.0 \
+            -c 'git config --global --add safe.directory /repo && gitleaks detect --source /repo --config /repo/.gitleaks.toml --redact --no-banner'
+        '''
       }
     }
 
@@ -306,7 +366,7 @@ ENDSSH
       echo "Deploy may have succeeded but Sonar was UNSTABLE."
     }
     failure {
-      echo "Failed. Prod only - stage was not touched. Nginx should still point at previous color."
+      echo "Failed. If the failing stage was Quality gates or Secret scan, NOTHING was deployed. Otherwise prod only - stage was not touched, and nginx should still point at the previous color."
     }
   }
 }

@@ -1,3 +1,4 @@
+import { safeFetch } from "../common/safe-fetch";
 import { Injectable, Logger } from "@nestjs/common";
 import { DatabaseService } from "../database/database.service";
 import { DECISION_PROMPT_CHAR_BUDGET } from "./integration-sync.constants";
@@ -128,7 +129,7 @@ export class IntegrationSyncDecisions {
     const cleanKey = String(allocation.api_key || "").replace(/^bearer\s+/i, "").trim();
     headers[authHeader] = scheme ? `${scheme} ${cleanKey}` : cleanKey;
 
-    const res = await fetch(chatCompletionsUrl(allocation.base_url), {
+    const res = await safeFetch(chatCompletionsUrl(allocation.base_url), {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -157,7 +158,7 @@ export class IntegrationSyncDecisions {
       headers["x-api-key"] = cleanKey;
     }
 
-    const res = await fetch(anthropicMessagesUrl(allocation.base_url), {
+    const res = await safeFetch(anthropicMessagesUrl(allocation.base_url), {
       method: "POST",
       headers,
       body: JSON.stringify({

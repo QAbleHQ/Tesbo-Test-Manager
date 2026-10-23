@@ -19,7 +19,7 @@ export type RunStatus = "queued" | "running" | "completed" | "failed";
  *   unverified — recorded before change tracking existed; cannot be proven current
  */
 export type StaleReason = "content" | "state" | "unverified";
-export type DifferenceField = "title" | "preconditions" | "steps" | "expectedResults" | "testData" | "postconditions";
+export type DifferenceField = "title" | "description" | "preconditions" | "steps" | "expectedResults" | "testData" | "postconditions";
 
 export interface AnalysisRun {
   id: string;
@@ -61,7 +61,7 @@ export const EDITED_FIELD_LABEL: Record<EditedField, string> = {
 /** What a reviewer changed when they edited a test case from a finding, kept at the moment of the edit. */
 export interface ReviewEditSummary {
   /** The test case that was edited (one of the finding's two). */
-  testcaseId: string | null;
+  testcaseId: string;
   editedAt: string;
   editedBy: string | null;
   /** The finding's match before and after the edit (null for edits saved before this was recorded). */
@@ -85,8 +85,8 @@ export interface ReviewRecommendation {
   staleReason: StaleReason | null;
   /** Steps the two test cases share right now (same action and expected result); the match % alone cannot show this. */
   stepAgreement: { identical: number; total: number };
-  /** Set only on edited findings: what was changed, before and after. */
-  edit: ReviewEditSummary | null;
+  /** Edits made to either test case since this finding appeared (from anywhere in the app), each with before and after. */
+  edits: ReviewEditSummary[];
   reviewedBy: string | null;
   reviewedAt: string | null;
   lastAnalysis: { runId: string | null; status: RunStatus | null; finishedAt: string | null };
@@ -193,6 +193,7 @@ export const RUN_ACTIVE: ReadonlySet<RunStatus> = new Set<RunStatus>(["queued", 
 
 export const DIFFERENCE_LABEL: Record<DifferenceField, string> = {
   title: "Title",
+  description: "Description",
   preconditions: "Preconditions",
   steps: "Steps",
   expectedResults: "Expected results",
@@ -332,6 +333,61 @@ export const STALE_HINT: Record<StaleReason, string> = {
   state: "The description, status, suite, priority, severity, type, component, owner or issue links of one of these test cases changed after the analysis.",
   unverified: "This finding was recorded before change tracking existed, so it cannot be verified as current.",
 };
+
+/**
+ * The server writes a finding's explanation when it is analysed, and older findings still carry the long form that lists
+ * every field, including the ones at 0%. This drops any field at 1% or less (and the whole "wording similarity" clause when
+ * none are left), so old and new findings read the same. Text in any other shape is returned unchanged.
+ */
+export function tidyExplanation(text: string): string {
+  const relevant = (list: string) =>
+    list
+      .split(", ")
+      .map((part) => part.trim())
+      .filter((part) => {
+        const m = /(\d+)%$/.exec(part);
+        return !m || Number(m[1]) > 1;
+      });
+
+  // "NN% match (1 of 4 steps identical; wording similarity: title 57%, steps 95%). Differs in: …"
+  const current = /^(\d+% match) \(([^)]*)\)([\s\S]*)$/.exec(text);
+  if (current) {
+    const clauses = current[2]
+      .split("; ")
+      .map((clause) => {
+        const prefix = "wording similarity: ";
+        if (!clause.startsWith(prefix)) return clause;
+        const kept = relevant(clause.slice(prefix.length));
+        return kept.length ? prefix + kept.join(", ") : "";
+      })
+      .filter(Boolean);
+    return current[1] + (clauses.length ? " (" + clauses.join("; ") + ")" : "") + current[3];
+  }
+
+  // Older still: "NN% similar overall (title 57%, steps 95%, …). Differs in: …"
+  const legacy = /^(\d+% similar overall) \(([^)]*)\)([\s\S]*)$/.exec(text);
+  if (legacy) {
+    const kept = relevant(legacy[2]);
+    return legacy[1] + (kept.length ? " (" + kept.join(", ") + ")" : "") + legacy[3];
+  }
+  return text;
+}
+
+/**
+ * What to tell the reader about a finding's match. At 0% the pair is not matching at all, and "Why they match" followed by
+ * "0% match (…)" contradicts itself, so a 0% finding gets a plain "not matching" message instead. This is decided from the
+ * match figure, so it also corrects findings stored with the older wording. Any other match keeps the (tidied) explanation.
+ */
+export function matchExplanation(text: string, similarity: number): { notMatching: boolean; text: string } {
+  const tidy = tidyExplanation(text);
+  if (Math.round(similarity * 100) !== 0) return { notMatching: false, text: tidy };
+  const steps = /\((\d+ of \d+ steps? identical)\)/.exec(tidy)?.[1];
+  const differs = /Differs in: [\s\S]*$/.exec(tidy)?.[0];
+  return {
+    notMatching: true,
+    text: "These two test cases are not matching: they have virtually nothing in common" + (steps ? " (" + steps + ")" : "") + "." + (differs ? " " + differs : ""),
+  };
+}
 
 export function formatPercent(similarity: number): string {
   return `${Math.round(similarity * 100)}%`;

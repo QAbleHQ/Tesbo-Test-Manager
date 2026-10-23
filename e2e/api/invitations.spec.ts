@@ -2,6 +2,7 @@ import { expect, test, type APIRequestContext } from "@playwright/test";
 import { env, testAddress } from "../utils/env";
 import { expectWelcomeJobScheduled, readWelcomeJob, removeWelcomeJob } from "../utils/welcome-email-queue";
 import { clearOtpIpRateLimit, clearOtpRateLimit, seedOtpCode } from "../utils/otp";
+import { exec, literal } from "../utils/psql";
 import {
   anonymousContext,
   clearInvitations,
@@ -837,6 +838,59 @@ test.describe("invitations", () => {
         expect(inviteStatus(id)).toBe("pending");
       } finally {
         await ctx.dispose();
+        clearOtpRateLimit(email);
+        detachUserByEmail(email);
+      }
+    });
+
+    test("five wrong codes kill the invite's code, so the right one is refused afterwards", async () => {
+      // The invite verify routes share OtpService.verifyOtpCode with signup and had no attempt limit,
+      // so anyone holding an invite link could brute-force the invitee's 6-digit code.
+      const email = uniqueEmail("brute");
+      const { id, token } = await invite(email);
+      const ctx = await anonymousContext();
+      try {
+        const start = await ctx.post(`/api/invitations/${token}/register/start`, {
+          data: { firstName: "EndToEnd", lastName: "Brute", password: "E2E-Otp-Reg-1!" },
+          failOnStatusCode: false,
+        });
+        expect(start.status()).toBe(204);
+
+        seedOtpCode(email, "121314");
+        for (const route of ["register/verify", "register/otp/verify"]) {
+          // Separate budgets per route would let an attacker double their guesses, so both routes are
+          // driven against the same code: five wrong in total, split across the two.
+          const wrong = await ctx.post(`/api/invitations/${token}/${route}`, {
+            data: { code: route === "register/verify" ? "000001" : "000002" },
+            failOnStatusCode: false,
+          });
+          expect(wrong.status()).toBe(401);
+        }
+        for (let guess = 3; guess <= 5; guess++) {
+          const wrong = await ctx.post(`/api/invitations/${token}/register/verify`, {
+            data: { code: `00000${guess}` },
+            failOnStatusCode: false,
+          });
+          expect(wrong.status()).toBe(401);
+        }
+
+        const right = await ctx.post(`/api/invitations/${token}/register/verify`, {
+          data: { code: "121314" },
+          failOnStatusCode: false,
+        });
+        expect(right.status(), "the correct code was accepted after five wrong guesses").toBe(401);
+        expect(orgRoleForEmail(tenant!, email)).toBe("");
+        expect(inviteStatus(id)).toBe("pending");
+
+        // Non-string code: a 400, not a 500.
+        const typed = await ctx.post(`/api/invitations/${token}/register/verify`, {
+          data: { code: 121314 },
+          failOnStatusCode: false,
+        });
+        expect(typed.status()).toBe(400);
+      } finally {
+        await ctx.dispose();
+        exec(`DELETE FROM otp_codes WHERE email = ${literal(email.toLowerCase())};`);
         clearOtpRateLimit(email);
         detachUserByEmail(email);
       }

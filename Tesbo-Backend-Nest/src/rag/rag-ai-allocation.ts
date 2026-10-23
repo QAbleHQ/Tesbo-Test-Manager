@@ -1,5 +1,6 @@
+import { safeFetch } from "../common/safe-fetch";
 import { DatabaseService } from "../database/database.service";
-import { EmbeddingCapability, embeddingCapability, embeddingCapableProviderKeys, expectedDimension } from "./rag-embedding-providers";
+import { EmbeddingCapability, embeddingCapability, embeddingCapableProviderKeys, expectedDimension, VOYAGE_BASE_URL, VOYAGE_EMBEDDING } from "./rag-embedding-providers";
 import { RAG_EMBEDDING_DIMENSION } from "./rag.constants";
 
 export interface EmbeddingKeyAllocation {
@@ -68,6 +69,20 @@ function toAllocation(row: KeyRow, capability: EmbeddingCapability): EmbeddingKe
  * a second allocation UI to express "and use this one for maths" would be ceremony, not safety.
  */
 export async function resolveEmbeddingAllocation(db: DatabaseService, projectId: string): Promise<EmbeddingAllocationResult> {
+  // Tier 0 — the platform's Voyage key from the environment. Wins over every workspace key on purpose:
+  // one embedding model for the whole platform keeps every stored vector in the same space, so chat
+  // can stay on each project's own (e.g. Anthropic) key while vectors always come from here.
+  const voyageKey = String(process.env.VOYAGE_API_KEY || "").trim();
+  if (voyageKey) {
+    return {
+      allocation: toAllocation(
+        { provider: "voyage", api_key: voyageKey, base_url: VOYAGE_BASE_URL, auth_header_name: null, auth_scheme: null, is_active: true },
+        VOYAGE_EMBEDDING
+      ),
+      reason: "Using the platform VOYAGE_API_KEY for embeddings."
+    };
+  }
+
   // Tier 1 — the project's own allocated key.
   const allocatedRes = await db.query<KeyRow & { name: string }>(
     `SELECT k.name, k.provider, k.api_key, k.base_url, k.auth_header_name, k.auth_scheme, k.is_active
@@ -156,7 +171,7 @@ export async function embedTexts(allocation: EmbeddingKeyAllocation, inputs: str
   // is not harmlessly ignored everywhere — some reject an unknown field outright.
   if (allocation.sendDimensionParam) body.dimensions = RAG_EMBEDDING_DIMENSION;
 
-  const res = await fetch(normalizeEmbeddingsUrl(allocation.base_url), {
+  const res = await safeFetch(normalizeEmbeddingsUrl(allocation.base_url), {
     method: "POST",
     headers,
     body: JSON.stringify(body)

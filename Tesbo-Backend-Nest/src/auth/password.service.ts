@@ -1,7 +1,13 @@
 import { BadRequestException, Injectable } from "@nestjs/common";
-import { pbkdf2Sync, randomBytes, timingSafeEqual } from "crypto";
+import { pbkdf2, randomBytes, timingSafeEqual } from "crypto";
+import { promisify } from "util";
 import { DatabaseService } from "../database/database.service";
 import { LoginLockoutService } from "./login-lockout.service";
+
+// PBKDF2 runs on libuv's thread pool, NOT on the event loop. The synchronous form blocked the whole
+// process for ~100ms per attempt, so a flood of wrong-password logins froze every other user's requests
+// whether or not it ever guessed right. Asynchronous, a flood costs throughput on the pool, not the app.
+const pbkdf2Async = promisify(pbkdf2);
 
 const MIN_LENGTH = 8;
 const MAX_LENGTH = 16;
@@ -65,7 +71,7 @@ export class PasswordService {
 
     if (!row.password_hash) return { outcome: "invalid_password" };
 
-    if (!this.verifyPassword(password, row.password_hash)) {
+    if (!(await this.verifyPassword(password, row.password_hash))) {
       // The failure that trips the lock (the 5th) still reads as an ordinary wrong-password
       // response for this request — the lock only takes effect starting with the *next* attempt,
       // which is what the getActiveLock check above catches. recordFailedAttempt's return value is
@@ -83,10 +89,10 @@ export class PasswordService {
     await this.lockout.clear(email);
   }
 
-  hashPassword(password: string): string {
+  async hashPassword(password: string): Promise<string> {
     this.assertValidPassword(password);
     const salt = randomBytes(16);
-    const hash = pbkdf2Sync(password, salt, this.iterations, this.keyLengthBytes, "sha256");
+    const hash = await pbkdf2Async(password, salt, this.iterations, this.keyLengthBytes, "sha256");
     return `pbkdf2_sha256$${this.iterations}$${salt.toString("base64url")}$${hash.toString("base64url")}`;
   }
 
@@ -99,22 +105,22 @@ export class PasswordService {
     const result = await this.db.query<{ password_hash: string | null }>("SELECT password_hash FROM users WHERE id = $1", [userId]);
     const hash = result.rows[0]?.password_hash;
     if (!hash) return false;
-    return this.verifyPassword(currentPassword, hash);
+    return await this.verifyPassword(currentPassword, hash);
   }
 
   async setPassword(userId: string, newPassword: string): Promise<void> {
-    const passwordHash = this.hashPassword(newPassword);
+    const passwordHash = await this.hashPassword(newPassword);
     await this.db.query("UPDATE users SET password_hash = $1 WHERE id = $2", [passwordHash, userId]);
   }
 
-  private verifyPassword(password: string, storedHash: string): boolean {
+  private async verifyPassword(password: string, storedHash: string): Promise<boolean> {
     try {
       const parts = storedHash.split("$");
       if (parts.length !== 4 || parts[0] !== "pbkdf2_sha256") return false;
       const iterations = Number.parseInt(parts[1], 10);
       const salt = Buffer.from(parts[2], "base64url");
       const expected = Buffer.from(parts[3], "base64url");
-      const actual = pbkdf2Sync(password, salt, iterations, expected.length, "sha256");
+      const actual = await pbkdf2Async(password, salt, iterations, expected.length, "sha256");
       return expected.length === actual.length && timingSafeEqual(expected, actual);
     } catch {
       return false;

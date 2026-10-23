@@ -516,6 +516,283 @@ test.describe("password login lockout", () => {
     }
   });
 
+  /**
+   * A project-less API token row for a user, inserted directly. api_tokens.project_id is nullable and
+   * these rows are never presented as credentials, so no project or membership is needed to prove the
+   * delete; deleting the user at the end cascades them away.
+   */
+  function seedApiToken(email: string, label: string): string {
+    const tokenHash = createHash("sha256").update(`${email}-${label}-${Date.now()}`).digest("hex");
+    exec(
+      `INSERT INTO api_tokens (user_id, name, token_hash) ` +
+        `SELECT id, ${literal(`E2E reset ${label}`)}, ${literal(tokenHash)} FROM users WHERE email = ${literal(email.toLowerCase())};`,
+    );
+    // Read back rather than RETURNING: scalar() runs psql -At, which would append the command tag.
+    const id = scalar(`SELECT id FROM api_tokens WHERE token_hash = ${literal(tokenHash)};`);
+    expect(id, "the token fixture was not inserted").toBeTruthy();
+    return id;
+  }
+
+  function tokenExists(id: string): boolean {
+    return scalar(`SELECT count(*) FROM api_tokens WHERE id = ${literal(id)};`) === "1";
+  }
+
+  test("RESET-TOK-01 completing a password reset revokes the user's API tokens, and only theirs", async ({ playwright }) => {
+    // A reset is what someone does when they suspect the account is compromised. Sessions already
+    // died with it; a token an attacker minted would otherwise live out its 90 days.
+    const victim = lockoutEmail("reset-tokens");
+    const bystander = lockoutEmail("reset-tokens-other");
+    seedPasswordUser(victim, "CorrectHorse9!");
+    seedPasswordUser(bystander, "CorrectHorse9!");
+    const victimTokens = [seedApiToken(victim, "one"), seedApiToken(victim, "two")];
+    const bystanderToken = seedApiToken(bystander, "keep");
+    const anon = await anonContext(playwright);
+    try {
+      // A reset that never completes changes nothing: the token alone does not revoke anything.
+      const wrong = await anon.post("/api/auth/password/reset", {
+        data: { token: "not-a-real-token", password: "NewHorse9!" },
+        failOnStatusCode: false,
+      });
+      expect(wrong.status()).toBe(401);
+      for (const id of victimTokens) expect(tokenExists(id), "a failed reset revoked a token").toBe(true);
+
+      const reset = await anon.post("/api/auth/password/reset", {
+        data: { token: seedResetToken(victim), password: "NewHorse9!" },
+        failOnStatusCode: false,
+      });
+      expect(reset.ok(), await reset.text()).toBeTruthy();
+
+      for (const id of victimTokens) expect(tokenExists(id), "a completed reset left an API token alive").toBe(false);
+      expect(tokenExists(bystanderToken), "a reset for one user revoked another user's token").toBe(true);
+
+      // The reset token is single-use, so replaying it cannot be used to revoke again later.
+      const replay = await anon.post("/api/auth/password/reset", {
+        data: { token: seedResetToken(victim), password: "AnotherHorse9!" },
+        failOnStatusCode: false,
+      });
+      expect(replay.ok()).toBeTruthy();
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("RESET-TOK-02 changing the password while signed in keeps the user's API tokens", async ({ playwright }) => {
+    // Deliberately asymmetric with RESET-TOK-01: a change needs the current password, so the caller has
+    // already proved they own the account. Revoking here would break pipelines on routine rotation.
+    const email = lockoutEmail("change-keeps-tokens");
+    seedPasswordUser(email, "CorrectHorse9!");
+    const tokenId = seedApiToken(email, "kept");
+    const anon = await anonContext(playwright);
+    try {
+      expect((await login(anon, email, "CorrectHorse9!")).ok()).toBeTruthy();
+      const changed = await anon.post("/api/auth/password/change", {
+        data: { currentPassword: "CorrectHorse9!", newPassword: "ChangedHorse9!" },
+        failOnStatusCode: false,
+      });
+      expect(changed.status(), await changed.text()).toBeLessThan(300);
+      expect(tokenExists(tokenId), "a password change revoked an API token").toBe(true);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  /*
+   * ── Brute-force limits: they stop a script, never a person ─────────────────
+   *
+   * Tesbo-Backend-Nest/src/rate-limit/. They count FAILED guesses only (wrong password, unknown email,
+   * wrong code, unknown token), per source address, with caps far above anything a person produces, so a
+   * signed-in user and a successful login never touch a counter. The per-account defences (the 5-failure
+   * lockout above, the 5-guess budget on a code) are separate and unchanged.
+   *
+   * These spoof the client address with X-Forwarded-For, which only works against the backend directly
+   * (trust proxy is 1, so the right-most entry is believed): behind nginx the real address overwrites it.
+   * Each test uses its own address so the shared one every other spec uses is never filled, and the per-IP
+   * caps are scaled by the stack's RATE_LIMIT_IP_MULTIPLIER (env.rateLimitIpMultiplier).
+   */
+  let addressCounter = 0;
+  function freshAddress(): string {
+    addressCounter += 1;
+    return `10.${200 + (addressCounter % 50)}.${Math.floor(Math.random() * 250) + 1}.${Math.floor(Math.random() * 250) + 1}`;
+  }
+
+  test("BF-01 an address that keeps failing to log in is stopped with a 429 and a Retry-After, and no other address is affected", async ({ playwright }) => {
+    test.skip(!env.targetIsLocal, "spoofing the client address needs the backend directly, not nginx");
+    test.setTimeout(240_000);
+    const cap = 100 * env.rateLimitIpMultiplier;
+    const address = freshAddress();
+    const elsewhere = freshAddress();
+    const anon = await anonContext(playwright);
+    let n = 0;
+    // An unknown email fails without hashing anything, so thousands of these are cheap.
+    const attempt = (from: string) =>
+      anon.post("/api/auth/password/login", {
+        data: { email: `bf-${Date.now()}-${n++}@example.test`, password: "Wrong9Horse" },
+        headers: { "x-forwarded-for": from },
+        failOnStatusCode: false,
+      });
+    try {
+      for (let sent = 0; sent < cap; sent += 50) {
+        const batch = await Promise.all(Array.from({ length: Math.min(50, cap - sent) }, () => attempt(address)));
+        for (const res of batch) expect(res.status()).toBe(401);
+      }
+      const blocked = await attempt(address);
+      expect(blocked.status()).toBe(429);
+      const body = await blocked.json();
+      expect(body.code).toBe("rate_limited");
+      expect(body.error).toMatch(/Too many attempts/);
+      expect(Number(blocked.headers()["retry-after"]), "no Retry-After header").toBeGreaterThan(0);
+
+      // A different address is untouched: a failure there is an ordinary 401.
+      expect((await attempt(elsewhere)).status()).toBe(401);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("BF-02 a blocked address cannot even try a correct password, but the same account still logs in from anywhere else", async ({ playwright }) => {
+    test.skip(!env.targetIsLocal, "spoofing the client address needs the backend directly, not nginx");
+    test.setTimeout(240_000);
+    const email = lockoutEmail("bf-correct");
+    seedPasswordUser(email, "CorrectHorse9!");
+    const cap = 100 * env.rateLimitIpMultiplier;
+    const address = freshAddress();
+    const anon = await anonContext(playwright);
+    let n = 0;
+    const wrong = () =>
+      anon.post("/api/auth/password/login", {
+        data: { email: `bf2-${Date.now()}-${n++}@example.test`, password: "Wrong9Horse" },
+        headers: { "x-forwarded-for": address },
+        failOnStatusCode: false,
+      });
+    try {
+      for (let sent = 0; sent < cap; sent += 50) await Promise.all(Array.from({ length: Math.min(50, cap - sent) }, wrong));
+      const fromBlocked = await anon.post("/api/auth/password/login", {
+        data: { email, password: "CorrectHorse9!" },
+        headers: { "x-forwarded-for": address },
+        failOnStatusCode: false,
+      });
+      expect(fromBlocked.status()).toBe(429);
+      const fromElsewhere = await anon.post("/api/auth/password/login", {
+        data: { email, password: "CorrectHorse9!" },
+        headers: { "x-forwarded-for": freshAddress() },
+        failOnStatusCode: false,
+      });
+      expect(fromElsewhere.ok(), await fromElsewhere.text()).toBeTruthy();
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("BF-03 asking for a reset link is capped per email AND per address, so a stranger cannot use up the owner allowance", async ({ playwright }) => {
+    test.skip(!env.targetIsLocal, "spoofing the client address needs the backend directly, not nginx");
+    const email = `bf-forgot-${Date.now()}@example.test`;
+    const attacker = freshAddress();
+    const owner = freshAddress();
+    const anon = await anonContext(playwright);
+    const ask = (from: string, who = email) =>
+      anon.post("/api/auth/password/forgot", { data: { email: who }, headers: { "x-forwarded-for": from }, failOnStatusCode: false });
+    try {
+      // Ten from one address are answered normally (this email has no account, so 404).
+      for (let i = 0; i < 10; i++) expect((await ask(attacker)).status(), `request ${i + 1}`).toBe(404);
+      const eleventh = await ask(attacker);
+      expect(eleventh.status()).toBe(429);
+      expect((await eleventh.json()).code).toBe("rate_limited");
+      expect(Number(eleventh.headers()["retry-after"])).toBeGreaterThan(0);
+
+      // The owner, from their own address, is not held up by the stranger requests.
+      expect((await ask(owner)).status(), "the owner was blocked by someone else").toBe(404);
+      // And the stranger is only stopped for THIS email, not for asking about others.
+      expect((await ask(attacker, `bf-other-${Date.now()}@example.test`)).status()).toBe(404);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("BF-04 a signed-in session guessing the current password is stopped after ten wrong tries", async ({ playwright }) => {
+    const email = lockoutEmail("bf-change");
+    seedPasswordUser(email, "CorrectHorse9!");
+    const anon = await anonContext(playwright);
+    try {
+      expect((await login(anon, email, "CorrectHorse9!")).ok()).toBeTruthy();
+      const change = (current: string, next = "BrandNew9Horse") =>
+        anon.post("/api/auth/password/change", { data: { currentPassword: current, newPassword: next }, failOnStatusCode: false });
+      for (let i = 0; i < 10; i++) {
+        const res = await change("Wrong9Horse");
+        expect(res.status(), `wrong attempt ${i + 1}`).toBe(401);
+        expect((await res.json()).error).toBe("invalid_current_password");
+      }
+      const blocked = await change("Wrong9Horse");
+      expect(blocked.status()).toBe(429);
+      expect(Number(blocked.headers()["retry-after"])).toBeGreaterThan(0);
+      // Even the right password waits: a guesser who found it must not get to use it.
+      expect((await change("CorrectHorse9!")).status()).toBe(429);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("BF-05 malformed auth input is a 400 with a message, never a 500", async ({ playwright }) => {
+    const anon = await anonContext(playwright);
+    const post = (path: string, data: unknown) =>
+      anon.post(path, { data: data as object, headers: { "x-forwarded-for": freshAddress() }, failOnStatusCode: false });
+    try {
+      const cases: Array<[string, string, unknown]> = [
+        ["login with a numeric email", "/api/auth/password/login", { email: 12345, password: "Correct9Horse" }],
+        ["login with an object email", "/api/auth/password/login", { email: { $ne: "" }, password: "Correct9Horse" }],
+        ["login with an array email", "/api/auth/password/login", { email: ["a@example.test"], password: "Correct9Horse" }],
+        ["login with an object password", "/api/auth/password/login", { email: "a@example.test", password: { $ne: "" } }],
+        ["login with a numeric password", "/api/auth/password/login", { email: "a@example.test", password: 123456 }],
+        ["login with a 256-character email", "/api/auth/password/login", { email: `${"a".repeat(250)}@e.test`, password: "Correct9Horse" }],
+        ["login with a 1025-character password", "/api/auth/password/login", { email: "a@example.test", password: "p".repeat(1025) }],
+        ["login with nothing", "/api/auth/password/login", {}],
+        ["forgot with a numeric email", "/api/auth/password/forgot", { email: 12345 }],
+        ["forgot with an object email", "/api/auth/password/forgot", { email: { a: 1 } }],
+        ["forgot with a blank email", "/api/auth/password/forgot", { email: "   " }],
+        ["forgot with a 256-character email", "/api/auth/password/forgot", { email: `${"a".repeat(250)}@e.test` }],
+        ["reset with a numeric token", "/api/auth/password/reset", { token: 123, password: "Newpass9x" }],
+        ["reset with an object password", "/api/auth/password/reset", { token: "abc", password: { a: 1 } }],
+        ["reset with no password", "/api/auth/password/reset", { token: "abc" }],
+        ["code login with a numeric code", "/api/auth/otp/verify", { email: "a@example.test", code: 123456 }],
+        ["code request with an object email", "/api/auth/otp/request", { email: { a: 1 } }],
+      ];
+      for (const [label, path, data] of cases) {
+        const res = await post(path, data);
+        expect(res.status(), `${label} answered ${res.status()}: ${await res.text()}`).toBe(400);
+        expect(typeof (await res.json()).error, label).toBe("string");
+      }
+      // The reset-link check reports "not valid" rather than failing for a link of any shape.
+      const check = await anon.get("/api/auth/password/reset/not-a-real-token", { failOnStatusCode: false });
+      expect(check.status()).toBe(200);
+      expect(await check.json()).toEqual({ valid: false });
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("BF-06 a flood of wrong passwords does not stop everyone else: the API keeps answering while it runs", async ({ playwright }) => {
+    // Password hashing used to run synchronously and freeze the whole process for ~100 ms per attempt, so
+    // a burst of wrong passwords stalled every other request. It runs on the thread pool now. Measured
+    // as: while 40 wrong-password logins are in flight, a plain read still answers promptly.
+    const email = lockoutEmail("bf-flood");
+    seedPasswordUser(email, "CorrectHorse9!");
+    const anon = await anonContext(playwright);
+    try {
+      const flood = Array.from({ length: 40 }, () =>
+        anon.post("/api/auth/password/login", { data: { email, password: "Wrong9Horse" }, headers: { "x-forwarded-for": freshAddress() }, failOnStatusCode: false }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const started = Date.now();
+      const read = await anon.get("/api/auth/password/reset/not-a-real-token", { failOnStatusCode: false });
+      const elapsed = Date.now() - started;
+      expect(read.status()).toBeLessThan(500);
+      // Generous: 40 hashes at ~100 ms each is 4 s of work if it blocked, and this answers in a fraction of that.
+      expect(elapsed, `a plain read took ${elapsed} ms during the flood`).toBeLessThan(2500);
+      await Promise.all(flood);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
   test("LOGIN-LOCK-05 the lock expires after 24 hours, and login works again with the correct password", async ({ playwright }) => {
     const email = lockoutEmail("expiry");
     const password = "CorrectHorse9!";

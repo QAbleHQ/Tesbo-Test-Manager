@@ -83,8 +83,19 @@ async function bootstrap() {
     requestCache.run(() => next());
   });
 
+  // Express advertises itself by default; there is no reason to tell a scanner what to aim at.
+  app.disable("x-powered-by");
+
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.setHeader("X-Request-Id", randomUUID());
+    // On every response, JSON included: stops a browser deciding a body is a different type than the
+    // Content-Type says, which is what turns an uploaded "text/plain" into HTML. These are the
+    // headers helmet would add that are safe for an API whose PDFs and images are framed and loaded
+    // cross-origin by the app; helmet itself is not used because its default frame, CSP and CORP
+    // headers would break that, and it would be a new dependency for four header lines.
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
     const forwardedProto = req.header("x-forwarded-proto");
     const secure = req.secure || forwardedProto?.trim().toLowerCase() === "https";
     if (secure) {

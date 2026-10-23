@@ -13,12 +13,15 @@ import { endZyraTurn, recordExistingCoverage, recordGeneration, recordJiraContex
 import { StorageService } from "../storage/storage.service";
 import { encryptSecret, decryptSecret } from "../common/crypto.util";
 import { externallyReachableBaseUrl } from "../common/external-url.util";
+import { UnsafeOutboundUrlError, assertSafeBaseUrl, safeFetch } from "../common/safe-fetch";
+import { PLAIN_TEXT_DELIVERY, resolveFileDelivery, safeContentType, withDelivery } from "../common/file-delivery";
 import { escapeHtml, jiraDescriptionToText } from "../common/integration-text.util";
 import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util";
 import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
 import { writeNotifications } from "./notification-writer";
+import { DEFAULT_WORKSPACE_TIMEZONE, assertDateRange, duePhase, isValidTimezone, parseDay, resolveDateChange, todayIn, type DuePhase } from "./due-dates";
 import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
@@ -1638,16 +1641,27 @@ export class LegacyService implements OnModuleInit {
     return this.apiTokens.listTokens(projectId);
   }
 
+  // The Settings page already hides token management from QA engineers; this is the same rule where
+  // it can't be bypassed. Without it any project member could POST /apikeys directly, and a token is
+  // a standing credential that outlives the member's session.
+  private assertCanManageApiKeys(project: { caller_role?: string }, action: string) {
+    if (this.normalizeRole(project.caller_role ?? "") === "qa_engineer") {
+      throw new ForbiddenException({ error: `Only project owners and managers can ${action} API tokens` });
+    }
+  }
+
   async createApiKey(userId: string | null | undefined, projectId: string, body: Body) {
     const uid = this.requireUser(userId);
-    await this.requireProjectAccess(uid, projectId);
+    const project = await this.requireProjectAccess(uid, projectId);
+    this.assertCanManageApiKeys(project, "create");
     const name = String(body?.name || "").trim();
     if (!name) throw new BadRequestException({ error: "name is required" });
-    return this.apiTokens.issueToken(uid, projectId, name, body?.scopes);
+    return this.apiTokens.issueToken(uid, projectId, name, body?.scopes, body?.expiresInDays);
   }
 
   async revokeApiKey(userId: string | null | undefined, projectId: string, keyId: string) {
-    await this.requireProjectAccess(userId, projectId);
+    const project = await this.requireProjectAccess(userId, projectId);
+    this.assertCanManageApiKeys(project, "revoke");
     if (!isUuid(keyId)) throw new NotFoundException({ error: "API key not found" });
     const removed = await this.apiTokens.revokeToken(projectId, keyId);
     if (!removed) throw new NotFoundException({ error: "API key not found" });
@@ -2440,7 +2454,7 @@ export class LegacyService implements OnModuleInit {
     const uid = this.requireUser(userId);
 
     const active = await this.db.query(
-      `SELECT o.id, o.name, o.slug, o.plan, o.country, om.role, o.created_at
+      `SELECT o.id, o.name, o.slug, o.plan, o.country, o.timezone, om.role, o.created_at
        FROM users u
        JOIN organizations o ON o.id = u.active_organization_id
        JOIN organization_members om ON om.organization_id = o.id AND om.user_id = u.id
@@ -2452,7 +2466,7 @@ export class LegacyService implements OnModuleInit {
     // active_organization_id is unset or stale (e.g. user was removed from
     // that org) — fall back to the earliest membership and self-heal.
     const res = await this.db.query(
-      `SELECT o.id, o.name, o.slug, o.plan, o.country, om.role, o.created_at
+      `SELECT o.id, o.name, o.slug, o.plan, o.country, o.timezone, om.role, o.created_at
        FROM organizations o
        JOIN organization_members om ON om.organization_id = o.id
        WHERE om.user_id = $1
@@ -2510,9 +2524,14 @@ export class LegacyService implements OnModuleInit {
 
     // `country` is optional here so a plain rename doesn't clear it; passing "" clears it explicitly.
     const country = body.country === undefined ? undefined : normalizeCountryCode(body.country);
+    // Optional too: the zone "due today" and "overdue" are judged in. A name that is not an IANA zone is refused.
+    if (body.timezone !== undefined && !isValidTimezone(body.timezone)) {
+      throw new BadRequestException({ error: "timezone must be a valid IANA timezone, e.g. Asia/Kolkata", field: "timezone" });
+    }
+    const timezone = body.timezone === undefined ? null : String(body.timezone).trim();
     await this.db.query(
-      `UPDATE organizations SET name = $1, country = CASE WHEN $3 THEN $2 ELSE country END, updated_at = now() WHERE id = $4`,
-      [name, country, country !== undefined, workspace.id]
+      `UPDATE organizations SET name = $1, country = CASE WHEN $3 THEN $2 ELSE country END, timezone = COALESCE($5, timezone), updated_at = now() WHERE id = $4`,
+      [name, country, country !== undefined, workspace.id, timezone]
     );
     return this.workspace(uid);
   }
@@ -3055,7 +3074,7 @@ export class LegacyService implements OnModuleInit {
     const existingUser = await this.db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [inv.email]);
     if (existingUser.rows[0]) throw new BadRequestException({ error: "An account with this email already exists. Please sign in and accept the invite." });
 
-    const passwordHash = this.password.hashPassword(pw);
+    const passwordHash = await this.password.hashPassword(pw);
 
     const newUser = await this.db.transaction(async (client) => {
       const uRes = await client.query<{ id: string }>(
@@ -3162,9 +3181,62 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
+  /** Throws a 400 naming what is wrong with a provider base URL; does nothing for "no URL", which means the provider's own. */
+  private async assertAiBaseUrl(baseUrl: string | null): Promise<void> {
+    if (!baseUrl) return;
+    try {
+      await assertSafeBaseUrl(baseUrl);
+    } catch (err) {
+      if (err instanceof UnsafeOutboundUrlError) {
+        throw new BadRequestException({ error: `Base URL not allowed: ${err.message}`, code: "ai_base_url_blocked" });
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The shape of the AI key fields, checked before any of them is used. They end up in a database
+   * column (name and provider have fixed widths and used to answer a Postgres 500 when over), in an
+   * HTTP header (the key, the header name and the scheme), and in a URL, so each is refused if it is
+   * not text, is longer than it can be, or could break a header. The header name is held to RFC 7230
+   * token characters and may not be one that changes how the request is framed or routed.
+   */
+  private static assertAiKeyFields(body: Body): void {
+    const text = (field: string, max: number, opts: { control?: boolean } = {}) => {
+      const value = body[field];
+      if (value === undefined || value === null || value === "") return;
+      if (typeof value !== "string") throw new BadRequestException({ error: `${field} must be text` });
+      if (value.length > max) throw new BadRequestException({ error: `${field} must be at most ${max} characters` });
+      if (opts.control && /[\u0000-\u001f\u007f]/.test(value)) {
+        throw new BadRequestException({ error: `${field} must not contain control characters or line breaks` });
+      }
+    };
+    text("name", 128, { control: true });
+    text("provider", 32, { control: true });
+    text("apiKey", 4096, { control: true });
+    text("defaultModel", 128, { control: true });
+    text("baseUrl", 2048, { control: true });
+    text("authScheme", 64, { control: true });
+    text("authHeaderName", 128, { control: true });
+    const provider = String(body.provider || "").trim();
+    if (provider && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(provider)) {
+      throw new BadRequestException({ error: "provider may only contain letters, digits, dots, dashes and underscores" });
+    }
+    const header = String(body.authHeaderName || "").trim();
+    if (header) {
+      if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(header)) {
+        throw new BadRequestException({ error: "authHeaderName is not a valid HTTP header name" });
+      }
+      if (/^(host|content-length|content-type|transfer-encoding|connection|upgrade|te|trailer|expect|keep-alive|proxy-.*|cookie|set-cookie|accept-encoding)$/i.test(header)) {
+        throw new BadRequestException({ error: `authHeaderName "${header}" cannot be used: it controls how the request is sent` });
+      }
+    }
+  }
+
   async createAiKey(userId: string | null | undefined, body: Body) {
     const workspace = await this.workspace(userId);
     if (this.normalizeRole(workspace.role) !== "owner") throw new ForbiddenException({ error: "Only the workspace owner can manage AI keys" });
+    LegacyService.assertAiKeyFields(body);
     const name = String(body.name || "").trim();
     const apiKey = String(body.apiKey || "").trim();
     const provider = String(body.provider || "openai").trim().toLowerCase();
@@ -3189,6 +3261,10 @@ export class LegacyService implements OnModuleInit {
           : "baseUrl is required for custom providers"
       });
     }
+    // Refused when typed rather than when first used. This is the address the server will call with the
+    // stored key, so it must not be one on the server's own network (see common/safe-fetch.ts). The
+    // catalog default counts too: choosing Ollama on a hosted deployment has nowhere to go.
+    await this.assertAiBaseUrl(baseUrl || definition?.defaultBaseUrl || null);
     // Plain insert, not an upsert: the form that posts here has no "edit" mode and always
     // defaults its Provider field to openai, so a conflicting name used to silently overwrite
     // an existing key's provider/model/etc. back to those defaults instead of failing loudly.
@@ -3241,6 +3317,7 @@ export class LegacyService implements OnModuleInit {
     if (this.normalizeRole(workspace.role) !== "owner") {
       throw new ForbiddenException({ error: "Only the workspace owner can manage AI keys" });
     }
+    LegacyService.assertAiKeyFields(body);
     const provider = String(body.provider || "").trim().toLowerCase();
     if (!provider) throw new BadRequestException({ error: "provider is required" });
 
@@ -3260,6 +3337,17 @@ export class LegacyService implements OnModuleInit {
       );
       const row = stored.rows[0];
       if (!row) throw new NotFoundException({ error: "AI key not found" });
+      // The stored secret is only ever sent where it was saved for. Without this, naming a saved key
+      // and supplying a different base URL made the server call that URL WITH the real key: the one way
+      // to read a key the browser only ever sees masked.
+      const sameDestination =
+        !baseUrl || resolveProviderBaseUrl(provider, baseUrl) === resolveProviderBaseUrl(provider, String(row.base_url || "") || null);
+      if (!sameDestination) {
+        throw new BadRequestException({
+          error: "To use this key with a different base URL, enter the API key again.",
+          code: "ai_key_reentry_required"
+        });
+      }
       apiKey = String(row.api_key || "");
       baseUrl = baseUrl || row.base_url || null;
       authHeaderName = authHeaderName || row.auth_header_name || null;
@@ -3315,7 +3403,7 @@ export class LegacyService implements OnModuleInit {
       const query = new URLSearchParams(existingQuery);
       query.set("limit", "100");
       if (cursor) query.set("after_id", cursor);
-      const res = await fetch(`${root}?${query.toString()}`, { method: "GET", headers });
+      const res = await safeFetch(`${root}?${query.toString()}`, { method: "GET", headers });
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({} as Body)) as Body;
         const raw = String(errBody.error?.message || errBody.error || res.status);
@@ -6182,9 +6270,38 @@ export class LegacyService implements OnModuleInit {
     return this.listPlans(projectId);
   }
 
+  /** The IANA timezone of the workspace a project belongs to — what "today" means for its due dates. */
+  private async projectTimezone(projectId: string): Promise<string> {
+    const res = await this.db.query<{ timezone: string | null }>(
+      "SELECT o.timezone FROM projects p JOIN organizations o ON o.id = p.organization_id WHERE p.id = $1",
+      [projectId]
+    );
+    const zone = res.rows[0]?.timezone;
+    return isValidTimezone(zone) ? zone : DEFAULT_WORKSPACE_TIMEZONE;
+  }
+
+  /**
+   * `dueState` / `isOverdue` for a plan or run, worked out at read time rather than stored: that is
+   * what makes "move an overdue item's due date into the future and the Overdue mark goes away" true
+   * with nothing to clear. A finished item (a completed run, a plan whose runs are all completed) is
+   * never due or overdue, whatever its date says.
+   */
+  private static withDueState(row: Body, today: string, finished: boolean): Body {
+    const dueState: DuePhase | null = finished ? null : duePhase((row.dueDate as string | null) ?? null, today);
+    return { ...row, dueState, isOverdue: dueState === "overdue" };
+  }
+
+  /** A plan is finished once it has runs and every one of them is Completed. */
+  private static planFinished(runCount: number, openRuns: number): boolean {
+    return runCount > 0 && openRuns === 0;
+  }
+
   async listPlans(projectId: string) {
+    const today = todayIn(await this.projectTimezone(projectId));
     const res = await this.db.query(
       `SELECT p.*,
+              to_char(p.start_date, 'YYYY-MM-DD') AS start_date, to_char(p.due_date, 'YYYY-MM-DD') AS due_date,
+              COALESCE(runs.open_runs, 0)::int AS open_runs,
               COALESCE(pi.case_count, 0)::int AS case_count,
               COALESCE(runs.run_count, 0)::int AS run_count,
               COALESCE(runs.passed, 0)::int AS passed,
@@ -6202,6 +6319,7 @@ export class LegacyService implements OnModuleInit {
        LEFT JOIN (
          SELECT c.plan_id,
                 COUNT(DISTINCT c.id)::int AS run_count,
+                COUNT(DISTINCT c.id) FILTER (WHERE c.status <> 'Completed')::int AS open_runs,
                 COUNT(e.id) FILTER (WHERE e.status = 'Passed')::int AS passed,
                 COUNT(e.id) FILTER (WHERE e.status = 'Failed')::int AS failed,
                 COUNT(e.id) FILTER (WHERE e.status = 'Blocked')::int AS blocked,
@@ -6217,34 +6335,66 @@ export class LegacyService implements OnModuleInit {
        ORDER BY p.created_at DESC`,
       [projectId]
     );
-    return res.rows.map(toCamel);
+    return res.rows.map((row) => {
+      const plan = toCamel(row);
+      const { openRuns, ...rest } = plan as Body & { openRuns?: number };
+      return LegacyService.withDueState(rest, today, LegacyService.planFinished(Number(plan.runCount) || 0, Number(openRuns) || 0));
+    });
   }
 
   async createPlan(userId: string | null | undefined, projectId: string, body: Body) {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     validateBoundedField(body.name, "Plan name", PLAN_NAME_MAX_LENGTH);
     validateBoundedField(body.targetRelease, "Target release", PLAN_TARGET_RELEASE_MAX_LENGTH);
+    const today = todayIn(await this.projectTimezone(projectId));
+    // Start date is required: when the caller names none it is the day of creation (workspace time).
+    const startDate = parseDay(body.startDate, "startDate", "Start date") ?? today;
+    const dueDate = parseDay(body.dueDate, "dueDate", "Due date");
+    assertDateRange(startDate, dueDate);
     const res = await this.db.query(
-      "INSERT INTO plans (project_id, name, description, target_release, owner_id) VALUES ($1,$2,$3,$4,$5) RETURNING *",
-      [projectId, body.name || "Untitled plan", body.description || "", body.targetRelease || null, body.ownerId || null]
+      `INSERT INTO plans (project_id, name, description, target_release, owner_id, start_date, due_date)
+       VALUES ($1,$2,$3,$4,$5,$6::date,$7::date)
+       RETURNING *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date`,
+      [projectId, body.name || "Untitled plan", body.description || "", body.targetRelease || null, body.ownerId || null, startDate, dueDate]
     );
-    return toCamel(res.rows[0]);
+    return LegacyService.withDueState(toCamel(res.rows[0]), today, false);
   }
 
   async getPlan(userId: string | null | undefined, planId: string) {
-    await this.requirePlanAccess(userId, planId);
-    const res = await this.db.query("SELECT * FROM plans WHERE id = $1", [planId]);
+    const projectId = await this.requirePlanAccess(userId, planId);
+    const res = await this.db.query(
+      "SELECT *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM plans WHERE id = $1",
+      [planId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Plan not found" });
-    return toCamel(res.rows[0]);
+    const runs = await this.db.query<{ run_count: number; open_runs: number }>(
+      `SELECT COUNT(*)::int AS run_count, COUNT(*) FILTER (WHERE status <> 'Completed')::int AS open_runs
+       FROM cycles WHERE plan_id = $1 AND deleted_at IS NULL`,
+      [planId]
+    );
+    const today = todayIn(await this.projectTimezone(projectId));
+    return LegacyService.withDueState(toCamel(res.rows[0]), today, LegacyService.planFinished(runs.rows[0]?.run_count ?? 0, runs.rows[0]?.open_runs ?? 0));
   }
 
   async updatePlan(userId: string | null | undefined, planId: string, body: Body) {
     await this.requirePlanAccess(userId, planId);
     validateBoundedField(body.name, "Plan name", PLAN_NAME_MAX_LENGTH);
     validateBoundedField(body.targetRelease, "Target release", PLAN_TARGET_RELEASE_MAX_LENGTH);
+    // Only read the stored dates when the body touches one: the range check needs the other side.
+    const touchesDates = body.startDate !== undefined || body.dueDate !== undefined;
+    const current = touchesDates
+      ? (await this.db.query<{ start_date: string | null; due_date: string | null }>(
+          "SELECT to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM plans WHERE id = $1",
+          [planId]
+        )).rows[0]
+      : undefined;
+    const dates = resolveDateChange(body, { startDate: current?.start_date ?? null, dueDate: current?.due_date ?? null });
     await this.db.query(
-      "UPDATE plans SET name=COALESCE($2,name), description=COALESCE($3,description), target_release=COALESCE($4,target_release), updated_at=now() WHERE id=$1",
-      [planId, body.name || null, body.description || null, body.targetRelease || null]
+      `UPDATE plans SET name=COALESCE($2,name), description=COALESCE($3,description), target_release=COALESCE($4,target_release),
+       start_date=COALESCE($5::date,start_date),
+       due_date=CASE WHEN $6::boolean THEN NULL ELSE COALESCE($7::date,due_date) END,
+       updated_at=now() WHERE id=$1`,
+      [planId, body.name || null, body.description || null, body.targetRelease || null, dates.startDate, dates.clearsDueDate, dates.dueDate]
     );
   }
 
@@ -6318,7 +6468,7 @@ export class LegacyService implements OnModuleInit {
     const res = await this.db.query(
       // Counted exactly like listCycles, so one run cannot report a different case count on the plan
       // screen than on the runs screen it links to.
-      `SELECT c.*,
+      `SELECT c.*, to_char(c.start_date, 'YYYY-MM-DD') AS start_date, to_char(c.due_date, 'YYYY-MM-DD') AS due_date,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
        LEFT JOIN cycle_items ci ON ci.cycle_id = c.id AND ci.deleted_at IS NULL
@@ -6328,7 +6478,9 @@ export class LegacyService implements OnModuleInit {
        ORDER BY c.created_at DESC`,
       [planId]
     );
-    return res.rows.map(toCamel);
+    if (!res.rows.length) return [];
+    const today = todayIn(await this.projectTimezone(res.rows[0].project_id));
+    return res.rows.map((row) => LegacyService.withDueState(toCamel(row), today, row.status === "Completed"));
   }
 
   async planProgress(userId: string | null | undefined, planId: string) {
@@ -6411,7 +6563,7 @@ export class LegacyService implements OnModuleInit {
       // on the run card can never disagree with the number of rows the run's own table renders.
       // Counting cycle_items instead let anything without a live execution inflate the card.
       `${limit ? "WITH recent AS (SELECT id FROM cycles WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT $2)" : ""}
-       SELECT c.*,
+       SELECT c.*, to_char(c.start_date, 'YYYY-MM-DD') AS start_date, to_char(c.due_date, 'YYYY-MM-DD') AS due_date,
               ${LegacyService.EXECUTION_BUCKET_COUNTS}
        FROM cycles c
        ${limit ? "JOIN recent r ON r.id = c.id" : ""}
@@ -6422,7 +6574,8 @@ export class LegacyService implements OnModuleInit {
        ORDER BY c.created_at DESC, c.id DESC`,
       limit ? [projectId, limit] : [projectId]
     );
-    return res.rows.map(LegacyService.cycleRow);
+    const today = todayIn(await this.projectTimezone(projectId));
+    return res.rows.map((row) => LegacyService.withDueState(LegacyService.cycleRow(row), today, row.status === "Completed"));
   }
 
   async createCycleForUser(userId: string | null | undefined, projectId: string, body: Body) {
@@ -6441,9 +6594,15 @@ export class LegacyService implements OnModuleInit {
     validateBoundedField(body.environment, "Environment", CYCLE_LABEL_MAX_LENGTH);
     validateBoundedField(body.buildVersion, "Build version", CYCLE_LABEL_MAX_LENGTH);
     validateBoundedField(body.releaseName, "Release name", CYCLE_LABEL_MAX_LENGTH);
+    const today = todayIn(await this.projectTimezone(projectId));
+    // Start date is required: when the caller names none it is the day of creation (workspace time).
+    const startDate = parseDay(body.startDate, "startDate", "Start date") ?? today;
+    const dueDate = parseDay(body.dueDate, "dueDate", "Due date");
+    assertDateRange(startDate, dueDate);
     const res = await this.db.query(
-      `INSERT INTO cycles (project_id, plan_id, name, description, environment, build_version, release_name, owner_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      `INSERT INTO cycles (project_id, plan_id, name, description, environment, build_version, release_name, owner_id, start_date, due_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10::date)
+       RETURNING *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date`,
       [
         projectId,
         body.planId || null,
@@ -6452,10 +6611,12 @@ export class LegacyService implements OnModuleInit {
         body.environment || null,
         body.buildVersion || null,
         body.releaseName || null,
-        body.ownerId || null
+        body.ownerId || null,
+        startDate,
+        dueDate
       ]
     );
-    return toCamel(res.rows[0]);
+    return LegacyService.withDueState(toCamel(res.rows[0]), today, false);
   }
 
   /**
@@ -6490,10 +6651,14 @@ export class LegacyService implements OnModuleInit {
   }
 
   async getCycle(cycleId: string, userId?: string | null) {
-    await this.requireCycleAccess(userId, cycleId);
-    const res = await this.db.query("SELECT * FROM cycles WHERE id = $1 AND deleted_at IS NULL", [cycleId]);
+    const projectId = await this.requireCycleAccess(userId, cycleId);
+    const res = await this.db.query(
+      "SELECT *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM cycles WHERE id = $1 AND deleted_at IS NULL",
+      [cycleId]
+    );
     if (!res.rows[0]) throw new NotFoundException({ error: "Cycle not found" });
-    return LegacyService.cycleRow(res.rows[0]);
+    const today = todayIn(await this.projectTimezone(projectId));
+    return LegacyService.withDueState(LegacyService.cycleRow(res.rows[0]), today, res.rows[0].status === "Completed");
   }
 
   async shareCycle(cycleId: string, userId: string | null | undefined, body: Body) {
@@ -6634,6 +6799,15 @@ export class LegacyService implements OnModuleInit {
      *   → Planning     leaves the original start alone but clears the end: it is not finished
      */
     const status = typeof body.status === "string" ? body.status : null;
+    // Only read the stored dates when the body touches one: the range check needs the other side.
+    const touchesDates = body.startDate !== undefined || body.dueDate !== undefined;
+    const currentDates = touchesDates
+      ? (await this.db.query<{ start_date: string | null; due_date: string | null }>(
+          "SELECT to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date FROM cycles WHERE id = $1",
+          [cycleId]
+        )).rows[0]
+      : undefined;
+    const dates = resolveDateChange(body, { startDate: currentDates?.start_date ?? null, dueDate: currentDates?.due_date ?? null });
     // A run with no cases has nothing to execute or complete; the UI disables both buttons, and
     // this keeps the API from being a way around it.
     if (status === "In Progress" || status === "Completed") {
@@ -6660,6 +6834,8 @@ export class LegacyService implements OnModuleInit {
        status=COALESCE($9,status),
        started_at=CASE WHEN $9 IN ('In Progress', 'Completed') THEN COALESCE(started_at, now()) ELSE started_at END,
        ended_at=CASE WHEN $9 = 'Completed' THEN now() WHEN $9 IN ('In Progress', 'Planning') THEN NULL ELSE ended_at END,
+       start_date=COALESCE($10::date,start_date),
+       due_date=CASE WHEN $11::boolean THEN NULL ELSE COALESCE($12::date,due_date) END,
        updated_at=now() WHERE id=$1`,
       [
         cycleId,
@@ -6670,7 +6846,10 @@ export class LegacyService implements OnModuleInit {
         body.releaseName || null,
         body.clearPlan === true,
         body.planId || null,
-        status
+        status,
+        dates.startDate,
+        dates.clearsDueDate,
+        dates.dueDate
       ]
     );
     if (beforeRun && status) await this.notifyRunLifecycle(cycleId, projectId, userId ?? null, beforeRun, status);
@@ -7482,7 +7661,9 @@ export class LegacyService implements OnModuleInit {
 
   private bugSelect(where: string): string {
     return `
-      SELECT b.*, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
+      -- to_char after b.*: the pg driver parses a DATE into a JS Date shifted by the server's
+      -- timezone, so the day is selected as text; the later column of the same name wins.
+      SELECT b.*, to_char(b.due_date, 'YYYY-MM-DD') AS due_date, COALESCE(u.name, u.email) AS reporter_name, u.email AS reporter_email,
              COALESCE(ap.display_name, ap.email) AS assignee_name, ap.actor_type AS assignee_type, links.items AS links,
              COALESCE(atts.items, '[]') AS attachments
       FROM bugs b
@@ -7764,6 +7945,36 @@ export class LegacyService implements OnModuleInit {
     return match;
   }
 
+  private parseBugDueDate(dueDate: unknown): string | null {
+    // Absent, null and "" all mean "no due date", the same convention as priority/severity.
+    if (dueDate === undefined || dueDate === null || dueDate === "") return null;
+    const text = typeof dueDate === "string" ? dueDate.trim() : "";
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+    // Round-trip through Date so an impossible day such as 2026-02-30 is refused rather than rolled
+    // over to March by Postgres or JS.
+    const valid =
+      !!match &&
+      new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))).toISOString().slice(0, 10) === text;
+    if (!valid) throw new BadRequestException({ error: "dueDate must be a valid date in YYYY-MM-DD format", field: "dueDate" });
+    return text;
+  }
+
+  /**
+   * A due date being set must not be in the past: it would be overdue from the moment it was
+   * chosen. The floor is today in UTC minus one day, because the form compares in the user's local
+   * calendar and a caller behind UTC can legitimately pick a day that is still "yesterday" in UTC.
+   * Callers only pass a date that is new or changed — a bug whose existing date has since gone by
+   * (it is overdue) must stay editable without touching it.
+   */
+  private assertBugDueDateNotInPast(dueDate: string | null): void {
+    if (!dueDate) return;
+    const now = new Date();
+    const floor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1)).toISOString().slice(0, 10);
+    if (dueDate < floor) {
+      throw new BadRequestException({ error: "dueDate cannot be earlier than today", field: "dueDate" });
+    }
+  }
+
   /**
    * The assignee a caller asked for, refused as caller error when they aren't a member of this
    * project. Mirrors bulkAssignExecutions' membership check so bugs and executions share one rule:
@@ -7796,6 +8007,8 @@ export class LegacyService implements OnModuleInit {
     const severity = this.parseBugSeverity(body.severity);
     const priority = this.parseBugPriority(body.priority);
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
+    const dueDate = this.parseBugDueDate(body.dueDate);
+    this.assertBugDueDateNotInPast(dueDate);
 
     // nextBugExternalId reads MAX(trailing number) + 1 in a separate statement from the INSERT
     // below, so two bugs filed for the same project at once can both compute the same id;
@@ -7811,8 +8024,8 @@ export class LegacyService implements OnModuleInit {
           await client.query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", [`bug-external-id:${projectId}`]);
           const externalId = await this.nextBugExternalId(projectId, client);
           const res = await client.query(
-            `INSERT INTO bugs (project_id, external_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+            `INSERT INTO bugs (project_id, external_id, execution_id, testcase_id, cycle_id, title, description, external_url, status, severity, priority, reported_by, integration_provider, integration_issue_key, betterbugs_url, assignee_id, due_date)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::date) RETURNING id`,
             [
               projectId,
               externalId,
@@ -7829,7 +8042,8 @@ export class LegacyService implements OnModuleInit {
               body.integrationProvider || null,
               body.integrationIssueKey || null,
               body.betterbugsUrl || null,
-              assigneeId
+              assigneeId,
+              dueDate
             ]
           );
           const id = res.rows[0].id;
@@ -7983,7 +8197,7 @@ export class LegacyService implements OnModuleInit {
         .map((l: Body) => `${l.testcaseId ?? ""}|${l.cycleId ?? ""}|${l.executionId ?? ""}`)
         .sort()
         .join(",");
-    const fields = ["title", "description", "externalUrl", "integrationProvider", "integrationIssueKey", "betterbugsUrl"].filter(
+    const fields = ["title", "description", "externalUrl", "integrationProvider", "integrationIssueKey", "betterbugsUrl", "dueDate"].filter(
       (field) => !same(before[field], after[field])
     );
     if (linkKey(before) !== linkKey(after)) fields.push("links");
@@ -8205,12 +8419,14 @@ export class LegacyService implements OnModuleInit {
         const entry: { key: string; id?: string } = {
           key: `bugs/${projectId}/${bugId}/comments/${commentId}/${randomUUID()}${ext ? `.${ext}` : ""}`
         };
-        await this.storage.put(entry.key, file.buffer, file.mimetype);
+        // The type the uploader's client claimed is never stored: see common/file-delivery.ts.
+        const contentType = safeContentType(file.mimetype, file.originalname);
+        await this.storage.put(entry.key, file.buffer, contentType);
         stored.push(entry);
         const res = await this.db.query<{ id: string }>(
           `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
            VALUES ($1, 'bug_comment', $2, $3, $4, $5, $6, $7) RETURNING id`,
-          [projectId, commentId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, entry.key, uid]
+          [projectId, commentId, LegacyService.displayFileName(file.originalname), contentType, file.size, entry.key, uid]
         );
         entry.id = res.rows[0].id;
       }
@@ -8499,13 +8715,18 @@ export class LegacyService implements OnModuleInit {
     // hidden from the picker.
     const clearsAssignee = body.assigneeId === null || body.assigneeId === "";
     const assigneeId = await this.parseBugAssignee(projectId, body.assigneeId);
+    // Same explicit-clear convention: null or "" removes the date, an absent key leaves it alone.
+    const clearsDueDate = body.dueDate === null || body.dueDate === "";
+    const dueDate = this.parseBugDueDate(body.dueDate);
     const before = await this.getBug(bugId);
+    if (dueDate !== ((before as Body).dueDate ?? null)) this.assertBugDueDateNotInPast(dueDate);
     await this.db.query(
       `UPDATE bugs SET title=COALESCE($2,title), description=COALESCE($3,description), external_url=COALESCE($4,external_url),
        status=COALESCE($5,status), severity=CASE WHEN $14::boolean THEN NULL ELSE COALESCE($6,severity) END, priority=CASE WHEN $10::boolean THEN NULL ELSE COALESCE($11,priority) END,
        integration_provider=COALESCE($7,integration_provider), integration_issue_key=COALESCE($8,integration_issue_key),
        betterbugs_url=COALESCE($9,betterbugs_url),
        assignee_id=CASE WHEN $12::boolean THEN NULL ELSE COALESCE($13,assignee_id) END,
+       due_date=CASE WHEN $15::boolean THEN NULL ELSE COALESCE($16::date,due_date) END,
        updated_at=now() WHERE id=$1`,
       [
         bugId,
@@ -8521,7 +8742,9 @@ export class LegacyService implements OnModuleInit {
         priority,
         clearsAssignee,
         assigneeId,
-        clearsSeverity
+        clearsSeverity,
+        clearsDueDate,
+        dueDate
       ]
     );
     if (Array.isArray(body.links)) {
@@ -8716,11 +8939,12 @@ export class LegacyService implements OnModuleInit {
     for (const file of files) {
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
       const storageKey = `bugs/${projectId}/${bugId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
-      await this.storage.put(storageKey, file.buffer, file.mimetype);
+      const contentType = safeContentType(file.mimetype, file.originalname);
+      await this.storage.put(storageKey, file.buffer, contentType);
       const res = await this.db.query(
         `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
          VALUES ($1, 'bug', $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [projectId, bugId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
+        [projectId, bugId, LegacyService.displayFileName(file.originalname), contentType, file.size, storageKey, uid]
       );
       created.push(toCamel(res.rows[0]));
       await this.logProjectActivity(projectId, uid, "bug_attachment_added", "bug", bugId, String(bug.rows[0].title ?? ""), {
@@ -8754,9 +8978,9 @@ export class LegacyService implements OnModuleInit {
     if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
-    const mimeType = file.content_type || "application/octet-stream";
-    const access = await this.storage.getAccessUrl(file.storage_path, { filename: file.file_name, inline, contentType: mimeType });
-    return { ...access, mimeType, originalFileName: file.file_name };
+    const delivery = resolveFileDelivery(file.content_type, file.file_name, inline);
+    const access = await this.storage.getAccessUrl(file.storage_path, { filename: file.file_name, ...delivery });
+    return withDelivery(access, delivery, file.file_name);
   }
 
   async deleteBugAttachment(attachmentId: string, userId?: string | null) {
@@ -8828,11 +9052,12 @@ export class LegacyService implements OnModuleInit {
     for (const file of files) {
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
       const storageKey = `executions/${projectId}/${executionId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
-      await this.storage.put(storageKey, file.buffer, file.mimetype);
+      const contentType = safeContentType(file.mimetype, file.originalname);
+      await this.storage.put(storageKey, file.buffer, contentType);
       const res = await this.db.query(
         `INSERT INTO attachments (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by)
          VALUES ($1, 'execution', $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [projectId, executionId, LegacyService.displayFileName(file.originalname), file.mimetype, file.size, storageKey, uid]
+        [projectId, executionId, LegacyService.displayFileName(file.originalname), contentType, file.size, storageKey, uid]
       );
       created.push(toCamel(res.rows[0]));
     }
@@ -8878,20 +9103,57 @@ export class LegacyService implements OnModuleInit {
     if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
-    const mimeType = file.content_type || "application/octet-stream";
     /*
      * A Playwright trace is a .zip that the ingest accepts as an exception to the evidence
-     * allowlist (see automation.types.ts). It is never served inline: `inline` is forced off for
-     * anything that is not an image or a video, so a stored archive or log cannot be rendered by a
-     * browser in Tesbo's own origin.
+     * allowlist (see automation.types.ts). It is never served inline, and neither is anything else
+     * outside the inline allowlist in common/file-delivery.ts: a stored archive, log or SVG cannot be
+     * rendered by a browser in Tesbo's own origin. This used to be `image/*` or `video/*` by the
+     * uploader's own claimed type, which let `image/svg+xml` through.
      */
-    const safeInline = inline && /^(image|video)\//.test(mimeType);
-    const access = await this.storage.getAccessUrl(file.storage_path, {
-      filename: file.file_name,
-      inline: safeInline,
-      contentType: mimeType
-    });
-    return { ...access, mimeType, originalFileName: file.file_name, inline: safeInline };
+    const delivery = resolveFileDelivery(file.content_type, file.file_name, inline);
+    const access = await this.storage.getAccessUrl(file.storage_path, { filename: file.file_name, ...delivery });
+    return withDelivery(access, delivery, file.file_name);
+  }
+
+  /**
+   * Deletes one evidence file from a run's result.
+   *
+   * Evidence could be uploaded and billed against the storage allowance but never removed, so a
+   * wrong or sensitive file (a trace that captured a secret) was permanent. Any project member may
+   * delete, including files the automation ingest attached. Mirrors deleteBugAttachment: the stored
+   * object is destroyed and the row is soft-deleted (who/when), which also releases the storage
+   * allowance. The lookup is scoped to this execution, so another execution's attachment id is a 404.
+   */
+  async deleteExecutionAttachment(
+    cycleId: string,
+    userId: string | null | undefined,
+    executionId: string,
+    attachmentId: string
+  ) {
+    const uid = this.requireUser(userId);
+    const execution = await this.executionOwner(cycleId, executionId);
+    const projectId = String(execution.project_id);
+    await this.requireProjectAccess(uid, projectId);
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
+    const res = await this.db.query(
+      `SELECT * FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
+      [attachmentId, executionId, projectId]
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Attachment not found" });
+    if (file.storage_path) await this.storage.delete(file.storage_path);
+    const deleted = await this.db.query(
+      "UPDATE attachments SET deleted_at = now(), deleted_by = $2 WHERE id = $1 AND deleted_at IS NULL RETURNING id",
+      [attachmentId, uid]
+    );
+    if (deleted.rows[0]) {
+      await this.logProjectActivity(projectId, uid, "execution_evidence_deleted", "execution", executionId, null, {
+        attachmentId,
+        fileName: String(file.file_name)
+      });
+    }
+    return { ok: true };
   }
 
   /**
@@ -11892,7 +12154,7 @@ export class LegacyService implements OnModuleInit {
       const scheme = String(key.auth_scheme || "Bearer").trim();
       const headers: Record<string, string> = {};
       headers[authHeader] = scheme ? `${scheme} ${key.api_key}` : String(key.api_key);
-      const res = await fetch(normalizeAudioTranscriptionsUrl(key.base_url), { method: "POST", headers, body: form });
+      const res = await safeFetch(normalizeAudioTranscriptionsUrl(key.base_url), { method: "POST", headers, body: form });
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({} as Body)) as Body;
         const rawMessage = String(errBody.error?.message || errBody.error || res.status);
@@ -11981,7 +12243,8 @@ export class LegacyService implements OnModuleInit {
       const ext = path.extname(file.originalname).replace(/^\./, "").toLowerCase();
       const originalFileName = await this.kbUniqueFileName(folderId, file.originalname);
       const storageKey = `knowledge-base/${project.organization_id}/${projectId}/${randomUUID()}${ext ? `.${ext}` : ""}`;
-      await this.storage.put(storageKey, file.buffer, file.mimetype);
+      const contentType = safeContentType(file.mimetype, file.originalname);
+      await this.storage.put(storageKey, file.buffer, contentType);
       // Audio/video transcription is slow (calls an external AI provider) and shouldn't block
       // the upload response — it's kicked off after insert, below, and fills in extracted_text
       // asynchronously. Everything else extracts synchronously (local CPU/WASM work only).
@@ -11991,7 +12254,7 @@ export class LegacyService implements OnModuleInit {
       const res = await this.db.query(
         `INSERT INTO knowledge_files (organization_id, project_id, folder_id, file_name, original_file_name, mime_type, file_extension, file_size, storage_key, uploaded_by, extracted_text, extraction_status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-        [project.organization_id, projectId, folderId, path.basename(storageKey), originalFileName, file.mimetype, ext, file.size, storageKey, uid, extractedText, extractionStatus]
+        [project.organization_id, projectId, folderId, path.basename(storageKey), originalFileName, contentType, ext, file.size, storageKey, uid, extractedText, extractionStatus]
       );
       created.push(this.kbFileView(res.rows[0]));
       await this.logProjectActivity(projectId, uid, "uploaded", "knowledge_file", res.rows[0].id, originalFileName, {});
@@ -12088,22 +12351,25 @@ export class LegacyService implements OnModuleInit {
     if (!file.storage_key || !(await this.storage.exists(file.storage_key))) {
       throw new NotFoundException({ error: "File content is not available" });
     }
-    const mimeType = file.mime_type || "application/octet-stream";
     const ext = String(file.file_extension || "").toLowerCase().replace(/^\./, "");
     // Plaintext previews are fetched client-side with credentials to our own API; streaming them
     // directly (instead of redirecting to a presigned URL) avoids needing the storage bucket's
     // CORS policy to allow credentialed cross-origin requests.
-    if (inline && LegacyService.KB_PLAINTEXT_EXTENSIONS.has(ext)) {
+    // Decided by the extension the server recorded, not the type the uploader claimed: Chrome sends
+    // `video/mp2t` for a .ts and `text/html` is one header away from a script.
+    const textPreview = inline && LegacyService.KB_PLAINTEXT_EXTENSIONS.has(ext);
+    const delivery = textPreview ? PLAIN_TEXT_DELIVERY : resolveFileDelivery(file.mime_type, file.original_file_name, inline);
+    if (textPreview) {
       // The exists() check above is a no-op on S3 (it answers true and lets the signed-URL request
       // do the checking), so this branch — the only one that reads the bytes here rather than
       // redirecting — is where a missing object actually surfaces. Without the catch it escapes as
       // a 500, reporting a server fault for a file that is merely gone.
       const buffer = await this.storage.getBuffer(file.storage_key).catch(() => null);
       if (!buffer) throw new NotFoundException({ error: "File content is not available" });
-      return { buffer, mimeType, originalFileName: file.original_file_name };
+      return { buffer, ...delivery, originalFileName: file.original_file_name };
     }
-    const access = await this.storage.getAccessUrl(file.storage_key, { filename: file.original_file_name, inline, contentType: mimeType });
-    return { ...access, mimeType, originalFileName: file.original_file_name };
+    const access = await this.storage.getAccessUrl(file.storage_key, { filename: file.original_file_name, ...delivery });
+    return withDelivery(access, delivery, file.original_file_name);
   }
 
   // ─── Knowledge Base v2: search ─────────────────────────────────────────────
@@ -14346,7 +14612,7 @@ export class LegacyService implements OnModuleInit {
       }
       if (providerWire(provider) === "anthropic") {
         const headers = this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme);
-        const res = await fetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
+        const res = await safeFetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
           method: "POST",
           headers,
           body: JSON.stringify({
@@ -14363,7 +14629,7 @@ export class LegacyService implements OnModuleInit {
         return { ok: true, provider, model, latencyMs: Math.round(performance.now() - start) };
       }
       const authHeaders = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-      const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+      const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
         method: "POST",
         headers: authHeaders,
         body: JSON.stringify({ model, max_tokens: 5, messages: [{ role: "user", content: "hi" }] })
@@ -20367,7 +20633,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         const chatUrl = normalizeAnthropicMessagesUrlFor(provider, key.base_url);
         const chatHeaders = this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme);
         for (const candidate of providerModelCandidates(provider, model)) {
-          const res = await fetch(chatUrl, {
+          const res = await safeFetch(chatUrl, {
             method: "POST",
             headers: chatHeaders,
             body: JSON.stringify({ model: candidate, max_tokens: 220, messages: [{ role: "user", content: prompt }] })
@@ -20380,7 +20646,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         return "";
       }
       const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-      const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+      const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
         method: "POST",
         headers,
         body: JSON.stringify({ model, max_tokens: 220, messages: [{ role: "user", content: prompt }] })
@@ -22405,7 +22671,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
   // for "all possible cases" generation without pulling in the full chat-decision prompt.
   private async zyraJsonCompletion(provider: string, model: string, key: Body, systemPrompt: string, userPrompt: string): Promise<Body> {
     if (providerWire(provider) === "anthropic") {
-      const res = await fetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
+      const res = await safeFetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
         method: "POST",
         headers: this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme),
         body: JSON.stringify({
@@ -22434,7 +22700,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       return { ...parsed, __zyraUsage: { input, output, total: input + output } };
     }
     const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-    const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+    const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -22564,7 +22830,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       openAiBody.stream_options = { include_usage: true };
     }
     const headers = this.providerAuthHeaders(params.provider, params.apiKey, params.authHeaderName ?? null, params.authScheme ?? null);
-    const response = await fetch(providerChatUrl(params.provider, params.baseUrl, String(openAiBody.model)), {
+    const response = await safeFetch(providerChatUrl(params.provider, params.baseUrl, String(openAiBody.model)), {
       method: "POST",
       headers,
       body: JSON.stringify(openAiBody),
@@ -22625,7 +22891,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     // …and whenever a live batch is listening (zyraDraftSink), whatever the size.
     const stream = params.input.requestedCount > LegacyService.ZYRA_STREAM_ABOVE || Boolean(zyraDraftSink());
     let maxTokens = Math.min(LegacyService.ZYRA_GEN_MAX_TOKENS, 2000 + params.input.requestedCount * 1500);
-    const send = (model: string) => fetch(anthropicUrl, {
+    const send = (model: string) => safeFetch(anthropicUrl, {
       method: "POST",
       headers: anthropicHeaders,
       body: JSON.stringify({
@@ -22780,7 +23046,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     };
     const provider = String(key.provider || "openai").toLowerCase();
     const headers = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
-    const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+    const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -22836,7 +23102,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
           { role: "user", content: message }
         ]
       };
-      const res = await fetch(chatUrl, {
+      const res = await safeFetch(chatUrl, {
         method: "POST",
         headers: chatHeaders,
         body: JSON.stringify(body),
@@ -23086,7 +23352,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     if (providerWire(provider) === "anthropic") {
       let lastStatus = "";
       for (const candidate of providerModelCandidates(String(key.provider || "anthropic"), model)) {
-        const res = await fetch(normalizeAnthropicMessagesUrl(key.base_url), {
+        const res = await safeFetch(normalizeAnthropicMessagesUrl(key.base_url), {
           method: "POST",
           headers: this.buildAnthropicAuthHeaders(key.api_key, key.auth_header_name, key.auth_scheme),
           body: JSON.stringify({
@@ -23114,7 +23380,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       }
       throw new Error(`Claude update drafting failed: ${lastStatus || "No compatible model was accepted."}`);
     }
-    const res = await fetch(providerChatUrl(provider, key.base_url, model), {
+    const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
       method: "POST",
       headers: this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme),
       body: JSON.stringify({ model, response_format: { type: "json_object" }, messages: [{ role: "system", content: system }, { role: "user", content: user }] }),

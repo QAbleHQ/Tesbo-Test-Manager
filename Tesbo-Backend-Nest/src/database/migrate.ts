@@ -30,6 +30,21 @@ function normalizeDatabaseUrl(raw: string): string {
   return value;
 }
 
+// Migrations take a session-level advisory lock and run DDL, neither of which is safe through a
+// transaction-mode pooler (Neon's `-pooler` host): the lock can land on a different server connection
+// than the one running the migration, so a leaked lock makes the next run block with no way out.
+// Use the direct endpoint. MIGRATION_DATABASE_URL overrides it for any other topology.
+function migrationDatabaseUrl(): string {
+  const override = process.env.MIGRATION_DATABASE_URL?.trim();
+  if (override) return normalizeDatabaseUrl(override);
+  const url = normalizeDatabaseUrl(process.env.DATABASE_URL ?? "postgresql://localhost:5432/tesbo");
+  return url.replace(/(@ep-[a-z0-9-]+)-pooler(\.)/i, "$1$2");
+}
+
+// Fail in seconds with a clear message instead of waiting on a lock until the connection is dropped
+// (lock_timeout defaults to 0 = wait forever).
+const LOCK_TIMEOUT_MS = Number.parseInt(process.env.MIGRATION_LOCK_TIMEOUT_MS ?? "60000", 10);
+
 function migrationsDir(): string {
   return process.env.MIGRATIONS_DIR ?? path.join(process.cwd(), "migrations");
 }
@@ -183,7 +198,7 @@ async function applyMigration(client: PoolClient, migration: MigrationFile) {
 async function main() {
   loadEnv();
   const migrations = readMigrations();
-  const databaseUrl = normalizeDatabaseUrl(process.env.DATABASE_URL ?? "postgresql://localhost:5432/tesbo");
+  const databaseUrl = migrationDatabaseUrl();
   const pool = new Pool({
     connectionString: databaseUrl,
     user: process.env.DATABASE_USER || undefined,
@@ -192,8 +207,15 @@ async function main() {
   });
 
   const client = await pool.connect();
+  // A connection dropped between queries is emitted as an 'error' event, not a rejected query, and
+  // would otherwise crash the process with an unattributed stack trace.
+  client.on("error", (error) => {
+    console.error(`Database connection lost during migration: ${error.message}`);
+    process.exit(1);
+  });
 
   try {
+    await client.query(`SET lock_timeout = ${LOCK_TIMEOUT_MS}`);
     await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK_KEY]);
     await ensureMigrationTable(client);
     await bootstrapFromLegacyChangelog(client, migrations);

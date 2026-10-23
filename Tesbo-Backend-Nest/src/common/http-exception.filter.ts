@@ -1,5 +1,6 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from "@nestjs/common";
 import type { Response } from "express";
+import { UnsafeOutboundUrlError } from "./safe-fetch";
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
@@ -34,6 +35,11 @@ export class HttpExceptionFilter implements ExceptionFilter {
           return;
         }
       }
+      // A 429 from the brute-force limits says when to try again, in the header clients and proxies read.
+      if (status === HttpStatus.TOO_MANY_REQUESTS && typeof body === "object" && body !== null) {
+        const retryAfter = (body as { retryAfterSeconds?: unknown }).retryAfterSeconds;
+        if (typeof retryAfter === "number" && retryAfter > 0) response.setHeader("Retry-After", String(Math.ceil(retryAfter)));
+      }
       if (typeof body === "string") {
         response.status(status).json({ error: body });
       } else {
@@ -47,6 +53,12 @@ export class HttpExceptionFilter implements ExceptionFilter {
       response
         .status(HttpStatus.PAYLOAD_TOO_LARGE)
         .json({ error: `This request is too large. Maximum supported size is ${limit}.` });
+      return;
+    }
+    // A saved AI provider URL that the server now refuses to call (a key saved before the check existed,
+    // or a name re-pointed since). A caller error to fix in settings, not a server fault.
+    if (exception instanceof UnsafeOutboundUrlError) {
+      response.status(HttpStatus.BAD_REQUEST).json({ error: `AI provider base URL not allowed: ${exception.message}`, code: "ai_base_url_blocked" });
       return;
     }
     console.error("Unhandled exception:", exception);
