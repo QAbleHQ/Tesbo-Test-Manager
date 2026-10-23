@@ -517,7 +517,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(storedAfterMinimum, "the removed 'minimum' tier reached the stored settings").not.toContain('"minimum"');
   });
 
-  test("ZYR-A-10b a project that has never saved this setting defaults to 30-50, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
+  test("ZYR-A-10b a project that has never saved this setting defaults to all, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
     // A dedicated project, not the shared tenant's mainProjectId — every other test in this file
     // PATCHes that project's testcaseRange, so it never reflects the true "nothing ever saved" state.
     // Projects cap name at 30 chars — "E2E Zyra Default Range " plus a 13-digit timestamp
@@ -530,7 +530,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const project = await created.json();
     try {
       const agent = await (await asOwner.get(url("/agents/zyra", project.id))).json();
-      expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("30-50");
+      expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("all");
       expect(agent.settings.testcaseCount).toBe(50);
     } finally {
       purgeProject(project.id);
