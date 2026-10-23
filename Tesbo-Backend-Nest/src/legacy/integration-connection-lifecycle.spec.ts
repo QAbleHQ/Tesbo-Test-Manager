@@ -170,13 +170,13 @@ describe("Jira credential lifecycle — getIntegrationConnection via the comment
     expect(h.row.auth_error).toBeNull();
   });
 
-  it("expired token issued to ANOTHER app: refuses without contacting Atlassian, and records it", async () => {
+  it("expired token whose client_id claim differs from this deployment's app: the claim is not trusted, Atlassian decides — renews and posts", async () => {
+    // A freshly authorised connection was wrongly flagged on this claim alone. Only Atlassian
+    // refusing the renewal (the 401/403 cases below) may mark a connection as needing a reconnect.
     const h = makeHarness({ token_expires_at: EXPIRED, access_token: encryptSecret(jwt(OTHER_APP, "foreign")) });
-    await expect(post(h)).rejects.toMatchObject({ response: { error: expect.stringMatching(/different Atlassian OAuth app/) } });
-    expect(h.tokenCalls()).toBe(0);
-    expect(h.commentCalls()).toHaveLength(0);
-    expect(h.row.auth_error).toMatch(/needs to be reconnected/);
-    expect(h.row.auth_error_refresh_fingerprint).toBe(fingerprint(h.row.refresh_token));
+    await expect(post(h)).resolves.toBe("10001");
+    expect(h.tokenCalls()).toBe(1);
+    expect(h.row.auth_error).toBeNull();
   });
 
   it("a refresh token already refused is never sent again — the stored reason comes back, no network", async () => {
@@ -250,6 +250,17 @@ describe("Jira credential lifecycle — getIntegrationConnection via the comment
     expect(h.tokenCalls()).toBe(0);
   });
 
+  it("404 on the post: surfaces providerStatus 404 (no renewal, no retry) and the stored reason names the key and both causes", async () => {
+    const h = makeHarness({}, { comment: [404] });
+    const err = await post(h).catch((e: unknown) => e);
+    expect(err).toMatchObject({ providerStatus: 404 });
+    expect(h.tokenCalls()).toBe(0);
+    expect(h.commentCalls()).toHaveLength(1);
+    const reason = (h.svc as unknown as { integrationErrorReason: (e: unknown, p: string, k?: string) => string }).integrationErrorReason(err, "Jira", "KAN-1");
+    expect(reason).toMatch(/could not find KAN-1 \(404\)/);
+    expect(reason).toMatch(/does not exist on the connected Jira site, or the connected account cannot see it/);
+  });
+
   it("a non-auth failure on the post (403) is not retried and does not trigger a renewal", async () => {
     const h = makeHarness({}, { comment: [403] });
     await expect(post(h)).rejects.toMatchObject({ providerStatus: 403 });
@@ -271,11 +282,10 @@ describe("Jira status reports whether this deployment can keep using the connect
     expect(h.fetchMock).not.toHaveBeenCalled();
   });
 
-  it("token from another app: connected but needsReconnect, even before it expires", async () => {
+  it("token whose client_id claim differs from this deployment's app: still healthy — the claim alone never flags a reconnect", async () => {
     const h = makeHarness({ access_token: encryptSecret(jwt(OTHER_APP, "foreign")) });
-    const status = await h.svc.jiraStatus(PROJECT_ID, "u1");
-    expect(status).toMatchObject({ connected: true, needsReconnect: true });
-    expect(String((status as Body).authError)).toMatch(/different Atlassian OAuth app/);
+    await expect(h.svc.jiraStatus(PROJECT_ID, "u1")).resolves.toMatchObject({ connected: true, needsReconnect: false, authError: null });
+    expect(h.fetchMock).not.toHaveBeenCalled();
   });
 
   it("a recorded refusal for the current refresh token: needsReconnect with that reason; a stale one is ignored", async () => {

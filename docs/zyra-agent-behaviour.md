@@ -74,8 +74,12 @@ Test case volume comes from Zyra → Settings → Test case range (`minimum`, `1
 
 - The configured range is the default and is stated in the router prompt.
 - An explicit user request wins: the router reports `requestedCount` (so "fifteen" works, not just
-  "15") or `exhaustive: true` ("all possible cases", "as many as you can").
+  "15"). `exhaustive: true` ("all possible cases", "as many as you can") only escalates to the
+  unbounded plan when the configured range is `all`; under `1-10`/`10-30`/`30-50` the range is the ceiling.
 - A message-level regex remains as fallback only when the router reports neither.
+- The unset default is `all`. The "tickets × cases per ticket is over one generation" question
+  (`zyraTicketScope`) is asked only on `all`; `1-10`/`10-30`/`30-50` are bounded runs and never ask. A count
+  the user names also beats `exhaustive`, so it never asks either.
 - Hard ceiling of 100 per message (`ZYRA_CHAT_MAX_OPERATIONS`, the largest plan batch); a count the user names is clamped to 50 (`ZYRA_CHAT_MAX_REQUESTED`).
 
 ## 4. Test cases appear in the table, and nowhere else
@@ -102,8 +106,8 @@ Large asks are planned then executed in batches rather than one oversized call t
 provider's output ceiling and returns invalid JSON.
 
 - **Batch size follows the project's "Test cases per task" range** (`ZYRA_BATCH_BY_RANGE`): `1-10` → 10,
-  `10-30` → 30, `30-50` → 50, `all` → 100. It used to be a flat 5. An "exhaustive" ask on any range runs
-  the plan flow with that range's batch size; only the `all` range runs it without the user saying so.
+  `10-30` → 30, `30-50` → 50, `all` → 100. It used to be a flat 5. Only the `all` range runs the plan
+  flow from an "exhaustive" ask (a ticket-scoped plan the user opts into is the other entry point).
 - A batch is one model call. Anthropic generation asks for up to `ZYRA_GEN_MAX_TOKENS` (100000) output tokens,
   drops to the model's own ceiling if it rejects that, and streams any batch above 10 (a plain request
   returns no headers until it finishes, and Node's fetch gives up on that after 5 minutes). The generation

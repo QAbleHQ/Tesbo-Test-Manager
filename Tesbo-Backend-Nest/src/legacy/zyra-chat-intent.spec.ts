@@ -336,8 +336,16 @@ describe("Zyra chat AI routing", () => {
         .toEqual({ requestedCount: 15 });
     });
 
-    it("takes exhaustive from the router", () => {
-      expect(internals(svc).chatTestcasePlan("cover everything you can", "1-10", { exhaustive: true }).testcaseRange).toBe("all");
+    it("takes exhaustive from the router, but only on a project set to 'all'", () => {
+      expect(internals(svc).chatTestcasePlan("cover everything you can", "all", { exhaustive: true }).testcaseRange).toBe("all");
+      // Below 'all' the configured range is the ceiling — the reported 1-10 project that made 100+ cases.
+      expect(internals(svc).chatTestcasePlan("cover everything you can", "1-10", { exhaustive: true })).toEqual({ testcaseRange: "1-10", requestedCount: 10 });
+      expect(internals(svc).chatTestcasePlan("generate all possible cases", "10-30")).toEqual({ testcaseRange: "10-30", requestedCount: 30 });
+    });
+
+    it("a named count beats exhaustive", () => {
+      expect(internals(svc).chatTestcasePlan("20 test cases for everything", "all", { exhaustive: true, requestedCount: 20 })).toEqual({ requestedCount: 20 });
+      expect(internals(svc).chatTestcasePlan("generate all possible, 20 test cases", "all", { exhaustive: true })).toEqual({ requestedCount: 20 });
     });
 
     it("clamps a router count to the per-message ceiling", () => {

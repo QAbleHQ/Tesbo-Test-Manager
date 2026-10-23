@@ -132,69 +132,60 @@ describe("zyraTicketScope — asks when the workload is over one generation unde
     });
   };
 
-  it("asks for two named tickets at 50 per ticket — 100 is over one generation of 50", async () => {
-    expect(await scopeFor("Generate test cases for QAB-1 and QAB-2", "30-50")).toEqual({
-      ticketKeys: ["QAB-1", "QAB-2"], ticketCount: 2, perTicket: 50, limit: 50, unspecified: false
+  it("asks for two named tickets on the 'all' range — 200 is over one generation of 100", async () => {
+    expect(await scopeFor("Generate test cases for QAB-1 and QAB-2", "all")).toEqual({
+      ticketKeys: ["QAB-1", "QAB-2"], ticketCount: 2, perTicket: 100, limit: 100, unspecified: false
     });
   });
 
-  it("the limit follows the configured setting, with no code change between them", async () => {
-    const message = "Generate test cases for QAB-1 and QAB-2";
-    for (const [range, limit] of [["1-10", 10], ["10-30", 30], ["30-50", 50], ["all", 100]] as const) {
-      expect({ range, limit: (await scopeFor(message, range))?.limit }).toEqual({ range, limit });
+  it("regression: a project set to 1-10, 10-30 or 30-50 is never asked — only 'all' can span several generations", async () => {
+    for (const range of ["1-10", "10-30", "30-50"]) {
+      expect(await scopeFor("Generate test cases for QAB-1 and QAB-2", range)).toBeNull();
+      expect(await scopeFor(`Generate test cases for ${keys(10).join(", ")}`, range)).toBeNull();
+      expect(await scopeFor("Generate test cases for all the tickets", range, { routedScope: "all_tickets", synced: 243 })).toBeNull();
+      // Even an 'all possible' wording: the range is the ceiling, not a reason to ask.
+      expect(await scopeFor("Generate all possible test cases for all tickets", range, { routedScope: "all_tickets", exhaustive: true, synced: 243 })).toBeNull();
     }
   });
 
-  it("is held to the setting, not a fixed 60: two tickets at 30 each (60) are over one generation of 30", async () => {
-    // Under the old fixed threshold of 60 this was exactly at it and never asked.
-    expect((await scopeFor("Generate test cases for QAB-1 and QAB-2", "10-30"))?.ticketCount).toBe(2);
-  });
-
-  it("below, at and over the limit: what fits one generation is not asked about", async () => {
-    // Below: one ticket at the project's own size is one generation's worth.
-    expect(await scopeFor("Generate test cases for QAB-1", "1-10")).toBeNull();
+  it("below, at and over the limit on 'all': what fits one generation is not asked about", async () => {
+    // Below: one ticket is one generation's worth.
+    expect(await scopeFor("Generate test cases for QAB-1", "all")).toBeNull();
     // At: every ticket of a project that only has one fits exactly — still one generation.
-    expect(await scopeFor("Generate test cases for all the tickets", "1-10", { routedScope: "all_tickets", synced: 1 })).toBeNull();
-    // Over: two tickets at the same size need two generations.
-    expect((await scopeFor("Generate test cases for all the tickets", "1-10", { routedScope: "all_tickets", synced: 2 }))?.ticketCount).toBe(2);
-  });
-
-  it("an 'all possible' request budgets each ticket at the 'all' range's full batch, not the single-call cap", async () => {
-    // ZYRA_BATCH_BY_RANGE.all — two tickets asked for in full are 100 each, not 50 each sharing one batch.
-    expect((await scopeFor("Generate all possible test cases for QAB-1 and QAB-2", "30-50"))?.perTicket).toBe(100);
-    // Without "all possible", the project's own range decides.
-    expect((await scopeFor("Generate test cases for QAB-1, QAB-2 and QAB-3", "10-30"))?.perTicket).toBe(30);
+    expect(await scopeFor("Generate test cases for all the tickets", "all", { routedScope: "all_tickets", synced: 1 })).toBeNull();
+    // Over: two tickets at 100 each need two generations.
+    expect((await scopeFor("Generate test cases for all the tickets", "all", { routedScope: "all_tickets", synced: 2 }))?.ticketCount).toBe(2);
   });
 
   it("never asks about a single ticket, however large its budget", async () => {
-    expect(await scopeFor("Generate all possible test cases for QAB-1", "30-50")).toBeNull();
+    expect(await scopeFor("Generate all possible test cases for QAB-1", "all", { exhaustive: true })).toBeNull();
   });
 
   it("an explicit count is the user's own budget and is never second-guessed", async () => {
-    expect(await scopeFor(`Generate 20 test cases for ${keys(10).join(", ")}`, "30-50")).toBeNull();
+    expect(await scopeFor(`Generate 20 test cases for ${keys(10).join(", ")}`, "all")).toBeNull();
   });
 
   it("does not count key-shaped words that are not this project's tickets", async () => {
-    expect(await scopeFor("Generate test cases for UTF-8 and ISO-8859 encoding", "30-50")).toBeNull();
+    expect(await scopeFor("Generate test cases for UTF-8 and ISO-8859 encoding", "all")).toBeNull();
     // Mixed: only the real tickets count — here one, so nothing to ask.
-    expect(await scopeFor("Generate test cases for QAB-1 with UTF-8 input", "30-50")).toBeNull();
+    expect(await scopeFor("Generate test cases for QAB-1 with UTF-8 input", "all")).toBeNull();
     // An unsynced key under a known prefix still counts; it is reported as not synced later.
-    expect((await scopeFor("Generate test cases for QAB-1 and QAB-999", "30-50"))?.ticketKeys).toEqual(["QAB-1", "QAB-999"]);
+    expect((await scopeFor("Generate test cases for QAB-1 and QAB-999", "all"))?.ticketKeys).toEqual(["QAB-1", "QAB-999"]);
   });
 
   it("counts every synced ticket for 'all the tickets'", async () => {
-    expect(await scopeFor("Generate test cases for all the Jira tickets", "30-50", { synced: 12 })).toEqual({
-      ticketKeys: null, ticketCount: 12, perTicket: 50, limit: 50, unspecified: false
+    expect(await scopeFor("Generate test cases for all the Jira tickets", "all", { synced: 12 })).toEqual({
+      ticketKeys: null, ticketCount: 12, perTicket: 100, limit: 100, unspecified: false
     });
   });
 
   it("does not read 'the login requirement' as every ticket there is", async () => {
-    expect(await scopeFor("Generate test cases for the login requirement", "30-50", { synced: 500 })).toBeNull();
+    expect(await scopeFor("Generate test cases for the login requirement", "all", { synced: 500 })).toBeNull();
   });
 
   it("does not ask about all tickets when the knowledge base is off, or a search matched strongly", async () => {
-    expect(await scopeFor("Generate test cases for all the tickets", "30-50", { synced: 12, knowledgeBase: false })).toBeNull();
-    expect(await scopeFor("Generate test cases for all the tickets", "30-50", { synced: 12, confidence: "strong" })).toBeNull();
+    expect(await scopeFor("Generate test cases for all the tickets", "all", { synced: 12, knowledgeBase: false })).toBeNull();
+    expect(await scopeFor("Generate test cases for all the tickets", "all", { synced: 12, confidence: "strong" })).toBeNull();
   });
 });
 
@@ -263,15 +254,25 @@ describe("zyraTicketScope — the router's scope decides, whatever the wording",
     expect(await scopeFor("generate 100 test cases", "all", { routedScope: "all_tickets", requestedCount: 100, synced: 243 })).toBeNull();
   });
 
+  it("regression: a named count under 100 never asks, even when the router also flags the request exhaustive", async () => {
+    for (const requestedCount of [20, 50, 99]) {
+      expect(
+        await scopeFor(`generate ${requestedCount} test cases for all tickets`, "all", { routedScope: "all_tickets", exhaustive: true, requestedCount, synced: 243 })
+      ).toBeNull();
+    }
+    // The regex fallback (router reported nothing) honours the number in the text the same way.
+    expect(await scopeFor("generate 20 test cases for all tickets", "all", { exhaustive: true, synced: 243 })).toBeNull();
+  });
+
   it("'all' means all of what the user refers to: tickets named earlier, not every ticket", async () => {
     const referenced = { routedScope: "referenced", referencedKeys: ["QAB-1", "QAB-2", "QAB-3"], synced: 243 };
-    expect(await scopeFor("write test cases for all of them", "30-50", referenced)).toEqual({
-      ticketKeys: ["QAB-1", "QAB-2", "QAB-3"], ticketCount: 3, perTicket: 50, limit: 50, unspecified: false
+    expect(await scopeFor("write test cases for all of them", "all", referenced)).toEqual({
+      ticketKeys: ["QAB-1", "QAB-2", "QAB-3"], ticketCount: 3, perTicket: 100, limit: 100, unspecified: false
     });
     // The same carried keys do not widen a request the router read as one feature.
-    expect(await scopeFor("write test cases for the login page", "30-50", { ...referenced, routedScope: "feature" })).toBeNull();
+    expect(await scopeFor("write test cases for the login page", "all", { ...referenced, routedScope: "feature" })).toBeNull();
     // And with no router scope (the fallback), only the tickets this message names count, as before.
-    expect(await scopeFor("write test cases for all of them", "30-50", { ...referenced, routedScope: undefined })).toBeNull();
+    expect(await scopeFor("write test cases for all of them", "all", { ...referenced, routedScope: undefined })).toBeNull();
   });
 
   it("the router's reading wins over a strong search match that used to suppress the question", async () => {
@@ -509,15 +510,15 @@ describe("generateZyraChatCreateDecision — asks before generating, and plans o
     const single = jest.spyOn(internals(svc), "generateZyraChatTestcasesWithAi").mockResolvedValue({ reply: "generated", actionType: "create", operations: [] });
     return { svc, plan, single };
   }
-  const create = (svc: LegacyService, message: string, routedCount?: Body) =>
+  const create = (svc: LegacyService, message: string, routedCount?: Body, projectTestcaseRange = "30-50") =>
     internals(svc).generateZyraChatCreateDecision({
       projectId: "p1", userId: "u1", sessionId: "s1", provider: "openai", model: "m", key: {}, message, knowledge: [], existingTestcases: [],
-      jiraIssueKeys: [], projectTestcaseRange: "30-50", suites: [], routedSuite: null, routedCount
+      jiraIssueKeys: [], projectTestcaseRange, suites: [], routedSuite: null, routedCount
     });
 
   it("many tickets: returns the question and generates nothing", async () => {
     const { svc, plan, single } = setup();
-    const decision = await create(svc, `Generate test cases for ${keys(10).join(", ")}`);
+    const decision = await create(svc, `Generate test cases for ${keys(10).join(", ")}`, undefined, "all");
     expect(decision.options?.kind).toBe("ticket_scope");
     expect(plan).not.toHaveBeenCalled();
     expect(single).not.toHaveBeenCalled();
@@ -532,7 +533,7 @@ describe("generateZyraChatCreateDecision — asks before generating, and plans o
 
   it("answered 'all in batches' for all the tickets: the existing paged plan, not the question again", async () => {
     const { svc, plan } = setup();
-    const decision = await create(svc, "Generate all possible test cases for all the Jira tickets.", { exhaustive: true, scopeDecided: true });
+    const decision = await create(svc, "Generate all possible test cases for all the Jira tickets.", { exhaustive: true, scopeDecided: true }, "all");
     expect(decision.options).toBeUndefined();
     expect(plan).toHaveBeenCalledTimes(1);
     expect((plan.mock.calls[0][0] as Body).ticketScope).toBeUndefined();

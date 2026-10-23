@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  IconApi,
   IconCamera,
   IconDownload,
   IconFileText,
@@ -13,6 +14,7 @@ import {
 } from "@tabler/icons-react";
 import { Button, ConfirmModal } from "@/components/ui";
 import TraceViewerPanel from "@/components/TraceViewerPanel";
+import ApiEvidenceViewer from "@/components/ApiEvidenceViewer";
 import {
   API_BASE,
   deleteExecutionEvidence,
@@ -47,6 +49,7 @@ const KIND_ICON: Record<EvidenceKind, typeof IconCamera> = {
   video: IconVideo,
   trace: IconTimeline,
   log: IconFileText,
+  api: IconApi,
 };
 
 const KIND_LABEL: Record<EvidenceKind, string> = {
@@ -54,10 +57,11 @@ const KIND_LABEL: Record<EvidenceKind, string> = {
   video: "Video",
   trace: "Trace",
   log: "Log",
+  api: "API call",
 };
 
 /** Order the groups appear in: what you look at first when a test failed. */
-const KIND_ORDER: EvidenceKind[] = ["screenshot", "video", "trace", "log"];
+const KIND_ORDER: EvidenceKind[] = ["screenshot", "video", "trace", "api", "log"];
 
 function inferKind(file: ExecutionEvidence): EvidenceKind {
   // evidence_kind is NULL for anything uploaded through the human path before/outside the ingest,
@@ -411,6 +415,19 @@ export default function ExecutionEvidencePanel({ cycleId, executionId, readOnly,
                   <ul className="space-y-1">
                     {items.map((file) => (
                       <VideoEvidenceRow key={file.id} cycleId={cycleId} executionId={executionId} file={file} onRemove={askRemove} />
+                    ))}
+                  </ul>
+                ) : kind === "api" ? (
+                  <ul className="space-y-1">
+                    {items.map((file) => (
+                      <ApiEvidenceViewer
+                        key={file.id}
+                        cycleId={cycleId}
+                        executionId={executionId}
+                        file={file}
+                        downloadUrl={evidenceDownloadUrl(cycleId, executionId, file.id)}
+                        removeButton={askRemove && <RemoveEvidenceButton file={file} onRemove={askRemove} />}
+                      />
                     ))}
                   </ul>
                 ) : (

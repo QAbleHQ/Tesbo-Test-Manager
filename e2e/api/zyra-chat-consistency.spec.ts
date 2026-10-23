@@ -1503,7 +1503,8 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     const sessionId = await newSession("E2E ZCC range 30-50 default");
     const before = liveCaseCount();
 
-    // No setRange: purge() leaves the project on the product default, which is 30-50.
+    // Explicit: the product default is now "all", so 30-50 has to be chosen.
+    await setRange("30-50");
     const assistant = await generateWithRange(sessionId, 40);
     expect(generationPrompt(), "the configured tier's instruction must reach the generation call").toContain("between 30 and 50");
 
@@ -1561,6 +1562,27 @@ test.describe("zyra chat — confirmation retry (fake provider)", () => {
     expect(reviewRequestFor(sessionId)!.payloadLength, "a model that overshoots 1-10 is trimmed to the tier's maximum").toBe(10);
     expect(assistant.testcases as unknown[]).toHaveLength(10);
   });
+
+  // Reported bug: "Test cases per task" set to 1-10, yet an "exhaustive" ask ran the scenario plan and
+  // produced 100+ cases. Under any range but "all" the range is the ceiling — the router's exhaustive
+  // flag and the "all possible" wording must not start a plan (ZCC-B-16 covers "all" itself).
+  for (const [range, cap] of [["1-10", 10], ["10-30", 30], ["30-50", 50]] as const) {
+    test(`ZCC-B-21 an exhaustive request on the ${range} range stays within ${cap} and starts no plan`, async () => {
+      await allocateFakeAiKey();
+      await setRange(range);
+      const sessionId = await newSession(`E2E ZCC exhaustive capped ${range}`);
+
+      ai.queueReply({ reply: "", reasoningSummary: "Planning exhaustive coverage.", action: "create", actionType: "create", operations: [], testcases: [], exhaustive: true });
+      // The model overshoots; generation must trim to the range's maximum.
+      ai.queueReply({ drafts: Array.from({ length: cap + 20 }, (_, i) => scenarioDraft(`E2E capped case ${i + 1} ${Date.now()}`)) });
+      const turn = await sendMessage(sessionId, "Generate all possible test cases for the login flow.");
+      expect(turn.status, JSON.stringify(turn.body)).toBeLessThan(300);
+
+      expect(ai.requests.some((r) => JSON.stringify(r.messages).includes("planning exhaustive test coverage")), "the exhaustive scenario planner must not run below the 'all' range").toBe(false);
+      expect(reviewRequestFor(sessionId)!.payloadLength, `staged cases are capped at the ${range} maximum`).toBe(cap);
+      expect(scalar(`SELECT active_plan FROM zyra_chat_sessions WHERE id = ${literal(sessionId)};`), "no batch plan may be running").toBeNull();
+    });
+  }
 
   test("ZCC-B-15 a count the user names overrides the range, in both directions, and is clamped at 50", async () => {
     await allocateFakeAiKey();

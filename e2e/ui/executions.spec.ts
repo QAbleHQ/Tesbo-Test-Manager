@@ -2382,6 +2382,62 @@ test.describe("execution evidence and automation provenance", () => {
   });
 
   /*
+   * API-call evidence renders as method / URL / status / headers / body in place. Credential
+   * headers are masked for display, and a file the viewer cannot recognise says so rather than
+   * showing an empty panel.
+   */
+  test("an API call can be viewed in place, with credential headers masked; an unrecognised file shows an error", async ({ page }) => {
+    const { runId, testcase } = await seedAutomatedRun("api-evidence");
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    try {
+      const base = `/api/projects/${ctx.projectId}/automation/runs/${runId}/results/${testcase.externalId}/evidence`;
+      const call = {
+        method: "POST",
+        url: "https://api.example.test/cart",
+        status: 500,
+        durationMs: 123,
+        request: { headers: { Authorization: "Bearer super-secret-token", "Content-Type": "application/json" }, body: { sku: "A1" } },
+        response: { headers: { "Content-Type": "application/json" }, body: { error: "boom" } },
+      };
+      await api.post(base, {
+        multipart: { kind: "api", files: { name: "cart-call.json", mimeType: "application/json", buffer: Buffer.from(JSON.stringify(call)) } },
+      });
+      // Valid JSON, so the server stores it, but not any shape the viewer understands.
+      await api.post(base, {
+        multipart: { kind: "api", files: { name: "unknown-shape.json", mimeType: "application/json", buffer: Buffer.from('{"hello":"world"}') } },
+      });
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${runId}`);
+      await page.getByText(testcase.title).first().click();
+      await expect(page.getByText("cart-call.json")).toBeVisible();
+      await expect(page.getByTestId("api-evidence-viewer")).toHaveCount(0);
+
+      await page.getByTestId("evidence-view-api").first().click();
+      await expect(page.getByTestId("api-evidence-method")).toHaveText("POST");
+      await expect(page.getByTestId("api-evidence-url")).toHaveText("https://api.example.test/cart");
+      await expect(page.getByTestId("api-evidence-status")).toContainText("500");
+      await expect(page.getByTestId("api-evidence-duration")).toContainText("123 ms");
+      await expect(page.getByTestId("api-evidence-request-body")).toContainText('"sku": "A1"');
+      await expect(page.getByTestId("api-evidence-response-body")).toContainText('"error": "boom"');
+
+      const requestHeaders = page.getByTestId("api-evidence-request-headers");
+      await expect(requestHeaders).toContainText("Authorization:");
+      await expect(requestHeaders).toContainText("[redacted]");
+      await expect(page.locator("body")).not.toContainText("super-secret-token");
+
+      // Hide unmounts the viewer.
+      await page.getByTestId("evidence-view-api").first().click();
+      await expect(page.getByTestId("api-evidence-viewer")).toHaveCount(0);
+
+      await page.getByTestId("evidence-view-api").nth(1).click();
+      await expect(page.getByTestId("api-evidence-error")).toContainText("isn't a recognised API call format");
+    } finally {
+      await api.dispose();
+      await cleanUp(runId, testcase.id);
+    }
+  });
+
+  /*
    * "[Test Run] Evidence > Not able to delete evidence once attached." Each file gets a delete
    * control behind a confirm. Asserted against the persisted list, not just the DOM.
    */
