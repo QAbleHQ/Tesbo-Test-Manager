@@ -9040,6 +9040,46 @@ export class LegacyService implements OnModuleInit {
   }
 
   /**
+   * The parsed body of one `api` evidence file, for the in-place viewer.
+   *
+   * The download route cannot serve this: it may redirect to a presigned storage URL, which a
+   * cross-origin fetch from the app cannot follow without CORS on the bucket. This streams the
+   * bytes through the API instead, same project-membership check and same per-execution scoping.
+   * Only `evidence_kind = 'api'` is readable this way — it is JSON that is returned as JSON, never
+   * as markup, so it cannot become a stored-XSS vector the way inline .html would.
+   */
+  async getExecutionApiEvidence(
+    cycleId: string,
+    userId: string | null | undefined,
+    executionId: string,
+    attachmentId: string
+  ) {
+    const uid = this.requireUser(userId);
+    const execution = await this.executionOwner(cycleId, executionId);
+    await this.requireProjectAccess(uid, String(execution.project_id));
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
+    const res = await this.db.query(
+      `SELECT id, file_name, evidence_kind, storage_path FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
+      [attachmentId, executionId, execution.project_id]
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Attachment not found" });
+    if (file.evidence_kind !== "api") {
+      throw new BadRequestException({ error: "This attachment is not API evidence" });
+    }
+    if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
+      throw new NotFoundException({ error: "File content is not available" });
+    }
+    const text = (await this.storage.getBuffer(file.storage_path)).toString("utf8");
+    try {
+      return { fileName: String(file.file_name), data: JSON.parse(text) as unknown };
+    } catch {
+      throw new BadRequestException({ error: "This API evidence file isn't valid JSON" });
+    }
+  }
+
+  /**
    * Deletes one evidence file from a run's result.
    *
    * Evidence could be uploaded and billed against the storage allowance but never removed, so a

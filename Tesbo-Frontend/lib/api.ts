@@ -4423,7 +4423,7 @@ export async function getWorkspaceActivitySummary(): Promise<ActivitySummary> {
 // Automation results are now ordinary runs and executions, linked by the test case's external id.
 
 /** What kind of file a piece of evidence is, which decides how the viewer renders it. */
-export type EvidenceKind = "screenshot" | "video" | "trace" | "log";
+export type EvidenceKind = "screenshot" | "video" | "trace" | "log" | "api";
 
 export interface ExecutionEvidence {
   id: string;
@@ -4521,6 +4521,17 @@ export async function createExecutionTraceLink(
 ): Promise<{ token: string; expiresAt: string }> {
   return api<{ token: string; expiresAt: string }>(
     `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/trace-link`
+  );
+}
+
+/** The parsed JSON of one `api` evidence file (an envelope or a HAR), for the request/response viewer. */
+export async function getExecutionApiEvidence(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<{ fileName: string; data: unknown }> {
+  return api<{ fileName: string; data: unknown }>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/api-content`
   );
 }
 
