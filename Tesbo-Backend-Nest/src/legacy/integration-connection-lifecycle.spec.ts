@@ -250,6 +250,17 @@ describe("Jira credential lifecycle — getIntegrationConnection via the comment
     expect(h.tokenCalls()).toBe(0);
   });
 
+  it("404 on the post: surfaces providerStatus 404 (no renewal, no retry) and the stored reason names the key and both causes", async () => {
+    const h = makeHarness({}, { comment: [404] });
+    const err = await post(h).catch((e: unknown) => e);
+    expect(err).toMatchObject({ providerStatus: 404 });
+    expect(h.tokenCalls()).toBe(0);
+    expect(h.commentCalls()).toHaveLength(1);
+    const reason = (h.svc as unknown as { integrationErrorReason: (e: unknown, p: string, k?: string) => string }).integrationErrorReason(err, "Jira", "KAN-1");
+    expect(reason).toMatch(/could not find KAN-1 \(404\)/);
+    expect(reason).toMatch(/does not exist on the connected Jira site, or the connected account cannot see it/);
+  });
+
   it("a non-auth failure on the post (403) is not retried and does not trigger a renewal", async () => {
     const h = makeHarness({}, { comment: [403] });
     await expect(post(h)).rejects.toMatchObject({ providerStatus: 403 });

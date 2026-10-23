@@ -1974,7 +1974,7 @@ export class LegacyService implements OnModuleInit {
       );
       await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${provider === "notion" ? await this.notionPageLabel(projectId, issueKey) : issueKey}.`);
     } catch (err) {
-      const reason = this.integrationErrorReason(err, label);
+      const reason = this.integrationErrorReason(err, label, issueKey);
       this.logger.warn(`Failed to post Zyra ticket comment to ${label} ${issueKey}: ${reason}`);
       await this.db.query(
         "UPDATE integration_ticket_comments SET status = 'failed', reason = $2, updated_at = now() WHERE id = $1",
@@ -2124,7 +2124,7 @@ export class LegacyService implements OnModuleInit {
   // it as `error` on their response body rather than as the exception's own message. 401 and 403
   // share one generic message everywhere else (cleanAuthErrorOrNull); for a ticket comment they need
   // different fixes, so they get different reasons here.
-  private integrationErrorReason(err: unknown, provider: string): string {
+  private integrationErrorReason(err: unknown, provider: string, issueKey?: string): string {
     const providerStatus = (err as { providerStatus?: number })?.providerStatus;
     // Notion's 403 is about the integration's capabilities or what is shared with it, and
     // notionFetch already wrote the exact remedy (insert-comment capability, share the page) into
@@ -2138,6 +2138,12 @@ export class LegacyService implements OnModuleInit {
     }
     if (providerStatus === 403) {
       return `${provider} refused the comment (403) — the connected ${provider} account doesn't have permission to comment on this issue. Give that account comment permission in the ${provider} project, or reconnect with an account that has it, then retry.`;
+    }
+    // Jira answers 404 both when the key does not exist on the connected site and when the connected
+    // account cannot see it. After a reconnect to another Jira site, every ticket linked on the old
+    // one lands here, so the reason names the key and both causes instead of a bare status.
+    if (provider === "Jira" && providerStatus === 404) {
+      return `Jira could not find ${issueKey || "this issue"} (404) — it does not exist on the connected Jira site, or the connected account cannot see it. If Jira was reconnected to a different site, link a ticket from the new site; otherwise give the connected account access to the project, then retry.`;
     }
     const response = (err as { getResponse?: () => unknown })?.getResponse?.();
     if (response && typeof response === "object" && typeof (response as Body).error === "string") return String((response as Body).error);
@@ -13521,7 +13527,9 @@ export class LegacyService implements OnModuleInit {
       const authError = this.cleanAuthErrorOrNull(providerLabel, res.status);
       if (authError) throw authError;
       const text = await res.text().catch(() => "");
-      throw new BadRequestException({ error: `${providerLabel} request failed (${res.status}).`, detail: text.slice(0, 500) });
+      const failure = new BadRequestException({ error: `${providerLabel} request failed (${res.status}).`, detail: text.slice(0, 500) });
+      Object.defineProperty(failure, "providerStatus", { value: res.status, enumerable: false });
+      throw failure;
     }
     return (await res.json()) as T;
   }
