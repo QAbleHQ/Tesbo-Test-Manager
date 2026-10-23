@@ -19277,8 +19277,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
       const testcaseRange = String((projectSettings as Body).testcaseRange || "all");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
-      provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
-      model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
+      ({ provider, model } = LegacyService.zyraTaskProviderAndModel(task, allocation.rows[0]));
       const { knowledge, knowledgeConfidence } = await this.zyraTaskKnowledge(projectId, options.knowledgeItemIds || [], [story, context, acceptanceCriteria]);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
@@ -19522,8 +19521,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     const zyraAgentSettings = await this.zyraAgentSettings(projectId);
     const testcaseRange = String(zyraAgentSettings.testcaseRange || "all");
     const requestedCount = Number(existing.rows[0].requested_count) || this.testcaseRangeConfig(testcaseRange).requestedCount;
-    const provider = String(existing.rows[0].provider || allocation.rows[0].provider || "openai").toLowerCase();
-    const model = normalizeProviderModel(provider, existing.rows[0].model || allocation.rows[0].default_model);
+    const { provider, model } = LegacyService.zyraTaskProviderAndModel(existing.rows[0], allocation.rows[0]);
     // Regeneration is a real provider call (the same one processZyraTask makes for the initial
     // generation) and routinely takes tens of seconds. Fire it off the same way processZyraTask
     // does — the claim UPDATE above already moved the task to 'todo' and is what the caller needs
@@ -20975,6 +20973,23 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       component: String(row.component || "").slice(0, 255)
     });
     return [...named.map((row) => snapshot(row, true)), ...res.rows.map((row) => snapshot(row, false))];
+  }
+
+  /**
+   * The provider and model a task-board (re)generation calls. Always the allocated key's provider: the
+   * request is signed with that key, so any other provider id sends it to the wrong API. The row's own
+   * `provider` is only a record of what ran before — and for an archive-sweep row it is the marker
+   * "zyra_archive_sweep", which resolves to the OpenAI wire, so an Anthropic key was sent to OpenAI and
+   * the failure read "Incorrect API key … platform.openai.com". The row's model is reused only when it
+   * belongs to that same provider.
+   */
+  static zyraTaskProviderAndModel(
+    row: Body,
+    allocation: { provider?: unknown; default_model?: unknown }
+  ): { provider: string; model: string } {
+    const provider = String(allocation.provider || "openai").toLowerCase();
+    const sameProvider = String(row.provider || "").toLowerCase() === provider;
+    return { provider, model: normalizeProviderModel(provider, (sameProvider && row.model) || allocation.default_model) };
   }
 
   /** Existing test cases that keep their description and steps in the snapshot; the rest are listed by title. */
