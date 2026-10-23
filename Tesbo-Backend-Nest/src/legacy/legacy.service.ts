@@ -20942,12 +20942,20 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       values.push(terms.map((term) => `%${term}%`));
       orderBy = `CASE WHEN lower(title) LIKE ANY($3::text[]) OR lower(coalesce(description, '')) LIKE ANY($3::text[]) THEN 0 ELSE 1 END, updated_at DESC`;
     }
+    // Every live test case in the project, however many: Zyra uses this list to avoid duplicating
+    // coverage, and a cap meant it regenerated whatever sat outside the top rows. Only the best
+    // ZYRA_DETAILED_TESTCASES by relevance carry their description and steps (the SQL leaves the rest
+    // NULL, so the wide columns are never read for them); the others are id/title/priority/status lines.
     const res = await this.db.query(
-      `SELECT external_id, title, description, priority, status, steps, component
-       FROM testcases
-       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND NOT (coalesce(external_id, '') = ANY($2::text[]))
-       ORDER BY ${orderBy}
-       LIMIT 25`,
+      `SELECT external_id, title, priority, status, component,
+              CASE WHEN rn <= ${LegacyService.ZYRA_DETAILED_TESTCASES} THEN description END AS description,
+              CASE WHEN rn <= ${LegacyService.ZYRA_DETAILED_TESTCASES} THEN steps END AS steps
+       FROM (
+         SELECT *, row_number() OVER (ORDER BY ${orderBy}) AS rn
+         FROM testcases
+         WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND NOT (coalesce(external_id, '') = ANY($2::text[]))
+       ) ranked
+       ORDER BY rn`,
       values
     );
     // A named case gets far more room than a listed one: it is the one the user is asking about, so
@@ -20968,6 +20976,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     });
     return [...named.map((row) => snapshot(row, true)), ...res.rows.map((row) => snapshot(row, false))];
   }
+
+  /** Existing test cases that keep their description and steps in the snapshot; the rest are listed by title. */
+  private static readonly ZYRA_DETAILED_TESTCASES = 25;
 
   /** How many test cases one request can name by id and get in full (see existingTestcaseSnapshot). */
   private static readonly ZYRA_NAMED_TESTCASE_LIMIT = 10;

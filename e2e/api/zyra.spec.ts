@@ -3411,6 +3411,52 @@ test.describe("zyra chat — citations (fake provider)", () => {
     }
   });
 
+  // Reported: "Zyra only considers 25 test cases" — the existing-coverage lookup was LIMIT 25, so in a
+  // larger project Zyra could not see (and so duplicated) everything past the 25 best matches.
+  test("ZYR-A-74b every existing test case in the project reaches the model, not just the first 25", async () => {
+    test.setTimeout(180_000);
+    await allocateFakeAiKey();
+    const stamp = Date.now();
+    const total = 30;
+    const seededIds: string[] = [];
+    try {
+      // Oldest first, so the earliest title is the one a recency-ordered LIMIT 25 would cut. The titles
+      // share no word (4+ letters) with the message below, so nothing is ranked up by keyword.
+      for (let i = 1; i <= total; i++) {
+        const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+          data: { title: `Zqx${stamp} ${String(i).padStart(2, "0")}` },
+          failOnStatusCode: false,
+        });
+        expect(res.status(), `seeding ${i} — ${await res.text()}`).toBe(201);
+        seededIds.push((await res.json()).id);
+      }
+
+      const sessionId = await newSession("E2E all existing cases");
+      ai.queueReply({
+        reply: "", reasoningSummary: "Creating a test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+      });
+      ai.queueReply({
+        drafts: [{
+          title: "A brand new one", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a",
+          priority: "P2", severity: "Low", tags: ["zyra"], sourceRefs: [],
+        }],
+      });
+      const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Create one more." }, failOnStatusCode: false,
+      });
+      expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+      const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+      for (let i = 1; i <= total; i++) {
+        expect(routerPrompt, `existing test case ${i} of ${total} must be listed`).toContain(`Zqx${stamp} ${String(i).padStart(2, "0")}`);
+      }
+    } finally {
+      for (const id of seededIds) {
+        await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${id}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
   // ─── Chat updates carry their new values into the staged proposal ─────────
   //
   // "[Zyra] Updated Expected Results Are Not Actually Updated": the chat prompt's schema showed
