@@ -1805,14 +1805,15 @@ export class LegacyService implements OnModuleInit {
     jiraIssueKeys: string[],
     linearIssueKeys: string[],
     notionPageIds: string[],
-    knowledgeLabels: Map<string, { provider: TicketProvider; issueKey: string }> = new Map()
+    knowledgeLabels: Map<string, { provider: TicketProvider; issueKey: string }> = new Map(),
+    notionKeys: Map<string, string> = new Map()
   ): number {
     if (jiraIssueKeys.length + linearIssueKeys.length + notionPageIds.length <= 1) return 0;
     const byLabel = new Map<string, { provider: TicketProvider; issueKey: string }>();
     for (const issueKey of jiraIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "jira", issueKey });
     for (const issueKey of linearIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "linear", issueKey });
     // The prompt labels a Notion page by its short display key (notionPageKey), not its page id.
-    for (const issueKey of notionPageIds) byLabel.set(notionPageKey(issueKey).toLowerCase(), { provider: "notion", issueKey });
+    for (const issueKey of notionPageIds) byLabel.set((notionKeys.get(issueKey) || notionPageKey(issueKey)).toLowerCase(), { provider: "notion", issueKey });
     for (const [label, ticket] of knowledgeLabels) {
       const own = (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).find((key) => key.trim().toLowerCase() === ticket.issueKey.trim().toLowerCase());
       if (own) byLabel.set(label, { provider: ticket.provider, issueKey: own });
@@ -5931,10 +5932,11 @@ export class LegacyService implements OnModuleInit {
   private async notifyIssueLinked(projectId: string, actorId: string, before: Body, after: Body | undefined): Promise<void> {
     try {
       if (!after?.id) return;
+      const notionKeys = await this.notionKeysByPageId(projectId, [String(after.notion_page_id ?? "")]);
       const links: Array<{ provider: IntegrationProvider; was: unknown; now: unknown; label: (v: string) => string }> = [
         { provider: "jira", was: before.jira_issue_key, now: after.jira_issue_key, label: (v) => v },
         { provider: "linear", was: before.linear_issue_key, now: after.linear_issue_key, label: (v) => v },
-        { provider: "notion", was: before.notion_page_id, now: after.notion_page_id, label: (v) => notionPageKey(v) }
+        { provider: "notion", was: before.notion_page_id, now: after.notion_page_id, label: (v) => notionKeys.get(v) || notionPageKey(v) }
       ];
       for (const link of links) {
         const now = String(link.now ?? "").trim();
@@ -14393,10 +14395,17 @@ export class LegacyService implements OnModuleInit {
       if (titleName) request.filter = { property: titleName, title: { contains: search } };
     }
     const data = await this.notionFetch<Body>(connection, "POST", `/databases/${encodeURIComponent(databaseId)}/query`, request, "database");
+    // Pages already synced show their project key (MYN-1); one not synced yet falls back to the short id.
+    const results = normalizeJsonArray(data.results);
+    const stored = await this.db.query(
+      "SELECT notion_page_id, notion_page_key FROM notion_pages WHERE project_id = $1 AND notion_page_id = ANY($2::text[])",
+      [projectId, results.map((page) => String(page.id || ""))]
+    ).catch(() => ({ rows: [] as any[] }));
+    const storedKeys = new Map<string, string>(stored.rows.map((row: any) => [String(row.notion_page_id), String(row.notion_page_key)]));
     return {
-      list: normalizeJsonArray(data.results).map((page) => ({
+      list: results.map((page) => ({
         provider: "NOTION",
-        key: notionPageKey(String(page.id || "")),
+        key: storedKeys.get(String(page.id || "")) || notionPageKey(String(page.id || "")),
         pageId: String(page.id || ""),
         summary: notionPageTitle(page.properties),
         status: notionTicketFields(page.properties).status,
@@ -14406,7 +14415,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   // Cache-only, like linearSnapshot: reads notion_pages, never calls Notion. `keys` are page ids.
-  private async notionSnapshot(projectId: string, pageIds: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
+  private async notionSnapshot(projectId: string, pageIds: string[]): Promise<Array<{ id: string; key: string; summary: string; description: string; status: string }>> {
     const selected = Array.from(new Set(pageIds.map((id) => id.trim()).filter(Boolean)));
     if (!selected.length) return [];
     const res = await this.db.query(
@@ -14414,10 +14423,11 @@ export class LegacyService implements OnModuleInit {
        WHERE project_id = $1 AND notion_page_id = ANY($2::text[])`,
       [projectId, selected]
     ).catch(() => ({ rows: [] as any[] }));
-    const byId = new Map<string, { key: string; summary: string; description: string; status: string }>(
+    const byId = new Map<string, { id: string; key: string; summary: string; description: string; status: string }>(
       res.rows.map((row) => [
         String(row.notion_page_id),
         {
+          id: String(row.notion_page_id),
           key: String(row.notion_page_key),
           summary: String(row.summary || ""),
           // Properties first (status, owner, dates), then the page body, the same order the mirrored document uses.
@@ -14427,11 +14437,28 @@ export class LegacyService implements OnModuleInit {
       ])
     );
     return selected.map((id) => byId.get(id) || {
+      id,
       key: notionPageKey(id),
       summary: "Selected Notion page",
       description: "Page details were not available from the local cache, but the selected page was included for Zyra context.",
       status: ""
     });
+  }
+
+  // Page id -> display key for human-facing Zyra text: the stored "<database> <n>" key of a synced page,
+  // the short id-derived label for one that is not cached.
+  private async notionKeysByPageId(projectId: string, pageIds: string[]): Promise<Map<string, string>> {
+    const ids = Array.from(new Set(pageIds.map(String).filter(Boolean)));
+    const keys = new Map<string, string>(ids.map((id) => [id, notionPageKey(id)]));
+    if (!ids.length) return keys;
+    const res = await this.db
+      .query<{ notion_page_id: string; notion_page_key: string }>(
+        "SELECT notion_page_id, notion_page_key FROM notion_pages WHERE project_id = $1 AND notion_page_id = ANY($2::text[])",
+        [projectId, ids]
+      )
+      .catch(() => ({ rows: [] as Array<{ notion_page_id: string; notion_page_key: string }> }));
+    for (const row of res.rows) if (row.notion_page_key) keys.set(String(row.notion_page_id), String(row.notion_page_key));
+    return keys;
   }
 
   // A page's title for human-facing text (ticket comments, task activity); the id when it is not cached.
@@ -19186,12 +19213,13 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     for (const ticket of derivedTickets) (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).push(ticket.issueKey);
     const derivedKeys = new Set(derivedTickets.map((ticket) => `${ticket.provider}:${ticket.issueKey}`));
     const derivedDetail = derivedTickets.length === 1 ? "Linked from the selected Knowledge Base document." : "Linked from the selected Knowledge Base documents.";
+    const notionKeys = await this.notionKeysByPageId(projectId, notionPageIds);
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
       ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
       ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: derivedKeys.has(`jira:${key}`) ? derivedDetail : "Selected Jira ticket queued for Zyra." })),
       ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: derivedKeys.has(`linear:${key}`) ? derivedDetail : "Selected Linear ticket queued for Zyra." })),
-      ...notionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: derivedKeys.has(`notion:${id}`) ? derivedDetail : "Selected Notion page queued for Zyra." }))
+      ...notionPageIds.map((id) => ({ type: "notion", title: notionKeys.get(id) || notionPageKey(id), detail: derivedKeys.has(`notion:${id}`) ? derivedDetail : "Selected Notion page queued for Zyra." }))
     ];
     const res = await this.db.query(
       `INSERT INTO ai_generation_requests
@@ -19284,7 +19312,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       ...linear.map((key) => ({ key, table: "linear_tickets", keyColumn: "linear_issue_key" })),
       ...notion.map((id) => ({ key: id, table: "notion_pages", keyColumn: "notion_page_id" }))
     ];
-    const named = tickets.map((t) => ({ key: t.table === "notion_pages" ? notionPageKey(t.key) : t.key, title: null as string | null }));
+    const notionKeys = await this.notionKeysByPageId(projectId, notion);
+    const named = tickets.map((t) => ({ key: t.table === "notion_pages" ? notionKeys.get(t.key) || notionPageKey(t.key) : t.key, title: null as string | null }));
     if (tickets.length === 1) {
       const [t] = tickets;
       const found = await this.db
@@ -19395,7 +19424,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       const drafts = aiResult.drafts;
       // Stamped into generated_payload together with the drafts themselves, so the save reads the
       // ticket each draft was generated for rather than re-deriving it later.
-      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()), new Map(notion.map((n) => [n.id, n.key])));
       const inputText = [
         story,
         context,
@@ -19727,7 +19756,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, aiResult.usage);
       // Against the FULL key list (original + any the reviewer added), which is what the UPDATE below
       // stores alongside these drafts — see processZyraTask's identical call.
-      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()), new Map(notion.map((n) => [n.id, n.key])));
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
@@ -19736,12 +19765,13 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         ...this.zyraUnattributedDraftsActivity(unattributedDrafts, aiResult.drafts.length, now)
       ];
       const previousSources = normalizeJsonArray(previousSourceSummary);
+      const notionKeys = await this.notionKeysByPageId(projectId, additionalNotionPageIds);
       const nextSources = [
         ...previousSources,
         ...(referenceNote ? [{ type: "feedback_reference", title: "Reviewer reference", detail: referenceNote.slice(0, 320) }] : []),
         ...additionalJiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: "Referenced by reviewer feedback." })),
         ...additionalLinearIssueKeys.map((key) => ({ type: "linear", title: key, detail: "Referenced by reviewer feedback." })),
-        ...additionalNotionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: "Referenced by reviewer feedback." })),
+        ...additionalNotionPageIds.map((id) => ({ type: "notion", title: notionKeys.get(id) || notionPageKey(id), detail: "Referenced by reviewer feedback." })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))
       ];
       const res = await this.db.query(
@@ -20252,7 +20282,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         "zyra",
         ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
         ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
-        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
+        ...(link.notionPageId ? [(await this.notionKeysByPageId(ctx.projectId, [link.notionPageId])).get(link.notionPageId) || notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -20375,7 +20405,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         "zyra",
         ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
         ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
-        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
+        ...(link.notionPageId ? [(await this.notionKeysByPageId(ctx.projectId, [link.notionPageId])).get(link.notionPageId) || notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -25505,6 +25535,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     item.jiraIssueKeys = normalizeJsonArray(row.jira_issue_keys);
     item.linearIssueKeys = normalizeJsonArray(row.linear_issue_keys);
     item.notionPageIds = normalizeJsonArray(row.notion_page_ids);
+    // Display keys aligned with notionPageIds ("Notes 1"), so the Zyra screens never show the id prefix.
+    const notionKeys = await this.notionKeysByPageId(String(row.project_id || ""), item.notionPageIds);
+    item.notionPageKeys = item.notionPageIds.map((id: string) => notionKeys.get(String(id)) || notionPageKey(String(id)));
     item.sources = normalizeJsonArray(row.source_summary);
     item.activities = normalizeJsonArray(row.activity_log);
     // A Russian task's timeline and sources are rendered in Russian; the stored English is untouched

@@ -679,7 +679,7 @@ describe("Notion pages, snapshots and linking", () => {
     ]);
     const fetchSpy = jest.spyOn(global, "fetch");
     const out = await (makeLegacy(db) as any).notionSnapshot(PROJECT_ID, [PAGE_ID, "uncached-id"]);
-    expect(out[0]).toEqual({ key: "notion:aaaaaaaa", summary: "Spec", description: "- **Owner:** Ada\n\nBody", status: "Open" });
+    expect(out[0]).toEqual({ id: PAGE_ID, key: "notion:aaaaaaaa", summary: "Spec", description: "- **Owner:** Ada\n\nBody", status: "Open" });
     expect(out[1].summary).toBe("Selected Notion page");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
