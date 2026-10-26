@@ -217,6 +217,11 @@ export default function ZyraTaskDetailPage() {
   const [selectedLinearKeys, setSelectedLinearKeys] = useState<string[]>([]);
   // Full Notion page ids (what the API links by), shown to the user as their short keys.
   const [selectedNotionIds, setSelectedNotionIds] = useState<string[]>([]);
+  // A page's stored display key ("Notes 1"): from the picker list, then the task's own keys, then the id prefix.
+  const notionKeyOf = (id: string) =>
+    notionPages.find((page) => page.notionPageId === id)?.notionPageKey ||
+    task?.notionPageKeys?.[(task.notionPageIds ?? []).indexOf(id)] ||
+    notionPageKey(id);
   const [activeTab, setActiveTab] = useState<DetailTab>("testcases");
   const [savingOpen, setSavingOpen] = useState(false);
   const [saveMode, setSaveMode] = useState<SaveMode>("");
@@ -633,7 +638,7 @@ export default function ZyraTaskDetailPage() {
                 <li key={comment.id} className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-[var(--border)] px-3 py-2">
                   <div className="min-w-0 space-y-1">
                     <div className="flex flex-wrap items-center gap-2 text-sm">
-                      <span className="font-medium text-[var(--foreground)]">{integrationProviderLabel(comment.provider)} {comment.provider === "notion" ? notionPageKey(comment.issueKey) : comment.issueKey}</span>
+                      <span className="font-medium text-[var(--foreground)]">{integrationProviderLabel(comment.provider)} {comment.provider === "notion" ? notionKeyOf(comment.issueKey) : comment.issueKey}</span>
                       <StatusChip tone={status.tone}>{t.opt(`task.commentStatus.${comment.status}`) ?? status.label}</StatusChip>
                       <span className="text-xs text-[var(--muted)]">
                         {t("task.commentCount", { n: comment.testcaseCount })} · {formatDateTime(comment.postedAt || comment.updatedAt, t.locale)}
@@ -894,7 +899,7 @@ export default function ZyraTaskDetailPage() {
                         onClick={() => setSelectedNotionIds((prev) => prev.filter((item) => item !== id))}
                         className="rounded-full border border-[var(--border)] px-2 py-1 text-xs text-[var(--muted)]"
                       >
-                        {notionPageKey(id)} x
+                        {notionKeyOf(id)} x
                       </button>
                     ))}
                   </div>

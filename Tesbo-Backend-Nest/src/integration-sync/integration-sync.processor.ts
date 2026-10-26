@@ -16,6 +16,7 @@ import {
   NotionNotSharedError,
   NotionPermissionError
 } from "./integration-sync.client";
+import { notionPageKey } from "./notion-api";
 import { IntegrationSyncDecisions } from "./integration-sync-decisions";
 import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.builder";
 import { IntegrationSyncService } from "./integration-sync.service";
@@ -386,6 +387,28 @@ export class IntegrationSyncProcessor extends WorkerHost {
     return res.rows[0]?.n ?? 0;
   }
 
+  /**
+   * A Notion page's display key is "<database name> <n>" (e.g. "Notes 1"). An already-synced page keeps
+   * the key it has; a new one takes the next number from its database link's own counter, so numbering
+   * starts at 1 per database and a relink of the same database continues where it left off.
+   */
+  private async notionDisplayKey(projectId: string, connectionId: string, pageId: string, databaseId: string): Promise<string> {
+    const existing = await this.db.query<{ notion_page_key: string }>(
+      "SELECT notion_page_key FROM notion_pages WHERE project_id = $1 AND integration_connection_id = $2 AND notion_page_id = $3",
+      [projectId, connectionId, pageId]
+    );
+    const kept = existing.rows[0]?.notion_page_key;
+    if (kept && !kept.startsWith("notion:")) return kept;
+    const next = await this.db.query<{ name: string | null; n: number }>(
+      `UPDATE notion_project_mappings SET page_counter = page_counter + 1
+       WHERE project_id = $1 AND integration_connection_id = $2 AND notion_database_id = $3
+       RETURNING notion_database_name AS name, page_counter AS n`,
+      [projectId, connectionId, databaseId]
+    );
+    const row = next.rows[0];
+    return row ? `${String(row.name || "").trim() || "Page"} ${row.n}` : notionPageKey(pageId);
+  }
+
   private async upsertTicket(
     projectId: string,
     connectionId: string,
@@ -398,6 +421,7 @@ export class IntegrationSyncProcessor extends WorkerHost {
     // not blank the description it already holds (the conflict branch leaves it alone). And it also
     // stores the rendered properties and the archived flag.
     const isNotion = provider === "notion";
+    if (isNotion) ticket = { ...ticket, issueKey: await this.notionDisplayKey(projectId, connectionId, ticket.issueId, mappedRemoteId) };
     const res = await this.db.query<{ id: string }>(
       `INSERT INTO ${c.table} (
          project_id, ${c.connectionCol}, ${c.issueIdCol}, ${c.issueKeyCol}, summary, description,

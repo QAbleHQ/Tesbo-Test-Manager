@@ -1022,6 +1022,8 @@ export interface ZyraTask {
   linearIssueKeys: string[];
   /** Full Notion page ids (not the short display keys) queued as Zyra context. */
   notionPageIds?: string[];
+  /** Display keys ("Notes 1") aligned with notionPageIds. */
+  notionPageKeys?: string[];
   drafts: AiGeneratedDraft[];
   sources: Array<{ type: string; title: string; detail: string }>;
   activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string; kind?: string }>;
@@ -3398,8 +3400,8 @@ export function notionPageKey(pageId: string): string {
 }
 
 /** Every ticket a Zyra task was built from, as display keys (Notion page ids shown by their short key). */
-export function zyraTaskTicketKeys(task: Pick<ZyraTask, "jiraIssueKeys" | "linearIssueKeys" | "notionPageIds">): string[] {
-  return [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? []), ...(task.notionPageIds ?? []).map(notionPageKey)];
+export function zyraTaskTicketKeys(task: Pick<ZyraTask, "jiraIssueKeys" | "linearIssueKeys" | "notionPageIds" | "notionPageKeys">): string[] {
+  return [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? []), ...(task.notionPageIds ?? []).map((id, i) => task.notionPageKeys?.[i] || notionPageKey(id))];
 }
 
 /**

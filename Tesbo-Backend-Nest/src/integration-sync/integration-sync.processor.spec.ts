@@ -443,6 +443,48 @@ describe("IntegrationSyncProcessor, notion provider", () => {
     expect(insert[1]).toEqual(expect.arrayContaining([JSON.stringify({ Status: "Open" }), false, "db-1"]));
   });
 
+  async function syncNotionPage(existingKey: string | null) {
+    const dbQuery = jest.fn((sql: string, _params: unknown[] = []) => {
+      if (sql.includes("UPDATE notion_project_mappings SET page_counter")) return Promise.resolve({ rows: [{ name: "Notes", n: 7 }] });
+      if (sql.includes("FROM notion_project_mappings")) {
+        return Promise.resolve({ rows: [{ remote_id: "db-1", remote_key: "db-1", remote_name: "Product specs" }] });
+      }
+      if (sql.includes("SELECT notion_page_key FROM notion_pages")) return Promise.resolve({ rows: existingKey ? [{ notion_page_key: existingKey }] : [] });
+      if (sql.includes("INSERT INTO notion_pages")) return Promise.resolve({ rows: [{ id: "row-1" }] });
+      return Promise.resolve({ rows: [] });
+    });
+    const { processor } = makeProcessor({
+      db: { query: dbQuery },
+      client: {
+        loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }),
+        fetchNotionPages: jest.fn(async (_conn, _db, onPage) => {
+          await onPage([remoteTicket({ issueId: "page-1", issueKey: "notion:3f2c8d6c", properties: {}, archived: false })]);
+          return { total: 1, truncated: false };
+        })
+      }
+    });
+    await processor.process(job(INTEGRATION_SYNC_RUN_JOB, payload));
+    const insert = dbQuery.mock.calls.find(([sql]) => String(sql).includes("INSERT INTO notion_pages"))!;
+    return { insertParams: insert[1] as unknown[], counterBumped: dbQuery.mock.calls.some(([sql]) => String(sql).includes("UPDATE notion_project_mappings SET page_counter")) };
+  }
+
+  it("keys a new page as database name + number from the database link's counter instead of the page-id prefix", async () => {
+    const { insertParams, counterBumped } = await syncNotionPage(null);
+    expect(counterBumped).toBe(true);
+    expect(insertParams[3]).toBe("Notes 7");
+  });
+
+  it("keeps the key an already-synced page has, without spending another number", async () => {
+    const { insertParams, counterBumped } = await syncNotionPage("Notes 2");
+    expect(counterBumped).toBe(false);
+    expect(insertParams[3]).toBe("Notes 2");
+  });
+
+  it("re-keys a page still carrying the legacy notion: key", async () => {
+    const { insertParams } = await syncNotionPage("notion:3f2c8d6c");
+    expect(insertParams[3]).toBe("Notes 7");
+  });
+
   it("shows a clear failure when the database is no longer shared", async () => {
     const { processor, runs } = makeProcessor({
       db: { query: notionDb() },
