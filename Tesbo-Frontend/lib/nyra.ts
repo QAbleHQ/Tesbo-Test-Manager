@@ -66,7 +66,7 @@ export interface NyraItem {
   reviewStatus: NyraReviewStatus;
   reviewedAt?: string | null;
   /** NYRA's own text, present only when a person edited the finding. */
-  original?: { title: string; data: Record<string, any> } | null;
+  original?: { title: string; data: NyraItem["data"] } | null;
 }
 
 /** Whether approved findings will get vectors: a key that can embed exists for this project. */
@@ -243,7 +243,7 @@ export function useNyraRunStream(projectId: string, nyraId: string, runId: strin
     };
     const parse = (e: MessageEvent) => {
       try {
-        return JSON.parse(e.data) as { ts: string; data: Record<string, any> };
+        return JSON.parse(e.data) as { ts: string; data: Record<string, unknown> };
       } catch {
         return null;
       }
@@ -272,7 +272,7 @@ export function useNyraRunStream(projectId: string, nyraId: string, runId: strin
       const m = parse(e as MessageEvent);
       const d = m?.data;
       if (d?.kind && d?.key) {
-        items.set(`${d.kind}:${d.key}`, { kind: d.kind, key: String(d.key), title: String(d.title ?? ""), data: d.data ?? {}, reviewStatus: "waiting" });
+        items.set(`${d.kind}:${d.key}`, { kind: d.kind as NyraKind, key: String(d.key), title: String(d.title ?? ""), data: (d.data ?? {}) as NyraItem["data"], reviewStatus: "waiting" });
         schedule();
       }
     });

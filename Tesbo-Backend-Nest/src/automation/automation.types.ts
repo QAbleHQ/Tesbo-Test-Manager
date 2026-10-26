@@ -29,7 +29,7 @@ export const TRIGGERED_BY_VALUES = [
 export type TriggeredBy = (typeof TRIGGERED_BY_VALUES)[number];
 
 /** `attachments.evidence_kind` — what a stored evidence file is, so the viewer can render it. */
-export const EVIDENCE_KINDS = ["screenshot", "video", "trace", "log"] as const;
+export const EVIDENCE_KINDS = ["screenshot", "video", "trace", "log", "api"] as const;
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
 
 /**
@@ -107,7 +107,10 @@ export const EVIDENCE_EXTENSIONS: Record<EvidenceKind, ReadonlySet<string>> = {
   screenshot: new Set(["png", "jpg", "jpeg", "webp"]),
   video: new Set(["mp4", "webm", "mov"]),
   trace: new Set(["zip"]),
-  log: new Set(["txt", "log", "json", "xml", "md"])
+  log: new Set(["txt", "log", "json", "xml", "md"]),
+  // A JSON envelope or a HAR (which is JSON); the viewer parses it, so assertValidEvidence also
+  // refuses a body that is not JSON rather than storing something it can only show as an error.
+  api: new Set(["json", "har"])
 };
 
 export function isEvidenceKind(value: unknown): value is EvidenceKind {

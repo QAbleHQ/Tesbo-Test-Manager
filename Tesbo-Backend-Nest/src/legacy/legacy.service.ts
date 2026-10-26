@@ -44,7 +44,7 @@ import { IntegrationSyncService } from "../integration-sync/integration-sync.ser
 import { INTEGRATION_SYNC_FETCH_TIMEOUT_MS, JIRA_PAGE_SIZE, NOTION_API_BASE, NOTION_API_VERSION, NOTION_PAGE_SIZE, NOTION_RICH_TEXT_LIMIT, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
 import { NotionApiError, describeNotionError, notionPageKey, notionRequest } from "../integration-sync/notion-api";
 import {
-  markdownToNotionRichText,
+  markdownToNotionCommentBodies,
   notionPageTitle,
   notionPropertiesMarkdown,
   notionTicketFields,
@@ -1805,14 +1805,15 @@ export class LegacyService implements OnModuleInit {
     jiraIssueKeys: string[],
     linearIssueKeys: string[],
     notionPageIds: string[],
-    knowledgeLabels: Map<string, { provider: TicketProvider; issueKey: string }> = new Map()
+    knowledgeLabels: Map<string, { provider: TicketProvider; issueKey: string }> = new Map(),
+    notionKeys: Map<string, string> = new Map()
   ): number {
     if (jiraIssueKeys.length + linearIssueKeys.length + notionPageIds.length <= 1) return 0;
     const byLabel = new Map<string, { provider: TicketProvider; issueKey: string }>();
     for (const issueKey of jiraIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "jira", issueKey });
     for (const issueKey of linearIssueKeys) byLabel.set(issueKey.trim().toLowerCase(), { provider: "linear", issueKey });
     // The prompt labels a Notion page by its short display key (notionPageKey), not its page id.
-    for (const issueKey of notionPageIds) byLabel.set(notionPageKey(issueKey).toLowerCase(), { provider: "notion", issueKey });
+    for (const issueKey of notionPageIds) byLabel.set((notionKeys.get(issueKey) || notionPageKey(issueKey)).toLowerCase(), { provider: "notion", issueKey });
     for (const [label, ticket] of knowledgeLabels) {
       const own = (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).find((key) => key.trim().toLowerCase() === ticket.issueKey.trim().toLowerCase());
       if (own) byLabel.set(label, { provider: ticket.provider, issueKey: own });
@@ -1987,7 +1988,7 @@ export class LegacyService implements OnModuleInit {
       );
       await this.appendZyraTaskActivity(projectId, taskId, `Posted ${label} comment`, `Listed ${count} test case${count === 1 ? "" : "s"} on ${provider === "notion" ? await this.notionPageLabel(projectId, issueKey) : issueKey}.`);
     } catch (err) {
-      const reason = this.integrationErrorReason(err, label);
+      const reason = this.integrationErrorReason(err, label, issueKey);
       this.logger.warn(`Failed to post Zyra ticket comment to ${label} ${issueKey}: ${reason}`);
       await this.db.query(
         "UPDATE integration_ticket_comments SET status = 'failed', reason = $2, updated_at = now() WHERE id = $1",
@@ -2137,7 +2138,7 @@ export class LegacyService implements OnModuleInit {
   // it as `error` on their response body rather than as the exception's own message. 401 and 403
   // share one generic message everywhere else (cleanAuthErrorOrNull); for a ticket comment they need
   // different fixes, so they get different reasons here.
-  private integrationErrorReason(err: unknown, provider: string): string {
+  private integrationErrorReason(err: unknown, provider: string, issueKey?: string): string {
     const providerStatus = (err as { providerStatus?: number })?.providerStatus;
     // Notion's 403 is about the integration's capabilities or what is shared with it, and
     // notionFetch already wrote the exact remedy (insert-comment capability, share the page) into
@@ -2151,6 +2152,12 @@ export class LegacyService implements OnModuleInit {
     }
     if (providerStatus === 403) {
       return `${provider} refused the comment (403) — the connected ${provider} account doesn't have permission to comment on this issue. Give that account comment permission in the ${provider} project, or reconnect with an account that has it, then retry.`;
+    }
+    // Jira answers 404 both when the key does not exist on the connected site and when the connected
+    // account cannot see it. After a reconnect to another Jira site, every ticket linked on the old
+    // one lands here, so the reason names the key and both causes instead of a bare status.
+    if (provider === "Jira" && providerStatus === 404) {
+      return `Jira could not find ${issueKey || "this issue"} (404) — it does not exist on the connected Jira site, or the connected account cannot see it. If Jira was reconnected to a different site, link a ticket from the new site; otherwise give the connected account access to the project, then retry.`;
     }
     const response = (err as { getResponse?: () => unknown })?.getResponse?.();
     if (response && typeof response === "object" && typeof (response as Body).error === "string") return String((response as Body).error);
@@ -5925,10 +5932,11 @@ export class LegacyService implements OnModuleInit {
   private async notifyIssueLinked(projectId: string, actorId: string, before: Body, after: Body | undefined): Promise<void> {
     try {
       if (!after?.id) return;
+      const notionKeys = await this.notionKeysByPageId(projectId, [String(after.notion_page_id ?? "")]);
       const links: Array<{ provider: IntegrationProvider; was: unknown; now: unknown; label: (v: string) => string }> = [
         { provider: "jira", was: before.jira_issue_key, now: after.jira_issue_key, label: (v) => v },
         { provider: "linear", was: before.linear_issue_key, now: after.linear_issue_key, label: (v) => v },
-        { provider: "notion", was: before.notion_page_id, now: after.notion_page_id, label: (v) => notionPageKey(v) }
+        { provider: "notion", was: before.notion_page_id, now: after.notion_page_id, label: (v) => notionKeys.get(v) || notionPageKey(v) }
       ];
       for (const link of links) {
         const now = String(link.now ?? "").trim();
@@ -9113,6 +9121,46 @@ export class LegacyService implements OnModuleInit {
     const delivery = resolveFileDelivery(file.content_type, file.file_name, inline);
     const access = await this.storage.getAccessUrl(file.storage_path, { filename: file.file_name, ...delivery });
     return withDelivery(access, delivery, file.file_name);
+  }
+
+  /**
+   * The parsed body of one `api` evidence file, for the in-place viewer.
+   *
+   * The download route cannot serve this: it may redirect to a presigned storage URL, which a
+   * cross-origin fetch from the app cannot follow without CORS on the bucket. This streams the
+   * bytes through the API instead, same project-membership check and same per-execution scoping.
+   * Only `evidence_kind = 'api'` is readable this way — it is JSON that is returned as JSON, never
+   * as markup, so it cannot become a stored-XSS vector the way inline .html would.
+   */
+  async getExecutionApiEvidence(
+    cycleId: string,
+    userId: string | null | undefined,
+    executionId: string,
+    attachmentId: string
+  ) {
+    const uid = this.requireUser(userId);
+    const execution = await this.executionOwner(cycleId, executionId);
+    await this.requireProjectAccess(uid, String(execution.project_id));
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
+    const res = await this.db.query(
+      `SELECT id, file_name, evidence_kind, storage_path FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
+      [attachmentId, executionId, execution.project_id]
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Attachment not found" });
+    if (file.evidence_kind !== "api") {
+      throw new BadRequestException({ error: "This attachment is not API evidence" });
+    }
+    if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
+      throw new NotFoundException({ error: "File content is not available" });
+    }
+    const text = (await this.storage.getBuffer(file.storage_path)).toString("utf8");
+    try {
+      return { fileName: String(file.file_name), data: JSON.parse(text) as unknown };
+    } catch {
+      throw new BadRequestException({ error: "This API evidence file isn't valid JSON" });
+    }
   }
 
   /**
@@ -13487,16 +13535,6 @@ export class LegacyService implements OnModuleInit {
 
       const { clientId, clientSecret } = this.integrationOAuthConfig(provider);
       const providerLabel: "Jira" | "Linear" = provider === "jira" ? "Jira" : "Linear";
-      if (provider === "jira") {
-        const issuer = this.jiraTokenOAuthClientId(current);
-        if (issuer && issuer !== clientId) {
-          return {
-            refused:
-              "Jira needs to be reconnected from this Tesbo deployment: its authorization was granted to a different Atlassian OAuth app than the one this deployment uses, so this deployment can't renew it. Reconnect Jira in workspace settings (or run this deployment with the same Jira OAuth app as the one that connected it).",
-            row: current
-          };
-        }
-      }
       const refreshToken = decryptSecret(String(current.refresh_token || ""));
       let token: Body;
       try {
@@ -13600,37 +13638,12 @@ export class LegacyService implements OnModuleInit {
     if (recorded && recorded.rowCount) await this.notifyIntegrationAuthExpired(connection);
   }
 
-  // Atlassian access tokens are JWTs naming the OAuth app they were issued to (`client_id`). A
-  // refresh token only renews through that same app, so a mismatch is knowable without asking
-  // Atlassian. Returns null when the token isn't a readable JWT — then the check is simply skipped.
-  private jiraTokenOAuthClientId(connection: Body): string | null {
-    try {
-      const payload = decryptSecret(String(connection.access_token || "")).split(".")[1];
-      if (!payload) return null;
-      const claims = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as Body;
-      const clientId = claims.client_id ?? claims["https://atlassian.com/oauthClientId"];
-      return typeof clientId === "string" && clientId ? clientId : null;
-    } catch {
-      return null;
-    }
-  }
-
   // Whether this deployment can keep using the connection, without contacting the provider — what
   // the status endpoints report alongside `connected`, so a connection that exists but can no longer
   // be renewed doesn't read as healthy.
   private integrationConnectionHealth(connection: Body, provider: IntegrationProvider): { needsReconnect: boolean; authError: string | null } {
     const refused = this.refusedRefreshReason(connection);
     if (refused) return { needsReconnect: true, authError: refused };
-    if (provider === "jira" && connection.refresh_token) {
-      const issuer = this.jiraTokenOAuthClientId(connection);
-      const ownClientId = this.envIntegrationConfig("jira")?.clientId;
-      if (issuer && ownClientId && issuer !== ownClientId) {
-        return {
-          needsReconnect: true,
-          authError: "This Jira connection was authorized through a different Atlassian OAuth app than the one this Tesbo deployment uses, so this deployment can't renew it once the current access token expires. Reconnect Jira in workspace settings."
-        };
-      }
-    }
     return { needsReconnect: false, authError: null };
   }
 
@@ -13642,7 +13655,9 @@ export class LegacyService implements OnModuleInit {
       const authError = this.cleanAuthErrorOrNull(providerLabel, res.status);
       if (authError) throw authError;
       const text = await res.text().catch(() => "");
-      throw new BadRequestException({ error: `${providerLabel} request failed (${res.status}).`, detail: text.slice(0, 500) });
+      const failure = new BadRequestException({ error: `${providerLabel} request failed (${res.status}).`, detail: text.slice(0, 500) });
+      Object.defineProperty(failure, "providerStatus", { value: res.status, enumerable: false });
+      throw failure;
     }
     return (await res.json()) as T;
   }
@@ -14348,14 +14363,14 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async notionCreateComment(connection: Body, pageId: string, markdown: string): Promise<string | null> {
-    const created = await this.notionFetch<Body>(
-      connection,
-      "POST",
-      "/comments",
-      { parent: { page_id: pageId }, rich_text: markdownToNotionRichText(markdown, NOTION_RICH_TEXT_LIMIT) },
-      "page"
-    );
-    return created?.id ? String(created.id) : null;
+    // A comment holds at most 100 rich_text elements, so a long list goes out as several comments in
+    // order, each still formatted. The first one's id is what the caller records.
+    let firstId: string | null = null;
+    for (const richText of markdownToNotionCommentBodies(markdown, NOTION_RICH_TEXT_LIMIT)) {
+      const created = await this.notionFetch<Body>(connection, "POST", "/comments", { parent: { page_id: pageId }, rich_text: richText }, "page");
+      if (!firstId && created?.id) firstId = String(created.id);
+    }
+    return firstId;
   }
 
   // Live search inside the mapped database (not the notion_pages sync cache), like linearSearchIssues.
@@ -14380,10 +14395,17 @@ export class LegacyService implements OnModuleInit {
       if (titleName) request.filter = { property: titleName, title: { contains: search } };
     }
     const data = await this.notionFetch<Body>(connection, "POST", `/databases/${encodeURIComponent(databaseId)}/query`, request, "database");
+    // Pages already synced show their project key (MYN-1); one not synced yet falls back to the short id.
+    const results = normalizeJsonArray(data.results);
+    const stored = await this.db.query(
+      "SELECT notion_page_id, notion_page_key FROM notion_pages WHERE project_id = $1 AND notion_page_id = ANY($2::text[])",
+      [projectId, results.map((page) => String(page.id || ""))]
+    ).catch(() => ({ rows: [] as any[] }));
+    const storedKeys = new Map<string, string>(stored.rows.map((row: any) => [String(row.notion_page_id), String(row.notion_page_key)]));
     return {
-      list: normalizeJsonArray(data.results).map((page) => ({
+      list: results.map((page) => ({
         provider: "NOTION",
-        key: notionPageKey(String(page.id || "")),
+        key: storedKeys.get(String(page.id || "")) || notionPageKey(String(page.id || "")),
         pageId: String(page.id || ""),
         summary: notionPageTitle(page.properties),
         status: notionTicketFields(page.properties).status,
@@ -14393,7 +14415,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   // Cache-only, like linearSnapshot: reads notion_pages, never calls Notion. `keys` are page ids.
-  private async notionSnapshot(projectId: string, pageIds: string[]): Promise<Array<{ key: string; summary: string; description: string; status: string }>> {
+  private async notionSnapshot(projectId: string, pageIds: string[]): Promise<Array<{ id: string; key: string; summary: string; description: string; status: string }>> {
     const selected = Array.from(new Set(pageIds.map((id) => id.trim()).filter(Boolean)));
     if (!selected.length) return [];
     const res = await this.db.query(
@@ -14401,10 +14423,11 @@ export class LegacyService implements OnModuleInit {
        WHERE project_id = $1 AND notion_page_id = ANY($2::text[])`,
       [projectId, selected]
     ).catch(() => ({ rows: [] as any[] }));
-    const byId = new Map<string, { key: string; summary: string; description: string; status: string }>(
+    const byId = new Map<string, { id: string; key: string; summary: string; description: string; status: string }>(
       res.rows.map((row) => [
         String(row.notion_page_id),
         {
+          id: String(row.notion_page_id),
           key: String(row.notion_page_key),
           summary: String(row.summary || ""),
           // Properties first (status, owner, dates), then the page body, the same order the mirrored document uses.
@@ -14414,11 +14437,28 @@ export class LegacyService implements OnModuleInit {
       ])
     );
     return selected.map((id) => byId.get(id) || {
+      id,
       key: notionPageKey(id),
       summary: "Selected Notion page",
       description: "Page details were not available from the local cache, but the selected page was included for Zyra context.",
       status: ""
     });
+  }
+
+  // Page id -> display key for human-facing Zyra text: the stored "<database> <n>" key of a synced page,
+  // the short id-derived label for one that is not cached.
+  private async notionKeysByPageId(projectId: string, pageIds: string[]): Promise<Map<string, string>> {
+    const ids = Array.from(new Set(pageIds.map(String).filter(Boolean)));
+    const keys = new Map<string, string>(ids.map((id) => [id, notionPageKey(id)]));
+    if (!ids.length) return keys;
+    const res = await this.db
+      .query<{ notion_page_id: string; notion_page_key: string }>(
+        "SELECT notion_page_id, notion_page_key FROM notion_pages WHERE project_id = $1 AND notion_page_id = ANY($2::text[])",
+        [projectId, ids]
+      )
+      .catch(() => ({ rows: [] as Array<{ notion_page_id: string; notion_page_key: string }> }));
+    for (const row of res.rows) if (row.notion_page_key) keys.set(String(row.notion_page_id), String(row.notion_page_key));
+    return keys;
   }
 
   // A page's title for human-facing text (ticket comments, task activity); the id when it is not cached.
@@ -14553,8 +14593,8 @@ export class LegacyService implements OnModuleInit {
         // Derived from the range rather than read from the stored snapshot, which is written only on
         // save — a project saved before a tier's count changed (or never saved at all) would report a
         // count generation no longer uses.
-        testcaseCount: this.testcaseRangeConfig(String(settings.testcaseRange || "30-50")).requestedCount,
-        testcaseRange: String(settings.testcaseRange || "30-50"),
+        testcaseCount: this.testcaseRangeConfig(String(settings.testcaseRange || "all")).requestedCount,
+        testcaseRange: String(settings.testcaseRange || "all"),
         capabilities: this.normalizeZyraCapabilities(settings.capabilities)
       },
       aiKey: key
@@ -14724,7 +14764,7 @@ export class LegacyService implements OnModuleInit {
     const validRanges = ["1-10", "10-30", "30-50", "all"];
     const testcaseRange = validRanges.includes(String(body.testcaseRange))
       ? String(body.testcaseRange)
-      : String(current.testcaseRange || "30-50");
+      : String(current.testcaseRange || "all");
     const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
     // Capabilities: merge the incoming partial over current, then normalize to strict booleans.
     const capabilities = this.normalizeZyraCapabilities({
@@ -16102,7 +16142,7 @@ export class LegacyService implements OnModuleInit {
 
     const provider = String(key.provider || "openai").toLowerCase();
     const model = normalizeProviderModel(provider, key.default_model);
-    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
+    const projectTestcaseRange = String(zyraAgentSettings.testcaseRange || "all");
     // Stored by beginZyraChatTurn from this very message, so it is already this turn's language.
     const replyLanguage = await this.zyraSessionLanguage(projectId, sessionId);
     const context = [
@@ -17935,7 +17975,7 @@ export class LegacyService implements OnModuleInit {
   private async zyraProjectBatchSize(projectId: string): Promise<number> {
     const project = await this.getProject(projectId);
     const settings = (this.parseProjectSettings(project.settings).zyraAgent || {}) as Body;
-    return LegacyService.zyraBatchSize(String(settings.testcaseRange || "30-50"));
+    return LegacyService.zyraBatchSize(String(settings.testcaseRange || "all"));
   }
   // Scenarios planned per round: one planner call (planZyraChatScenarios), and the cap on one ticket
   // page's plan. A paged plan (see zyraPlanTicketPage) runs many rounds, so the total is not bounded by it.
@@ -18307,7 +18347,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     // The router's reading of what the request is for — decides the paged all-tickets plan below.
     routedScope?: ZyraRoutedScope;
   }): Promise<ZyraChatDecision> {
-    const batchSize = LegacyService.zyraBatchSize(String(params.projectTestcaseRange || "30-50"));
+    const batchSize = LegacyService.zyraBatchSize(String(params.projectTestcaseRange || "all"));
     if (params.ticketScope) return this.startZyraTicketScopedPlan(params, params.ticketScope, batchSize);
     let scenarios: string[] = [];
     // Set when the plan walks the project's tickets page by page (zyraPlanTicketRound) instead of
@@ -18488,7 +18528,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     batchSize: number
   ): Promise<ZyraChatDecision> {
     const ru = zyraReplyLanguage() === "ru";
-    const perTicket = Math.max(1, Number(ticketScope.perTicket) || LegacyService.zyraBatchSize(String(params.projectTestcaseRange || "30-50")));
+    const perTicket = Math.max(1, Number(ticketScope.perTicket) || LegacyService.zyraBatchSize(String(params.projectTestcaseRange || "all")));
     const scope: ZyraPlanTicketScope = { ticketKeys: ticketScope.ticketKeys, perTicket };
     const synced = await this.zyraSyncedTicketKeys(params.projectId, scope.ticketKeys);
     const missing = scope.ticketKeys ? scope.ticketKeys.filter((key) => !synced.includes(key)) : [];
@@ -19141,7 +19181,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     if (!this.normalizeZyraCapabilities((settings as Body).capabilities).generation) {
       throw new BadRequestException({ error: "Test case generation is disabled for Zyra in this project. Enable it under Zyra → Settings → Capabilities.", code: "zyra_capability_disabled" });
     }
-    const testcaseRange = String((settings as Body).testcaseRange || "30-50");
+    const testcaseRange = String((settings as Body).testcaseRange || "all");
     const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
     const story = String(body.userStory || body.story || "").trim();
     const context = String(body.context || body.prompt || "").trim();
@@ -19173,12 +19213,13 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     for (const ticket of derivedTickets) (ticket.provider === "jira" ? jiraIssueKeys : ticket.provider === "linear" ? linearIssueKeys : notionPageIds).push(ticket.issueKey);
     const derivedKeys = new Set(derivedTickets.map((ticket) => `${ticket.provider}:${ticket.issueKey}`));
     const derivedDetail = derivedTickets.length === 1 ? "Linked from the selected Knowledge Base document." : "Linked from the selected Knowledge Base documents.";
+    const notionKeys = await this.notionKeysByPageId(projectId, notionPageIds);
     const sourceSummary = [
       { type: "story", title: "User story", detail: story.slice(0, 320) },
       ...(context ? [{ type: "context", title: "User Story Context", detail: context.slice(0, 320) }] : []),
       ...jiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: derivedKeys.has(`jira:${key}`) ? derivedDetail : "Selected Jira ticket queued for Zyra." })),
       ...linearIssueKeys.map((key) => ({ type: "linear", title: key, detail: derivedKeys.has(`linear:${key}`) ? derivedDetail : "Selected Linear ticket queued for Zyra." })),
-      ...notionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: derivedKeys.has(`notion:${id}`) ? derivedDetail : "Selected Notion page queued for Zyra." }))
+      ...notionPageIds.map((id) => ({ type: "notion", title: notionKeys.get(id) || notionPageKey(id), detail: derivedKeys.has(`notion:${id}`) ? derivedDetail : "Selected Notion page queued for Zyra." }))
     ];
     const res = await this.db.query(
       `INSERT INTO ai_generation_requests
@@ -19271,7 +19312,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       ...linear.map((key) => ({ key, table: "linear_tickets", keyColumn: "linear_issue_key" })),
       ...notion.map((id) => ({ key: id, table: "notion_pages", keyColumn: "notion_page_id" }))
     ];
-    const named = tickets.map((t) => ({ key: t.table === "notion_pages" ? notionPageKey(t.key) : t.key, title: null as string | null }));
+    const notionKeys = await this.notionKeysByPageId(projectId, notion);
+    const named = tickets.map((t) => ({ key: t.table === "notion_pages" ? notionKeys.get(t.key) || notionPageKey(t.key) : t.key, title: null as string | null }));
     if (tickets.length === 1) {
       const [t] = tickets;
       const found = await this.db
@@ -19361,10 +19403,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       const linearIssueKeys = normalizeJsonArray(task.linear_issue_keys).map(String);
       const notionPageIds = normalizeJsonArray(task.notion_page_ids).map(String);
       const projectSettings = this.parseProjectSettings((await this.getProject(projectId)).settings).zyraAgent || {};
-      const testcaseRange = String((projectSettings as Body).testcaseRange || "30-50");
+      const testcaseRange = String((projectSettings as Body).testcaseRange || "all");
       const { requestedCount } = this.testcaseRangeConfig(testcaseRange);
-      provider = String(task.provider || allocation.rows[0].provider || "openai").toLowerCase();
-      model = normalizeProviderModel(provider, task.model || allocation.rows[0].default_model);
+      ({ provider, model } = LegacyService.zyraTaskProviderAndModel(task, allocation.rows[0]));
       const { knowledge, knowledgeConfidence } = await this.zyraTaskKnowledge(projectId, options.knowledgeItemIds || [], [story, context, acceptanceCriteria]);
       const jira = await this.jiraSnapshot(projectId, jiraIssueKeys);
       const linear = await this.linearSnapshot(projectId, linearIssueKeys);
@@ -19383,7 +19424,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       const drafts = aiResult.drafts;
       // Stamped into generated_payload together with the drafts themselves, so the save reads the
       // ticket each draft was generated for rather than re-deriving it later.
-      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()), new Map(notion.map((n) => [n.id, n.key])));
       const inputText = [
         story,
         context,
@@ -19606,10 +19647,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     // otherwise this falls back to the generic "generate exactly N" phrasing, which reads very
     // differently to the model than "all possible cases".
     const zyraAgentSettings = await this.zyraAgentSettings(projectId);
-    const testcaseRange = String(zyraAgentSettings.testcaseRange || "30-50");
+    const testcaseRange = String(zyraAgentSettings.testcaseRange || "all");
     const requestedCount = Number(existing.rows[0].requested_count) || this.testcaseRangeConfig(testcaseRange).requestedCount;
-    const provider = String(existing.rows[0].provider || allocation.rows[0].provider || "openai").toLowerCase();
-    const model = normalizeProviderModel(provider, existing.rows[0].model || allocation.rows[0].default_model);
+    const { provider, model } = LegacyService.zyraTaskProviderAndModel(existing.rows[0], allocation.rows[0]);
     // Regeneration is a real provider call (the same one processZyraTask makes for the initial
     // generation) and routinely takes tens of seconds. Fire it off the same way processZyraTask
     // does — the claim UPDATE above already moved the task to 'todo' and is what the caller needs
@@ -19716,7 +19756,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       await this.recordZyraTokenUsage(projectId, "task_regenerate", provider, model, aiResult.usage);
       // Against the FULL key list (original + any the reviewer added), which is what the UPDATE below
       // stores alongside these drafts — see processZyraTask's identical call.
-      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()));
+      const unattributedDrafts = this.zyraAttributeDraftsToTickets(aiResult.drafts, jiraIssueKeys, linearIssueKeys, notionPageIds, await this.zyraKnowledgeTicketLabels(projectId, knowledge).catch(() => new Map()), new Map(notion.map((n) => [n.id, n.key])));
       const now = new Date().toISOString();
       const activity = [
         { actor: "agent", stage: "in_progress", title: "Moved task back to Todo", detail: "Zyra queued the task again after reviewer feedback.", createdAt: now },
@@ -19725,12 +19765,13 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         ...this.zyraUnattributedDraftsActivity(unattributedDrafts, aiResult.drafts.length, now)
       ];
       const previousSources = normalizeJsonArray(previousSourceSummary);
+      const notionKeys = await this.notionKeysByPageId(projectId, additionalNotionPageIds);
       const nextSources = [
         ...previousSources,
         ...(referenceNote ? [{ type: "feedback_reference", title: "Reviewer reference", detail: referenceNote.slice(0, 320) }] : []),
         ...additionalJiraIssueKeys.map((key) => ({ type: "jira", title: key, detail: "Referenced by reviewer feedback." })),
         ...additionalLinearIssueKeys.map((key) => ({ type: "linear", title: key, detail: "Referenced by reviewer feedback." })),
-        ...additionalNotionPageIds.map((id) => ({ type: "notion", title: notionPageKey(id), detail: "Referenced by reviewer feedback." })),
+        ...additionalNotionPageIds.map((id) => ({ type: "notion", title: notionKeys.get(id) || notionPageKey(id), detail: "Referenced by reviewer feedback." })),
         ...existingTestcases.map((item) => ({ type: "existing_testcase", title: `${item.externalId} ${item.title}`, detail: item.description.slice(0, 320) }))
       ];
       const res = await this.db.query(
@@ -20241,7 +20282,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         "zyra",
         ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
         ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
-        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
+        ...(link.notionPageId ? [(await this.notionKeysByPageId(ctx.projectId, [link.notionPageId])).get(link.notionPageId) || notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -20364,7 +20405,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         "zyra",
         ...(link.jiraIssueKey ? [`jira:${link.jiraIssueKey}`] : []),
         ...(link.linearIssueKey ? [`linear:${link.linearIssueKey}`] : []),
-        ...(link.notionPageId ? [notionPageKey(link.notionPageId)] : []),
+        ...(link.notionPageId ? [(await this.notionKeysByPageId(ctx.projectId, [link.notionPageId])).get(link.notionPageId) || notionPageKey(link.notionPageId)] : []),
         existingLinkedRow?.id ? "zyra-regenerated" : "zyra-generated"
       ])).join(",");
       const payload = {
@@ -21028,12 +21069,20 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       values.push(terms.map((term) => `%${term}%`));
       orderBy = `CASE WHEN lower(title) LIKE ANY($3::text[]) OR lower(coalesce(description, '')) LIKE ANY($3::text[]) THEN 0 ELSE 1 END, updated_at DESC`;
     }
+    // Every live test case in the project, however many: Zyra uses this list to avoid duplicating
+    // coverage, and a cap meant it regenerated whatever sat outside the top rows. Only the best
+    // ZYRA_DETAILED_TESTCASES by relevance carry their description and steps (the SQL leaves the rest
+    // NULL, so the wide columns are never read for them); the others are id/title/priority/status lines.
     const res = await this.db.query(
-      `SELECT external_id, title, description, priority, status, steps, component
-       FROM testcases
-       WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND NOT (coalesce(external_id, '') = ANY($2::text[]))
-       ORDER BY ${orderBy}
-       LIMIT 25`,
+      `SELECT external_id, title, priority, status, component,
+              CASE WHEN rn <= ${LegacyService.ZYRA_DETAILED_TESTCASES} THEN description END AS description,
+              CASE WHEN rn <= ${LegacyService.ZYRA_DETAILED_TESTCASES} THEN steps END AS steps
+       FROM (
+         SELECT *, row_number() OVER (ORDER BY ${orderBy}) AS rn
+         FROM testcases
+         WHERE project_id = $1 AND deleted_at IS NULL AND status <> 'Archived' AND NOT (coalesce(external_id, '') = ANY($2::text[]))
+       ) ranked
+       ORDER BY rn`,
       values
     );
     // A named case gets far more room than a listed one: it is the one the user is asking about, so
@@ -21054,6 +21103,26 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     });
     return [...named.map((row) => snapshot(row, true)), ...res.rows.map((row) => snapshot(row, false))];
   }
+
+  /**
+   * The provider and model a task-board (re)generation calls. Always the allocated key's provider: the
+   * request is signed with that key, so any other provider id sends it to the wrong API. The row's own
+   * `provider` is only a record of what ran before — and for an archive-sweep row it is the marker
+   * "zyra_archive_sweep", which resolves to the OpenAI wire, so an Anthropic key was sent to OpenAI and
+   * the failure read "Incorrect API key … platform.openai.com". The row's model is reused only when it
+   * belongs to that same provider.
+   */
+  static zyraTaskProviderAndModel(
+    row: Body,
+    allocation: { provider?: unknown; default_model?: unknown }
+  ): { provider: string; model: string } {
+    const provider = String(allocation.provider || "openai").toLowerCase();
+    const sameProvider = String(row.provider || "").toLowerCase() === provider;
+    return { provider, model: normalizeProviderModel(provider, (sameProvider && row.model) || allocation.default_model) };
+  }
+
+  /** Existing test cases that keep their description and steps in the snapshot; the rest are listed by title. */
+  private static readonly ZYRA_DETAILED_TESTCASES = 25;
 
   /** How many test cases one request can name by id and get in full (see existingTestcaseSnapshot). */
   private static readonly ZYRA_NAMED_TESTCASE_LIMIT = 10;
@@ -24618,14 +24687,20 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     // The router read the request in context — "fifteen", "a couple more than last time", "cover
     // everything you can" — so its reading wins. The patterns below only cover the case where it
     // reported nothing.
-    if (routed?.exhaustive) return { testcaseRange: "all", requestedCount: this.testcaseRangeConfig("all").requestedCount };
+    // "Exhaustive" wording only escalates to the unbounded plan when the project is set to "all".
+    // Under 1-10 / 10-30 / 30-50 the configured range is the ceiling: only a count the user names
+    // (below) may exceed it, otherwise "all possible cases" ran a 100+ case plan on a 1-10 project.
+    const exhaustiveAllowed = projectTestcaseRange === "all";
+    // A count the user named beats "exhaustive": "all tickets, 20 cases" is a 20-case ask, one
+    // generation, and must never reach the plan flow or its "how would you like to proceed" question.
     const routedCount = Number(routed?.requestedCount);
     if (Number.isFinite(routedCount) && routedCount >= 1) return { requestedCount: Math.min(LegacyService.ZYRA_CHAT_MAX_REQUESTED, Math.floor(routedCount)) };
     const explicit = message.match(/\b(\d{1,2})\s+(?:testcases|test cases|tests|cases)\b/i);
     if (explicit) return { requestedCount: Math.max(1, Math.min(LegacyService.ZYRA_CHAT_MAX_REQUESTED, Number(explicit[1]))) };
+    if (routed?.exhaustive && exhaustiveAllowed) return { testcaseRange: "all", requestedCount: this.testcaseRangeConfig("all").requestedCount };
     const lower = message.toLowerCase();
     const wantsExhaustive = /\ball( the)? possible\b|as many as possible|\bexhaustive\b|every (scenario|edge case|flow|case)|full coverage|\ball types?\b/.test(lower);
-    const range = wantsExhaustive ? "all" : projectTestcaseRange;
+    const range = wantsExhaustive && exhaustiveAllowed ? "all" : projectTestcaseRange;
     return { testcaseRange: range, requestedCount: this.testcaseRangeConfig(range).requestedCount };
   }
 
@@ -24723,6 +24798,10 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     }
   ): Promise<ZyraTicketScopeEstimate | null> {
     if (!plan.testcaseRange) return null;
+    // Only the "all" range can span more than one generation. 1-10 / 10-30 / 30-50 are the user's
+    // choice of a small, bounded run (the range is the ceiling — see chatTestcasePlan), so there is
+    // nothing to batch and nothing to ask.
+    if (options.projectTestcaseRange !== "all") return null;
     const { routedScope, knowledgeConfidence } = options;
     // What one ticket gets: its range's batch ceiling (ZYRA_BATCH_BY_RANGE) — 100 for "all possible",
     // the project's 10/30/50 otherwise. Not requestedCount, which for "all" is the single-call cap of 50:
@@ -25456,6 +25535,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     item.jiraIssueKeys = normalizeJsonArray(row.jira_issue_keys);
     item.linearIssueKeys = normalizeJsonArray(row.linear_issue_keys);
     item.notionPageIds = normalizeJsonArray(row.notion_page_ids);
+    // Display keys aligned with notionPageIds ("Notes 1"), so the Zyra screens never show the id prefix.
+    const notionKeys = await this.notionKeysByPageId(String(row.project_id || ""), item.notionPageIds);
+    item.notionPageKeys = item.notionPageIds.map((id: string) => notionKeys.get(String(id)) || notionPageKey(String(id)));
     item.sources = normalizeJsonArray(row.source_summary);
     item.activities = normalizeJsonArray(row.activity_log);
     // A Russian task's timeline and sources are rendered in Russian; the stored English is untouched

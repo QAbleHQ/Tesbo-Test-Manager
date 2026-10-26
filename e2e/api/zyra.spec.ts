@@ -517,7 +517,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     expect(storedAfterMinimum, "the removed 'minimum' tier reached the stored settings").not.toContain('"minimum"');
   });
 
-  test("ZYR-A-10b a project that has never saved this setting defaults to 30-50, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
+  test("ZYR-A-10b a project that has never saved this setting defaults to all, not 1-10", { tag: '@tesbo.testId("TES-TC-604")' }, async () => {
     // A dedicated project, not the shared tenant's mainProjectId — every other test in this file
     // PATCHes that project's testcaseRange, so it never reflects the true "nothing ever saved" state.
     // Projects cap name at 30 chars — "E2E Zyra Default Range " plus a 13-digit timestamp
@@ -530,7 +530,7 @@ test.describe("zyra — agent, chat, tasks and AI keys", () => {
     const project = await created.json();
     try {
       const agent = await (await asOwner.get(url("/agents/zyra", project.id))).json();
-      expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("30-50");
+      expect(agent.settings.testcaseRange, "a fresh project's default range").toBe("all");
       expect(agent.settings.testcaseCount).toBe(50);
     } finally {
       purgeProject(project.id);
@@ -3722,6 +3722,52 @@ test.describe("zyra chat — citations (fake provider)", () => {
     }
   });
 
+  // Reported: "Zyra only considers 25 test cases" — the existing-coverage lookup was LIMIT 25, so in a
+  // larger project Zyra could not see (and so duplicated) everything past the 25 best matches.
+  test("ZYR-A-74b every existing test case in the project reaches the model, not just the first 25", async () => {
+    test.setTimeout(180_000);
+    await allocateFakeAiKey();
+    const stamp = Date.now();
+    const total = 30;
+    const seededIds: string[] = [];
+    try {
+      // Oldest first, so the earliest title is the one a recency-ordered LIMIT 25 would cut. The titles
+      // share no word (4+ letters) with the message below, so nothing is ranked up by keyword.
+      for (let i = 1; i <= total; i++) {
+        const res = await asOwner.post(`/api/projects/${tenant!.mainProjectId}/testcases`, {
+          data: { title: `Zqx${stamp} ${String(i).padStart(2, "0")}` },
+          failOnStatusCode: false,
+        });
+        expect(res.status(), `seeding ${i} — ${await res.text()}`).toBe(201);
+        seededIds.push((await res.json()).id);
+      }
+
+      const sessionId = await newSession("E2E all existing cases");
+      ai.queueReply({
+        reply: "", reasoningSummary: "Creating a test case.", action: "create", actionType: "create", operations: [], testcases: [], requestedCount: 1, exhaustive: false,
+      });
+      ai.queueReply({
+        drafts: [{
+          title: "A brand new one", preconditions: "n/a", stepsJson: "[]", testData: "", expectedSummary: "n/a",
+          priority: "P2", severity: "Low", tags: ["zyra"], sourceRefs: [],
+        }],
+      });
+      const turn = await asOwner.post(url(`/chat/sessions/${sessionId}/messages`), {
+        data: { message: "Create one more." }, failOnStatusCode: false,
+      });
+      expect(turn.status(), `sending the message — ${await turn.text()}`).toBeLessThan(300);
+
+      const routerPrompt = JSON.stringify(ai.requests[0]?.messages ?? []);
+      for (let i = 1; i <= total; i++) {
+        expect(routerPrompt, `existing test case ${i} of ${total} must be listed`).toContain(`Zqx${stamp} ${String(i).padStart(2, "0")}`);
+      }
+    } finally {
+      for (const id of seededIds) {
+        await asOwner.delete(`/api/projects/${tenant!.mainProjectId}/testcases/${id}`, { failOnStatusCode: false });
+      }
+    }
+  });
+
   // ─── Chat updates carry their new values into the staged proposal ─────────
   //
   // "[Zyra] Updated Expected Results Are Not Actually Updated": the chat prompt's schema showed
@@ -6113,25 +6159,34 @@ test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
   // ─── Credential lifecycle: a connection this deployment can't renew (V125) ─
 
   /*
-   * The KAN-4 root cause, reproduced: the connection's token was issued to a different Atlassian
-   * OAuth app than the one this deployment renews with, so renewal can never succeed here. The token
-   * is an unsigned JWT naming another client_id — getIntegrationConnection reads that claim and
-   * refuses BEFORE contacting Atlassian, so these tests make no outbound call. Stored as plaintext,
-   * which decryptSecret passes through, like the other connection fixtures in this suite.
+   * An unsigned JWT whose `client_id` claim is NOT this deployment's JIRA_CLIENT_ID. That claim is
+   * not a reliable statement of which OAuth app issued the token — a connection freshly authorised
+   * through this deployment's own app carried one that differed and was wrongly flagged as
+   * "authorised through a different Atlassian OAuth app". Only Atlassian refusing a renewal may mark
+   * a connection as needing a reconnect. Stored as plaintext, which decryptSecret passes through,
+   * like the other connection fixtures in this suite.
    */
-  function foreignAppToken(): string {
+  function oddClaimToken(): string {
     const b64 = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
-    return `${b64({ alg: "RS256" })}.${b64({ client_id: `e2e-other-deployment-app-${Date.now()}` })}.sig`;
+    return `${b64({ alg: "RS256" })}.${b64({ client_id: `e2e-unrelated-claim-${Date.now()}` })}.sig`;
   }
 
-  function seedForeignAppConnection(options: { expired: boolean }): string {
+  function seedJiraConnection(options: { expired: boolean }): string {
     exec(
       "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, " +
         `refresh_token, token_expires_at, connected_by) VALUES (${literal(tenant!.organizationId)}, 'jira', ` +
-        `'e2e-jira-site', 'https://e2e.invalid', ${literal(foreignAppToken())}, 'e2e-refresh-token', ` +
+        `'e2e-jira-site', 'https://e2e.invalid', ${literal(oddClaimToken())}, 'e2e-refresh-token', ` +
         `${options.expired ? "now() - interval '5 minutes'" : "now() + interval '1 hour'"}, ${literal(tenant!.owner.userId)});`,
     );
     return scalar(`SELECT id FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+  }
+
+  // Records a refusal the way recordRefusedRefresh does, keyed on the refresh token the row holds.
+  function recordRefusal(connectionId: string, reason: string, refreshToken = "e2e-refresh-token") {
+    exec(
+      `UPDATE integration_connections SET auth_error = ${literal(reason)}, auth_error_at = now(), ` +
+        `auth_error_refresh_fingerprint = encode(sha256(convert_to(${literal(refreshToken)}, 'UTF8')), 'hex') WHERE id = ${literal(connectionId)};`,
+    );
   }
 
   async function jiraStatus(): Promise<any> {
@@ -6140,39 +6195,37 @@ test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
     return res.json();
   }
 
-  test("ZYR-AC-28 status no longer reads healthy for a connection this deployment can't renew", async () => {
-    seedForeignAppConnection({ expired: false });
+  const REFUSAL = "Jira needs to be reconnected: Jira refused to renew the connection (403) — its authorization was revoked or has already been used. Reconnect Jira in workspace settings.";
+
+  test("ZYR-AC-28 a token whose client_id claim differs from this deployment's app is NOT flagged for reconnect", async () => {
+    seedJiraConnection({ expired: false });
     const status = await jiraStatus();
     expect(status.connected).toBe(true);
-    expect(status.needsReconnect).toBe(true);
-    expect(status.authError).toMatch(/different Atlassian OAuth app/);
+    expect(status.needsReconnect).toBe(false);
+    expect(status.authError ?? null).toBeNull();
 
-    // The workspace-level status (the page where Reconnect lives) says the same.
+    // The workspace-level status (the page where Reconnect lives) agrees.
     const ws = await (await asOwner.get("/api/workspace/integrations/jira/status")).json();
-    expect(ws).toMatchObject({ connected: true, needsReconnect: true });
+    expect(ws).toMatchObject({ connected: true, needsReconnect: false });
   });
 
-  test("ZYR-AC-29 an expired foreign-app token: the comment fails with an actionable reason, and the dead refresh token is recorded, not re-sent", async () => {
-    const connectionId = seedForeignAppConnection({ expired: true });
+  test("ZYR-AC-29 a renewal Atlassian refused is recorded: the comment fails with that reason, and the dead refresh token is not re-sent", async () => {
+    const connectionId = seedJiraConnection({ expired: true });
+    recordRefusal(connectionId, REFUSAL);
     await setAutoComment({ jiraAutoComment: true });
-    const taskId = seedReviewTask({ titles: ["Foreign app case"], jiraIssueKey: "KAN-50" });
+    const taskId = seedReviewTask({ titles: ["Refused renewal case"], jiraIssueKey: "KAN-50" });
     expect((await save(taskId)).status()).toBe(201);
 
     const [row] = await waitForDelivery(taskId);
     expect(row.status).toBe("failed");
-    expect(row.reason).toMatch(/needs to be reconnected from this Tesbo deployment/);
-    expect(row.reason).toMatch(/different Atlassian OAuth app/);
+    expect(row.reason).toMatch(/needs to be reconnected/);
 
-    // The refusal is recorded against this exact refresh token (V125)…
     const markedAt = scalar(`SELECT auth_error_at::text FROM integration_connections WHERE id = ${literal(connectionId)};`);
-    expect(markedAt, "the refusal was not recorded").toBeTruthy();
-    expect(scalar(`SELECT auth_error_refresh_fingerprint = encode(sha256(convert_to(refresh_token, 'UTF8')), 'hex') FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe("t");
-
-    // …so a Retry gets the same reason straight from the record, without another renewal attempt.
+    // A Retry gets the same reason straight from the record, without another renewal attempt.
     const commentId = scalar(`SELECT id FROM integration_ticket_comments WHERE generation_request_id = ${literal(taskId)};`);
     const retried = await (await asOwner.post(url(`/tasks/${taskId}/ticket-comments/${commentId}/retry`), { failOnStatusCode: false })).json();
     expect(retried.status).toBe("failed");
-    expect(retried.reason).toMatch(/different Atlassian OAuth app/);
+    expect(retried.reason).toMatch(/needs to be reconnected/);
     expect(scalar(`SELECT auth_error_at::text FROM integration_connections WHERE id = ${literal(connectionId)};`)).toBe(markedAt);
 
     const status = await jiraStatus();
@@ -6180,16 +6233,12 @@ test.describe("zyra task-board — ticket auto-comment (fake provider)", () => {
   });
 
   test("ZYR-AC-30 a recorded refusal heals itself when the refresh token changes (reconnect, or another deployment renewed it)", async () => {
-    const connectionId = seedForeignAppConnection({ expired: false });
+    const connectionId = seedJiraConnection({ expired: false });
     // A refusal recorded for an OLDER refresh token than the one the row holds now.
-    exec(
-      `UPDATE integration_connections SET auth_error = 'Jira needs to be reconnected: old refusal', auth_error_at = now(), ` +
-        `auth_error_refresh_fingerprint = encode(sha256(convert_to('some-older-refresh-token', 'UTF8')), 'hex') WHERE id = ${literal(connectionId)};`,
-    );
+    recordRefusal(connectionId, "Jira needs to be reconnected: old refusal", "some-older-refresh-token");
     const status = await jiraStatus();
-    // Still flagged — but for the app mismatch, which is true of the CURRENT token, not the stale record.
-    expect(status.authError).not.toContain("old refusal");
-    expect(status.authError).toMatch(/different Atlassian OAuth app/);
+    expect(status.needsReconnect).toBe(false);
+    expect(status.authError ?? null).toBeNull();
   });
 });
 

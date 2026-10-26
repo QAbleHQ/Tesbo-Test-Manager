@@ -483,13 +483,17 @@ function CreateFolderModal({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [nameError, setNameError] = useState("");
-  useEffect(() => {
+  // Reset the fields each time the dialog opens. Done during render rather than in an effect, so the
+  // dialog never paints one frame with the previous values (and no setState runs inside an effect).
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) {
       setName("");
       setDescription("");
       setNameError("");
     }
-  }, [open]);
+  }
   async function handleCreateClick() {
     const trimmed = name.trim();
     const error = validateKnowledgeFolderName(trimmed);
@@ -555,12 +559,15 @@ function RenameFolderModal({
 }) {
   const [name, setName] = useState(initialName);
   const [nameError, setNameError] = useState("");
-  useEffect(() => {
+  // Re-seed whenever the dialog opens or its initial name changes (see the create dialog above).
+  const [seed, setSeed] = useState({ open, initialName });
+  if (seed.open !== open || seed.initialName !== initialName) {
+    setSeed({ open, initialName });
     if (open) {
       setName(initialName);
       setNameError("");
     }
-  }, [open, initialName]);
+  }
   async function handleSaveClick() {
     const trimmed = name.trim();
     const error = validateKnowledgeFolderName(trimmed);
@@ -622,12 +629,15 @@ function MoveModal({
   const [target, setTarget] = useState("");
   const [destError, setDestError] = useState("");
   const options = tree ? flattenFolders(tree).filter((f) => f.id !== excludeId) : [];
-  useEffect(() => {
+  // Re-seed whenever the dialog opens or the tree changes (see the create dialog above).
+  const [seed, setSeed] = useState({ open, tree });
+  if (seed.open !== open || seed.tree !== tree) {
+    setSeed({ open, tree });
     if (open) {
       setTarget(tree?.id || "");
       setDestError("");
     }
-  }, [open, tree]);
+  }
   async function handleMoveClick() {
     if (!target) return;
     try {
@@ -689,14 +699,17 @@ function CreateDocumentModal({
   // Only the "Blank document" template starts with no content, so it's the only one that
   // needs this field — the other templates already come with pre-filled starter content.
   const [blankContent, setBlankContent] = useState("");
-  useEffect(() => {
+  // Reset on open (see the create-folder dialog above).
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) {
       setTitle("");
       setTitleError("");
       setTemplateKey(DOCUMENT_TEMPLATES[0].key);
       setBlankContent("");
     }
-  }, [open]);
+  }
   const template = DOCUMENT_TEMPLATES.find((t) => t.key === templateKey) || DOCUMENT_TEMPLATES[0];
   const isBlankTemplate = template.key === "blank";
   const canCreate = Boolean(title.trim()) && (!isBlankTemplate || Boolean(blankContent.trim()));
@@ -794,12 +807,15 @@ function UploadModal({
   const [rejectionMessage, setRejectionMessage] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const pickerOpenRef = useRef(false);
-  useEffect(() => {
+  // Reset on open (see the create-folder dialog above).
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
     if (open) {
       setFiles([]);
       setRejectionMessage(null);
     }
-  }, [open]);
+  }
   useEffect(() => {
     if (!open) return;
     const clearPickerOpen = () => { pickerOpenRef.current = false; };

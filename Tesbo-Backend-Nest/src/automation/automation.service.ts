@@ -827,6 +827,19 @@ export class AutomationService {
           error: `${name} is over the ${mb}MB limit for evidence files.`
         });
       }
+      if (kind === "api") {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(file.buffer.toString("utf8"));
+        } catch {
+          throw new BadRequestException({ error: `${name} isn't valid JSON, so it can't be shown as API evidence.` });
+        }
+        if (parsed === null || typeof parsed !== "object") {
+          throw new BadRequestException({
+            error: `${name} must contain a JSON object or array describing the API call(s).`
+          });
+        }
+      }
     }
   }
 

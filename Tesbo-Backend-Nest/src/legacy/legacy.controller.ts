@@ -744,6 +744,17 @@ export class LegacyController {
     return sendStoredFile(res, access);
   }
 
+  /** The parsed JSON of one `api` evidence file, for the in-place request/response viewer. */
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/api-content")
+  getExecutionApiEvidence(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.getExecutionApiEvidence(cycleId, req.userId, executionId, attachmentId);
+  }
+
   /**
    * Mints a short-lived link the embedded Playwright trace viewer can read.
    *

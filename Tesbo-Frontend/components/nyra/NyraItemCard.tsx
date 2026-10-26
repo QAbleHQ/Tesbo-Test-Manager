@@ -133,7 +133,7 @@ export default function NyraItemCard({
             {str(d.method).toUpperCase()} {str(d.action)} on {list(d.screens).join(", ") || str(d.screen)}
           </div>
           <ul className="mt-2 space-y-0.5 text-[13px]">
-            {(Array.isArray(d.fields) ? d.fields : []).map((f: Record<string, any>, i: number) => (
+            {(Array.isArray(d.fields) ? d.fields : []).map((f: Record<string, unknown>, i: number) => (
               <li key={i} className="flex flex-wrap gap-x-2">
                 <span className="font-medium text-[var(--foreground)]">{str(f.label) || str(f.name) || "(unlabelled)"}</span>
                 <span className={muted}>{[str(f.type), f.required ? "required" : ""].filter(Boolean).join(" · ")}</span>

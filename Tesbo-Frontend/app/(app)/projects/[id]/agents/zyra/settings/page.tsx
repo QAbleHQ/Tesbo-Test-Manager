@@ -38,7 +38,7 @@ const RANGE_OPTIONS: { value: TestcaseRange; num: string; label: string; descrip
   { value: "all",     num: "All",   label: "Exhaustive", description: "Every scenario Zyra can find" },
 ];
 
-const DEFAULT_TESTCASE_RANGE: TestcaseRange = "30-50";
+const DEFAULT_TESTCASE_RANGE: TestcaseRange = "all";
 const DEFAULT_CAPABILITIES: ZyraCapabilities = { generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true };
 
 const CAPABILITY_FIELDS: { key: keyof ZyraCapabilities; label: string; description: string }[] = [

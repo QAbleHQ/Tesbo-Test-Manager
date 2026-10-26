@@ -789,21 +789,21 @@ test.describe("zyra / agents (UI)", () => {
     await expect(page.getByText("1–3", { exact: true })).toHaveCount(0);
   });
 
-  test("ZYU-07c a project that has never saved this setting defaults to 30–50 Extensive", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+  test("ZYU-07c a project that has never saved this setting defaults to All Exhaustive", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
     // purgeZyra() strips the zyraAgent settings key after every test in this file (see the
     // afterEach above), so this project genuinely has no saved testcaseRange at this point.
     const page = await open(browser, "/agents/zyra/settings");
 
-    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: /All Exhaustive/ })).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByRole("button", { name: /1–10 Focused/ })).toHaveAttribute("aria-pressed", "false");
     await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "false");
-    await expect(page.getByRole("button", { name: /All Exhaustive/ })).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "false");
 
     const state = await (await api.get(`/api/projects/${tenant!.mainProjectId}/agents/zyra`)).json();
-    expect(state.settings.testcaseRange, "a project that never saved this setting defaults to 30-50").toBe("30-50");
+    expect(state.settings.testcaseRange, "a project that never saved this setting defaults to all").toBe("all");
   });
 
-  test("ZYU-07d selecting 30-50 persists across a reload, and Reset to defaults returns to 30-50", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
+  test("ZYU-07d selecting 30-50 persists across a reload, and Reset to defaults returns to All", { tag: '@tesbo.testId("TES-TC-1092")' }, async ({ browser }) => {
     const page = await open(browser, "/agents/zyra/settings");
 
     // Move off the default first, so the save below is a real, observable change.
@@ -826,7 +826,7 @@ test.describe("zyra / agents (UI)", () => {
     await page.getByRole("button", { name: /10–30 Broad/ }).click();
     await expect(page.getByRole("button", { name: /10–30 Broad/ })).toHaveAttribute("aria-pressed", "true");
     await page.getByRole("button", { name: "Reset to defaults" }).click();
-    await expect(page.getByRole("button", { name: /30–50 Extensive/ })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: /All Exhaustive/ })).toHaveAttribute("aria-pressed", "true");
   });
 
   test("ZYU-08 reset to defaults puts every capability back on", { tag: '@tesbo.testId("TES-TC-1093")' }, async ({ browser }) => {

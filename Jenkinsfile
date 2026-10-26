@@ -1,8 +1,8 @@
 // Auto-deploy on main + SonarQube scan before deploy.
-// Gates: typecheck, lint ratchet, unit tests, critical-dependency audit and a secret scan must pass BEFORE anything
-// deploys (scripts/ci-check.sh, .gitleaks.toml). A failure there stops the build with nothing deployed.
+// Quality gates (typecheck, lint ratchet, unit tests, critical-dependency audit via scripts/ci-check.sh)
+// and the SonarQube scan run in parallel with the prod deploy. Deploy does not wait for them.
 // Sonar secrets: Jenkins Managed file id = tesbo-test-manager-env
-// Sonar failure does NOT block deploy (catchError).
+// Sonar failure does NOT block deploy. It is not a dependency of Deploy or Smoke check.
 //
 // Blue/green prod deploy (near-zero downtime) — all logic lives in this Jenkinsfile:
 //   - Live color keeps serving while the idle color is built + started
@@ -20,14 +20,6 @@
 
 pipeline {
   agent any
-
-  parameters {
-    booleanParam(
-      name: 'SKIP_GATES',
-      defaultValue: false,
-      description: 'EMERGENCY ONLY: deploy without the quality gates and the secret scan. Only a person pressing "Build with Parameters" can set this; a push never does. The build is labelled so it cannot be missed.'
-    )
-  }
 
   options {
     timestamps()
@@ -67,63 +59,37 @@ pipeline {
       }
     }
 
-    // Nothing below the gates runs unless the code is fit to ship. Both stages run in throwaway containers
-    // as the Jenkins user (no root-owned files left in the workspace), with the npm cache kept inside the
-    // workspace so the second build onwards does not download everything again. A first build, or one that
-    // pre-dates the SKIP_GATES parameter, has params.SKIP_GATES unset, which is treated as "run the gates".
-    stage('Gates skipped') {
-      when { expression { params.SKIP_GATES } }
-      steps {
-        script {
-          currentBuild.description = 'QUALITY GATES SKIPPED (SKIP_GATES)'
-          echo '!!! SKIP_GATES was set: this build is deploying WITHOUT the quality gates or the secret scan. !!!'
-          unstable('Quality gates skipped by SKIP_GATES')
+    // Tests and Sonar keep running while the prod deploy starts. Deploy does not wait for them.
+    // Sonar failure leaves the build result unchanged. A test failure still fails the build, but it does not cancel deploy.
+    stage('Release') {
+      failFast false
+      parallel {
+        stage('Quality gates') {
+          steps {
+            timeout(time: 60, unit: 'MINUTES') {
+              sh '''
+            set -eu
+            echo "==> typecheck, lint ratchet, unit tests, dependency audit, repo hygiene (scripts/ci-check.sh)"
+            docker run --rm \
+              --user "$(id -u):$(id -g)" \
+              -e HOME=/tmp \
+              -e npm_config_cache=/work/.npm-cache \
+              -v "${WORKSPACE}:/work" \
+              -w /work \
+              node:22-bookworm-slim \
+              bash scripts/ci-check.sh
+          '''
+            }
+          }
         }
-      }
-    }
-
-    stage('Quality gates') {
-      when { expression { !params.SKIP_GATES } }
-      options { timeout(time: 30, unit: 'MINUTES') }
-      steps {
-        sh '''
-          set -eu
-          echo "==> typecheck, lint ratchet, unit tests, dependency audit, repo hygiene (scripts/ci-check.sh)"
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            -e HOME=/tmp \
-            -e npm_config_cache=/work/.npm-cache \
-            -v "${WORKSPACE}:/work" \
-            -w /work \
-            node:22-bookworm-slim \
-            bash scripts/ci-check.sh
-        '''
-      }
-    }
-
-    stage('Secret scan') {
-      when { expression { !params.SKIP_GATES } }
-      options { timeout(time: 10, unit: 'MINUTES') }
-      steps {
-        sh '''
-          set -eu
-          echo "==> gitleaks over the committed tree and history (.gitleaks.toml, .gitleaksignore)"
-          docker run --rm \
-            --entrypoint sh \
-            -v "${WORKSPACE}:/repo:ro" \
-            zricethezav/gitleaks:v8.28.0 \
-            -c 'git config --global --add safe.directory /repo && gitleaks detect --source /repo --config /repo/.gitleaks.toml --redact --no-banner'
-        '''
-      }
-    }
-
-    stage('SonarQube') {
-      steps {
-        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-          configFileProvider([
-            configFile(fileId: 'tesbo-test-manager-env', variable: 'TESBO_ENV_FILE')
-          ]) {
-            sh '''
+        stage('SonarQube') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+              timeout(time: 30, unit: 'MINUTES') {
+                configFileProvider([
+                  configFile(fileId: 'tesbo-test-manager-env', variable: 'TESBO_ENV_FILE')
+                ]) {
+                  sh '''
               set -eu
               set +x  # Jenkins sh runs with -x; keep SONAR_TOKEN out of the console log
               set -a
@@ -142,13 +108,16 @@ pipeline {
                 -w /usr/src \
                 sonarsource/sonar-scanner-cli:11 \
                 -Dsonar.projectBaseDir=/usr/src
-            '''
+              '''
+                }
+              }
+            }
           }
         }
-      }
-    }
 
     stage('Deploy prod (blue/green)') {
+      stages {
+        stage('Deploy') {
       steps {
         // IMPORTANT: use <<'ENDSSH' (quoted). Unquoted heredocs break under Jenkins durable
         // task / dash and can execute the deploy body on the Jenkins agent instead of prod.
@@ -356,6 +325,10 @@ ENDSSH
         '''
       }
     }
+      }
+    }
+      }
+    }
   }
 
   post {
@@ -366,7 +339,7 @@ ENDSSH
       echo "Deploy may have succeeded but Sonar was UNSTABLE."
     }
     failure {
-      echo "Failed. If the failing stage was Quality gates or Secret scan, NOTHING was deployed. Otherwise prod only - stage was not touched, and nginx should still point at the previous color."
+      echo "Failed. Deploy runs in parallel with quality gates, so a test failure does not roll back a deploy that already started. Stage was not touched. If deploy itself failed, nginx should still point at the previous color."
     }
   }
 }

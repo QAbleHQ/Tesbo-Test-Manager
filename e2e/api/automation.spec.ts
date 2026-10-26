@@ -1507,6 +1507,114 @@ test.describe("automation ingest - evidence", () => {
       await cleanup(api, [run.runId], cases.map((c) => c.id));
     }
   });
+
+  /*
+   * API-call evidence (kind 'api'): a captured request/response, readable in place instead of as a
+   * .json download. The file is a Tesbo envelope or a HAR; the server only insists it is JSON, and
+   * the viewer decides what it recognises.
+   */
+  const API_CALL = {
+    method: "POST",
+    url: "https://api.example.test/cart",
+    status: 500,
+    durationMs: 123,
+    request: { headers: { Authorization: "Bearer secret-token", "Content-Type": "application/json" }, body: { sku: "A1" } },
+    response: { headers: { "Content-Type": "application/json" }, body: { error: "boom" } },
+  };
+
+  async function uploadApiEvidence(api: APIRequestContext, runId: string, caseId: string, name: string, buffer: Buffer) {
+    return api.post(evidenceUrl(runId, caseId), {
+      multipart: { kind: "api", files: { name, mimeType: "application/json", buffer } },
+      failOnStatusCode: false,
+    });
+  }
+
+  test("AUT-66 an API call is accepted as api evidence, listed with that kind, and readable as JSON", async ({
+    request: api,
+  }) => {
+    const { cases, run } = await runWithResult(api, "api-evidence");
+    try {
+      const res = await uploadApiEvidence(api, run.runId, cases[0].externalId, "cart-call.json", Buffer.from(JSON.stringify(API_CALL)));
+      expect(res.status(), await res.text()).toBe(201);
+
+      const detail = await (await api.get(`${automationBase(ctxA.projectId)}/runs/${run.runId}`)).json();
+      const evidence = detail.results[0].evidence;
+      expect(evidence).toHaveLength(1);
+      expect(evidence[0].kind).toBe("api");
+
+      const executionId = detail.results[0].executionId;
+      const content = await api.get(
+        `/api/cycles/${run.runId}/executions/${executionId}/attachments/${evidence[0].id}/api-content`,
+        { failOnStatusCode: false },
+      );
+      expect(content.status(), await content.text()).toBe(200);
+      const body = await content.json();
+      expect(body.fileName).toBe("cart-call.json");
+      expect(body.data.url).toBe(API_CALL.url);
+      expect(body.data.status).toBe(500);
+    } finally {
+      await cleanup(api, [run.runId], cases.map((c) => c.id));
+    }
+  });
+
+  test("AUT-67 a HAR is accepted as api evidence; a non-JSON body, an empty file and a wrong extension are refused", async ({
+    request: api,
+  }) => {
+    const { cases, run } = await runWithResult(api, "api-evidence-bad");
+    try {
+      const har = { log: { entries: [{ request: { method: "GET", url: "https://api.example.test/x", headers: [] }, response: { status: 200, headers: [], content: { text: "ok" } }, time: 5 }] } };
+      const ok = await uploadApiEvidence(api, run.runId, cases[0].externalId, "session.har", Buffer.from(JSON.stringify(har)));
+      expect(ok.status(), await ok.text()).toBe(201);
+
+      const notJson = await uploadApiEvidence(api, run.runId, cases[0].externalId, "broken.json", Buffer.from("{not json"));
+      expect(notJson.status()).toBe(400);
+      expect((await notJson.json()).error).toContain("isn't valid JSON");
+
+      // JSON, but a bare scalar describes no call at all.
+      const scalar = await uploadApiEvidence(api, run.runId, cases[0].externalId, "scalar.json", Buffer.from("42"));
+      expect(scalar.status()).toBe(400);
+
+      const empty = await uploadApiEvidence(api, run.runId, cases[0].externalId, "empty.json", Buffer.alloc(0));
+      expect(empty.status()).toBe(400);
+
+      const wrongExt = await uploadApiEvidence(api, run.runId, cases[0].externalId, "call.png", Buffer.from(JSON.stringify(API_CALL)));
+      expect(wrongExt.status()).toBe(400);
+      expect((await wrongExt.json()).error).toContain("aren't accepted as api evidence");
+
+      const detail = await (await api.get(`${automationBase(ctxA.projectId)}/runs/${run.runId}`)).json();
+      expect(detail.results[0].evidence, "only the valid HAR may have been stored").toHaveLength(1);
+    } finally {
+      await cleanup(api, [run.runId], cases.map((c) => c.id));
+    }
+  });
+
+  test("AUT-68 api-content serves only api evidence, and not to another tenant or an anonymous caller", async ({
+    request: api,
+  }) => {
+    const { cases, run } = await runWithResult(api, "api-content-auth");
+    try {
+      await uploadApiEvidence(api, run.runId, cases[0].externalId, "call.json", Buffer.from(JSON.stringify(API_CALL)));
+      await api.post(evidenceUrl(run.runId, cases[0].externalId), {
+        multipart: { kind: "log", files: { name: "run.log", mimeType: "text/plain", buffer: Buffer.from("hello") } },
+      });
+      const detail = await (await api.get(`${automationBase(ctxA.projectId)}/runs/${run.runId}`)).json();
+      const executionId = detail.results[0].executionId;
+      const apiFile = detail.results[0].evidence.find((e: any) => e.kind === "api");
+      const logFile = detail.results[0].evidence.find((e: any) => e.kind === "log");
+      const url = (id: string) => `/api/cycles/${run.runId}/executions/${executionId}/attachments/${id}/api-content`;
+
+      // A log is a download, never JSON-parsed or rendered through this route.
+      const asLog = await api.get(url(logFile.id), { failOnStatusCode: false });
+      expect(asLog.status()).toBe(400);
+
+      for (const [label, ctx] of [["account B", asB], ["anonymous", anon]] as const) {
+        const res = await ctx.get(url(apiFile.id), { failOnStatusCode: false });
+        expect(REFUSED, `${label} answered ${res.status()}`).toContain(res.status());
+      }
+    } finally {
+      await cleanup(api, [run.runId], cases.map((c) => c.id));
+    }
+  });
 });
 
 /*

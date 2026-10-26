@@ -1022,6 +1022,8 @@ export interface ZyraTask {
   linearIssueKeys: string[];
   /** Full Notion page ids (not the short display keys) queued as Zyra context. */
   notionPageIds?: string[];
+  /** Display keys ("Notes 1") aligned with notionPageIds. */
+  notionPageKeys?: string[];
   drafts: AiGeneratedDraft[];
   sources: Array<{ type: string; title: string; detail: string }>;
   activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string; kind?: string }>;
@@ -3398,8 +3400,8 @@ export function notionPageKey(pageId: string): string {
 }
 
 /** Every ticket a Zyra task was built from, as display keys (Notion page ids shown by their short key). */
-export function zyraTaskTicketKeys(task: Pick<ZyraTask, "jiraIssueKeys" | "linearIssueKeys" | "notionPageIds">): string[] {
-  return [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? []), ...(task.notionPageIds ?? []).map(notionPageKey)];
+export function zyraTaskTicketKeys(task: Pick<ZyraTask, "jiraIssueKeys" | "linearIssueKeys" | "notionPageIds" | "notionPageKeys">): string[] {
+  return [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? []), ...(task.notionPageIds ?? []).map((id, i) => task.notionPageKeys?.[i] || notionPageKey(id))];
 }
 
 /**
@@ -4453,7 +4455,7 @@ export async function getWorkspaceActivitySummary(): Promise<ActivitySummary> {
 // Automation results are now ordinary runs and executions, linked by the test case's external id.
 
 /** What kind of file a piece of evidence is, which decides how the viewer renders it. */
-export type EvidenceKind = "screenshot" | "video" | "trace" | "log";
+export type EvidenceKind = "screenshot" | "video" | "trace" | "log" | "api";
 
 export interface ExecutionEvidence {
   id: string;
@@ -4551,6 +4553,17 @@ export async function createExecutionTraceLink(
 ): Promise<{ token: string; expiresAt: string }> {
   return api<{ token: string; expiresAt: string }>(
     `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/trace-link`
+  );
+}
+
+/** The parsed JSON of one `api` evidence file (an envelope or a HAR), for the request/response viewer. */
+export async function getExecutionApiEvidence(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<{ fileName: string; data: unknown }> {
+  return api<{ fileName: string; data: unknown }>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/api-content`
   );
 }
 
