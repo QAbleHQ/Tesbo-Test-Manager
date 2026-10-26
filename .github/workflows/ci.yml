@@ -30,7 +30,7 @@ jobs:
     steps:
       # Third-party actions are pinned to a major tag; Dependabot (github-actions ecosystem) proposes bumps.
       # Pin to a full commit SHA if the repository's policy requires it.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # History is scanned too: a secret committed and later deleted is still a leaked secret.
           fetch-depth: 0
