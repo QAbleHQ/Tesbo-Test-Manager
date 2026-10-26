@@ -31,7 +31,7 @@ jobs:
       # Third-party actions are pinned to a major tag; Dependabot (github-actions ecosystem) proposes bumps.
       # Pin to a full commit SHA if the repository's policy requires it.
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
