@@ -20,7 +20,7 @@
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@tesbox/playwright-reporter": "^0.2.0",
-    "@types/node": "^22.10.7",
+    "@types/node": "^26.6.5",
     "@types/pg": "^8.23.1",
     "exceljs": "^4.4.0",
     "pg": "^8.23.0",
