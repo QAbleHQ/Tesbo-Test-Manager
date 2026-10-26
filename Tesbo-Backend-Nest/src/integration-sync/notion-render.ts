@@ -329,3 +329,34 @@ export function markdownToNotionRichText(markdown: string, limit = 2000, maxElem
   if (segments.length <= maxElements) return segments;
   return chunkText(markdown, limit).map((content) => ({ type: "text" as const, text: { content } }));
 }
+
+/**
+ * Like markdownToNotionRichText, but never gives up formatting: a body that would need more than
+ * `maxElements` rich_text elements (a save listing 50 test cases is ~150) is split at line breaks into
+ * several comments, each within the cap, so bold and links render the same as they do on Jira and
+ * Linear instead of the whole comment falling back to raw markdown.
+ */
+export function markdownToNotionCommentBodies(markdown: string, limit = 2000, maxElements = 100): NotionTextSegment[][] {
+  const bodies: NotionTextSegment[][] = [];
+  let current: NotionTextSegment[] = [];
+  const flush = () => {
+    // The newline that joined the lines is not content of the last line of a comment.
+    const last = current[current.length - 1];
+    if (last && last.text.content === "\n") current.pop();
+    if (current.length) bodies.push(current);
+    current = [];
+  };
+  for (const line of markdown.split("\n")) {
+    const segments = markdownToNotionRichText(line, limit, maxElements);
+    if (current.length && current.length + segments.length + 1 > maxElements) flush();
+    if (segments.length > maxElements) {
+      // A single line this big already came back as plain chunks; give each chunk its own comment.
+      flush();
+      for (let i = 0; i < segments.length; i += maxElements) bodies.push(segments.slice(i, i + maxElements));
+      continue;
+    }
+    current.push(...segments, { type: "text", text: { content: "\n" } });
+  }
+  flush();
+  return bodies.length ? bodies : [[{ type: "text", text: { content: "" } }]];
+}
