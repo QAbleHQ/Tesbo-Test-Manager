@@ -61,10 +61,7 @@ pipeline {
     stage('Release') {
       failFast false
       parallel {
-    stage('Quality gates') {
-      failFast false
-      parallel {
-        stage('Tests') {
+        stage('Quality gates') {
           steps {
             timeout(time: 60, unit: 'MINUTES') {
               sh '''
@@ -114,8 +111,6 @@ pipeline {
             }
           }
         }
-      }
-    }
 
     stage('Deploy stage (blue/green)') {
       stages {

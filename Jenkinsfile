@@ -1,6 +1,6 @@
 // Auto-deploy on main + SonarQube scan before deploy.
 // Quality gates (typecheck, lint ratchet, unit tests, critical-dependency audit via scripts/ci-check.sh)
-// and the SonarQube scan run in parallel. A quality-gate failure stops the build with nothing deployed.
+// and the SonarQube scan run in parallel with the prod deploy. Deploy does not wait for them.
 // Sonar secrets: Jenkins Managed file id = tesbo-test-manager-env
 // Sonar failure does NOT block deploy. It is not a dependency of Deploy or Smoke check.
 //
@@ -59,13 +59,12 @@ pipeline {
       }
     }
 
-    // Quality gates and SonarQube run at the same time. Neither waits for the other.
-    // A quality-gate failure stops the build with nothing deployed.
-    // Sonar is not a dependency: a scan failure or timeout leaves the build result unchanged, and Deploy still runs.
-    stage('Quality gates') {
+    // Tests and Sonar keep running while the prod deploy starts. Deploy does not wait for them.
+    // Sonar failure leaves the build result unchanged. A test failure still fails the build, but it does not cancel deploy.
+    stage('Release') {
       failFast false
       parallel {
-        stage('Tests') {
+        stage('Quality gates') {
           steps {
             timeout(time: 60, unit: 'MINUTES') {
               sh '''
@@ -115,10 +114,10 @@ pipeline {
             }
           }
         }
-      }
-    }
 
     stage('Deploy prod (blue/green)') {
+      stages {
+        stage('Deploy') {
       steps {
         // IMPORTANT: use <<'ENDSSH' (quoted). Unquoted heredocs break under Jenkins durable
         // task / dash and can execute the deploy body on the Jenkins agent instead of prod.
@@ -326,6 +325,10 @@ ENDSSH
         '''
       }
     }
+      }
+    }
+      }
+    }
   }
 
   post {
@@ -336,7 +339,7 @@ ENDSSH
       echo "Deploy may have succeeded but Sonar was UNSTABLE."
     }
     failure {
-      echo "Failed. If the failing stage was Quality gates, NOTHING was deployed. Otherwise prod only - stage was not touched, and nginx should still point at the previous color."
+      echo "Failed. Deploy runs in parallel with quality gates, so a test failure does not roll back a deploy that already started. Stage was not touched. If deploy itself failed, nginx should still point at the previous color."
     }
   }
 }
