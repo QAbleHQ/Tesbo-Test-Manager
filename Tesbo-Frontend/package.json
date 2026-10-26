@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@betterbugs/web-sdk": "^0.0.44",
-    "@sentry/nextjs": "^10.73.0",
+    "@sentry/nextjs": "^11.9.0",
     "@tabler/icons-react": "^3.44.0",
     "@tiptap/extension-image": "3.32.0",
     "@tiptap/extension-table": "3.32.0",
