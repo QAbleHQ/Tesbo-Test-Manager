@@ -10,9 +10,9 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@betterbugs/web-sdk": "^0.0.44",
+    "@betterbugs/web-sdk": "^0.0.47",
     "@sentry/nextjs": "^10.73.0",
-    "@tabler/icons-react": "^3.44.0",
+    "@tabler/icons-react": "^3.49.0",
     "@tiptap/extension-image": "3.32.0",
     "@tiptap/extension-table": "3.32.0",
     "@tiptap/extension-task-item": "3.32.0",
@@ -21,10 +21,10 @@
     "@tiptap/react": "3.32.0",
     "@tiptap/starter-kit": "3.32.0",
     "exceljs": "^4.4.0",
-    "next": "16.4.2",
-    "posthog-js": "^1.433.7",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
+    "next": "16.4.3",
+    "posthog-js": "^1.438.21",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
@@ -33,7 +33,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.3.3",
+    "eslint-config-next": "16.4.3",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
