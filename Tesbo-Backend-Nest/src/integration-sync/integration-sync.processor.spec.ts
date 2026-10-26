@@ -160,7 +160,7 @@ describe.each<SyncProvider>(["jira", "linear"])(
         return Promise.resolve({ rows: [] });
       });
 
-      const { processor, runs, client, db } = makeProcessor({
+      const { processor, runs, db } = makeProcessor({
         db: { query: dbQuery },
         client: {
           loadConnection: jest.fn().mockResolvedValue({ id: "conn-1" }),
