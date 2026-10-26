@@ -43,7 +43,7 @@ export default function NyraWorkspace({ projectId, nyraId }: { projectId: string
   const [scanOpen, setScanOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  const isPro = !!billing && (billing.plan === "pro" || billing.inGracePeriod);
+  const isPro = !!billing && (billing.enabled === false || billing.plan === "pro" || billing.inGracePeriod);
 
   useEffect(() => {
     getBillingInfo().then(setBilling).catch(() => setBillingError(true));
