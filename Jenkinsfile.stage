@@ -1,6 +1,6 @@
 // Auto-deploy on dev + SonarQube scan before deploy.
 // Quality gates (typecheck, lint ratchet, unit tests, critical-dependency audit via scripts/ci-check.sh)
-// and the SonarQube scan run in one stage. A quality-gate failure stops the build with nothing deployed.
+// and the SonarQube scan run in parallel. A quality-gate failure stops the build with nothing deployed.
 // Sonar secrets: Jenkins Managed file id = tesbo-test-manager-env
 // Sonar failure does NOT block deploy. It is not a dependency of Deploy or Smoke check.
 //
@@ -56,12 +56,16 @@ pipeline {
       }
     }
 
-    // Quality gates and SonarQube are one stage. Only the test/lint step can stop the build.
-    // Sonar is not a dependency: a scan failure or timeout is caught here, then Deploy still runs.
+    // Quality gates and SonarQube run at the same time. Neither waits for the other.
+    // A quality-gate failure stops the build with nothing deployed.
+    // Sonar is not a dependency: a scan failure or timeout leaves the build result unchanged, and Deploy still runs.
     stage('Quality gates') {
-      steps {
-        timeout(time: 60, unit: 'MINUTES') {
-          sh '''
+      failFast false
+      parallel {
+        stage('Tests') {
+          steps {
+            timeout(time: 60, unit: 'MINUTES') {
+              sh '''
             set -eu
             echo "==> typecheck, lint ratchet, unit tests, dependency audit, repo hygiene (scripts/ci-check.sh)"
             docker run --rm \
@@ -73,13 +77,17 @@ pipeline {
               node:22-bookworm-slim \
               bash scripts/ci-check.sh
           '''
+            }
+          }
         }
-        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
-          timeout(time: 30, unit: 'MINUTES') {
-            configFileProvider([
-              configFile(fileId: 'tesbo-test-manager-env', variable: 'TESBO_ENV_FILE')
-            ]) {
-              sh '''
+        stage('SonarQube') {
+          steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+              timeout(time: 30, unit: 'MINUTES') {
+                configFileProvider([
+                  configFile(fileId: 'tesbo-test-manager-env', variable: 'TESBO_ENV_FILE')
+                ]) {
+                  sh '''
               set -eu
               set +x  # Jenkins sh runs with -x; keep SONAR_TOKEN out of the console log
               set -a
@@ -99,6 +107,8 @@ pipeline {
                 sonarsource/sonar-scanner-cli:11 \
                 -Dsonar.projectBaseDir=/usr/src
               '''
+                }
+              }
             }
           }
         }
