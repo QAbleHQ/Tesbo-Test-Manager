@@ -81,7 +81,8 @@ pipeline {
 
     stage('Quality gates') {
       when { expression { !params.SKIP_GATES } }
-      options { timeout(time: 30, unit: 'MINUTES') }
+      // backend (npm ci + lint + 800s of jest) then frontend (npm ci + tsc + lint) run back to back and take ~35-45 min cold; 30 aborted the 2026-10-26 stage build mid frontend npm ci.
+      options { timeout(time: 60, unit: 'MINUTES') }
       steps {
         sh '''
           set -eu
