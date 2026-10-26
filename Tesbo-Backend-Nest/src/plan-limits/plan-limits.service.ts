@@ -414,6 +414,7 @@ export class PlanLimitsService {
   }
 
   async assertNyraEnabled(organizationId: string): Promise<void> {
+    if (!this.config.isStripeBillingEnabled) return;
     const { effectivePlan } = await this.getEntitlement(organizationId);
     if (effectivePlan !== "pro") {
       throw new ForbiddenException({
