@@ -1,6 +1,6 @@
 // Auto-deploy on dev + SonarQube scan before deploy.
 // Quality gates (typecheck, lint ratchet, unit tests, critical-dependency audit via scripts/ci-check.sh)
-// and the SonarQube scan run in parallel. A quality-gate failure stops the build with nothing deployed.
+// and the SonarQube scan run in parallel with the stage deploy. Deploy does not wait for them.
 // Sonar secrets: Jenkins Managed file id = tesbo-test-manager-env
 // Sonar failure does NOT block deploy. It is not a dependency of Deploy or Smoke check.
 //
@@ -56,9 +56,11 @@ pipeline {
       }
     }
 
-    // Quality gates and SonarQube run at the same time. Neither waits for the other.
-    // A quality-gate failure stops the build with nothing deployed.
-    // Sonar is not a dependency: a scan failure or timeout leaves the build result unchanged, and Deploy still runs.
+    // Tests and Sonar keep running while the stage deploy starts. Deploy does not wait for them.
+    // Sonar failure leaves the build result unchanged. A test failure still fails the build, but it does not cancel deploy.
+    stage('Release') {
+      failFast false
+      parallel {
     stage('Quality gates') {
       failFast false
       parallel {
@@ -116,6 +118,8 @@ pipeline {
     }
 
     stage('Deploy stage (blue/green)') {
+      stages {
+        stage('Deploy') {
       steps {
         withCredentials([usernamePassword(credentialsId: 'github-creds', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
           sh '''
@@ -326,6 +330,10 @@ EOS
         '''
       }
     }
+      }
+    }
+      }
+    }
   }
 
   post {
@@ -336,7 +344,7 @@ EOS
       echo "Deploy may have succeeded but Sonar was UNSTABLE."
     }
     failure {
-      echo "Failed. If the failing stage was Quality gates, NOTHING was deployed. Otherwise stage only - prod was not touched, and nginx should still point at the previous color."
+      echo "Failed. Deploy runs in parallel with quality gates, so a test failure does not roll back a deploy that already started. Prod was not touched. If deploy itself failed, nginx should still point at the previous color."
     }
   }
 }
