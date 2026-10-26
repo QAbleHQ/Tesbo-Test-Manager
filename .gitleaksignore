@@ -4,3 +4,12 @@
 # e2e/.env.example, 2026-08-12: a prose comment ("... POSTMARK_API_TOKEN configured, signup/OTP/invite become
 # real ...") whose "OTP/invite" the generic-api-key rule read as a high-entropy string. No credential.
 d217ccd6aeb7de53a6245d423fdcbeaf85aa844b:e2e/.env.example:generic-api-key:8
+
+# docs/security-hardening-checklist.md, 2026-10-21: the checklist step that tells the reader to plant a fake AWS
+# key to prove the scan catches it. The value is a made-up placeholder in the shape of AWS's documented example
+# key, not a credential.
+f841b40887d586716a6fd229781363c266e5771f:docs/security-hardening-checklist.md:aws-access-token:233
+
+# .gitleaksignore itself, same commit: the comment above in this file quoted the e2e/.env.example prose, and the
+# quoted prose tripped generic-api-key again. Comments here must not repeat the text they excuse.
+f841b40887d586716a6fd229781363c266e5771f:.gitleaksignore:generic-api-key:4

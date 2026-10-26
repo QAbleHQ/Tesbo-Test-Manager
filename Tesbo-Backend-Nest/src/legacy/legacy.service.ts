@@ -44,7 +44,7 @@ import { IntegrationSyncService } from "../integration-sync/integration-sync.ser
 import { INTEGRATION_SYNC_FETCH_TIMEOUT_MS, JIRA_PAGE_SIZE, NOTION_API_BASE, NOTION_API_VERSION, NOTION_PAGE_SIZE, NOTION_RICH_TEXT_LIMIT, PROVIDER_FOLDER_NAMES } from "../integration-sync/integration-sync.constants";
 import { NotionApiError, describeNotionError, notionPageKey, notionRequest } from "../integration-sync/notion-api";
 import {
-  markdownToNotionRichText,
+  markdownToNotionCommentBodies,
   notionPageTitle,
   notionPropertiesMarkdown,
   notionTicketFields,
@@ -14363,14 +14363,14 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async notionCreateComment(connection: Body, pageId: string, markdown: string): Promise<string | null> {
-    const created = await this.notionFetch<Body>(
-      connection,
-      "POST",
-      "/comments",
-      { parent: { page_id: pageId }, rich_text: markdownToNotionRichText(markdown, NOTION_RICH_TEXT_LIMIT) },
-      "page"
-    );
-    return created?.id ? String(created.id) : null;
+    // A comment holds at most 100 rich_text elements, so a long list goes out as several comments in
+    // order, each still formatted. The first one's id is what the caller records.
+    let firstId: string | null = null;
+    for (const richText of markdownToNotionCommentBodies(markdown, NOTION_RICH_TEXT_LIMIT)) {
+      const created = await this.notionFetch<Body>(connection, "POST", "/comments", { parent: { page_id: pageId }, rich_text: richText }, "page");
+      if (!firstId && created?.id) firstId = String(created.id);
+    }
+    return firstId;
   }
 
   // Live search inside the mapped database (not the notion_pages sync cache), like linearSearchIssues.
