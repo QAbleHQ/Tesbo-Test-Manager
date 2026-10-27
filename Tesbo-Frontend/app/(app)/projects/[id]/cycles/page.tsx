@@ -104,6 +104,9 @@ function StatTile({ label, value, color }: { label: string; value: string; color
   );
 }
 
+// Temporarily hidden: scheduled runs are not implemented (the create route answers 501). Flip to true to restore the header link.
+const SHOW_SCHEDULE_BUTTON = false;
+
 export default function TestRunsPage() {
   const params = useParams();
   const router = useRouter();
@@ -328,13 +331,15 @@ export default function TestRunsPage() {
           actions={
             canManageRuns ? (
               <div className="flex items-center gap-2">
-                <Link
-                  href={`/projects/${projectId}/cycles/schedule`}
-                  className="inline-flex h-9 items-center gap-2 rounded-[6px] border border-[var(--ink-200)] px-4 text-[13px] font-medium text-[var(--ink-600)] transition-colors hover:bg-[var(--ink-100)]"
-                >
-                  <IconCalendarEvent size={15} stroke={1.75} />
-                  Schedule
-                </Link>
+                {SHOW_SCHEDULE_BUTTON && (
+                  <Link
+                    href={`/projects/${projectId}/cycles/schedule`}
+                    className="inline-flex h-9 items-center gap-2 rounded-[6px] border border-[var(--ink-200)] px-4 text-[13px] font-medium text-[var(--ink-600)] transition-colors hover:bg-[var(--ink-100)]"
+                  >
+                    <IconCalendarEvent size={15} stroke={1.75} />
+                    Schedule
+                  </Link>
+                )}
                 <Button
                   onClick={() => {
                     resetForm();

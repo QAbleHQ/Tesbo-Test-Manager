@@ -815,6 +815,15 @@ test.describe("Schedule Run — Run At validation", () => {
     }
   });
 
+  // Temporarily hidden (SHOW_SCHEDULE_BUTTON in the runs page): scheduled runs are not implemented.
+  // The /cycles/schedule page itself stays reachable by URL, which the tests below rely on.
+  test("the Test Runs header does not offer a Schedule link, but still offers Create Test Run", async ({ page }) => {
+    await page.goto(`/projects/${ctx.projectId}/cycles`);
+    await expect(page.getByRole("button", { name: "Create Test Run" }).first()).toBeVisible();
+    await expect(page.getByRole("link", { name: "Schedule", exact: true })).toHaveCount(0);
+    await expect(page.locator(`a[href$="/cycles/schedule"]`)).toHaveCount(0);
+  });
+
   /** The "Test Run" select isn't tied to its label via for/id, so this walks the DOM structure. */
   const testRunSelect = (page: Page) =>
     page.locator('xpath=//label[normalize-space(text())="Test Run"]/following-sibling::select');
