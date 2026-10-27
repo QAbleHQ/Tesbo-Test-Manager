@@ -49,7 +49,8 @@ import { useProjectData } from "@/components/project/ProjectDataProvider";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { Breadcrumbs } from "@/components/workflows";
 import { planStatus, formatLastRun, OwnerAvatar, PlanStatusBadge } from "@/components/testplans/PlanCard";
-import { DateRangeFields, DateRangeSummary, dateRangeError, type DueState } from "@/components/testplans/DueDates";
+import { DateRangeFields, DateRangeSummary, dateRangeError, startDateError, type DueState } from "@/components/testplans/DueDates";
+import { todayInZone } from "@/lib/date";
 import { statusTone, formatDate, RunAvatar, RunProgressBar } from "@/components/testruns/runDisplay";
 
 /* ───── Helpers ───── */
@@ -121,7 +122,8 @@ export default function PlanDetailPage() {
   const router = useRouter();
   const projectId = params.id as string;
   const planId = params.planId as string;
-  const { currentUser } = useAppData();
+  const { currentUser, workspace } = useAppData();
+  const today = todayInZone(workspace?.timezone);
   const { project, projectMembers } = useProjectData();
   const projectName = String(project.name || "");
 
@@ -253,8 +255,11 @@ export default function PlanDetailPage() {
     await loadData();
   }
 
+  // The saved start date: an unchanged past start must not block saving an already-started plan.
+  const storedStartDate = typeof plan?.startDate === "string" ? plan.startDate : "";
+
   async function handleSaveEdit() {
-    if (!editStartDate || dateRangeError(editStartDate, editDueDate)) return;
+    if (!editStartDate || dateRangeError(editStartDate, editDueDate) || startDateError(editStartDate, today, storedStartDate)) return;
     setEditError(null);
     try {
       await updatePlan(planId, {
@@ -423,6 +428,8 @@ export default function PlanDetailPage() {
                 dueDate={editDueDate}
                 onStartDateChange={setEditStartDate}
                 onDueDateChange={setEditDueDate}
+                today={today}
+                originalStartDate={storedStartDate}
               />
               {editError && (
                 <p role="alert" data-testid="plan-edit-error" className="rounded-lg border border-[var(--error)]/30 bg-[var(--error)]/10 px-3 py-2 text-sm text-[var(--error-foreground)]">
@@ -430,7 +437,7 @@ export default function PlanDetailPage() {
                 </p>
               )}
               <div className="flex gap-2">
-                <Button onClick={handleSaveEdit} disabled={!editStartDate || !!dateRangeError(editStartDate, editDueDate)}>Save</Button>
+                <Button onClick={handleSaveEdit} disabled={!editStartDate || !!dateRangeError(editStartDate, editDueDate) || !!startDateError(editStartDate, today, storedStartDate)}>Save</Button>
                 <Button variant="secondary" onClick={() => setEditing(false)}>Cancel</Button>
               </div>
             </div>

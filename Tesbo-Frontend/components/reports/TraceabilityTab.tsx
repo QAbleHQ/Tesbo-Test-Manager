@@ -1,8 +1,8 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import { IconSearch } from "@tabler/icons-react";
-import { StatusChip, PriorityBadge, type Priority } from "@/components/ui";
+import { IconSearch, IconX } from "@tabler/icons-react";
+import { Modal, StatusChip, PriorityBadge, type Priority } from "@/components/ui";
 import type { RequirementMatrixRow } from "@/lib/api";
 import { formatDate } from "@/lib/date";
 import { statusTone, LoadingBlock } from "./shared";
@@ -94,8 +94,71 @@ export function TraceabilityTab({
     return groups;
   }, [filteredRows]);
 
+  const [selectedTestcaseId, setSelectedTestcaseId] = useState<string | null>(null);
+  const selectedGroup = groupedRows.find((g) => g.testcaseId === selectedTestcaseId) ?? null;
+  // A run can appear on several rows when it has several bugs; list each run once and gather its bugs.
+  const selectedRuns = useMemo(() => {
+    if (!selectedGroup) return [];
+    const byRun = new Map<string, { row: RequirementMatrixRow; bugs: { title: string; url?: string | null }[] }>();
+    for (const r of selectedGroup.runs) {
+      const key = r.runId ?? `none-${byRun.size}`;
+      let entry = byRun.get(key);
+      if (!entry) {
+        entry = { row: r, bugs: [] };
+        byRun.set(key, entry);
+      }
+      if (r.bugTitle) entry.bugs.push({ title: r.bugTitle, url: r.bugUrl });
+    }
+    return Array.from(byRun.values()).filter((e) => e.row.runId || e.row.runName);
+  }, [selectedGroup]);
+
   return (
     <div className="fade-in">
+      <Modal
+        open={selectedGroup !== null}
+        onClose={() => setSelectedTestcaseId(null)}
+        className="max-w-[720px]"
+      >
+        {selectedGroup && (
+          <>
+            {/* Header is rendered here, not via Modal's `title`, so the close button can sit beside it. */}
+            <div className="mb-3 flex items-start justify-between gap-4">
+              <h2 className="text-[24px] font-semibold leading-[1.2] tracking-[-0.02em] text-[var(--ink-800)]">{selectedGroup.externalId} · Runs</h2>
+              <button
+                type="button"
+                aria-label="Close"
+                onClick={() => setSelectedTestcaseId(null)}
+                className="shrink-0 rounded-[6px] p-1 text-[var(--muted-soft)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+              >
+                <IconX size={18} stroke={1.75} />
+              </button>
+            </div>
+            <div className="mb-4 text-[14px] text-[var(--foreground)]">{selectedGroup.testcaseTitle}</div>
+            {selectedRuns.length === 0 ? (
+              <div className="py-6 text-center text-[13px] text-[var(--muted-soft)]">This test case has not been run yet.</div>
+            ) : (
+              <ul className="divide-y divide-[var(--border)] rounded-xl border border-[var(--border)]">
+                {selectedRuns.map(({ row, bugs }, i) => (
+                  <li key={`${row.runId}-${i}`} className="flex items-start justify-between gap-4 px-4 py-3">
+                    <div className="min-w-0">
+                      <div className="break-words text-[13px] text-[var(--foreground)]">{row.runName || "—"}</div>
+                      <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">{row.executedAt ? formatDate(row.executedAt) : "Not executed"}</div>
+                      {bugs.map((b, bi) =>
+                        b.url ? (
+                          <a key={bi} href={b.url} target="_blank" rel="noreferrer" className="mt-1 block break-words text-[12px] text-[var(--accent-light)] hover:underline">{b.title}</a>
+                        ) : (
+                          <span key={bi} className="mt-1 block break-words text-[12px] text-[var(--muted)]">{b.title}</span>
+                        )
+                      )}
+                    </div>
+                    <StatusChip tone={statusTone(row.executionStatus)}>{row.executionStatus || "—"}</StatusChip>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </Modal>
       <div className="mb-4 flex items-center justify-between gap-4">
         <div>
           <div className="mb-0.5 text-[15px] font-semibold text-[var(--foreground)]">Traceability Matrix</div>
@@ -141,22 +204,30 @@ export function TraceabilityTab({
                   <tr><td colSpan={9} className="px-3 py-8 text-center text-[13px] text-[var(--muted-soft)]">{search ? "No matching rows found." : "No test case data available."}</td></tr>
                 ) : (
                   groupedRows.map((group) => {
-                    const rowCount = group.runs.length;
-                    return group.runs.map((row, ri) => (
-                      <tr key={`${row.testcaseId}-${row.runId}-${row.bugId}-${ri}`} className={`hover:bg-[var(--surface-secondary)] ${ri < rowCount - 1 ? "" : "border-b border-[var(--border)]"}`}>
+                    // Only the latest run is shown inline; the full list opens from the title.
+                    const visibleRuns = group.runs.slice(0, 1);
+                    const rowCount = visibleRuns.length;
+                    return visibleRuns.map((row, ri) => (
+                      <tr key={`${row.testcaseId}-${row.runId}-${row.bugId}-${ri}`} onClick={() => setSelectedTestcaseId(group.testcaseId)} className={`cursor-pointer hover:bg-[var(--brand-soft)] ${ri < rowCount - 1 ? "" : "border-b border-[var(--border)]"}`}>
                         {ri === 0 && (
                           <>
-                            <td rowSpan={rowCount} className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 align-top font-mono text-[11px] text-[var(--muted)]">{group.externalId}</td>
-                            <td rowSpan={rowCount} className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 align-top text-[13px] text-[var(--foreground)]">
-                              <span className="whitespace-normal break-words">{group.testcaseTitle}</span>
+                            <td rowSpan={rowCount} className="border-b border-[var(--border)] px-3 py-2.5 align-top font-mono text-[11px] text-[var(--muted)]">{group.externalId}</td>
+                            <td rowSpan={rowCount} className="border-b border-[var(--border)] px-3 py-2.5 align-top text-[13px] text-[var(--foreground)]">
+                              <button
+                                type="button"
+                                onClick={() => setSelectedTestcaseId(group.testcaseId)}
+                                className="whitespace-normal break-words text-left"
+                              >
+                                {group.testcaseTitle}
+                              </button>
                             </td>
-                            <td rowSpan={rowCount} className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 align-top">
+                            <td rowSpan={rowCount} className="border-b border-[var(--border)] px-3 py-2.5 align-top">
                               {group.priority ? <PriorityBadge priority={group.priority as Priority} /> : <span className="text-[var(--muted-soft)]">—</span>}
                             </td>
-                            <td rowSpan={rowCount} className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 align-top">
+                            <td rowSpan={rowCount} className="border-b border-[var(--border)] px-3 py-2.5 align-top">
                               <StatusChip tone={statusTone(group.testcaseStatus)}>{group.testcaseStatus || "—"}</StatusChip>
                             </td>
-                            <td rowSpan={rowCount} className="border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 align-top text-[12px] text-[var(--muted)]">
+                            <td rowSpan={rowCount} className="border-b border-[var(--border)] px-3 py-2.5 align-top text-[12px] text-[var(--muted)]">
                               <span className="whitespace-normal break-words">{group.suiteName || "—"}</span>
                             </td>
                           </>
@@ -173,7 +244,7 @@ export function TraceabilityTab({
                         <td className={`px-3 py-2 text-[13px] ${ri > 0 ? "border-t border-dashed border-[var(--border-subtle)]" : ""}`}>
                           {row.bugTitle ? (
                             row.bugUrl ? (
-                              <a href={row.bugUrl} target="_blank" rel="noreferrer" className="break-words text-[12px] text-[var(--accent-light)] hover:underline">{row.bugTitle}</a>
+                              <a onClick={(e) => e.stopPropagation()} href={row.bugUrl} target="_blank" rel="noreferrer" className="break-words text-[12px] text-[var(--accent-light)] hover:underline">{row.bugTitle}</a>
                             ) : (
                               <span className="break-words text-[12px] text-[var(--muted)]">{row.bugTitle}</span>
                             )
@@ -191,7 +262,7 @@ export function TraceabilityTab({
           {groupedRows.length > 0 && (
             <div className="flex items-center justify-between gap-4 border-t border-[var(--border)] px-4 py-2.5 text-[11px] text-[var(--muted-soft)]">
               <span>
-                Test cases {offset + 1}–{offset + groupedRows.length} of {total} ({filteredRows.length} row{filteredRows.length !== 1 ? "s" : ""} on this page)
+                Test cases {offset + 1}–{offset + groupedRows.length} of {total}
               </span>
               <span className="flex gap-2">
                 <button

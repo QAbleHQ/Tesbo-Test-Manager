@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request as newRequestContext, test, type APIRequestContext } from "@playwright/test";
 import { env } from "../utils/env";
-import { workspaceDays } from "../utils/due-dates";
+import { backdate, workspaceDays } from "../utils/due-dates";
 import { dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 import { softDeleteExecutions } from "../utils/screens-tenant";
 
@@ -888,13 +888,14 @@ test.describe("plan start / due dates", () => {
     const d = await workspaceDays(request);
     const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(3) });
     try {
-      const patch = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.yesterday, dueDate: d.inDays(10) } });
+      // The start moves forward: a start earlier than today is refused (PLN-D-16).
+      const patch = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.tomorrow, dueDate: d.inDays(10) } });
       expect(patch.ok(), await patch.text()).toBeTruthy();
-      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.tomorrow, dueDate: d.inDays(10) });
 
       // A rename must not clear, reset or re-default either date.
       await request.patch(`/api/plans/${body.id}`, { data: { name: `E2E Plan Renamed ${Date.now()}` } });
-      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.tomorrow, dueDate: d.inDays(10) });
     } finally {
       await rm(request, body.id);
     }
@@ -967,7 +968,9 @@ test.describe("plan start / due dates", () => {
 
   test("PLN-D-12 a plan with a past due date and no runs is Overdue; moving the date forward removes it; due today and tomorrow are flagged but not overdue", async ({ request }) => {
     const d = await workspaceDays(request);
-    const { body } = await mkPlan(request, { startDate: d.inDays(-5), dueDate: d.yesterday });
+    const { body } = await mkPlan(request, { startDate: d.today });
+    // A past start can no longer be created through the API, so seed the already-started plan directly.
+    backdate("plans", body.id, d.inDays(-5), d.yesterday);
     const read = async () => {
       const got = await (await request.get(`/api/plans/${body.id}`)).json();
       const listed = (await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json()).find((p: any) => p.id === body.id);
@@ -993,7 +996,8 @@ test.describe("plan start / due dates", () => {
 
   test("PLN-D-13 a plan whose runs are all Completed is never Overdue; one open run makes it Overdue again", async ({ request }) => {
     const d = await workspaceDays(request);
-    const { body: plan } = await mkPlan(request, { startDate: d.inDays(-10), dueDate: d.yesterday });
+    const { body: plan } = await mkPlan(request, { startDate: d.today });
+    backdate("plans", plan.id, d.inDays(-10), d.yesterday);
     const runIds: string[] = [];
     const caseIds: string[] = [];
     const mkRun = async () => {
@@ -1050,5 +1054,92 @@ test.describe("plan start / due dates", () => {
     await rm(request, body.id);
     const list = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
     expect(list.some((p: any) => p.id === body.id)).toBe(false);
+  });
+
+  /*
+   * A start date may not be earlier than today (workspace timezone). On update the rule applies only
+   * when the start date is being changed, so an already-started plan stays editable.
+   */
+  test("PLN-D-16 a start date before today is refused on create, with the field named, and nothing is saved", async ({ request }) => {
+    const d = await workspaceDays(request);
+    for (const startDate of [d.yesterday, d.inDays(-30)]) {
+      const name = `E2E Plan Past Start ${Date.now()}`;
+      const { res, body } = await mkPlan(request, { name, startDate });
+      try {
+        expect(res.status(), `${startDate} must be refused`).toBe(400);
+        expect(body.field).toBe("startDate");
+        expect(body.error).toMatch(/start date cannot be earlier than today/i);
+        const list = await (await request.get(`/api/projects/${ctx.projectId}/plans`)).json();
+        expect(list.some((p: any) => p.name === name), "a refused create must not leave a row").toBe(false);
+      } finally {
+        await rm(request, body.id);
+      }
+    }
+  });
+
+  test("PLN-D-17 today and any future day are accepted as a start date", async ({ request }) => {
+    const d = await workspaceDays(request);
+    for (const startDate of [d.today, d.tomorrow, d.inDays(365)]) {
+      const { res, body } = await mkPlan(request, { startDate });
+      try {
+        expect(res.status(), JSON.stringify(body)).toBeLessThan(300);
+        expect(body.startDate).toBe(startDate);
+      } finally {
+        await rm(request, body.id);
+      }
+    }
+  });
+
+  test("PLN-D-18 changing the start date to a past day is refused and the stored dates are untouched", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(5) });
+    try {
+      const patch = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.yesterday }, failOnStatusCode: false });
+      expect(patch.status()).toBe(400);
+      expect((await patch.json()).field).toBe("startDate");
+      // Sent together with a valid due date, the past start must still be the thing that is refused.
+      const both = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.inDays(-3), dueDate: d.inDays(9) }, failOnStatusCode: false });
+      expect(both.status()).toBe(400);
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json()), "refused updates must not land").toEqual({ startDate: d.today, dueDate: d.inDays(5) });
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-19 a plan that already started in the past stays editable: an unrelated edit, or re-sending its own start date, is not refused", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkPlan(request, { startDate: d.today, dueDate: d.inDays(5) });
+    try {
+      backdate("plans", body.id, d.inDays(-4), d.inDays(5));
+      const rename = await request.patch(`/api/plans/${body.id}`, { data: { name: `E2E Plan Started ${Date.now()}` } });
+      expect(rename.ok(), await rename.text()).toBeTruthy();
+      // The edit form always posts startDate back; an unchanged one must not trip the rule.
+      const resend = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.inDays(-4), dueDate: d.inDays(8) } });
+      expect(resend.ok(), await resend.text()).toBeTruthy();
+      expect(dateKeys(await (await request.get(`/api/plans/${body.id}`)).json())).toEqual({ startDate: d.inDays(-4), dueDate: d.inDays(8) });
+      // Moving it to a different past day is a change, and is refused.
+      const move = await request.patch(`/api/plans/${body.id}`, { data: { startDate: d.inDays(-2) }, failOnStatusCode: false });
+      expect(move.status()).toBe(400);
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("PLN-D-20 the past-start rule does not mask the other date errors, and a past start with a malformed value is still the malformed error", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const inverted = await mkPlan(request, { startDate: d.tomorrow, dueDate: d.today });
+    try {
+      expect(inverted.res.status()).toBe(400);
+      expect(inverted.body.field).toBe("dueDate");
+    } finally {
+      await rm(request, inverted.body.id);
+    }
+    const bad = await mkPlan(request, { startDate: "2026-02-30" });
+    try {
+      expect(bad.res.status()).toBe(400);
+      expect(bad.body.error).toMatch(/valid date/i);
+    } finally {
+      await rm(request, bad.body.id);
+    }
   });
 });
