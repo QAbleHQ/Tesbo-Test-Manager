@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request as pwRequest, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { env } from "../utils/env";
-import { workspaceDays } from "../utils/due-dates";
+import { backdate, workspaceDays } from "../utils/due-dates";
 import { literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -1284,9 +1284,9 @@ test.describe("Test Runs — start and due dates", () => {
     const d = await workspaceDays(api);
     const projectId = await seedProject();
     const name = `E2E Run Overdue ${Date.now()}`;
-    const run = await (
-      await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.inDays(-6), dueDate: d.yesterday } })
-    ).json();
+    const run = await (await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.today } })).json();
+    // The API refuses a past start, so the already-started, past-due run is seeded directly.
+    backdate("cycles", run.id, d.inDays(-6), d.yesterday);
     await page.goto(`/projects/${projectId}/cycles`);
     const card = runCard(page, run.id);
     await expect(card.getByTestId("overdue-badge")).toHaveText("Overdue");
@@ -1295,6 +1295,8 @@ test.describe("Test Runs — start and due dates", () => {
     await card.getByTitle("Edit run").click();
     await expect(dueInput(page, "edit-run")).toHaveValue(d.yesterday);
     await expect(startInput(page, "edit-run")).toHaveValue(d.inDays(-6));
+    // The stored start is in the past and is not being changed: the form must not flag it or block Save.
+    await expect(page.getByTestId("edit-run-start-date-error")).toHaveCount(0);
     await dueInput(page, "edit-run").fill(d.inDays(10));
     await page.getByRole("button", { name: "Save Changes" }).click();
 
@@ -1330,11 +1332,50 @@ test.describe("Test Runs — start and due dates", () => {
     const d = await workspaceDays(api);
     const projectId = await seedProject();
     const run = await (
-      await api.post(`/api/projects/${projectId}/cycles`, { data: { name: `E2E Run Detail ${Date.now()}`, environment: "Staging", startDate: d.inDays(-4), dueDate: d.yesterday } })
+      await api.post(`/api/projects/${projectId}/cycles`, { data: { name: `E2E Run Detail ${Date.now()}`, environment: "Staging", startDate: d.today } })
     ).json();
+    backdate("cycles", run.id, d.inDays(-4), d.yesterday);
     await page.goto(`/projects/${projectId}/cycles/${run.id}`);
     await expect(page.getByTestId("start-date-value")).toHaveText(/Start: \d{2} \w{3} \d{4}/);
     await expect(page.getByTestId("due-date-value")).toHaveText(/Due: \d{2} \w{3} \d{4}/);
     await expect(page.getByTestId("overdue-badge")).toBeVisible();
+  });
+
+  test("RUN-D-U-07 a start date before today is flagged, blocks Create, saves nothing, and clears once moved to today", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run PastStart ${Date.now()}`;
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await fillBasics(page, name);
+    // The picker itself greys out earlier days; typing one in must still be caught.
+    await expect(startInput(page, "new-run")).toHaveAttribute("min", d.today);
+    await startInput(page, "new-run").fill(d.yesterday);
+    await expect(page.getByTestId("new-run-start-date-error")).toHaveText(/start date cannot be earlier than today/i);
+    await expect(createButton(page)).toBeDisabled();
+    expect(await runByName(projectId, name), "nothing may be saved with a past start date").toBeUndefined();
+
+    await startInput(page, "new-run").fill(d.today);
+    await expect(page.getByTestId("new-run-start-date-error")).toHaveCount(0);
+    await expect(createButton(page)).toBeEnabled();
+    await createButton(page).click();
+    await expect.poll(async () => (await runByName(projectId, name))?.startDate).toBe(d.today);
+  });
+
+  test("RUN-D-U-08 the edit form refuses moving a run's start to a past day and saves nothing; a future day saves", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run EditPastStart ${Date.now()}`;
+    const run = await (await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.today } })).json();
+    await page.goto(`/projects/${projectId}/cycles`);
+    await runCard(page, run.id).getByTitle("Edit run").click();
+    await startInput(page, "edit-run").fill(d.yesterday);
+    await expect(page.getByTestId("edit-run-start-date-error")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+    expect((await runByName(projectId, name)).startDate).toBe(d.today);
+
+    await startInput(page, "edit-run").fill(d.tomorrow);
+    await expect(page.getByTestId("edit-run-start-date-error")).toHaveCount(0);
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect.poll(async () => (await runByName(projectId, name)).startDate).toBe(d.tomorrow);
   });
 });

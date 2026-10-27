@@ -11,7 +11,7 @@ import {
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
 import { todayInZone } from "@/lib/date";
-import { DateRangeFields, dateRangeError } from "@/components/testplans/DueDates";
+import { DateRangeFields, dateRangeError, startDateError } from "@/components/testplans/DueDates";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import {
@@ -193,7 +193,7 @@ export default function PlansPage() {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    if (!newName.trim() || !newStartDate || dateRangeError(newStartDate, newDueDate)) return;
+    if (!newName.trim() || !newStartDate || dateRangeError(newStartDate, newDueDate) || startDateError(newStartDate, todayInZone(workspace?.timezone))) return;
     setCreating(true);
     setCreateError(null);
     try {
@@ -343,6 +343,7 @@ export default function PlansPage() {
                   onStartDateChange={setNewStartDate}
                   onDueDateChange={setNewDueDate}
                   disabled={creating}
+                  today={todayInZone(workspace?.timezone)}
                 />
               </div>
             </div>
@@ -352,7 +353,7 @@ export default function PlansPage() {
               </p>
             )}
             <div className="flex items-center gap-3 mt-4">
-              <Button type="submit" disabled={creating || !newName.trim() || !newStartDate || !!dateRangeError(newStartDate, newDueDate)}>
+              <Button type="submit" disabled={creating || !newName.trim() || !newStartDate || !!dateRangeError(newStartDate, newDueDate) || !!startDateError(newStartDate, todayInZone(workspace?.timezone))}>
                 {creating ? "Creating..." : "Create Test Plan"}
               </Button>
               <Button

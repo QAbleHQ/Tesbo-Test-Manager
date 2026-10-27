@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request, test, type APIRequestContext } from "@playwright/test";
 import { env } from "../utils/env";
-import { dayIn, shiftDay } from "../utils/due-dates";
+import { backdate, dayIn, shiftDay } from "../utils/due-dates";
 import { column, dbControlAvailable, exec, literal, scalar } from "../utils/psql";
 
 /*
@@ -259,11 +259,13 @@ test.describe("workspace timezone", () => {
       expect(res.ok(), await res.text()).toBeTruthy();
     };
     const created = await api.post(`/api/projects/${owner!.projectId}/plans`, {
-      data: { name: `E2E TZ Plan ${Date.now()}`, startDate: shiftDay(dayBehind, -3), dueDate: dayBehind },
+      data: { name: `E2E TZ Plan ${Date.now()}` },
     });
     const plan = await created.json();
     try {
       expect(created.ok(), JSON.stringify(plan)).toBeTruthy();
+      // The API refuses a start before today, so the plan's range is written directly.
+      backdate("plans", plan.id, shiftDay(dayBehind, -3), dayBehind);
       await setZone(behind);
       expect(await (await api.get(`/api/plans/${plan.id}`)).json()).toMatchObject({ dueState: "due_today", isOverdue: false });
       await setZone(ahead);

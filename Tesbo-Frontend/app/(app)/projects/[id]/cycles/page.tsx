@@ -33,7 +33,7 @@ import {
 } from "@/lib/api";
 import { computePassRate } from "@/lib/executionMetrics";
 import { todayInZone } from "@/lib/date";
-import { DateRangeFields, DateRangeSummary, dateRangeError } from "@/components/testplans/DueDates";
+import { DateRangeFields, DateRangeSummary, dateRangeError, startDateError } from "@/components/testplans/DueDates";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import {
@@ -139,6 +139,7 @@ export default function TestRunsPage() {
   // Start Date is required (defaults to today in the workspace's timezone); Due Date is optional.
   const [startDate, setStartDate] = useState(() => todayInZone(workspace?.timezone));
   const [dueDate, setDueDate] = useState("");
+  const today = todayInZone(workspace?.timezone);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -234,7 +235,7 @@ export default function TestRunsPage() {
   /* create */
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    if (!name.trim() || !environment.trim() || !startDate || dateRangeError(startDate, dueDate)) return;
+    if (!name.trim() || !environment.trim() || !startDate || dateRangeError(startDate, dueDate) || startDateError(startDate, today)) return;
     setSaving(true);
     setFormError(null);
     try {
@@ -262,7 +263,7 @@ export default function TestRunsPage() {
 
   async function handleEdit(e: React.FormEvent) {
     e.preventDefault();
-    if (!editRun || !environment.trim() || !startDate || dateRangeError(startDate, dueDate)) return;
+    if (!editRun || !environment.trim() || !startDate || dateRangeError(startDate, dueDate) || startDateError(startDate, today, editRun.startDate)) return;
     setSaving(true);
     setFormError(null);
     try {
@@ -656,6 +657,7 @@ export default function TestRunsPage() {
             onStartDateChange={setStartDate}
             onDueDateChange={setDueDate}
             disabled={saving}
+            today={today}
           />
           {formError && (
             <p className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">
@@ -672,7 +674,7 @@ export default function TestRunsPage() {
             </Button>
             <Button
               type="submit"
-              disabled={saving || !name.trim() || !environment.trim() || environmentOptions.length === 0 || !startDate || !!dateRangeError(startDate, dueDate)}
+              disabled={saving || !name.trim() || !environment.trim() || environmentOptions.length === 0 || !startDate || !!dateRangeError(startDate, dueDate) || !!startDateError(startDate, today)}
             >
               {saving ? "Creating…" : "Create Test Run"}
             </Button>
@@ -746,6 +748,8 @@ export default function TestRunsPage() {
             onStartDateChange={setStartDate}
             onDueDateChange={setDueDate}
             disabled={saving}
+            today={today}
+            originalStartDate={editRun?.startDate}
           />
           {formError && (
             <p className="rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">
@@ -766,7 +770,7 @@ export default function TestRunsPage() {
             </Button>
             <Button
               type="submit"
-              disabled={saving || !environment.trim() || !startDate || !!dateRangeError(startDate, dueDate)}
+              disabled={saving || !environment.trim() || !startDate || !!dateRangeError(startDate, dueDate) || !!startDateError(startDate, today, editRun?.startDate)}
             >
               {saving ? "Saving…" : "Save Changes"}
             </Button>

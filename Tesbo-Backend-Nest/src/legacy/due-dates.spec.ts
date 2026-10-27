@@ -1,5 +1,5 @@
 import { BadRequestException } from "@nestjs/common";
-import { addDays, assertDateRange, duePhase, formatDay, hourIn, isValidTimezone, parseDay, resolveDateChange, todayIn } from "./due-dates";
+import { addDays, assertDateRange, assertStartNotInPast, duePhase, formatDay, hourIn, isValidTimezone, parseDay, resolveDateChange, todayIn } from "./due-dates";
 
 describe("parseDay", () => {
   it("treats absent, null and empty as no date", () => {
@@ -61,34 +61,64 @@ describe("date range", () => {
   });
 });
 
+describe("assertStartNotInPast", () => {
+  it("refuses a day before today, naming the field", () => {
+    expect(() => assertStartNotInPast("2026-10-24", "2026-10-25")).toThrow(BadRequestException);
+    try {
+      assertStartNotInPast("2026-10-24", "2026-10-25");
+    } catch (err) {
+      expect((err as BadRequestException).getResponse()).toMatchObject({ field: "startDate" });
+    }
+  });
+  it("allows today, a future day, and no date", () => {
+    expect(() => assertStartNotInPast("2026-10-25", "2026-10-25")).not.toThrow();
+    expect(() => assertStartNotInPast("2026-10-26", "2026-10-25")).not.toThrow();
+    expect(() => assertStartNotInPast(null, "2026-10-25")).not.toThrow();
+  });
+});
+
 describe("resolveDateChange", () => {
   const current = { startDate: "2026-10-10", dueDate: "2026-10-20" };
+  const today = "2026-10-05";
   it("leaves both alone when the body names neither", () => {
-    expect(resolveDateChange({ name: "x" }, current)).toEqual({ startDate: null, dueDate: null, clearsDueDate: false });
+    expect(resolveDateChange({ name: "x" }, current, today)).toEqual({ startDate: null, dueDate: null, clearsDueDate: false });
   });
   it("clears the due date on null or empty string", () => {
-    expect(resolveDateChange({ dueDate: null }, current).clearsDueDate).toBe(true);
-    expect(resolveDateChange({ dueDate: "" }, current).clearsDueDate).toBe(true);
+    expect(resolveDateChange({ dueDate: null }, current, today).clearsDueDate).toBe(true);
+    expect(resolveDateChange({ dueDate: "" }, current, today).clearsDueDate).toBe(true);
   });
   it("checks a new due date against the stored start date", () => {
-    expect(() => resolveDateChange({ dueDate: "2026-10-09" }, current)).toThrow(BadRequestException);
-    expect(resolveDateChange({ dueDate: "2026-10-10" }, current).dueDate).toBe("2026-10-10");
+    expect(() => resolveDateChange({ dueDate: "2026-10-09" }, current, today)).toThrow(BadRequestException);
+    expect(resolveDateChange({ dueDate: "2026-10-10" }, current, today).dueDate).toBe("2026-10-10");
   });
   it("checks a new start date against the stored due date", () => {
-    expect(() => resolveDateChange({ startDate: "2026-10-21" }, current)).toThrow(BadRequestException);
+    expect(() => resolveDateChange({ startDate: "2026-10-21" }, current, today)).toThrow(BadRequestException);
   });
   it("lets both move together even when each alone would cross the stored other", () => {
-    expect(resolveDateChange({ startDate: "2026-11-01", dueDate: "2026-11-05" }, current)).toEqual({ startDate: "2026-11-01", dueDate: "2026-11-05", clearsDueDate: false });
+    expect(resolveDateChange({ startDate: "2026-11-01", dueDate: "2026-11-05" }, current, today)).toEqual({ startDate: "2026-11-01", dueDate: "2026-11-05", clearsDueDate: false });
   });
   it("lets a start date move past a due date that is being cleared in the same call", () => {
-    expect(() => resolveDateChange({ startDate: "2026-12-01", dueDate: null }, current)).not.toThrow();
+    expect(() => resolveDateChange({ startDate: "2026-12-01", dueDate: null }, current, today)).not.toThrow();
   });
   it("refuses removing the start date", () => {
-    expect(() => resolveDateChange({ startDate: null }, current)).toThrow(BadRequestException);
-    expect(() => resolveDateChange({ startDate: "" }, current)).toThrow(BadRequestException);
+    expect(() => resolveDateChange({ startDate: null }, current, today)).toThrow(BadRequestException);
+    expect(() => resolveDateChange({ startDate: "" }, current, today)).toThrow(BadRequestException);
+  });
+  it("refuses moving the start to a day before today", () => {
+    expect(() => resolveDateChange({ startDate: "2026-10-04" }, current, today)).toThrow(BadRequestException);
+    expect(() => resolveDateChange({ startDate: "2026-10-04", dueDate: "2026-10-30" }, current, today)).toThrow(BadRequestException);
+  });
+  it("accepts a start of today or later", () => {
+    expect(resolveDateChange({ startDate: "2026-10-05" }, current, today).startDate).toBe("2026-10-05");
+    expect(resolveDateChange({ startDate: "2026-10-06" }, current, today).startDate).toBe("2026-10-06");
+  });
+  it("lets an already-started row re-send its own past start, and refuses a different past one", () => {
+    const started = { startDate: "2026-09-01", dueDate: "2026-10-20" };
+    expect(resolveDateChange({ startDate: "2026-09-01", dueDate: "2026-10-25" }, started, today).startDate).toBe("2026-09-01");
+    expect(() => resolveDateChange({ startDate: "2026-09-02" }, started, today)).toThrow(BadRequestException);
   });
   it("does not range-check a legacy row with no start date", () => {
-    expect(() => resolveDateChange({ dueDate: "2020-01-01" }, { startDate: null, dueDate: null })).not.toThrow();
+    expect(() => resolveDateChange({ dueDate: "2020-01-01" }, { startDate: null, dueDate: null }, today)).not.toThrow();
   });
 });
 

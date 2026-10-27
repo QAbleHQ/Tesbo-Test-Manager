@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request as newRequestContext, test, type APIRequestContext } from "@playwright/test";
 import { env } from "../utils/env";
-import { workspaceDays } from "../utils/due-dates";
+import { backdate, workspaceDays } from "../utils/due-dates";
 import { column, exec, literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -1541,18 +1541,19 @@ test.describe("run start / due dates", () => {
     const d = await workspaceDays(request);
     const { body } = await mkRun(request, { startDate: d.today, dueDate: d.inDays(3) });
     try {
-      const patch = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.yesterday, dueDate: d.inDays(10) } });
+      // The start moves forward: a start earlier than today is refused (RUN-D-16).
+      const patch = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.tomorrow, dueDate: d.inDays(10) } });
       expect(patch.ok(), await patch.text()).toBeTruthy();
-      expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+      expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.tomorrow, dueDate: d.inDays(10) });
 
       await request.patch(`/api/cycles/${body.id}`, { data: { buildVersion: "9.9.9" } });
-      expect(dateKeys(await getRun(request, body.id)), "an edit that names no date must not touch them").toEqual({ startDate: d.yesterday, dueDate: d.inDays(10) });
+      expect(dateKeys(await getRun(request, body.id)), "an edit that names no date must not touch them").toEqual({ startDate: d.tomorrow, dueDate: d.inDays(10) });
 
       for (const clear of [null, ""]) {
         await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: d.inDays(10) } });
         const res = await request.patch(`/api/cycles/${body.id}`, { data: { dueDate: clear } });
         expect(res.ok(), await res.text()).toBeTruthy();
-        expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.yesterday, dueDate: null });
+        expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.tomorrow, dueDate: null });
       }
     } finally {
       await rm(request, body.id);
@@ -1601,7 +1602,9 @@ test.describe("run start / due dates", () => {
 
   test("RUN-D-10 an open run past its due date is Overdue; moving the date forward removes it; due today / tomorrow are flagged, not overdue", async ({ request }) => {
     const d = await workspaceDays(request);
-    const { body } = await mkRun(request, { startDate: d.inDays(-5), dueDate: d.yesterday });
+    const { body } = await mkRun(request, { startDate: d.today });
+    // A past start can no longer be created through the API, so seed the already-started run directly.
+    backdate("cycles", body.id, d.inDays(-5), d.yesterday);
     const read = async () => {
       const got = await getRun(request, body.id);
       const row = await listed(request, body.id);
@@ -1627,7 +1630,8 @@ test.describe("run start / due dates", () => {
 
   test("RUN-D-11 a Completed run is never Overdue, and reopening it brings the mark back", async ({ request }) => {
     const d = await workspaceDays(request);
-    const { body } = await mkRun(request, { startDate: d.inDays(-10), dueDate: d.yesterday });
+    const { body } = await mkRun(request, { startDate: d.today });
+    backdate("cycles", body.id, d.inDays(-10), d.yesterday);
     let caseId: string | undefined;
     try {
       caseId = await addCase(request, body.id);
@@ -1703,5 +1707,97 @@ test.describe("run start / due dates", () => {
     await rm(request, body.id);
     expect(await listed(request, body.id)).toBeUndefined();
     expect((await request.get(`/api/cycles/${body.id}`, { failOnStatusCode: false })).status()).toBe(404);
+  });
+
+  /*
+   * A start date may not be earlier than today (workspace timezone). On update the rule applies only
+   * when the start date is being changed, so an already-started run stays editable.
+   */
+  test("RUN-D-16 a start date before today is refused on create, with the field named, and no run is made", async ({ request }) => {
+    const d = await workspaceDays(request);
+    for (const startDate of [d.yesterday, d.inDays(-30)]) {
+      const name = `E2E Run Past Start ${Date.now()}`;
+      const { res, body } = await mkRun(request, { name, startDate });
+      try {
+        expect(res.status(), `${startDate} must be refused`).toBe(400);
+        expect(body.field).toBe("startDate");
+        expect(body.error).toMatch(/start date cannot be earlier than today/i);
+        const all = await (await request.get(`/api/projects/${ctx.projectId}/cycles`)).json();
+        expect(all.some((r: any) => r.name === name), "a refused create must not leave a row").toBe(false);
+      } finally {
+        await rm(request, body.id);
+      }
+    }
+  });
+
+  test("RUN-D-17 today and any future day are accepted as a start date", async ({ request }) => {
+    const d = await workspaceDays(request);
+    for (const startDate of [d.today, d.tomorrow, d.inDays(365)]) {
+      const { res, body } = await mkRun(request, { startDate });
+      try {
+        expect(res.status(), JSON.stringify(body)).toBeLessThan(300);
+        expect(body.startDate).toBe(startDate);
+      } finally {
+        await rm(request, body.id);
+      }
+    }
+  });
+
+  test("RUN-D-18 changing the start date to a past day is refused and the stored dates are untouched", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today, dueDate: d.inDays(5) });
+    try {
+      const patch = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.yesterday }, failOnStatusCode: false });
+      expect(patch.status()).toBe(400);
+      expect((await patch.json()).field).toBe("startDate");
+      // Sent together with a valid due date, the past start must still be the thing that is refused.
+      const both = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.inDays(-3), dueDate: d.inDays(9) }, failOnStatusCode: false });
+      expect(both.status()).toBe(400);
+      expect(dateKeys(await getRun(request, body.id)), "refused updates must not land").toEqual({ startDate: d.today, dueDate: d.inDays(5) });
+    } finally {
+      await rm(request, body.id);
+    }
+  });
+
+  test("RUN-D-19 a run that already started in the past stays editable: an unrelated edit, a status change, or re-sending its own start date is not refused", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const { body } = await mkRun(request, { startDate: d.today, dueDate: d.inDays(5) });
+    let caseId: string | undefined;
+    try {
+      backdate("cycles", body.id, d.inDays(-4), d.inDays(5));
+      const edit = await request.patch(`/api/cycles/${body.id}`, { data: { buildVersion: "1.2.3" } });
+      expect(edit.ok(), await edit.text()).toBeTruthy();
+      // The edit form always posts startDate back; an unchanged one must not trip the rule.
+      const resend = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.inDays(-4), dueDate: d.inDays(8) } });
+      expect(resend.ok(), await resend.text()).toBeTruthy();
+      expect(dateKeys(await getRun(request, body.id))).toEqual({ startDate: d.inDays(-4), dueDate: d.inDays(8) });
+      caseId = await addCase(request, body.id);
+      const started = await request.patch(`/api/cycles/${body.id}`, { data: { status: "In Progress" } });
+      expect(started.ok(), await started.text()).toBeTruthy();
+      // Moving it to a different past day is a change, and is refused.
+      const move = await request.patch(`/api/cycles/${body.id}`, { data: { startDate: d.inDays(-2) }, failOnStatusCode: false });
+      expect(move.status()).toBe(400);
+    } finally {
+      await rm(request, body.id);
+      if (caseId) await request.delete(`/api/projects/${ctx.projectId}/testcases/${caseId}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("RUN-D-20 the past-start rule does not mask the other date errors", async ({ request }) => {
+    const d = await workspaceDays(request);
+    const inverted = await mkRun(request, { startDate: d.tomorrow, dueDate: d.today });
+    try {
+      expect(inverted.res.status()).toBe(400);
+      expect(inverted.body.field).toBe("dueDate");
+    } finally {
+      await rm(request, inverted.body.id);
+    }
+    const bad = await mkRun(request, { startDate: "2026-02-30" });
+    try {
+      expect(bad.res.status()).toBe(400);
+      expect(bad.body.error).toMatch(/valid date/i);
+    } finally {
+      await rm(request, bad.body.id);
+    }
   });
 });

@@ -1,6 +1,6 @@
 import path from "node:path";
 import { expect, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
-import { workspaceDays } from "../utils/due-dates";
+import { backdate, workspaceDays } from "../utils/due-dates";
 import {
   cleanupRun,
   createPlan,
@@ -788,8 +788,8 @@ test.describe("test plans — start and due dates", () => {
     const project = await createProject(api);
     try {
       const plan = await createPlan(api, project.id, { name: `E2E Plan Overdue ${uniqueSuffix()}` });
-      const res = await api.patch(`/api/plans/${plan.id}`, { data: { startDate: d.inDays(-8), dueDate: d.yesterday } });
-      expect(res.ok(), await res.text()).toBeTruthy();
+      // The API refuses a past start, so the already-started, past-due plan is seeded directly.
+      backdate("plans", plan.id, d.inDays(-8), d.yesterday);
 
       await page.goto(`/projects/${project.id}/plans`);
       const card = planCard(page, plan.name);
@@ -800,6 +800,8 @@ test.describe("test plans — start and due dates", () => {
       await expect(page.getByTestId("overdue-badge")).toBeVisible();
       await page.getByRole("button", { name: "Edit", exact: true }).click();
       await expect(dueInput(page, "plan-edit")).toHaveValue(d.yesterday);
+      // The stored start is in the past and is not being changed: the form must not flag it or block Save.
+      await expect(page.getByTestId("plan-edit-start-date-error")).toHaveCount(0);
       await dueInput(page, "plan-edit").fill(d.inDays(14));
       await page.getByRole("button", { name: "Save", exact: true }).click();
 
@@ -844,6 +846,51 @@ test.describe("test plans — start and due dates", () => {
       const card = planCard(page, plan.name);
       await expect(card.getByTestId("due-soon-badge")).toHaveText("Due tomorrow");
       await expect(card.getByTestId("overdue-badge")).toHaveCount(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PLN-D-U-06 a start date before today is flagged, blocks Create, saves nothing, and clears once moved to today", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const project = await createProject(api);
+    const name = `E2E Plan PastStart ${uniqueSuffix()}`;
+    try {
+      await page.goto(`/projects/${project.id}/plans?create=1`);
+      await page.getByPlaceholder("e.g. Sprint 12 Regression").fill(name);
+      // The picker itself greys out earlier days; typing one in must still be caught.
+      await expect(startInput(page, "new-plan")).toHaveAttribute("min", d.today);
+      await startInput(page, "new-plan").fill(d.yesterday);
+      await expect(page.getByTestId("new-plan-start-date-error")).toHaveText(/start date cannot be earlier than today/i);
+      await expect(submit(page)).toBeDisabled();
+      expect(await planByName(project.id, name), "nothing may be saved with a past start date").toBeUndefined();
+
+      await startInput(page, "new-plan").fill(d.today);
+      await expect(page.getByTestId("new-plan-start-date-error")).toHaveCount(0);
+      await submit(page).click();
+      await page.waitForURL(/\/plans\/[0-9a-f-]{36}/);
+      expect((await planByName(project.id, name)).startDate).toBe(d.today);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PLN-D-U-07 the plan edit form refuses moving the start to a past day and saves nothing; a future day saves", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const project = await createProject(api);
+    try {
+      const plan = await createPlan(api, project.id);
+      await page.goto(`/projects/${project.id}/plans/${plan.id}`);
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await startInput(page, "plan-edit").fill(d.yesterday);
+      await expect(page.getByTestId("plan-edit-start-date-error")).toBeVisible();
+      await expect(page.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+      expect((await planByName(project.id, plan.name)).startDate).toBe(d.today);
+
+      await startInput(page, "plan-edit").fill(d.tomorrow);
+      await expect(page.getByTestId("plan-edit-start-date-error")).toHaveCount(0);
+      await page.getByRole("button", { name: "Save", exact: true }).click();
+      await expect.poll(async () => (await planByName(project.id, plan.name)).startDate).toBe(d.tomorrow);
     } finally {
       await deleteProjects(api, [project.id]);
     }
