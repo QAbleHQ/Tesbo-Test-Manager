@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import { IconSearch } from "@tabler/icons-react";
+import { IconSearch, IconX } from "@tabler/icons-react";
 import { Modal, StatusChip, PriorityBadge, type Priority } from "@/components/ui";
 import type { RequirementMatrixRow } from "@/lib/api";
 import { formatDate } from "@/lib/date";
@@ -117,11 +117,22 @@ export function TraceabilityTab({
       <Modal
         open={selectedGroup !== null}
         onClose={() => setSelectedTestcaseId(null)}
-        title={selectedGroup ? `${selectedGroup.externalId} · Runs` : undefined}
         className="max-w-[720px]"
       >
         {selectedGroup && (
           <>
+            {/* Header is rendered here, not via Modal's `title`, so the close button can sit beside it. */}
+            <div className="mb-3 flex items-start justify-between gap-4">
+              <h2 className="text-[24px] font-semibold leading-[1.2] tracking-[-0.02em] text-[var(--ink-800)]">{selectedGroup.externalId} · Runs</h2>
+              <button
+                type="button"
+                aria-label="Close"
+                onClick={() => setSelectedTestcaseId(null)}
+                className="shrink-0 rounded-[6px] p-1 text-[var(--muted-soft)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+              >
+                <IconX size={18} stroke={1.75} />
+              </button>
+            </div>
             <div className="mb-4 text-[14px] text-[var(--foreground)]">{selectedGroup.testcaseTitle}</div>
             {selectedRuns.length === 0 ? (
               <div className="py-6 text-center text-[13px] text-[var(--muted-soft)]">This test case has not been run yet.</div>
