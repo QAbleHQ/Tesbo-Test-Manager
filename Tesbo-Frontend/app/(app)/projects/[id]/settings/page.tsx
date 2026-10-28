@@ -1004,6 +1004,9 @@ export default function ProjectSettingsPage() {
                     <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
                     <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
                   </div>
+                  {jiraStatus.needsReconnect && (
+                    <p data-testid="jira-needs-reconnect" className="text-xs text-[var(--warning-foreground)]">Jira needs to be reconnected.</p>
+                  )}
                   {jiraStatus.connectedProjects && jiraStatus.connectedProjects.length > 0 ? (
                     <p className="text-xs text-[var(--muted)]">
                       {jiraStatus.connectedProjects.length} Jira project{jiraStatus.connectedProjects.length > 1 ? "s" : ""} linked to this project:{" "}

@@ -208,7 +208,7 @@ export function TraceabilityTab({
                     const visibleRuns = group.runs.slice(0, 1);
                     const rowCount = visibleRuns.length;
                     return visibleRuns.map((row, ri) => (
-                      <tr key={`${row.testcaseId}-${row.runId}-${row.bugId}-${ri}`} onClick={() => setSelectedTestcaseId(group.testcaseId)} className={`cursor-pointer hover:bg-[var(--brand-soft)] ${ri < rowCount - 1 ? "" : "border-b border-[var(--border)]"}`}>
+                      <tr key={`${row.testcaseId}-${row.runId}-${row.bugId}-${ri}`} title="Click to view full backlog" onClick={() => setSelectedTestcaseId(group.testcaseId)} className={`cursor-pointer hover:bg-[var(--brand-soft)] ${ri < rowCount - 1 ? "" : "border-b border-[var(--border)]"}`}>
                         {ri === 0 && (
                           <>
                             <td rowSpan={rowCount} className="border-b border-[var(--border)] px-3 py-2.5 align-top font-mono text-[11px] text-[var(--muted)]">{group.externalId}</td>
