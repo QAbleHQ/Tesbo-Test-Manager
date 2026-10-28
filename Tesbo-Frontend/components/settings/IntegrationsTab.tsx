@@ -177,8 +177,19 @@ export default function IntegrationsTab() {
                 {status?.connected && (
                   <div className="mt-2 space-y-1">
                     <div className="flex items-center gap-2">
-                      <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
-                      <span className="text-xs text-[var(--success-foreground)] font-medium">Connected</span>
+                      {status.needsReconnect ? (
+                        <>
+                          <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning)]" />
+                          <span data-testid={`integration-needs-reconnect-${provider.id}`} className="text-xs text-[var(--warning-foreground)] font-medium">
+                            {provider.name} needs to be reconnected
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                          <span className="text-xs text-[var(--success-foreground)] font-medium">Connected</span>
+                        </>
+                      )}
                       {status.siteUrl && (
                         <>
                           <span className="text-xs text-[var(--muted-soft)]">·</span>
@@ -210,9 +221,11 @@ export default function IntegrationsTab() {
                     <Link
                       href={`/settings/integrations/${provider.id}`}
                       data-testid={`integration-manage-${provider.id}`}
+                      // A connection this deployment can no longer renew is fixed on the Manage page (disconnect, then connect again).
+                      aria-label={status.needsReconnect ? `Reconnect ${provider.name}` : undefined}
                       className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)] transition-colors text-center"
                     >
-                      Manage
+                      {status.needsReconnect ? "Reconnect" : "Manage"}
                     </Link>
                     {canManage && (
                       <Button
