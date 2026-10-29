@@ -91,7 +91,7 @@ export default function ReviewBoard({ projectId }: { projectId: string }) {
   }
   if (!billingInfo) return <PageLoader label="Checking your plan…" />;
 
-  if (billingInfo.plan !== "pro" && !billingInfo.inGracePeriod) {
+  if (billingInfo.enabled !== false && billingInfo.plan !== "pro" && !billingInfo.inGracePeriod) {
     return (
       <>
         <Card className="p-5">

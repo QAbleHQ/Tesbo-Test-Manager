@@ -389,6 +389,8 @@ export async function updateWorkspace(data: { name: string; country?: string; ti
 export type BillingInterval = "monthly" | "annual";
 
 export interface BillingInfo {
+  /** False when server has no STRIPE_SECRET_KEY — billing UI should hide. */
+  enabled: boolean;
   plan: "launch" | "pro";
   billingInterval: BillingInterval | null;
   status: string | null;

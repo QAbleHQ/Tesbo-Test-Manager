@@ -59,7 +59,7 @@ export default function NyraPage() {
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
 
-  const isPro = !!billing && (billing.plan === "pro" || billing.inGracePeriod);
+  const isPro = !!billing && (billing.enabled === false || billing.plan === "pro" || billing.inGracePeriod);
 
   useEffect(() => {
     if (!currentUser) router.replace("/login");
