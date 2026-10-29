@@ -669,7 +669,7 @@ test.describe("Add Test Cases picker — suite filter", () => {
       // directly under its CHILD suite, not just the parent's own case.
       await expect(page.getByText(parentCaseTitle, { exact: true })).toBeVisible();
       await expect(page.getByText(childCaseTitle, { exact: true })).toBeVisible();
-      await expect(page.getByText("0 of 2 selectable selected", { exact: true })).toBeVisible();
+      await expect(page.getByText("0 of 2 selected", { exact: true })).toBeVisible();
     } finally {
       if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
       if (testcaseIds.length > 0) {
@@ -680,6 +680,101 @@ test.describe("Add Test Cases picker — suite filter", () => {
       }
       if (childSuiteId) await api.delete(`/api/suites/${childSuiteId}`, { failOnStatusCode: false });
       if (parentSuiteId) await api.delete(`/api/suites/${parentSuiteId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("lists cases in ascending ID order regardless of creation order (2 before 9 before 10)", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let cycleId = "";
+    let testcaseIds: string[] = [];
+    try {
+      const prefix = `E2E PickerOrder ${stamp}`;
+      // Created out of order, and "10" < "9" lexically, so a plain string sort would also fail.
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: {
+            testcases: [
+              { title: `${prefix} ten`, status: "Approved", externalId: `ZZPO${stamp}-10` },
+              { title: `${prefix} two`, status: "Approved", externalId: `ZZPO${stamp}-2` },
+              { title: `${prefix} nine`, status: "Approved", externalId: `ZZPO${stamp}-9` },
+            ],
+          },
+        })
+      ).json();
+      testcaseIds = created.created.map((c: { id: string }) => c.id);
+
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Picker Order ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+      await page.getByRole("button", { name: "Add Test Cases" }).click();
+      await expect(page.getByText("Add Test Cases to Run")).toBeVisible();
+      await page.getByPlaceholder("Search by title or ID…").fill(prefix);
+
+      await expect(page.locator("tbody tr")).toHaveCount(3);
+      const titles = await page.locator("tbody tr td:nth-child(3)").allTextContents();
+      expect(titles.map((t) => t.trim())).toEqual([`${prefix} two`, `${prefix} nine`, `${prefix} ten`]);
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (testcaseIds.length > 0) {
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+          data: { testcaseIds },
+          failOnStatusCode: false,
+        });
+      }
+      await api.dispose();
+    }
+  });
+
+  test("lists only Approved cases — Draft and In Review cases are hidden, not shown disabled", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let cycleId = "";
+    let testcaseIds: string[] = [];
+    try {
+      const approvedTitle = `E2E PickerOnlyApproved Approved ${stamp}`;
+      const draftTitle = `E2E PickerOnlyApproved Draft ${stamp}`;
+      const reviewTitle = `E2E PickerOnlyApproved Review ${stamp}`;
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: {
+            testcases: [
+              { title: approvedTitle, status: "Approved" },
+              { title: draftTitle, status: "Draft" },
+              { title: reviewTitle, status: "In Review" },
+            ],
+          },
+        })
+      ).json();
+      testcaseIds = created.created.map((c: { id: string }) => c.id);
+
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Picker Approved Only ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+      await page.getByRole("button", { name: "Add Test Cases" }).click();
+      await expect(page.getByText("Add Test Cases to Run")).toBeVisible();
+
+      await page.getByPlaceholder("Search by title or ID…").fill(`E2E PickerOnlyApproved`);
+      await expect(page.getByText(approvedTitle, { exact: true })).toBeVisible();
+      await expect(page.getByText(draftTitle, { exact: true })).toHaveCount(0);
+      await expect(page.getByText(reviewTitle, { exact: true })).toHaveCount(0);
+      // The Status filter is gone — every listed case is Approved, so it would only mislead.
+      await expect(page.locator("select:has(option:text-is('All Statuses'))")).toHaveCount(0);
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (testcaseIds.length > 0) {
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+          data: { testcaseIds },
+          failOnStatusCode: false,
+        });
+      }
       await api.dispose();
     }
   });
