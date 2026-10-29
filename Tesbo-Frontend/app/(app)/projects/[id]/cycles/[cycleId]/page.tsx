@@ -440,7 +440,6 @@ export default function TestRunDetailPage() {
   const [filterPriority, setFilterPriority] = useState("");
   const [filterType, setFilterType] = useState("");
   const [filterSuiteId, setFilterSuiteId] = useState("");
-  const [filterStatus, setFilterStatus] = useState("");
   const [adding, setAdding] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
   /* synchronous double-submit guard: `adding` state only takes effect after a render, so two
@@ -609,24 +608,21 @@ export default function TestRunDetailPage() {
     return ids;
   }, [filterSuiteId, suites]);
 
-  /* filtered available cases (not already added) */
+  /* filtered available cases (not already added). Only Approved cases are ever offered —
+     a run can't contain Draft/In Review cases, so they are hidden rather than shown disabled. */
   const filteredCases = useMemo(() => {
     return allCases.filter((tc) => {
+      if (tc.status !== "Approved") return false;
       if (includedCaseIds.has(tc.id)) return false;
       if (filterSearch && !tc.title.toLowerCase().includes(filterSearch.toLowerCase()) && !tc.externalId.toLowerCase().includes(filterSearch.toLowerCase())) return false;
       if (filterPriority && tc.priority !== filterPriority) return false;
       if (filterType && tc.type !== filterType) return false;
       if (filterSuiteId && !suiteSubtreeIds.has(tc.suiteId ?? "")) return false;
-      if (filterStatus && tc.status !== filterStatus) return false;
       return true;
     });
-  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, suiteSubtreeIds, filterStatus]);
+  }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, suiteSubtreeIds]);
 
-  /* selectable = only Approved cases */
-  const selectableCases = useMemo(
-    () => filteredCases.filter((tc) => tc.status === "Approved"),
-    [filteredCases]
-  );
+  const selectableCases = filteredCases;
 
   /*
    * Selections are cumulative across filter changes (a case picked under one Module filter stays
@@ -644,8 +640,7 @@ export default function TestRunDetailPage() {
   /* toggle selection (only Approved) */
   function toggleCase(id: string) {
     if (adding) return;
-    const tc = filteredCases.find((c) => c.id === id);
-    if (tc && tc.status !== "Approved") return;
+    if (!filteredCases.some((c) => c.id === id)) return;
     setSelectedCases((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -1713,15 +1708,6 @@ export default function TestRunDetailPage() {
               </option>
             ))}
           </Select>
-          <Select
-            value={filterStatus}
-            onChange={(e) => setFilterStatus(e.target.value)}
-          >
-            <option value="">All Statuses</option>
-            <option value="Approved">Approved</option>
-            <option value="Draft">Draft</option>
-            <option value="In Review">In Review</option>
-          </Select>
         </div>
 
         {/* Info note */}
@@ -1730,7 +1716,7 @@ export default function TestRunDetailPage() {
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
           <p className="text-xs text-blue-700">
-            Only <span className="font-semibold">Approved</span> test cases can be added to a test run. Draft, In Review, or other status cases are shown but cannot be selected.
+            Only <span className="font-semibold">Approved</span> test cases can be added to a test run, so only those are listed here.
           </p>
         </div>
 
@@ -1781,29 +1767,22 @@ export default function TestRunDetailPage() {
                 </thead>
                 <tbody className="divide-y divide-[var(--border-subtle)]">
                   {filteredCases.map((tc) => {
-                    const isApproved = tc.status === "Approved";
                     return (
                       <tr
                         key={tc.id}
-                        className={`${
-                          isApproved
-                            ? `cursor-pointer hover:bg-[var(--surface-secondary)] ${
-                                selectedCases.has(tc.id) ? "bg-blue-50/50" : ""
-                              }`
-                            : "opacity-50 cursor-not-allowed"
+                        className={`cursor-pointer hover:bg-[var(--surface-secondary)] ${
+                          selectedCases.has(tc.id) ? "bg-blue-50/50" : ""
                         }`}
-                        onClick={() => isApproved && toggleCase(tc.id)}
-                        title={!isApproved ? `Only Approved test cases can be added to a test run. This case is "${tc.status}" — please approve it first.` : undefined}
+                        onClick={() => toggleCase(tc.id)}
                       >
                         <td className="px-3 py-2">
                           <input
                             type="checkbox"
                             checked={selectedCases.has(tc.id)}
                             onChange={() => toggleCase(tc.id)}
-                            className={`rounded ${!isApproved ? "cursor-not-allowed" : ""}`}
+                            className="rounded"
                             onClick={(e) => e.stopPropagation()}
-                            disabled={!isApproved || adding}
-                            title={!isApproved ? `Only Approved test cases can be added. This case is "${tc.status}".` : undefined}
+                            disabled={adding}
                           />
                         </td>
                         <td className="px-3 py-2 text-xs text-[var(--muted-soft)] font-mono whitespace-nowrap">
@@ -1815,11 +1794,7 @@ export default function TestRunDetailPage() {
                         <td className="px-3 py-2"><PriorityBadge priority={tc.priority as Priority} /></td>
                         <td className="px-3 py-2 text-xs text-[var(--muted)]">{tc.type}</td>
                         <td className="px-3 py-2">
-                          <span className={`text-xs ${
-                            isApproved
-                              ? "text-[var(--success-foreground)] font-medium"
-                              : "text-[var(--muted)]"
-                          }`}>
+                          <span className="text-xs text-[var(--success-foreground)] font-medium">
                             {tc.status}
                           </span>
                         </td>
@@ -1831,12 +1806,7 @@ export default function TestRunDetailPage() {
             </div>
             <div className="flex items-center justify-between mt-4">
               <p className="text-sm text-[var(--muted)]">
-                {selectedInView} of {selectableCases.length} selectable selected
-                {selectableCases.length < filteredCases.length && (
-                  <span className="text-[var(--muted-soft)] ml-1">
-                    ({filteredCases.length - selectableCases.length} non-approved)
-                  </span>
-                )}
+                {selectedInView} of {selectableCases.length} selected
                 {selectedCases.size > selectedInView && (
                   <span className="text-[var(--muted-soft)] ml-1">
                     ({selectedCases.size - selectedInView} more selected outside this filter)
