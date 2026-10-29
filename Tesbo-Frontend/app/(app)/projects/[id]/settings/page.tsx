@@ -1001,12 +1001,18 @@ export default function ProjectSettingsPage() {
               {jiraStatus?.connected ? (
                 <div className="mt-2 space-y-1">
                   <div className="flex items-center gap-2">
-                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
-                    <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                    {jiraStatus.needsReconnect ? (
+                      <>
+                        <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning)]" />
+                        <span data-testid="jira-needs-reconnect" className="text-xs text-[var(--warning-foreground)] font-medium">Jira needs to be reconnected</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                        <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                      </>
+                    )}
                   </div>
-                  {jiraStatus.needsReconnect && (
-                    <p data-testid="jira-needs-reconnect" className="text-xs text-[var(--warning-foreground)]">Jira needs to be reconnected.</p>
-                  )}
                   {jiraStatus.connectedProjects && jiraStatus.connectedProjects.length > 0 ? (
                     <p className="text-xs text-[var(--muted)]">
                       {jiraStatus.connectedProjects.length} Jira project{jiraStatus.connectedProjects.length > 1 ? "s" : ""} linked to this project:{" "}
@@ -1056,8 +1062,17 @@ export default function ProjectSettingsPage() {
               {linearStatus?.connected ? (
                 <div className="mt-2 space-y-1">
                   <div className="flex items-center gap-2">
-                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
-                    <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                    {linearStatus.needsReconnect ? (
+                      <>
+                        <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning)]" />
+                        <span data-testid="linear-needs-reconnect" className="text-xs text-[var(--warning-foreground)] font-medium">Linear needs to be reconnected</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                        <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                      </>
+                    )}
                   </div>
                   {linearStatus.connectedProjects && linearStatus.connectedProjects.length > 0 ? (
                     <p className="text-xs text-[var(--muted)]">
@@ -1119,12 +1134,18 @@ export default function ProjectSettingsPage() {
               {notionStatus?.connected ? (
                 <div className="mt-2 space-y-1">
                   <div className="flex items-center gap-2">
-                    <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
-                    <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                    {notionStatus.needsReconnect ? (
+                      <>
+                        <span className="inline-block w-2 h-2 rounded-full bg-[var(--warning)]" />
+                        <span data-testid="notion-needs-reconnect" className="text-xs text-[var(--warning-foreground)] font-medium">Notion needs to be reconnected</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="inline-block w-2 h-2 rounded-full bg-[var(--success)]" />
+                        <span className="text-xs text-[var(--success-foreground)] font-medium">Workspace connected</span>
+                      </>
+                    )}
                   </div>
-                  {notionStatus.needsReconnect && (
-                    <p className="text-xs text-[var(--warning-foreground)]">Needs to be reconnected in Workspace Settings.</p>
-                  )}
                   {notionStatus.connectedProjects && notionStatus.connectedProjects.length > 0 ? (
                     <p className="text-xs text-[var(--muted)] truncate" title={notionStatus.connectedProjects.map((d) => d.notionDatabaseName).join(", ")}>
                       Notion database linked to this project:{" "}
