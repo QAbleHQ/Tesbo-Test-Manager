@@ -1021,6 +1021,59 @@ test.describe("test case repository table and detail panel — Context column", 
       await api.dispose();
     }
   });
+
+  // Regression: a case generated from a Notion page / Linear ticket on the Zyra task board carries
+  // the source only in its link columns (task-board generation never resolves sourceRefs), so the
+  // Context tab and column read "No specific source cited" even though the origin is known.
+  test("a case linked to a Notion page / Linear ticket shows that source in the Context tab and column, and an unlinked case still shows the placeholder", async ({
+    page,
+  }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const marker = `UI Context Linked ${Date.now()}`;
+    const created: string[] = [];
+    const notionPageId = "3f2c8d6e0a1b4c5d8e9f0a1b2c3d4e5f";
+    const notionUrl = "https://www.notion.so/e2e-context-page";
+    const linearUrl = "https://linear.app/e2e/issue/E2E-7";
+    try {
+      const linkedRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, {
+        data: { title: `${marker} linked`, notionPageId, notionUrl, linearIssueKey: "E2E-7", linearUrl },
+      });
+      created.push((await linkedRes.json()).id);
+      const plainRes = await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title: `${marker} plain` } });
+      created.push((await plainRes.json()).id);
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      const panel = page.locator("aside");
+
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} linked`);
+      await page.getByRole("button", { name: `${marker} linked` }).click();
+      await panel.getByRole("button", { name: "Context (2)" }).click();
+      const notionRow = panel.getByRole("link", { name: /Notion/ });
+      const linearRow = panel.getByRole("link", { name: /Linear/ });
+      await expect(notionRow).toHaveAttribute("href", notionUrl);
+      await expect(notionRow).toContainText("notion:3f2c8d6e");
+      await expect(linearRow).toHaveAttribute("href", linearUrl);
+      await expect(linearRow).toContainText("E2E-7");
+      await expect(panel.getByText("No specific source cited")).toHaveCount(0);
+      await panel.getByRole("button", { name: "Close panel" }).click();
+
+      // Same data through the repository table's Context column.
+      const columnsButton = page.getByRole("button", { name: "Columns" });
+      await columnsButton.click();
+      await page.locator("label", { hasText: "Context" }).locator('input[type="checkbox"]').click();
+      await columnsButton.click();
+      await expect(page.getByRole("button", { name: "Context used (2)" })).toBeVisible();
+
+      // An unlinked, uncited case keeps the placeholder.
+      await page.getByPlaceholder("Search by ID, title, or type").fill(`${marker} plain`);
+      await page.getByRole("button", { name: `${marker} plain` }).click();
+      await panel.getByRole("button", { name: "Context", exact: true }).click();
+      await expect(panel.getByText("No specific source cited")).toBeVisible();
+    } finally {
+      for (const id of created) await api.delete(`/api/projects/${ctx.projectId}/testcases/${id}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
 });
 
 // The Create/Edit panel's Priority, Type and Automation Type dropdowns are fixed lists. A case whose

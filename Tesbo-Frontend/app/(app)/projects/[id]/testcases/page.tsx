@@ -60,13 +60,17 @@ import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
 
 // Same 5-entry map as ZyraCitationsList/ZyraCitationsBadge — kept local rather than importing from
 // either, which don't export it (each of those components already keeps its own local copy too).
-const CONTEXT_TYPE_LABEL: Record<ZyraSourceRef["type"], string> = {
+const CONTEXT_TYPE_LABEL: Record<ContextEntry["type"], string> = {
   knowledge_document: "Knowledge base",
   knowledge_file: "Knowledge base",
   jira_ticket: "Jira",
+  linear_ticket: "Linear",
+  notion_page: "Notion",
   testcase: "Test case",
   bug: "Bug",
 };
+
+import { buildContextEntries, isLinkedOnlyContext, type ContextEntry } from "@/lib/testcase-context";
 import { RepositoryTestCaseTable, type RepoTcSort, type RepoTcSortColumn } from "@/components/testcases/RepositoryTestCaseTable";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
@@ -377,7 +381,7 @@ export default function TestCasesPage() {
   const [preconditions, setPreconditions] = useState("");
   // Read-only — never sent back on save (see updateTestCaseWithClient's COALESCE-preserves-existing
   // contract), so there's no setter used by the form itself beyond fillFormFromTestCase/resetForm.
-  const [panelSourceRefs, setPanelSourceRefs] = useState<ZyraSourceRef[]>([]);
+  const [panelSourceRefs, setPanelSourceRefs] = useState<ContextEntry[]>([]);
   const [selectedSourceRef, setSelectedSourceRef] = useState<ZyraSourceRef | null>(null);
   const [postconditions, setPostconditions] = useState("");
   const [steps, setSteps] = useState<Step[]>([{ ...EMPTY_STEP }]);
@@ -933,7 +937,7 @@ export default function TestCasesPage() {
     setPanelJiraUrl((data.jiraUrl as string) ?? "");
     setPanelOriginalStatus((data.status as string) ?? "Draft");
     setPanelOriginalSuiteId((data.suiteId as string) || null);
-    setPanelSourceRefs(Array.isArray(data.sourceRefs) ? (data.sourceRefs as ZyraSourceRef[]) : []);
+    setPanelSourceRefs(buildContextEntries(data));
   }
 
   function resetForm(defaultSuiteId?: string | null) {
@@ -2801,22 +2805,37 @@ export default function TestCasesPage() {
                             />
                           ) : (
                             <div className="space-y-3">
-                              {panelSourceRefs.map((ref, index) => (
-                                <button
-                                  key={`${ref.type}-${ref.id}-${index}`}
-                                  type="button"
-                                  onClick={() => setSelectedSourceRef(ref)}
-                                  className="flex w-full items-start justify-between gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-4 text-left hover:border-[var(--brand-primary)]"
-                                >
-                                  <div className="min-w-0">
-                                    <p className="text-sm font-semibold text-[var(--foreground)]">{ref.title || ref.id}</p>
-                                    <p className="mt-0.5 truncate text-[11px] text-[var(--muted)]" title={ref.id}>{ref.id}</p>
-                                  </div>
-                                  <span className="mt-[1px] shrink-0 rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">
-                                    {CONTEXT_TYPE_LABEL[ref.type] || ref.type}
-                                  </span>
-                                </button>
-                              ))}
+                              {panelSourceRefs.map((ref, index) => {
+                                const rowClass = "flex w-full items-start justify-between gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-4 text-left hover:border-[var(--brand-primary)]";
+                                const body = (
+                                  <>
+                                    <div className="min-w-0">
+                                      <p className="text-sm font-semibold text-[var(--foreground)]">{ref.title || ref.id}</p>
+                                      {ref.title !== ref.id && ref.type !== "notion_page" && (
+                                        <p className="mt-0.5 truncate text-[11px] text-[var(--muted)]" title={ref.id}>{ref.id}</p>
+                                      )}
+                                    </div>
+                                    <span className="mt-[1px] shrink-0 rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted-soft)]">
+                                      {CONTEXT_TYPE_LABEL[ref.type] || ref.type}
+                                    </span>
+                                  </>
+                                );
+                                const key = `${ref.type}-${ref.id}-${index}`;
+                                // Linear/Notion rows have no in-app detail view: open the original, or
+                                // render plain when the case carries no URL for it.
+                                if (isLinkedOnlyContext(ref)) {
+                                  return ref.url ? (
+                                    <a key={key} href={ref.url} target="_blank" rel="noopener noreferrer" className={rowClass}>{body}</a>
+                                  ) : (
+                                    <div key={key} className={rowClass.replace("hover:border-[var(--brand-primary)]", "")}>{body}</div>
+                                  );
+                                }
+                                return (
+                                  <button key={key} type="button" onClick={() => setSelectedSourceRef(ref as ZyraSourceRef)} className={rowClass}>
+                                    {body}
+                                  </button>
+                                );
+                              })}
                             </div>
                           )}
                           {selectedSourceRef && (

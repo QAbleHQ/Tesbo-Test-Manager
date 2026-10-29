@@ -8,6 +8,7 @@ import type { TestCaseListItem } from "@/lib/api";
 import { readStoredValue, writeStoredValue } from "@/lib/storage";
 import { formatDate } from "@/lib/date";
 import { ZyraCitationsBadge } from "@/components/agents/ZyraCitationsBadge";
+import { buildContextEntries } from "@/lib/testcase-context";
 
 /** The columns the repository table's header offers a sort control for — mirrors the Test Runs table. */
 export type RepoTcSortColumn = "id" | "title" | "priority";
@@ -566,7 +567,7 @@ export function RepositoryTestCaseTable({
       case "context":
         return (
           <td key={col} style={tdStyle} className={cellClass} onClick={(e) => e.stopPropagation()}>
-            <ZyraCitationsBadge refs={tc.sourceRefs} projectId={projectId} />
+            <ZyraCitationsBadge refs={buildContextEntries(tc)} projectId={projectId} />
           </td>
         );
       default:
