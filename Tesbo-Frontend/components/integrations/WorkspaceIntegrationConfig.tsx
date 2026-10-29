@@ -170,7 +170,7 @@ function WorkspaceIntegrationConfigInner({
       {status?.connected && status.needsReconnect && (
         <div role="alert" className="rounded-lg border border-[var(--warning)]/40 bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning-foreground)]">
           <p className="font-medium">{label} needs to be reconnected</p>
-          {status.authError && <p className="mt-1">{status.authError}</p>}
+          {status.authError && <p className="mt-1">{status.authError.replace(new RegExp(`^${label} needs to be reconnected:\\s*`, "i"), "")}</p>}
           <p className="mt-1">Disconnect below, then connect again to authorize this Tesbo deployment.</p>
         </div>
       )}

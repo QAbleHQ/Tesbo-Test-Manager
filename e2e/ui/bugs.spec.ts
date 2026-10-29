@@ -2454,6 +2454,31 @@ test.describe("bug full page", () => {
     await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/bugs$`));
   });
 
+  test("BUG-U-59b after in-app navigation to a bug that has since been deleted, Back to Bugs returns to the list", async ({ page }) => {
+    // BUG-U-59 arrives by page.goto (a full load). The reported defect is the in-app path: the bug is
+    // opened from the list (its readable id is cached and the address bar rewritten), deleted, and the
+    // page is revisited without a reload — so the cached id resolves but the bug is gone.
+    const bug = await createBug(api, projectId, { title: `E2E Full Page Gone SPA ${uniqueSuffix()}` });
+    try {
+      const { externalId } = await (await api.get(`/api/bugs/${bug.id}`)).json();
+      await page.goto(`/projects/${projectId}/bugs`);
+      await page.locator(`a[href$="/bugs/${externalId}"]`).first().click();
+      await expect(page.getByRole("heading", { level: 1, name: bug.title })).toBeVisible();
+
+      await api.delete(`/api/bugs/${bug.id}`);
+      await page.goBack();
+      await expect(page).toHaveURL(new RegExp(`/projects/[^/]+/bugs$`));
+      await page.goForward();
+      await expect(page.getByText("This bug could not be found. It may have been deleted.")).toBeVisible();
+
+      await page.getByRole("link", { name: "Back to Bugs" }).click();
+      await expect(page).toHaveURL(new RegExp(`/projects/[^/]+/bugs$`));
+      await expect(page.getByText("This bug could not be found. It may have been deleted.")).toHaveCount(0);
+    } finally {
+      await api.delete(`/api/bugs/${bug.id}`, { failOnStatusCode: false });
+    }
+  });
+
   test("BUG-U-60 a signed-out visitor is sent to log in and never sees the bug", async ({ browser }) => {
     const bug = await createBug(api, projectId, { title: `E2E Full Page Anon ${uniqueSuffix()}` });
     const ctx = await browser.newContext({ storageState: { cookies: [], origins: [] } });

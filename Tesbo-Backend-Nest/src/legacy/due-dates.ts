@@ -80,6 +80,13 @@ export function assertDateRange(startDate: string | null | undefined, dueDate: s
   }
 }
 
+/** A start date cannot be earlier than today (workspace timezone). Only called when the start date is being set or changed. */
+export function assertStartNotInPast(startDate: string | null | undefined, today: string): void {
+  if (startDate && startDate < today) {
+    throw new BadRequestException({ error: "Start date cannot be earlier than today", field: "startDate" });
+  }
+}
+
 /** What an update body says about the two dates, resolved against what is stored. */
 export interface DateChange {
   startDate: string | null;
@@ -93,10 +100,12 @@ export interface DateChange {
  *  - absent key        → unchanged
  *  - dueDate null / "" → cleared (a plan or run may have no due date)
  *  - startDate null / "" → refused: a start date, once given, cannot be removed
+ *  - startDate before `today` → refused, unless it equals the stored start (an unchanged re-send)
  */
 export function resolveDateChange(
   body: Record<string, unknown>,
-  current: { startDate: string | null; dueDate: string | null }
+  current: { startDate: string | null; dueDate: string | null },
+  today: string
 ): DateChange {
   const hasStart = Object.prototype.hasOwnProperty.call(body, "startDate") && body.startDate !== undefined;
   const hasDue = Object.prototype.hasOwnProperty.call(body, "dueDate") && body.dueDate !== undefined;
@@ -104,6 +113,7 @@ export function resolveDateChange(
     throw new BadRequestException({ error: "Start date cannot be removed", field: "startDate" });
   }
   const startDate = hasStart ? parseDay(body.startDate, "startDate", "Start date") : null;
+  if (startDate !== current.startDate) assertStartNotInPast(startDate, today);
   const clearsDueDate = hasDue && (body.dueDate === null || body.dueDate === "");
   const dueDate = hasDue && !clearsDueDate ? parseDay(body.dueDate, "dueDate", "Due date") : null;
   const effectiveStart = startDate ?? current.startDate;

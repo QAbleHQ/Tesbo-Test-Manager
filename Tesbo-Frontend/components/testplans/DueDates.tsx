@@ -12,9 +12,19 @@ export function dateRangeError(startDate: string, dueDate: string): string | nul
 }
 
 /**
+ * The message to show when the start date is before today, or null when it is fine. Mirrors the API's
+ * rule: a start date that is unchanged from the stored one (`originalStartDate`) is never flagged, so an
+ * already-started plan or run can still be edited.
+ */
+export function startDateError(startDate: string, today: string, originalStartDate?: string | null): string | null {
+  if (!startDate || !today || startDate >= today || startDate === originalStartDate) return null;
+  return "Start date cannot be earlier than today.";
+}
+
+/**
  * Start Date (required) and Due Date (optional) for a test plan or test run. Both are native date
- * pickers; the due picker's `min` is the start date, and the due date has its own Clear button
- * because a browser's date input cannot always be emptied by hand.
+ * pickers; the start picker's `min` is today, the due picker's `min` is the start date, and the due
+ * date has its own Clear button because a browser's date input cannot always be emptied by hand.
  */
 export function DateRangeFields({
   idPrefix,
@@ -23,6 +33,8 @@ export function DateRangeFields({
   onStartDateChange,
   onDueDateChange,
   disabled,
+  today,
+  originalStartDate,
 }: {
   idPrefix: string;
   startDate: string;
@@ -30,8 +42,15 @@ export function DateRangeFields({
   onStartDateChange: (value: string) => void;
   onDueDateChange: (value: string) => void;
   disabled?: boolean;
+  /** The workspace's current day (YYYY-MM-DD). */
+  today: string;
+  /** The stored start date when editing, so an unchanged past start is not flagged. */
+  originalStartDate?: string | null;
 }) {
   const error = dateRangeError(startDate, dueDate);
+  const startError = startDateError(startDate, today, originalStartDate);
+  // An unchanged past start keeps its own value as the floor, otherwise the picker would flag it invalid.
+  const startMin = originalStartDate && originalStartDate < today ? originalStartDate : today;
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
       <Field>
@@ -42,11 +61,14 @@ export function DateRangeFields({
           id={`${idPrefix}-start-date`}
           type="date"
           value={startDate}
+          min={startMin}
           onChange={(e) => onStartDateChange(e.target.value)}
           disabled={disabled}
           required
           aria-label="Start date"
+          aria-invalid={startError ? true : undefined}
         />
+        {startError && <FieldError data-testid={`${idPrefix}-start-date-error`}>{startError}</FieldError>}
       </Field>
       <Field>
         <div className="flex items-center justify-between gap-2">

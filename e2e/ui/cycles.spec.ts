@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, request as pwRequest, test, type APIRequestContext, type Locator, type Page } from "@playwright/test";
 import { env } from "../utils/env";
-import { workspaceDays } from "../utils/due-dates";
+import { backdate, workspaceDays } from "../utils/due-dates";
 import { literal, scalar } from "../utils/psql";
 
 const ctx = JSON.parse(fs.readFileSync(path.join(__dirname, "../.auth/context.json"), "utf-8"));
@@ -669,7 +669,7 @@ test.describe("Add Test Cases picker — suite filter", () => {
       // directly under its CHILD suite, not just the parent's own case.
       await expect(page.getByText(parentCaseTitle, { exact: true })).toBeVisible();
       await expect(page.getByText(childCaseTitle, { exact: true })).toBeVisible();
-      await expect(page.getByText("0 of 2 selectable selected", { exact: true })).toBeVisible();
+      await expect(page.getByText("0 of 2 selected", { exact: true })).toBeVisible();
     } finally {
       if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
       if (testcaseIds.length > 0) {
@@ -680,6 +680,101 @@ test.describe("Add Test Cases picker — suite filter", () => {
       }
       if (childSuiteId) await api.delete(`/api/suites/${childSuiteId}`, { failOnStatusCode: false });
       if (parentSuiteId) await api.delete(`/api/suites/${parentSuiteId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+
+  test("lists cases in ascending ID order regardless of creation order (2 before 9 before 10)", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let cycleId = "";
+    let testcaseIds: string[] = [];
+    try {
+      const prefix = `E2E PickerOrder ${stamp}`;
+      // Created out of order, and "10" < "9" lexically, so a plain string sort would also fail.
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: {
+            testcases: [
+              { title: `${prefix} ten`, status: "Approved", externalId: `ZZPO${stamp}-10` },
+              { title: `${prefix} two`, status: "Approved", externalId: `ZZPO${stamp}-2` },
+              { title: `${prefix} nine`, status: "Approved", externalId: `ZZPO${stamp}-9` },
+            ],
+          },
+        })
+      ).json();
+      testcaseIds = created.created.map((c: { id: string }) => c.id);
+
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Picker Order ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+      await page.getByRole("button", { name: "Add Test Cases" }).click();
+      await expect(page.getByText("Add Test Cases to Run")).toBeVisible();
+      await page.getByPlaceholder("Search by title or ID…").fill(prefix);
+
+      await expect(page.locator("tbody tr")).toHaveCount(3);
+      const titles = await page.locator("tbody tr td:nth-child(3)").allTextContents();
+      expect(titles.map((t) => t.trim())).toEqual([`${prefix} two`, `${prefix} nine`, `${prefix} ten`]);
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (testcaseIds.length > 0) {
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+          data: { testcaseIds },
+          failOnStatusCode: false,
+        });
+      }
+      await api.dispose();
+    }
+  });
+
+  test("lists only Approved cases — Draft and In Review cases are hidden, not shown disabled", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let cycleId = "";
+    let testcaseIds: string[] = [];
+    try {
+      const approvedTitle = `E2E PickerOnlyApproved Approved ${stamp}`;
+      const draftTitle = `E2E PickerOnlyApproved Draft ${stamp}`;
+      const reviewTitle = `E2E PickerOnlyApproved Review ${stamp}`;
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: {
+            testcases: [
+              { title: approvedTitle, status: "Approved" },
+              { title: draftTitle, status: "Draft" },
+              { title: reviewTitle, status: "In Review" },
+            ],
+          },
+        })
+      ).json();
+      testcaseIds = created.created.map((c: { id: string }) => c.id);
+
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Picker Approved Only ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+      await page.getByRole("button", { name: "Add Test Cases" }).click();
+      await expect(page.getByText("Add Test Cases to Run")).toBeVisible();
+
+      await page.getByPlaceholder("Search by title or ID…").fill(`E2E PickerOnlyApproved`);
+      await expect(page.getByText(approvedTitle, { exact: true })).toBeVisible();
+      await expect(page.getByText(draftTitle, { exact: true })).toHaveCount(0);
+      await expect(page.getByText(reviewTitle, { exact: true })).toHaveCount(0);
+      // The Status filter is gone — every listed case is Approved, so it would only mislead.
+      await expect(page.locator("select:has(option:text-is('All Statuses'))")).toHaveCount(0);
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (testcaseIds.length > 0) {
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+          data: { testcaseIds },
+          failOnStatusCode: false,
+        });
+      }
       await api.dispose();
     }
   });
@@ -813,6 +908,15 @@ test.describe("Schedule Run — Run At validation", () => {
     } finally {
       await api.dispose();
     }
+  });
+
+  // Temporarily hidden (SHOW_SCHEDULE_BUTTON in the runs page): scheduled runs are not implemented.
+  // The /cycles/schedule page itself stays reachable by URL, which the tests below rely on.
+  test("the Test Runs header does not offer a Schedule link, but still offers Create Test Run", async ({ page }) => {
+    await page.goto(`/projects/${ctx.projectId}/cycles`);
+    await expect(page.getByRole("button", { name: "Create Test Run" }).first()).toBeVisible();
+    await expect(page.getByRole("link", { name: "Schedule", exact: true })).toHaveCount(0);
+    await expect(page.locator(`a[href$="/cycles/schedule"]`)).toHaveCount(0);
   });
 
   /** The "Test Run" select isn't tied to its label via for/id, so this walks the DOM structure. */
@@ -1284,9 +1388,9 @@ test.describe("Test Runs — start and due dates", () => {
     const d = await workspaceDays(api);
     const projectId = await seedProject();
     const name = `E2E Run Overdue ${Date.now()}`;
-    const run = await (
-      await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.inDays(-6), dueDate: d.yesterday } })
-    ).json();
+    const run = await (await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.today } })).json();
+    // The API refuses a past start, so the already-started, past-due run is seeded directly.
+    backdate("cycles", run.id, d.inDays(-6), d.yesterday);
     await page.goto(`/projects/${projectId}/cycles`);
     const card = runCard(page, run.id);
     await expect(card.getByTestId("overdue-badge")).toHaveText("Overdue");
@@ -1295,6 +1399,8 @@ test.describe("Test Runs — start and due dates", () => {
     await card.getByTitle("Edit run").click();
     await expect(dueInput(page, "edit-run")).toHaveValue(d.yesterday);
     await expect(startInput(page, "edit-run")).toHaveValue(d.inDays(-6));
+    // The stored start is in the past and is not being changed: the form must not flag it or block Save.
+    await expect(page.getByTestId("edit-run-start-date-error")).toHaveCount(0);
     await dueInput(page, "edit-run").fill(d.inDays(10));
     await page.getByRole("button", { name: "Save Changes" }).click();
 
@@ -1330,11 +1436,50 @@ test.describe("Test Runs — start and due dates", () => {
     const d = await workspaceDays(api);
     const projectId = await seedProject();
     const run = await (
-      await api.post(`/api/projects/${projectId}/cycles`, { data: { name: `E2E Run Detail ${Date.now()}`, environment: "Staging", startDate: d.inDays(-4), dueDate: d.yesterday } })
+      await api.post(`/api/projects/${projectId}/cycles`, { data: { name: `E2E Run Detail ${Date.now()}`, environment: "Staging", startDate: d.today } })
     ).json();
+    backdate("cycles", run.id, d.inDays(-4), d.yesterday);
     await page.goto(`/projects/${projectId}/cycles/${run.id}`);
     await expect(page.getByTestId("start-date-value")).toHaveText(/Start: \d{2} \w{3} \d{4}/);
     await expect(page.getByTestId("due-date-value")).toHaveText(/Due: \d{2} \w{3} \d{4}/);
     await expect(page.getByTestId("overdue-badge")).toBeVisible();
+  });
+
+  test("RUN-D-U-07 a start date before today is flagged, blocks Create, saves nothing, and clears once moved to today", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run PastStart ${Date.now()}`;
+    await page.goto(`/projects/${projectId}/cycles?create=1`);
+    await fillBasics(page, name);
+    // The picker itself greys out earlier days; typing one in must still be caught.
+    await expect(startInput(page, "new-run")).toHaveAttribute("min", d.today);
+    await startInput(page, "new-run").fill(d.yesterday);
+    await expect(page.getByTestId("new-run-start-date-error")).toHaveText(/start date cannot be earlier than today/i);
+    await expect(createButton(page)).toBeDisabled();
+    expect(await runByName(projectId, name), "nothing may be saved with a past start date").toBeUndefined();
+
+    await startInput(page, "new-run").fill(d.today);
+    await expect(page.getByTestId("new-run-start-date-error")).toHaveCount(0);
+    await expect(createButton(page)).toBeEnabled();
+    await createButton(page).click();
+    await expect.poll(async () => (await runByName(projectId, name))?.startDate).toBe(d.today);
+  });
+
+  test("RUN-D-U-08 the edit form refuses moving a run's start to a past day and saves nothing; a future day saves", async ({ page }) => {
+    const d = await workspaceDays(api);
+    const projectId = await seedProject();
+    const name = `E2E Run EditPastStart ${Date.now()}`;
+    const run = await (await api.post(`/api/projects/${projectId}/cycles`, { data: { name, environment: "Staging", startDate: d.today } })).json();
+    await page.goto(`/projects/${projectId}/cycles`);
+    await runCard(page, run.id).getByTitle("Edit run").click();
+    await startInput(page, "edit-run").fill(d.yesterday);
+    await expect(page.getByTestId("edit-run-start-date-error")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Save Changes" })).toBeDisabled();
+    expect((await runByName(projectId, name)).startDate).toBe(d.today);
+
+    await startInput(page, "edit-run").fill(d.tomorrow);
+    await expect(page.getByTestId("edit-run-start-date-error")).toHaveCount(0);
+    await page.getByRole("button", { name: "Save Changes" }).click();
+    await expect.poll(async () => (await runByName(projectId, name)).startDate).toBe(d.tomorrow);
   });
 });

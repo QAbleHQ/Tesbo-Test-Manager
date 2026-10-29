@@ -1,4 +1,5 @@
 import type { APIRequestContext } from "@playwright/test";
+import { exec, literal } from "./psql";
 
 /**
  * Helpers for the plan / run Start Date and Due Date specs.
@@ -24,6 +25,19 @@ export async function workspaceTimezone(api: APIRequestContext): Promise<string>
   const res = await api.get("/api/workspace");
   const body = await res.json();
   return body.timezone;
+}
+
+/**
+ * Puts a plan / run in the past by writing its dates straight to the database.
+ *
+ * The API refuses a start date earlier than today, so a fixture that needs an already-started or
+ * overdue plan or run (a legacy row, in product terms) cannot be made through it. Both columns are
+ * written in one statement so the start <= due CHECK holds throughout.
+ */
+export function backdate(table: "plans" | "cycles", id: string, startDate: string, dueDate: string | null): void {
+  exec(
+    `UPDATE ${table} SET start_date = ${literal(startDate)}::date, due_date = ${dueDate === null ? "NULL" : `${literal(dueDate)}::date`} WHERE id = ${literal(id)};`
+  );
 }
 
 /** Today in the caller's workspace timezone, plus helpers for the days around it. */

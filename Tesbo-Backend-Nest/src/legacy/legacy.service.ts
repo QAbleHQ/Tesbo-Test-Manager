@@ -21,7 +21,7 @@ import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
 import { writeNotifications } from "./notification-writer";
-import { DEFAULT_WORKSPACE_TIMEZONE, assertDateRange, duePhase, isValidTimezone, parseDay, resolveDateChange, todayIn, type DuePhase } from "./due-dates";
+import { DEFAULT_WORKSPACE_TIMEZONE, assertDateRange, assertStartNotInPast, duePhase, isValidTimezone, parseDay, resolveDateChange, todayIn, type DuePhase } from "./due-dates";
 import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
@@ -6357,10 +6357,11 @@ export class LegacyService implements OnModuleInit {
     const today = todayIn(await this.projectTimezone(projectId));
     // Start date is required: when the caller names none it is the day of creation (workspace time).
     const startDate = parseDay(body.startDate, "startDate", "Start date") ?? today;
+    assertStartNotInPast(startDate, today);
     const dueDate = parseDay(body.dueDate, "dueDate", "Due date");
     assertDateRange(startDate, dueDate);
     const res = await this.db.query(
-      `INSERT INTO plans (project_id, name, description, target_release, owner_id, start_date, due_date)
+      `INSERT INTO plans(project_id, name, description, target_release, owner_id, start_date, due_date)
        VALUES ($1,$2,$3,$4,$5,$6::date,$7::date)
        RETURNING *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date`,
       [projectId, body.name || "Untitled plan", body.description || "", body.targetRelease || null, body.ownerId || null, startDate, dueDate]
@@ -6385,7 +6386,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   async updatePlan(userId: string | null | undefined, planId: string, body: Body) {
-    await this.requirePlanAccess(userId, planId);
+    const projectId = await this.requirePlanAccess(userId, planId);
     validateBoundedField(body.name, "Plan name", PLAN_NAME_MAX_LENGTH);
     validateBoundedField(body.targetRelease, "Target release", PLAN_TARGET_RELEASE_MAX_LENGTH);
     // Only read the stored dates when the body touches one: the range check needs the other side.
@@ -6396,7 +6397,8 @@ export class LegacyService implements OnModuleInit {
           [planId]
         )).rows[0]
       : undefined;
-    const dates = resolveDateChange(body, { startDate: current?.start_date ?? null, dueDate: current?.due_date ?? null });
+    const today = todayIn(await this.projectTimezone(projectId));
+    const dates = resolveDateChange(body, { startDate: current?.start_date ?? null, dueDate: current?.due_date ?? null }, today);
     await this.db.query(
       `UPDATE plans SET name=COALESCE($2,name), description=COALESCE($3,description), target_release=COALESCE($4,target_release),
        start_date=COALESCE($5::date,start_date),
@@ -6605,10 +6607,11 @@ export class LegacyService implements OnModuleInit {
     const today = todayIn(await this.projectTimezone(projectId));
     // Start date is required: when the caller names none it is the day of creation (workspace time).
     const startDate = parseDay(body.startDate, "startDate", "Start date") ?? today;
+    assertStartNotInPast(startDate, today);
     const dueDate = parseDay(body.dueDate, "dueDate", "Due date");
     assertDateRange(startDate, dueDate);
     const res = await this.db.query(
-      `INSERT INTO cycles (project_id, plan_id, name, description, environment, build_version, release_name, owner_id, start_date, due_date)
+      `INSERT INTO cycles(project_id, plan_id, name, description, environment, build_version, release_name, owner_id, start_date, due_date)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10::date)
        RETURNING *, to_char(start_date, 'YYYY-MM-DD') AS start_date, to_char(due_date, 'YYYY-MM-DD') AS due_date`,
       [
@@ -6815,7 +6818,11 @@ export class LegacyService implements OnModuleInit {
           [cycleId]
         )).rows[0]
       : undefined;
-    const dates = resolveDateChange(body, { startDate: currentDates?.start_date ?? null, dueDate: currentDates?.due_date ?? null });
+    const dates = resolveDateChange(
+      body,
+      { startDate: currentDates?.start_date ?? null, dueDate: currentDates?.due_date ?? null },
+      todayIn(await this.projectTimezone(projectId))
+    );
     // A run with no cases has nothing to execute or complete; the UI disables both buttons, and
     // this keeps the API from being a way around it.
     if (status === "In Progress" || status === "Completed") {

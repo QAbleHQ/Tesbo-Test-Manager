@@ -264,13 +264,14 @@ export function ProjectIntegrationMapping({
       {status.needsReconnect && (
         <div role="alert" className="rounded-lg border border-[var(--warning)]/40 bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning-foreground)]">
           <p className="font-medium">{label} needs to be reconnected</p>
-          {status.authError && <p className="mt-1">{status.authError}</p>}
+          {status.authError && <p className="mt-1">{status.authError.replace(new RegExp(`^${label} needs to be reconnected:\\s*`, "i"), "")}</p>}
           <Link href={`${workspaceConfigHref}?returnProjectId=${projectId}`} className="mt-1 inline-block font-medium underline">
             Reconnect {label} in workspace settings
           </Link>
         </div>
       )}
-      {message && (
+      {/* The yellow banner above already says this; the load error repeats it verbatim in red. */}
+      {message && !(status.needsReconnect && message.type === "error" && /needs to be reconnected/i.test(message.text)) && (
         <div
           className={`rounded-lg border px-3 py-2 text-sm ${
             message.type === "success"
