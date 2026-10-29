@@ -619,7 +619,7 @@ export default function TestRunDetailPage() {
       if (filterType && tc.type !== filterType) return false;
       if (filterSuiteId && !suiteSubtreeIds.has(tc.suiteId ?? "")) return false;
       return true;
-    });
+    }).sort((a, b) => compareExternalId(a.externalId, b.externalId)); // ascending by ID (TC-2 before TC-10)
   }, [allCases, includedCaseIds, filterSearch, filterPriority, filterType, filterSuiteId, suiteSubtreeIds]);
 
   const selectableCases = filteredCases;

@@ -684,6 +684,52 @@ test.describe("Add Test Cases picker — suite filter", () => {
     }
   });
 
+  test("lists cases in ascending ID order regardless of creation order (2 before 9 before 10)", async ({ page }) => {
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+    let cycleId = "";
+    let testcaseIds: string[] = [];
+    try {
+      const prefix = `E2E PickerOrder ${stamp}`;
+      // Created out of order, and "10" < "9" lexically, so a plain string sort would also fail.
+      const created = await (
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-create`, {
+          data: {
+            testcases: [
+              { title: `${prefix} ten`, status: "Approved", externalId: `ZZPO${stamp}-10` },
+              { title: `${prefix} two`, status: "Approved", externalId: `ZZPO${stamp}-2` },
+              { title: `${prefix} nine`, status: "Approved", externalId: `ZZPO${stamp}-9` },
+            ],
+          },
+        })
+      ).json();
+      testcaseIds = created.created.map((c: { id: string }) => c.id);
+
+      const cycle = await (
+        await api.post(`/api/projects/${ctx.projectId}/cycles`, { data: { name: `E2E Picker Order ${stamp}` } })
+      ).json();
+      cycleId = cycle.id;
+
+      await page.goto(`/projects/${ctx.projectId}/cycles/${cycleId}`);
+      await page.getByRole("button", { name: "Add Test Cases" }).click();
+      await expect(page.getByText("Add Test Cases to Run")).toBeVisible();
+      await page.getByPlaceholder("Search by title or ID…").fill(prefix);
+
+      await expect(page.locator("tbody tr")).toHaveCount(3);
+      const titles = await page.locator("tbody tr td:nth-child(3)").allTextContents();
+      expect(titles.map((t) => t.trim())).toEqual([`${prefix} two`, `${prefix} nine`, `${prefix} ten`]);
+    } finally {
+      if (cycleId) await api.delete(`/api/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (testcaseIds.length > 0) {
+        await api.post(`/api/projects/${ctx.projectId}/testcases/bulk-delete`, {
+          data: { testcaseIds },
+          failOnStatusCode: false,
+        });
+      }
+      await api.dispose();
+    }
+  });
+
   test("lists only Approved cases — Draft and In Review cases are hidden, not shown disabled", async ({ page }) => {
     const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
     const stamp = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
