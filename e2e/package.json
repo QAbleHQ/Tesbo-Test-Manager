@@ -18,12 +18,12 @@
     "coverage:audit": "node --experimental-strip-types --no-warnings scripts/coverage-report.ts --audit"
   },
   "devDependencies": {
-    "@playwright/test": "^1.58.2",
+    "@playwright/test": "^1.64.1",
     "@tesbox/playwright-reporter": "^0.2.0",
     "@types/node": "^22.10.7",
     "@types/pg": "^8.23.1",
     "exceljs": "^4.4.0",
-    "pg": "^8.23.0",
+    "pg": "^8.23.1",
     "typescript": "^5.7.3",
     "xlsx": "^0.18.5"
   }
